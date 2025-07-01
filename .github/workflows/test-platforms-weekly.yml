@@ -34,15 +34,16 @@ jobs:
     with:
       matrix: ${{ needs.gen-matrix.outputs.matrix }}
 
-  # Run full Go test suite on linux/amd64 only for now
-  tests-linux:
+  tests:
     needs: gen-matrix
-    # Filter: pick first element matching linux/amd64
-    if: ${{ contains(needs.gen-matrix.outputs.matrix, '"goos":"linux"') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.gen-matrix.outputs.matrix) }}
     uses: ./.github/workflows/test-go.yml
     with:
-      runs-on: ubuntu-latest
-      go-arch: amd64
+      runs-on: ${{ matrix.os }}
+      go-arch: ${{ matrix.goarch }}
       total-runners: 4
       binary-tests: true
-      name: weekly-linux-amd64
+      name: weekly-${{ matrix.goos }}-${{ matrix.goarch }}
