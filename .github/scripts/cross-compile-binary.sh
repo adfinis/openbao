@@ -31,7 +31,7 @@ LD_FLAGS="-s -w -X ${PKG}/version.GitCommit=${GIT_COMMIT} -X ${PKG}/version.Buil
 
 echo "Cross-compiling bao for $GOOS/$GOARCH (CGO_ENABLED=$CGO_ENABLED)"
 GOOS=$GOOS GOARCH=$GOARCH GOARM=${GOARM:-} \
-  go build -trimpath -ldflags="$LD_FLAGS" -tags "${BUILD_TAGS:-openbao}" -o "$BIN" ./cmd/bao
+  go build -trimpath -ldflags="$LD_FLAGS" -tags "${BUILD_TAGS:-openbao}" -o "$BIN" .
 
 echo "Built $BIN"
 
