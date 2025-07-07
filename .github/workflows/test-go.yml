@@ -178,6 +178,7 @@ jobs:
           INPUTS_GO_ARCH: ${{ inputs.go-arch }}
           INPUTS_EXTRA_FLAGS: ${{ inputs.extra-flags }}
           INPUTS_GO_TAGS: ${{ inputs.go-tags }}
+          SKIP_DOCKER_TESTS: ${{ runner.os == 'Windows' && 'true' || 'false' }}
         run: |
           set -exo pipefail
 
@@ -191,9 +192,27 @@ jobs:
             exit 1
           fi
 
+          # Skip Docker-based tests if SKIP_DOCKER_TESTS is set
+          if [[ "$SKIP_DOCKER_TESTS" == "true" ]]; then
+            echo "Filtering out Docker tests for platform compatibility"
+            # Remove packages that contain Docker tests (_binary tests)
+            packages=$(echo "$packages" | tr ' ' '\n' | grep -v "_binary" | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+            if [ -z "$packages" ]; then
+              echo "No non-Docker packages to run"
+              exit 0
+            fi
+            echo "Filtered packages: $packages"
+          fi
+
           # shellcheck disable=SC2034
-          if [ -f bin/bao ]; then
-            BAO_BINARY="$(pwd)/bin/bao"
+          # Determine binary name based on OS
+          BAO_BINARY_NAME="bao"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            BAO_BINARY_NAME="bao.exe"
+          fi
+
+          if [ -f "bin/$BAO_BINARY_NAME" ]; then
+            BAO_BINARY="$(pwd)/bin/$BAO_BINARY_NAME"
             export BAO_BINARY
           fi
 
