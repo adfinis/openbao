@@ -24,17 +24,24 @@ jobs:
           goos: ${{ matrix.goos }}
           goarch: ${{ matrix.goarch }}
 
-      - name: Build binary (native)
-        if: ${{ matrix.buildx != true }}
-        id: native
+      - name: Build binary (native) - Unix
+        if: ${{ matrix.buildx != true && matrix.goos != 'windows' }}
+        id: native_unix
         run: ./.github/scripts/cross-compile-binary.sh
+        shell: bash
+
+      - name: Build binary (native) - Windows
+        if: ${{ matrix.buildx != true && matrix.goos == 'windows' }}
+        id: native_windows
+        run: ./.github/scripts/cross-compile-binary.ps1
+        shell: pwsh
 
       - name: Upload artifact (native)
         if: ${{ matrix.buildx != true }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bao-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: ${{ steps.native.outputs.out }}
+          path: ${{ steps.native_unix.outputs.out || steps.native_windows.outputs.out }}
 
       - name: Set up QEMU
         if: ${{ matrix.buildx == true }}
