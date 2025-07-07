@@ -44,6 +44,6 @@ jobs:
     with:
       runs-on: ${{ matrix.os }}
       go-arch: ${{ matrix.goarch }}
-      total-runners: 4
+      total-runners: 16
       binary-tests: true
       name: weekly-${{ matrix.goos }}-${{ matrix.goarch }}
