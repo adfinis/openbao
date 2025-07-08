@@ -36,6 +36,7 @@ jobs:
 
   tests:
     needs: gen-matrix
+    if: ${{ matrix.goos == 'linux' }}
     strategy:
       fail-fast: false
       matrix:
