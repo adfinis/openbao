@@ -16,6 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.mk.outputs.matrix }}
+      test-matrix: ${{ steps.mk.outputs.test-matrix }}
     steps:
       - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
       - name: Generate platform matrix
@@ -26,7 +27,12 @@ jobs:
             SCOPE="mandatory"
           fi
           echo "Generating matrix for scope: $SCOPE"
-          echo "matrix=$(./.github/scripts/generate-platform-matrix.sh $SCOPE | jq -c .)" >> "$GITHUB_OUTPUT"
+          FULL_MATRIX=$(./.github/scripts/generate-platform-matrix.sh $SCOPE | jq -c .)
+          echo "matrix=$FULL_MATRIX" >> "$GITHUB_OUTPUT"
+
+          # Generate test matrix - only Linux platforms
+          TEST_MATRIX=$(echo "$FULL_MATRIX" | jq -c 'map(select(.goos == "linux"))')
+          echo "test-matrix=$TEST_MATRIX" >> "$GITHUB_OUTPUT"
 
   build:
     needs: gen-matrix
@@ -36,11 +42,10 @@ jobs:
 
   tests:
     needs: gen-matrix
-    if: ${{ matrix.goos == 'linux' }}
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(needs.gen-matrix.outputs.matrix) }}
+        include: ${{ fromJSON(needs.gen-matrix.outputs.test-matrix) }}
     uses: ./.github/workflows/test-go.yml
     with:
       runs-on: ${{ matrix.os }}
