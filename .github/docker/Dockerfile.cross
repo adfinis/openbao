@@ -1,5 +1,7 @@
 # syntax=docker/dockerfile:1
 
+ARG VERSION
+
 # Multi-arch builder image
 FROM golang:${VERSION} AS builder
 
