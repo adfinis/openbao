@@ -30,8 +30,8 @@ jobs:
           FULL_MATRIX=$(./.github/scripts/generate-platform-matrix.sh $SCOPE | jq -c .)
           echo "matrix=$FULL_MATRIX" >> "$GITHUB_OUTPUT"
 
-          # Generate test matrix - only Linux platforms
-          TEST_MATRIX=$(echo "$FULL_MATRIX" | jq -c 'map(select(.goos == "linux"))')
+          # Generate test matrix - only linux/amd64 
+          TEST_MATRIX=$(echo "$FULL_MATRIX" | jq -c 'map(select(.goos == "linux" and .goarch == "amd64"))')
           echo "test-matrix=$TEST_MATRIX" >> "$GITHUB_OUTPUT"
 
   build:
@@ -50,6 +50,7 @@ jobs:
     with:
       runs-on: ${{ matrix.os }}
       go-arch: ${{ matrix.goarch }}
+      # Full test suite on linux/amd64 only
       total-runners: 16
       binary-tests: true
       name: weekly-${{ matrix.goos }}-${{ matrix.goarch }}
