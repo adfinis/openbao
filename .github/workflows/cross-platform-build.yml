@@ -53,7 +53,7 @@ jobs:
 
       - name: Get Go version
         id: go-version
-        run: echo "v=$(cat .go-version | cut -d' ' -f3)" >> $GITHUB_OUTPUT
+        run: echo "v=$(cat .go-version)" >> $GITHUB_OUTPUT
 
       - name: Build binary (buildx)
         if: ${{ matrix.buildx == true }}
