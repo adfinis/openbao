@@ -45,7 +45,9 @@ json="$(echo "$pairs" | awk -F'|' '
 {
   goos=$1; arch=$2;
   if (goos=="darwin") {
-    if (arch=="amd64") runner="macos-latest"; else if (arch=="arm64") runner="macos-latest-arm64"; else next;
+    # GitHub offers the same runner label for all macOS arches.
+    if (arch=="amd64" && arch=="arm64") next;
+    runner="macos-latest";
   } else if (goos=="windows") {
     # GitHub offers the same runner label for all Windows arches.
     if (arch!="amd64" && arch!="arm64") next;
