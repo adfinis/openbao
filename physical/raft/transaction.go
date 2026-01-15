@@ -23,6 +23,8 @@ import (
 	"github.com/openbao/openbao/sdk/v2/helper/pointerutil"
 	"github.com/openbao/openbao/sdk/v2/physical"
 	bolt "go.etcd.io/bbolt"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
 )
 
 // Hashes used to perform verification operations.
@@ -1034,14 +1036,41 @@ func (s *fsmTxnCommitIndexApplicationState) canFastWriteBypassList(key string) b
 	return !found
 }
 
+var (
+	meter                                                   = otel.Meter("github.com/openbao/openbao/physical/raft")
+	txnFastApplyReadHitCounter, txnFastApplyReadMissCounter metric.Int64Counter
+)
+
+func init() {
+	var err error
+	txnFastApplyReadHitCounter, err = meter.Int64Counter(
+		"txn_fast_apply.read_hit",
+		metric.WithDescription("Number of cache hits"),
+		metric.WithUnit("{count}"), // TODO: find unit
+	)
+	if err != nil {
+		panic(err)
+	}
+	txnFastApplyReadMissCounter, err = meter.Int64Counter(
+		"txn_fast_apply.read_miss",
+		metric.WithDescription("Number of cache misses"),
+		metric.WithUnit("{count}"), // TODO: find unit
+	)
+	if err != nil {
+		panic(err)
+	}
+}
+
 func (s *fsmTxnCommitIndexApplicationState) doVerifyRead(b *bolt.Bucket, op *LogOperation) error {
 	if s.canFastWrite() || s.canFastWriteBypassRead(op.Key) {
 		metrics.IncrCounter([]string{"raft-storage", "txn_fast_apply_read_hit"}, 1)
+		txnFastApplyReadHitCounter.Add(context.TODO(), 1)
 		return nil
 	}
 
 	metrics.AddSample([]string{"raft-storage", "txn_applied_index_delta"}, float32(s.indexDelta()))
 	metrics.IncrCounter([]string{"raft-storage", "txn_fast_apply_miss"}, 1)
+	txnFastApplyReadMissCounter.Add(context.TODO(), 1)
 	val := b.Get([]byte(op.Key))
 	err := doVerifyEntry(op.Key, val, op.Value)
 

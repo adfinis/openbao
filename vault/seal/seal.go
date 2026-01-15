@@ -5,10 +5,14 @@ package seal
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	metrics "github.com/hashicorp/go-metrics/compat"
 	wrapping "github.com/openbao/go-kms-wrapping/v2"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 )
 
 type StoredKeysSupport int
@@ -78,6 +82,25 @@ func (a *access) Type(ctx context.Context) (wrapping.WrapperType, error) {
 	return a.w.Type(ctx)
 }
 
+var (
+	meter              = otel.Meter("github.com/openbao/openbao/vault/seal")
+	sealEncryptCounter metric.Int64Counter
+)
+
+func init() {
+	var err error
+	sealEncryptCounter, err = meter.Int64Counter(
+		"seal_encrypt",
+		metric.WithDescription("Number of cache hits"),
+		metric.WithUnit("{count}"), // TODO: find unit
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	// h, err := meter.Float64Histogram()
+}
+
 // Encrypt uses the underlying seal to encrypt the plaintext and returns it.
 func (a *access) Encrypt(ctx context.Context, plaintext []byte, options ...wrapping.Option) (blob *wrapping.BlobInfo, err error) {
 	wTyp, err := a.w.Type(ctx)
@@ -97,6 +120,12 @@ func (a *access) Encrypt(ctx context.Context, plaintext []byte, options ...wrapp
 
 	metrics.IncrCounter([]string{"seal", "encrypt"}, 1)
 	metrics.IncrCounter([]string{"seal", wTyp.String(), "encrypt"}, 1)
+
+	metric.WithAttributeSet(attribute.NewSet())
+	sealEncryptCounter.Add(ctx, 1, metric.WithAttributeSet(attribute.NewSet(attribute.KeyValue{Key: "type", Value: attribute.StringValue(wTyp.String())})))
+	sealEncryptCounter.Add(ctx, 1)
+
+	fmt.Println("encrypt")
 
 	return a.w.Encrypt(ctx, plaintext, options...)
 }

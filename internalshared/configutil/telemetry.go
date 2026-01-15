@@ -7,9 +7,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
-
-	"github.com/hashicorp/go-secure-stdlib/parseutil"
 
 	monitoring "cloud.google.com/go/monitoring/apiv3"
 	stackdriver "github.com/google/go-metrics-stackdriver"
@@ -20,9 +21,16 @@ import (
 	"github.com/hashicorp/go-metrics/compat/datadog"
 	"github.com/hashicorp/go-metrics/compat/prometheus"
 	"github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/go-secure-stdlib/parseutil"
 	"github.com/hashicorp/hcl"
 	"github.com/hashicorp/hcl/hcl/ast"
 	"github.com/openbao/openbao/helper/metricsutil"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
+	"go.opentelemetry.io/otel/exporters/stdout/stdoutmetric"
+	"go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"google.golang.org/api/option"
 )
 
@@ -410,7 +418,68 @@ func SetupTelemetry(opts *SetupTelemetryOpts) (*metrics.InmemSink, *metricsutil.
 	}
 
 	metrics.UpdateFilter(telemetryAllowedPrefixes, telemetryBlockedPrefixes)
+
+	stdoutmetric.New()
+	meterProvider, err := newMeterProvider()
+	if err != nil {
+		return nil, nil, false, err
+	}
+	// TODO: call meterProvider.Shutdown()
+	fmt.Println("otel.SetMeterProvider")
+	otel.SetMeterProvider(meterProvider)
+
+	otlpmetrichttp.New(context.TODO())
+
 	return inm, wrapper, prometheusEnabled, nil
+}
+
+func newMeterProvider() (*metric.MeterProvider, error) {
+	metricExporter, err := stdoutmetric.New(
+		stdoutmetric.WithPrettyPrint(),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	mr := metric.NewManualReader()
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGUSR1)
+
+		var metrics metricdata.ResourceMetrics
+
+		for {
+			<-sigCh
+			fmt.Println("---")
+			mr.Collect(context.TODO(), &metrics)
+			for _, scopedmetric := range metrics.ScopeMetrics {
+				fmt.Println(scopedmetric.Scope.Name)
+				for _, metric := range scopedmetric.Metrics {
+					switch data := metric.Data.(type) {
+
+					case metricdata.Sum[int64]:
+						fmt.Printf("\t%s\n", metric.Name)
+						for _, datapoint := range data.DataPoints {
+							fmt.Printf("\t\t%s %v\n", datapoint.Attributes.Encoded(attribute.DefaultEncoder()), datapoint.Value)
+						}
+
+					default:
+						fmt.Printf("\t%s %T %v\n", metric.Name, metric.Data, metric.Data)
+
+					}
+				}
+			}
+			fmt.Println("---")
+		}
+	}()
+
+	meterProvider := metric.NewMeterProvider(
+		metric.WithReader(metric.NewPeriodicReader(metricExporter,
+			// Default is 1m. Set to 10s for demonstrative purposes.
+			metric.WithInterval(10*time.Second))),
+		metric.WithReader(mr),
+	)
+	return meterProvider, nil
 }
 
 func parsePrefixFilter(prefixFilters []string) ([]string, []string, error) {
