@@ -396,7 +396,7 @@ func SetupTelemetry(opts *SetupTelemetryOpts) (*metrics.InmemSink, *metricsutil.
 	} else {
 		metricsConf.EnableHostname = false
 	}
-	fanout = append(fanout, inm)
+	fanout = append(fanout, inm, OTLAdapter{})
 	globalMetrics, err := metrics.NewGlobal(metricsConf, fanout)
 	if err != nil {
 		return nil, nil, false, err
@@ -456,6 +456,12 @@ func newMeterProvider() (*metric.MeterProvider, error) {
 				fmt.Println(scopedmetric.Scope.Name)
 				for _, metric := range scopedmetric.Metrics {
 					switch data := metric.Data.(type) {
+
+					case metricdata.Sum[float64]:
+						fmt.Printf("\t%s\n", metric.Name)
+						for _, datapoint := range data.DataPoints {
+							fmt.Printf("\t\t%s %v\n", datapoint.Attributes.Encoded(attribute.DefaultEncoder()), datapoint.Value)
+						}
 
 					case metricdata.Sum[int64]:
 						fmt.Printf("\t%s\n", metric.Name)
