@@ -476,6 +476,9 @@ type Core struct {
 	replicationState           atomic.Uint32
 	activeNodeReplicationState atomic.Uint32
 
+	// drManager manages the DR replication lifecycle.
+	drManager *drRelationshipManager
+
 	// uiConfig contains UI configuration
 	uiConfig *UIConfig
 
@@ -1155,6 +1158,9 @@ func NewCore(conf *CoreConfig) (*Core, error) {
 		c.logger.Info("Initializing version history cache for core")
 		c.versionHistory = make(map[string]VaultVersion)
 	}
+
+	// DR replication manager
+	c.drManager = newDRRelationshipManager(c, conf.Logger)
 
 	return c, nil
 }
@@ -2352,6 +2358,15 @@ func (c *Core) postUnseal(ctx context.Context, ctxCancelFunc context.CancelFunc,
 
 	c.loginMFABackend.usedCodes = zcache.New[string, struct{}](0, 30*time.Second)
 	c.loginMFABackend.rateLimits = zcache.New[string, uint32](0, 30*time.Second)
+
+	// Load DR replication configuration and resume if previously enabled.
+	if c.drManager != nil {
+		if err := c.drManager.LoadConfig(ctx); err != nil {
+			c.logger.Warn("failed to load DR replication config", "error", err)
+		} else {
+			c.logger.Info("DR replication config loaded", "mode", string(c.drManager.Mode()))
+		}
+	}
 
 	c.logger.Info("post-unseal setup complete")
 	return nil

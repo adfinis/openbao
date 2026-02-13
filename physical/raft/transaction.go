@@ -329,8 +329,9 @@ func (t *RaftTransaction) Put(ctx context.Context, entry *physical.Entry) error 
 		// one for the cache.
 		OpType: putOp,
 		Contents: &physical.Entry{
-			Key:   entry.Key,
-			Value: cloneBytes(entry.Value),
+			Key:      entry.Key,
+			Value:    cloneBytes(entry.Value),
+			SealWrap: entry.SealWrap,
 		},
 	}
 	t.updates[entry.Key] = update
@@ -750,10 +751,15 @@ func (t *RaftTransaction) Commit(ctx context.Context) error {
 				Key:    key,
 			})
 		case putOp:
+			var flags uint64
+			if updateInfo.Contents != nil && updateInfo.Contents.SealWrap {
+				flags |= flagSealWrap
+			}
 			log.Operations = append(log.Operations, &LogOperation{
 				OpType: putOp,
 				Key:    key,
 				Value:  updateInfo.Contents.Value,
+				Flags:  flags,
 			})
 		}
 	}

@@ -41,6 +41,10 @@ const (
 	beginTxOp
 	commitTxOp
 
+	// flagSealWrap is a bit flag in LogOperation.Flags indicating
+	// the entry uses seal wrapping.
+	flagSealWrap uint64 = 1 << 0
+
 	chunkingPrefix   = "raftchunking/"
 	databaseFilename = "vault.db"
 )
@@ -137,7 +141,8 @@ type FSM struct {
 	// tracker for fast application of transactions
 	fastTxnTracker *fsmTxnCommitIndexTracker
 
-	invalidateHook physical.InvalidateFunc
+	invalidateHook   physical.InvalidateFunc
+	changeStreamHook physical.ChangeStreamFunc
 }
 
 // NewFSM constructs a FSM using the given directory
@@ -174,6 +179,13 @@ func (f *FSM) hookInvalidate(hook physical.InvalidateFunc) {
 	defer f.l.Unlock()
 
 	f.invalidateHook = hook
+}
+
+func (f *FSM) hookChangeStream(hook physical.ChangeStreamFunc) {
+	f.l.Lock()
+	defer f.l.Unlock()
+
+	f.changeStreamHook = hook
 }
 
 func (f *FSM) getDB() *bolt.DB {
@@ -921,21 +933,46 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 		f.fastTxnTracker.clearOldEntries(*lowestActiveIndex)
 	}
 
-	if f.invalidateHook != nil {
+	if f.invalidateHook != nil || f.changeStreamHook != nil {
 		var keys []string
-		for _, commandRaw := range commands {
+		var streamEntries []physical.ChangeStreamEntry
+
+		for logIdx, commandRaw := range commands {
 			switch command := commandRaw.(type) {
 			case *LogData:
 				for _, op := range command.Operations {
 					switch op.OpType {
 					case putOp, deleteOp:
-						keys = append(keys, op.Key)
+						if f.invalidateHook != nil {
+							keys = append(keys, op.Key)
+						}
+						if f.changeStreamHook != nil {
+							entry := physical.ChangeStreamEntry{
+								Key:       op.Key,
+								Value:     op.Value,
+								SealWrap:  op.Flags&flagSealWrap != 0,
+								RaftIndex: logs[logIdx].Index,
+							}
+							if op.OpType == putOp {
+								entry.OpType = physical.PutOperation
+							} else {
+								entry.OpType = physical.DeleteOperation
+							}
+							streamEntries = append(streamEntries, entry)
+						}
 					}
 				}
 			}
 		}
 
-		go f.invalidateHook(keys...)
+		if f.invalidateHook != nil && len(keys) > 0 {
+			go f.invalidateHook(keys...)
+		}
+		if f.changeStreamHook != nil && len(streamEntries) > 0 {
+			// Deliver change stream hooks synchronously to preserve apply
+			// ordering by Raft index for DR replication consumers.
+			f.changeStreamHook(streamEntries)
+		}
 	}
 
 	// If we advanced the latest value, update the in-memory representation too.

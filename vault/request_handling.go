@@ -582,6 +582,20 @@ func (c *Core) switchedLockHandleRequest(httpCtx context.Context, req *logical.R
 		return nil, consts.ErrSealed
 	}
 
+	// DR secondary read-only enforcement: reject write requests except
+	// for DR status and promote endpoints.
+	if c.drManager != nil && c.drManager.Mode() == DRModeSecondary {
+		if req.Operation == logical.UpdateOperation ||
+			req.Operation == logical.CreateOperation ||
+			req.Operation == logical.DeleteOperation ||
+			req.Operation == logical.PatchOperation {
+			// Allow DR-specific operations through.
+			if !isDRSecondaryAllowedPath(req.Path) {
+				return logical.ErrorResponse("request denied on DR secondary: this cluster is in read-only mode"), logical.ErrReadOnly
+			}
+		}
+	}
+
 	if c.activeContext.Load().Err() != nil {
 		if c.standby.Load() {
 			return nil, logical.ErrPerfStandbyPleaseForward

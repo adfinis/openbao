@@ -71,6 +71,37 @@ type CacheInvalidationBackend interface {
 
 type InvalidateFunc func(key ...string)
 
+// ChangeStreamEntry represents a single storage mutation for
+// replication change streaming.
+type ChangeStreamEntry struct {
+	// OpType is the operation type: PutOperation or DeleteOperation.
+	OpType Operation
+
+	// Key is the storage key that was mutated.
+	Key string
+
+	// Value is the new value (nil for deletes).
+	Value []byte
+
+	// SealWrap indicates whether the entry uses seal wrapping.
+	SealWrap bool
+
+	// RaftIndex is the Raft log index at which this mutation was applied.
+	RaftIndex uint64
+}
+
+// ChangeStreamFunc is called with a batch of storage mutations after
+// they have been applied to the FSM. The callback is invoked in Raft
+// apply order (monotonic by RaftIndex) for DR replication streaming.
+type ChangeStreamFunc func(entries []ChangeStreamEntry)
+
+// ChangeStreamBackend is an extension to support DR replication by
+// providing a hook that receives all storage mutations (key, value,
+// operation type, and raft index) as they are applied.
+type ChangeStreamBackend interface {
+	HookChangeStream(hook ChangeStreamFunc)
+}
+
 // HABackend is an extensions to the standard physical
 // backend to support high-availability. Vault only expects to
 // use mutual exclusion to allow multiple instances to act as a

@@ -85,12 +85,22 @@ func NewSystemBackend(core *Core, logger log.Logger) *SystemBackend {
 				"leases/lookup/*",
 				"leases",
 				"internal/inspect/*",
+				"replication/dr/primary/enable",
+				"replication/dr/primary/disable",
+				"replication/dr/primary/secondary-token",
+				"replication/dr/primary/relationships",
+				"replication/dr/primary/relationships/*",
+				"replication/dr/secondary/enable",
+				"replication/dr/secondary/disable",
+				"replication/dr/secondary/promote",
 			},
 
 			Unauthenticated: []string{
 				"wrapping/lookup",
 				"wrapping/pubkey",
 				"replication/status",
+				"replication/dr/status",
+				"replication/dr/primary/register-secondary",
 				"internal/specs/openapi",
 				"internal/ui/mounts",
 				"internal/ui/mounts/*",
@@ -162,6 +172,8 @@ func NewSystemBackend(core *Core, logger log.Logger) *SystemBackend {
 	b.Paths = append(b.Paths, b.loginMFAPaths()...)
 	b.Paths = append(b.Paths, b.introspectionPaths()...)
 	b.Paths = append(b.Paths, b.workflowPaths()...)
+
+	b.Paths = append(b.Paths, b.drReplicationPaths()...)
 
 	if core.rawEnabled {
 		b.Paths = append(b.Paths, b.rawPaths()...)

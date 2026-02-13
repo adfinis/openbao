@@ -1,0 +1,293 @@
+// Copyright (c) OpenBao a Series of LF Projects, LLC
+// SPDX-License-Identifier: MPL-2.0
+
+syntax = "proto3";
+
+option go_package = "github.com/openbao/openbao/vault";
+
+package vault;
+
+// DRReplication provides the cross-cluster gRPC service for disaster
+// recovery replication. It supports two modes:
+//
+// Normal mode: Primary streams storage mutations to secondary via
+// StreamChanges (entry-level change stream, not WAL shipping).
+//
+// Recovery mode: When the stream is interrupted or the secondary
+// detects divergence, IBLT/prefix digest reconciliation identifies
+// and repairs differences with bandwidth proportional to the number
+// of differences (d), not the total keyspace (n).
+service DRReplication {
+    // StreamChanges is the normal-mode replication stream. The primary
+    // pushes storage mutations to the secondary in real time.
+    rpc StreamChanges(StreamChangesRequest) returns (stream EntryChange) {}
+
+    // RequestCheckpoint asks the primary to create a consistent
+    // checkpoint at its current commit index for reconciliation.
+    rpc RequestCheckpoint(CheckpointRequest) returns (CheckpointResponse) {}
+
+    // ExchangeStrataEstimator exchanges strata estimator sketches to
+    // estimate the number of differences between primary and secondary.
+    rpc ExchangeStrataEstimator(StrataMessage) returns (StrataMessage) {}
+
+    // ExchangeIBLT exchanges IBLT sketches to decode the actual
+    // differing elements.
+    rpc ExchangeIBLT(IBLTMessage) returns (IBLTMessage) {}
+
+    // ExchangePrefixDigests exchanges prefix digest buckets for
+    // adaptive drill-down when IBLT decode fails.
+    rpc ExchangePrefixDigests(PrefixDigestRequest) returns (PrefixDigestResponse) {}
+
+    // FetchEntries retrieves the actual storage entries for a set of
+    // divergent keys identified during reconciliation.
+    rpc FetchEntries(FetchEntriesRequest) returns (stream EntryBatch) {}
+
+    // Heartbeat is a lightweight health check exchanging replication
+    // state between primary and secondary.
+    rpc Heartbeat(DRHeartbeatRequest) returns (DRHeartbeatResponse) {}
+
+    // SyncKeyring transfers the encrypted keyring blob from primary to
+    // secondary during bootstrap. The secondary must share the same
+    // seal configuration to decrypt it.
+    rpc SyncKeyring(SyncKeyringRequest) returns (SyncKeyringResponse) {}
+}
+
+// EntryChange represents a single storage mutation.
+message EntryChange {
+    // op_type: "put" or "delete"
+    string op_type = 1;
+
+    // key is the storage path.
+    string key = 2;
+
+    // value is the (encrypted) entry bytes. Empty for deletes.
+    bytes value = 3;
+
+    // seal_wrap indicates if the entry uses seal wrapping.
+    bool seal_wrap = 4;
+
+    // raft_index is the primary's Raft log index for this mutation.
+    uint64 raft_index = 5;
+
+    // kid is the Key IDentifier (HMAC of the storage key). Used in
+    // FetchEntries delete responses where the primary cannot resolve
+    // the key (it was deleted). The secondary uses its local KID->key
+    // map to resolve the actual storage path.
+    bytes kid = 6;
+}
+
+// StreamChangesRequest initiates the change stream from primary.
+message StreamChangesRequest {
+    // relationship_id identifies the DR relationship.
+    string relationship_id = 1;
+
+    // last_applied_index is the secondary's last known primary index.
+    // Used as a hint for the primary to skip already-applied entries.
+    uint64 last_applied_index = 2;
+}
+
+// CheckpointRequest asks the primary to create a reconciliation checkpoint.
+message CheckpointRequest {
+    string relationship_id = 1;
+}
+
+// CheckpointResponse contains the checkpoint details.
+message CheckpointResponse {
+    // checkpoint_id is a unique identifier for this checkpoint.
+    string checkpoint_id = 1;
+
+    // commit_index is the primary's Raft commit index at checkpoint time.
+    uint64 commit_index = 2;
+
+    // top_ranges is the primary-generated deterministic top-level range
+    // manifest for range-based reconciliation.
+    repeated RangeDigest top_ranges = 3;
+
+    // range_plan_version identifies the deterministic range planner
+    // algorithm used to generate top_ranges.
+    uint32 range_plan_version = 4;
+}
+
+// RangeSpan is an inclusive KID interval.
+message RangeSpan {
+    // start_kid and end_kid are inclusive 32-byte KID boundaries.
+    bytes start_kid = 1;
+    bytes end_kid = 2;
+
+    // split_depth indicates adaptive split depth from the parent range.
+    uint32 split_depth = 3;
+}
+
+// RangeDigest summarizes a KID interval for mismatch detection and sizing hints.
+message RangeDigest {
+    RangeSpan span = 1;
+    uint64 count = 2;
+    bytes xor_key_hash = 3;
+    bytes xor_value_hash = 4;
+    uint32 suggested_iblt_cells = 5;
+    uint64 approx_value_bytes = 6;
+}
+
+// StrataMessage carries a serialized strata estimator.
+message StrataMessage {
+    string checkpoint_id = 1;
+
+    // strata_data is the serialized StrataEstimator.
+    bytes strata_data = 2;
+
+    // checkpoint_index is the primary commit index associated with this
+    // checkpoint. All reconciliation phase requests must carry the same
+    // checkpoint tuple (id + index).
+    uint64 checkpoint_index = 3;
+}
+
+// IBLTMessage carries a serialized IBLT.
+message IBLTMessage {
+    string checkpoint_id = 1;
+
+    // num_cells is the IBLT size (for informational purposes).
+    uint32 num_cells = 2;
+
+    // iblt_data is the serialized IBLT.
+    bytes iblt_data = 3;
+
+    // span optionally scopes IBLT exchange to a specific KID interval.
+    // When unset, global behavior is used.
+    RangeSpan span = 4;
+
+    // checkpoint_index fences this request to a specific checkpoint tuple.
+    uint64 checkpoint_index = 5;
+}
+
+// PrefixDigestRequest requests prefix digests at a given depth.
+message PrefixDigestRequest {
+    string checkpoint_id = 1;
+
+    // prefix_length is the number of prefix bits (e.g. 8, 12, 16).
+    uint32 prefix_length = 2;
+
+    // bucket_indices restricts the response to specific buckets.
+    // Empty means all buckets at this prefix length.
+    repeated uint32 bucket_indices = 3;
+
+    // span optionally scopes digest generation to a specific KID interval.
+    // When unset, global behavior is used.
+    RangeSpan span = 4;
+
+    // checkpoint_index fences this request to a specific checkpoint tuple.
+    uint64 checkpoint_index = 5;
+}
+
+// PrefixDigestResponse returns prefix digest buckets.
+message PrefixDigestResponse {
+    uint32 prefix_length = 1;
+    repeated BucketDigestProto buckets = 2;
+}
+
+// BucketDigestProto is the wire representation of a single prefix bucket.
+message BucketDigestProto {
+    uint32 index = 1;
+    uint64 count = 2;
+    bytes xor_key_hash = 3;
+    bytes xor_value_hash = 4;
+}
+
+// FetchEntriesRequest asks the primary for specific entries by KID.
+message FetchItem {
+    // kid identifies the item to fetch.
+    bytes kid = 1;
+    // expected_vid is the VID derived on the secondary from the active
+    // checkpoint diff. The primary must verify fetched value provenance.
+    bytes expected_vid = 2;
+}
+
+// FetchEntriesRequest asks the primary for specific entries by KID.
+message FetchEntriesRequest {
+    string checkpoint_id = 1;
+
+    // kids is the list of KID hashes to fetch entries for.
+    repeated bytes kids = 2;
+
+    // include_deletes indicates whether tombstoned/deleted entries
+    // should be included in the response.
+    bool include_deletes = 3;
+
+    // bucket_prefix_length and bucket_indices enable bucket-based
+    // fetching for prefix digest reconciliation. When set, the primary
+    // returns all entries whose KID falls into the specified buckets,
+    // not just the KIDs listed in the kids field.
+    uint32 bucket_prefix_length = 4;
+    repeated uint32 bucket_indices = 5;
+
+    // ranges optionally requests all entries in the provided KID intervals.
+    repeated RangeSpan ranges = 6;
+
+    // checkpoint_index fences this request to a specific checkpoint tuple.
+    uint64 checkpoint_index = 7;
+
+    // items is a provenance-safe fetch list of (KID, expected_VID) pairs.
+    // When checkpoint_index is set and point fetches are requested, items
+    // should be used instead of kids.
+    repeated FetchItem items = 8;
+}
+
+// EntryBatch is a batch of storage entries.
+message EntryBatch {
+    repeated EntryChange entries = 1;
+
+    // errors lists KIDs that could not be fetched due to storage
+    // errors. The secondary should retry these in a subsequent
+    // reconciliation pass.
+    repeated bytes failed_kids = 2;
+
+    // checkpoint tuple provenance for this batch.
+    string checkpoint_id = 3;
+    uint64 checkpoint_index = 4;
+}
+
+// DRHeartbeatRequest is sent periodically from secondary to primary.
+message DRHeartbeatRequest {
+    string relationship_id = 1;
+    uint64 applied_index = 2;
+    uint64 term = 3;
+    string node_id = 4;
+}
+
+// DRHeartbeatResponse is the primary's reply to a heartbeat.
+message DRHeartbeatResponse {
+    uint64 primary_index = 1;
+    uint64 primary_term = 2;
+    uint32 replication_state = 3;
+}
+
+// SyncKeyringRequest is sent by the secondary during bootstrap to
+// request the primary's keyring.
+message SyncKeyringRequest {
+    string relationship_id = 1;
+    bytes client_ephemeral_pubkey = 2;
+    bytes client_nonce = 3;
+}
+
+// SyncKeyringResponse carries the encrypted keyring, root key entry,
+// and the root key wrapped to the secondary's ephemeral public key.
+message SyncKeyringResponse {
+    // keyring_entry is the raw value of "core/keyring" from physical storage.
+    bytes keyring_entry = 1;
+
+    // root_key_entry is the raw value of "core/root-key" from physical storage.
+    bytes root_key_entry = 2;
+
+    // wrapped_root_key is the root key encrypted with a symmetric key
+    // derived from ECDH(primary_ephemeral, secondary_ephemeral_pubkey).
+    bytes wrapped_root_key = 3;
+
+    // server_ephemeral_pubkey is the primary's ephemeral public key used
+    // for ECDH key agreement.
+    bytes server_ephemeral_pubkey = 4;
+
+    // wrap_nonce is the AEAD nonce used to encrypt wrapped_root_key.
+    bytes wrap_nonce = 5;
+
+    // wrap_aad_version is the protocol version encoded in AEAD AAD.
+    uint32 wrap_aad_version = 6;
+}

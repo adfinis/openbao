@@ -69,6 +69,7 @@ var (
 	_ physical.Transactional            = (*RaftBackend)(nil)
 	_ physical.HABackend                = (*RaftBackend)(nil)
 	_ physical.CacheInvalidationBackend = (*RaftBackend)(nil)
+	_ physical.ChangeStreamBackend      = (*RaftBackend)(nil)
 	_ physical.Lock                     = (*RaftLock)(nil)
 )
 
@@ -213,6 +214,11 @@ type RaftBackend struct {
 // HookInvalidate implements physical.CacheInvalidationBackend.
 func (r *RaftBackend) HookInvalidate(hook physical.InvalidateFunc) {
 	r.fsm.hookInvalidate(hook)
+}
+
+// HookChangeStream implements physical.ChangeStreamBackend.
+func (r *RaftBackend) HookChangeStream(hook physical.ChangeStreamFunc) {
+	r.fsm.hookChangeStream(hook)
 }
 
 // LeaderJoinInfo contains information required by a node to join itself as a
@@ -1667,10 +1673,16 @@ func (b *RaftBackend) Put(ctx context.Context, entry *physical.Entry) error {
 		return err
 	}
 
+	var flags uint64
+	if entry.SealWrap {
+		flags |= flagSealWrap
+	}
+
 	command := &LogData{
 		Operations: []*LogOperation{
 			{
 				OpType: putOp,
+				Flags:  flags,
 				Key:    entry.Key,
 				Value:  entry.Value,
 			},
