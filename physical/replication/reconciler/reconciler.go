@@ -1,0 +1,332 @@
+// Copyright (c) OpenBao a Series of LF Projects, LLC
+// SPDX-License-Identifier: MPL-2.0
+
+// Package reconciler builds reconciliation sets from storage for
+// disaster recovery replication. It scans the full keyspace, computes
+// (KID, VID) pairs, and populates sketch data structures (IBLT,
+// strata estimator, prefix digest) for set reconciliation.
+package reconciler
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"fmt"
+	"sync"
+
+	log "github.com/hashicorp/go-hclog"
+	"github.com/openbao/openbao/physical/replication/sketch"
+	"github.com/openbao/openbao/sdk/v2/logical"
+	"github.com/openbao/openbao/sdk/v2/physical"
+)
+
+// tombstoneMarker is a fixed byte sequence used to derive the VID
+// for deleted/tombstoned keys.
+var tombstoneMarker = []byte("__openbao_tombstone__")
+
+// Checkpoint represents a consistent point-in-time snapshot of the
+// reconciliation state.
+type Checkpoint struct {
+	// ID is a unique identifier for this checkpoint.
+	ID string
+
+	// CommitIndex is the Raft commit index at the time of scanning.
+	CommitIndex uint64
+
+	// Term is the Raft term at the time of scanning.
+	Term uint64
+}
+
+// CheckpointItemMeta is the compact checkpoint representation used by
+// metadata-first reconciliation and range manifest planning.
+type CheckpointItemMeta struct {
+	KID [32]byte
+	VID [32]byte
+	Key string
+}
+
+// CheckpointArtifact is an immutable reconciliation artifact for one
+// checkpoint tuple.
+type CheckpointArtifact struct {
+	CheckpointID  string
+	CommitIndex   uint64
+	Items         []CheckpointItemMeta
+	RangeManifest []RangeDescriptor
+}
+
+// ReconciliationSet contains the sketch data structures built from
+// scanning the storage keyspace at a specific checkpoint.
+type ReconciliationSet struct {
+	// Checkpoint anchors this set to a specific point in time.
+	Checkpoint Checkpoint
+
+	// Strata is the strata estimator for difference size estimation.
+	Strata *sketch.StrataEstimator
+
+	// IBLT is an IBLT sized for a specific expected difference.
+	// May be nil if the caller only wanted strata/prefix digests.
+	IBLT *sketch.IBLT
+
+	// PrefixDigest is the prefix digest for bucket-level comparison.
+	PrefixDigest *sketch.PrefixDigest
+
+	// KeyCount is the total number of keys scanned.
+	KeyCount int
+
+	// KIDToKey maps KID -> original storage key for entry fetching.
+	// Only populated on the local side (not sent over the wire).
+	KIDToKey map[[32]byte]string
+
+	// KIDToVID maps KID -> VID for all scanned entries. This allows
+	// building IBLTs from a single checkpoint snapshot without rescanning.
+	KIDToVID map[[32]byte][32]byte
+
+	// Entries is an optional snapshot of scanned storage entries keyed by
+	// KID. Populated when ScanConfig.BuildEntryMap is true.
+	Entries map[[32]byte]*physical.Entry
+}
+
+// ScanConfig configures the reconciliation scan.
+type ScanConfig struct {
+	// ReplSalt is the HMAC key used to derive KIDs from storage keys.
+	// Must be the same on primary and secondary.
+	ReplSalt []byte
+
+	// IBLTCells is the number of cells for the IBLT. If 0, no IBLT
+	// is built during the scan (use BuildIBLT after strata estimation).
+	IBLTCells uint32
+
+	// PrefixLen is the prefix length for the PrefixDigest.
+	// Default: 8 (256 buckets).
+	PrefixLen uint32
+
+	// StrataLevels is the number of strata estimator levels.
+	// Default: 32.
+	StrataLevels int
+
+	// StrataCells is the number of cells per stratum.
+	// Default: 80.
+	StrataCells uint32
+
+	// BuildKIDMap if true, populates ReconciliationSet.KIDToKey for
+	// reverse lookups. Should be true on the side that will serve
+	// entry fetches (typically the primary).
+	BuildKIDMap bool
+
+	// BuildEntryMap if true, populates ReconciliationSet.Entries with a
+	// point-in-time snapshot of scanned entries keyed by KID.
+	BuildEntryMap bool
+
+	// ExcludePaths is an optional set of storage paths to skip during
+	// reconciliation scans. Paths in this set cannot be read through
+	// the barrier (e.g. core/keyring, encrypted with root key) or
+	// are cluster-local (e.g. core/hsm/barrier-unseal-keys).
+	ExcludePaths map[string]bool
+
+	// ExcludePathFunc, when set, is evaluated for every scanned path
+	// and can be used for prefix- or pattern-based exclusions.
+	ExcludePathFunc func(string) bool
+
+	// Logger for scan progress.
+	Logger log.Logger
+}
+
+// DefaultScanConfig returns a ScanConfig with sensible defaults.
+func DefaultScanConfig(replSalt []byte) ScanConfig {
+	return ScanConfig{
+		ReplSalt:     replSalt,
+		PrefixLen:    8,
+		StrataLevels: sketch.DefaultStrataLevels,
+		StrataCells:  sketch.DefaultStrataCells,
+		BuildKIDMap:  false,
+	}
+}
+
+// Scanner builds reconciliation sets by scanning storage.
+type Scanner struct {
+	config ScanConfig
+	logger log.Logger
+}
+
+// NewScanner creates a new reconciliation scanner.
+func NewScanner(config ScanConfig) *Scanner {
+	logger := config.Logger
+	if logger == nil {
+		logger = log.NewNullLogger()
+	}
+	return &Scanner{
+		config: config,
+		logger: logger,
+	}
+}
+
+// Scan iterates the full storage keyspace and builds a ReconciliationSet.
+// The storage should ideally support transactions; ScanView handles this
+// internally by wrapping in a read-only transaction if available.
+func (s *Scanner) Scan(ctx context.Context, storage logical.Storage, checkpoint Checkpoint) (*ReconciliationSet, error) {
+	s.logger.Info("starting reconciliation scan", "checkpoint_id", checkpoint.ID, "commit_index", checkpoint.CommitIndex)
+
+	rs := &ReconciliationSet{
+		Checkpoint:   checkpoint,
+		Strata:       sketch.NewStrataEstimator(s.config.StrataLevels, s.config.StrataCells, sketch.DefaultHashCount),
+		PrefixDigest: sketch.NewPrefixDigest(s.config.PrefixLen),
+		KIDToVID:     make(map[[32]byte][32]byte),
+	}
+
+	if s.config.IBLTCells > 0 {
+		rs.IBLT = sketch.NewIBLT(s.config.IBLTCells, sketch.DefaultHashCount)
+	}
+
+	if s.config.BuildKIDMap {
+		rs.KIDToKey = make(map[[32]byte]string)
+	}
+	if s.config.BuildEntryMap {
+		rs.Entries = make(map[[32]byte]*physical.Entry)
+	}
+
+	var mu sync.Mutex
+	err := logical.ScanView(ctx, storage, func(path string) {
+		// Skip excluded paths (e.g. core/keyring which is encrypted
+		// with the root key and cannot be read through the barrier).
+		if s.shouldExclude(path) {
+			return
+		}
+
+		// Get the entry to compute VID from value hash.
+		entry, err := storage.Get(ctx, path)
+		if err != nil {
+			s.logger.Warn("failed to get entry during scan", "path", path, "error", err)
+			return
+		}
+
+		kid := s.computeKID(path)
+		var vid [32]byte
+		if entry == nil {
+			// Tombstone / deleted entry.
+			vid = s.computeTombstoneVID(path)
+		} else {
+			vid = s.computeVID(entry.Value)
+		}
+
+		mu.Lock()
+		rs.Strata.Insert(kid, vid)
+		rs.PrefixDigest.Insert(kid, vid)
+		rs.KIDToVID[kid] = vid
+		if rs.IBLT != nil {
+			rs.IBLT.Insert(kid, vid)
+		}
+		if rs.KIDToKey != nil {
+			rs.KIDToKey[kid] = path
+		}
+		if rs.Entries != nil && entry != nil {
+			valueCopy := make([]byte, len(entry.Value))
+			copy(valueCopy, entry.Value)
+			rs.Entries[kid] = &physical.Entry{
+				Key:      path,
+				Value:    valueCopy,
+				SealWrap: entry.SealWrap,
+			}
+		}
+		rs.KeyCount++
+		mu.Unlock()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("reconciler: scan failed: %w", err)
+	}
+
+	s.logger.Info("reconciliation scan complete", "keys", rs.KeyCount, "checkpoint_id", checkpoint.ID)
+	return rs, nil
+}
+
+// BuildIBLTFromScan builds an IBLT from a full storage scan. This is
+// used after strata estimation to create an IBLT sized appropriately
+// for the estimated difference.
+func (s *Scanner) BuildIBLTFromScan(ctx context.Context, storage logical.Storage, numCells uint32) (*sketch.IBLT, error) {
+	iblt := sketch.NewIBLT(numCells, sketch.DefaultHashCount)
+
+	err := logical.ScanView(ctx, storage, func(path string) {
+		// Skip excluded paths.
+		if s.shouldExclude(path) {
+			return
+		}
+
+		entry, err := storage.Get(ctx, path)
+		if err != nil {
+			s.logger.Warn("failed to get entry for IBLT build", "path", path, "error", err)
+			return
+		}
+
+		kid := s.computeKID(path)
+		var vid [32]byte
+		if entry == nil {
+			vid = s.computeTombstoneVID(path)
+		} else {
+			vid = s.computeVID(entry.Value)
+		}
+
+		iblt.Insert(kid, vid)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("reconciler: IBLT build failed: %w", err)
+	}
+	return iblt, nil
+}
+
+func (s *Scanner) shouldExclude(path string) bool {
+	if s.config.ExcludePaths[path] {
+		return true
+	}
+	if s.config.ExcludePathFunc != nil && s.config.ExcludePathFunc(path) {
+		return true
+	}
+	return false
+}
+
+// ComputeKID computes the KID for a storage key. Exported for use
+// in entry fetch resolution.
+func (s *Scanner) ComputeKID(key string) [32]byte {
+	return s.computeKID(key)
+}
+
+// ComputeVID computes the VID for an entry value. Exported for use
+// in change stream processing.
+func (s *Scanner) ComputeVID(value []byte) [32]byte {
+	return s.computeVID(value)
+}
+
+// ComputeItemFromEntry computes the (KID, VID) pair for a storage entry.
+func (s *Scanner) ComputeItemFromEntry(entry *physical.Entry) (kid, vid [32]byte) {
+	kid = s.computeKID(entry.Key)
+	if entry.Value == nil {
+		vid = s.computeTombstoneVID(entry.Key)
+	} else {
+		vid = s.computeVID(entry.Value)
+	}
+	return
+}
+
+// --- Internal helpers ---
+
+// computeKID derives KID = HMAC-SHA256(replSalt, key).
+func (s *Scanner) computeKID(key string) [32]byte {
+	mac := hmac.New(sha256.New, s.config.ReplSalt)
+	mac.Write([]byte(key))
+	var kid [32]byte
+	copy(kid[:], mac.Sum(nil))
+	return kid
+}
+
+// computeVID derives VID = SHA-256(value).
+func (s *Scanner) computeVID(value []byte) [32]byte {
+	return sha256.Sum256(value)
+}
+
+// computeTombstoneVID derives VID for a deleted key.
+func (s *Scanner) computeTombstoneVID(key string) [32]byte {
+	h := sha256.New()
+	h.Write(tombstoneMarker)
+	h.Write([]byte(key))
+	var vid [32]byte
+	copy(vid[:], h.Sum(nil))
+	return vid
+}
