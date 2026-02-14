@@ -5,8 +5,10 @@ package vault
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc64"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,7 +25,6 @@ import (
 
 	"github.com/openbao/openbao/physical/raft"
 	"github.com/openbao/openbao/physical/replication/reconciler"
-	"github.com/openbao/openbao/physical/replication/sketch"
 	"github.com/openbao/openbao/sdk/v2/physical"
 )
 
@@ -39,6 +40,17 @@ const (
 	drCheckpointLaggingActiveWindow        = 10 * time.Second
 	drCheckpointForceBuildInterval         = 15 * time.Second
 	drCheckpointIndexFullScanInterval      = 10 * time.Minute
+
+	drDirtyBitmapSize            = 1024
+	drDirtyBitmapBytes           = drDirtyBitmapSize / 8
+	drDirtyBitmapStoragePath     = "core/dr-replication/dirty-bitmap"
+	drDirtyBitmapPersistInterval = 5 * time.Second
+
+	drDefaultInitialWindow = 4096             // default credit window if secondary omits it
+	drCreditWaitTimeout    = 30 * time.Second // how long primary waits for credits before cancelling subscriber
+
+	drStreamSendBatchMaxEntries = 64      // max entries per EntryBatch on the stream
+	drStreamSendBatchMaxBytes   = 1 << 20 // 1 MiB max payload per stream batch
 
 	drBackpressureDefaultEnabled        = true
 	drBackpressureDefaultDegradedRatio  = 0.80
@@ -78,7 +90,8 @@ type drSecondaryPressureSample struct {
 // drReplicationPrimary implements the DRReplicationServer gRPC interface
 // on the primary side. It provides:
 //   - Change streaming (normal-mode replication)
-//   - IBLT/strata/prefix digest reconciliation (recovery mode)
+//   - Dirty-bitmap + ordered hash-stream reconciliation (recovery mode)
+//   - Fine-grained range drill-down for efficient diff narrowing
 //   - Entry fetching for divergent keys
 type drReplicationPrimary struct {
 	UnimplementedDRReplicationServer
@@ -151,6 +164,7 @@ type drReplicationPrimary struct {
 	streamJournal *drStreamJournal
 
 	checkpointArtifacts *drCheckpointArtifactStore
+	tombstoneGC         *drTombstoneGC
 
 	// Journal replay health counters.
 	journalReplayAttempts atomic.Uint64
@@ -171,6 +185,17 @@ type drReplicationPrimary struct {
 	backpressureCount      int64
 	backpressureCapQPS     atomic.Int64
 	backpressureRejected   atomic.Uint64
+
+	// dirty tracking
+	dirtyMapMu          sync.RWMutex
+	dirtyMap            []byte
+	dirtyMapStart       uint64
+	dirtyMapLastPersist time.Time
+
+	// creditWaitTimeout is how long the primary waits for credit
+	// replenishment before cancelling a subscriber. Defaults to
+	// drCreditWaitTimeout; overridable for tests.
+	creditWaitTimeout time.Duration
 }
 
 type drCheckpointBuildResult struct {
@@ -187,11 +212,8 @@ type drCheckpointCacheEntry struct {
 	metaBytes        uint64
 	valueBytes       uint64
 	manifestBytes    uint64
-	derivedBytes     uint64
-	prefixDigest     *sketch.PrefixDigest
 	kidToKey         map[[32]byte]string
 	kidToVID         map[[32]byte][32]byte
-	topRanges        []reconciler.RangeDescriptor
 	rangePlanVersion uint32
 }
 
@@ -202,6 +224,13 @@ type changeStreamSubscriber struct {
 	relationshipID string
 	ch             chan physical.ChangeStreamEntry
 	cancel         context.CancelFunc
+
+	// Credit-based flow control. The secondary sends an initial window
+	// and periodically replenishes credits via WindowUpdate messages.
+	// The primary decrements credits on each send; when exhausted it
+	// blocks until credits arrive or drCreditWaitTimeout fires.
+	credits  atomic.Int64
+	creditCh chan struct{} // signaled (non-blocking) when credits arrive
 }
 
 // NewDRReplicationPrimary creates a new DR replication gRPC server for
@@ -259,18 +288,57 @@ func NewDRReplicationPrimary(core *Core, replSalt []byte, logger log.Logger) *dr
 		backpressureHorizonSec:                  drBackpressureDefaultHorizonSeconds,
 		backpressureMinQPSDeg:                   drBackpressureDefaultDegradedMinQPS,
 		backpressureMinQPSCrit:                  drBackpressureDefaultCriticalMinQPS,
+		dirtyMap:                                make([]byte, drDirtyBitmapBytes),
+		creditWaitTimeout:                       drCreditWaitTimeout,
 	}
 	if err := primary.streamJournal.configure(true, drDefaultStreamJournalMaxBytes, drDefaultStreamJournalSegmentBytes, drDefaultStreamJournalRetention); err != nil {
 		primary.logger.Warn("failed to initialize DR stream journal", "error", err)
 	}
 	primary.checkpointArtifacts.configure(true, drCheckpointArtifactDefaultTTL, drCheckpointArtifactDefaultGlobalBudget, drCheckpointArtifactDefaultPerRelBudget, drCheckpointArtifactDefaultSegmentBytes)
+	primary.tombstoneGC = newDRTombstoneGC(primary, logger)
+	primary.tombstoneGC.Start()
 	return primary
+}
+
+// SeedAppliedIndex sets the baseline applied index so the checkpoint
+// fence does not wait for Raft entries that were committed before the
+// change stream hook was registered.  It must be called exactly once
+// after the hook is wired and before any checkpoint requests are served.
+// The value is only stored when it advances the current watermark (i.e.
+// it never moves the counter backwards).
+func (s *drReplicationPrimary) SeedAppliedIndex(idx uint64) {
+	if idx == 0 {
+		return
+	}
+	for {
+		cur := s.indexApplied.Load()
+		if cur >= idx {
+			return
+		}
+		if s.indexApplied.CompareAndSwap(cur, idx) {
+			s.logger.Info("seeded indexApplied from Raft applied index", "index", idx)
+			return
+		}
+	}
 }
 
 // OnChange is called by the FSM change stream hook when storage
 // mutations are applied. It distributes changes to all subscribers
 // and appends to the ring buffer.
 func (s *drReplicationPrimary) OnChange(entries []physical.ChangeStreamEntry) {
+	// Always advance the applied-index watermark from the raw (unfiltered)
+	// entries so the checkpoint fence sees every Raft index we have
+	// observed, including entries for non-replicated paths (e.g.
+	// core/dr-replication/*, core/raft/*).  Without this, batches that
+	// contain only excluded paths would leave indexApplied behind the
+	// true Raft applied index and cause the fence to time out.
+	if len(entries) > 0 {
+		last := entries[len(entries)-1].RaftIndex
+		if last > 0 {
+			s.indexApplied.Store(last)
+		}
+	}
+
 	// Filter out cluster-local keys that are never replicated.
 	replicableEntries := make([]physical.ChangeStreamEntry, 0, len(entries))
 	for _, e := range entries {
@@ -283,12 +351,24 @@ func (s *drReplicationPrimary) OnChange(entries []physical.ChangeStreamEntry) {
 		return
 	}
 
+	// Mark dirty ranges.
+	s.dirtyMapMu.Lock()
+	if s.dirtyMapStart == 0 && len(replicableEntries) > 0 {
+		s.dirtyMapStart = replicableEntries[0].RaftIndex
+	}
+	for _, e := range replicableEntries {
+		kid := s.scanner.ComputeKID(e.Key)
+		// RangeID = first 10 bits of KID
+		rangeID := (uint64(kid[0]) << 2) | (uint64(kid[1]) >> 6)
+		byteIdx := rangeID / 8
+		bitIdx := rangeID % 8
+		s.dirtyMap[byteIdx] |= (1 << bitIdx)
+	}
+	s.maybePersistDirtyBitmap()
+	s.dirtyMapMu.Unlock()
+
 	// Keep metadata index in sync with committed changes.
 	s.updateIndexFromChanges(replicableEntries)
-	last := replicableEntries[len(replicableEntries)-1].RaftIndex
-	if last > 0 {
-		s.indexApplied.Store(last)
-	}
 
 	if s.streamJournal != nil {
 		if err := s.streamJournal.append(replicableEntries); err != nil {
@@ -377,8 +457,22 @@ func (s *drReplicationPrimary) OnChange(entries []physical.ChangeStreamEntry) {
 }
 
 // StreamChanges implements DRReplicationServer.StreamChanges.
-// The primary streams storage mutations to the secondary in real time.
-func (s *drReplicationPrimary) StreamChanges(req *StreamChangesRequest, stream grpc.ServerStreamingServer[EntryChange]) error {
+// The primary streams storage mutations to the secondary in real time
+// as EntryBatch messages (batched for throughput). The RPC is
+// bidirectional: the secondary sends an init message followed by
+// periodic WindowUpdate credits; the primary sends batched entries
+// gated by available credits.
+func (s *drReplicationPrimary) StreamChanges(stream grpc.BidiStreamingServer[StreamChangesUpstream, EntryBatch]) error {
+	// --- Handshake: first upstream message must be init ---
+	initMsg, err := stream.Recv()
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "failed to receive init message: %v", err)
+	}
+	req := initMsg.GetInit()
+	if req == nil {
+		return status.Error(codes.InvalidArgument, "first StreamChangesUpstream message must be init")
+	}
+
 	if err := s.authorizeRelationship(stream.Context(), req.RelationshipId, DRRelationshipStateRegistered, DRRelationshipStateActive); err != nil {
 		return err
 	}
@@ -391,12 +485,19 @@ func (s *drReplicationPrimary) StreamChanges(req *StreamChangesRequest, stream g
 	ctx, cancel := context.WithCancel(stream.Context())
 	defer cancel()
 
+	initialWindow := int64(req.InitialWindow)
+	if initialWindow <= 0 {
+		initialWindow = drDefaultInitialWindow
+	}
+
 	sub := &changeStreamSubscriber{
 		id:             subID,
 		relationshipID: req.RelationshipId,
 		ch:             make(chan physical.ChangeStreamEntry, s.bufMaxSize),
 		cancel:         cancel,
+		creditCh:       make(chan struct{}, 1),
 	}
+	sub.credits.Store(initialWindow)
 
 	s.mu.Lock()
 	s.subscribers[subID] = sub
@@ -411,8 +512,33 @@ func (s *drReplicationPrimary) StreamChanges(req *StreamChangesRequest, stream g
 	s.logger.Info("change stream subscriber connected",
 		"subscriber", subID,
 		"relationship", req.RelationshipId,
-		"last_applied_index", req.LastAppliedIndex)
+		"last_applied_index", req.LastAppliedIndex,
+		"initial_window", initialWindow)
 
+	// --- Credit-reader goroutine ---
+	// Reads subsequent upstream messages (WindowUpdate) and replenishes
+	// the subscriber's credit counter.
+	go func() {
+		for {
+			upstream, err := stream.Recv()
+			if err != nil {
+				// Stream closed or error -- cancel the subscriber context
+				// so the send loop exits.
+				cancel()
+				return
+			}
+			if wu := upstream.GetWindowUpdate(); wu != nil && wu.Credits > 0 {
+				sub.credits.Add(int64(wu.Credits))
+				// Non-blocking signal to wake up a waiting sender.
+				select {
+				case sub.creditCh <- struct{}{}:
+				default:
+				}
+			}
+		}
+	}()
+
+	// --- Catch-up replay ---
 	// Check if buffer/journal can satisfy catch-up, and send catch-up changes.
 	//
 	// Resume is inclusive on last_applied_index because EntryChange is emitted
@@ -424,6 +550,16 @@ func (s *drReplicationPrimary) StreamChanges(req *StreamChangesRequest, stream g
 	bufferSnapshot := append([]physical.ChangeStreamEntry(nil), s.changeBuffer...)
 	s.bufMu.RUnlock()
 
+	// sendBatch is a helper that sends an accumulated batch as a single
+	// EntryBatch message. It is used by both catch-up replay and live
+	// streaming to reduce per-message gRPC overhead.
+	sendBatch := func(batch []*EntryChange) error {
+		if len(batch) == 0 {
+			return nil
+		}
+		return stream.Send(&EntryBatch{Entries: batch})
+	}
+
 	bufferStart := resumeFrom
 	if len(bufferSnapshot) > 0 {
 		oldestIdx := bufferSnapshot[0].RaftIndex
@@ -431,8 +567,17 @@ func (s *drReplicationPrimary) StreamChanges(req *StreamChangesRequest, stream g
 			if s.streamJournal != nil {
 				s.journalReplayAttempts.Add(1)
 				metrics.IncrCounter([]string{"replication", "dr", "stream", "journal_replay_attempts_total"}, 1)
+				// Batch journal replay entries for throughput.
+				journalBatch := make([]*EntryChange, 0, drStreamSendBatchMaxEntries)
 				if err := s.streamJournal.replayRange(bufferStart, oldestIdx, func(e physical.ChangeStreamEntry) error {
-					return stream.Send(entryChangeFromPhysical(e))
+					journalBatch = append(journalBatch, entryChangeFromPhysical(e))
+					if len(journalBatch) >= drStreamSendBatchMaxEntries {
+						if err := sendBatch(journalBatch); err != nil {
+							return err
+						}
+						journalBatch = journalBatch[:0]
+					}
+					return nil
 				}); err != nil {
 					if errors.Is(err, errDRStreamJournalRangeTooOld) {
 						s.journalRangeTooOld.Add(1)
@@ -444,6 +589,10 @@ func (s *drReplicationPrimary) StreamChanges(req *StreamChangesRequest, stream g
 							bufferStart, oldestIdx)
 					}
 					return status.Errorf(codes.Internal, "journal catch-up failed: %v", err)
+				}
+				// Flush remaining journal entries.
+				if err := sendBatch(journalBatch); err != nil {
+					return err
 				}
 				s.journalReplaySuccess.Add(1)
 				metrics.IncrCounter([]string{"replication", "dr", "stream", "journal_replay_success_total"}, 1)
@@ -457,15 +606,24 @@ func (s *drReplicationPrimary) StreamChanges(req *StreamChangesRequest, stream g
 			bufferStart = oldestIdx
 		}
 	}
+	// Batch buffer catch-up entries for throughput.
+	bufCatchupBatch := make([]*EntryChange, 0, drStreamSendBatchMaxEntries)
 	for _, e := range bufferSnapshot {
 		if e.RaftIndex >= bufferStart {
-			if err := stream.Send(entryChangeFromPhysical(e)); err != nil {
-				return err
+			bufCatchupBatch = append(bufCatchupBatch, entryChangeFromPhysical(e))
+			if len(bufCatchupBatch) >= drStreamSendBatchMaxEntries {
+				if err := sendBatch(bufCatchupBatch); err != nil {
+					return err
+				}
+				bufCatchupBatch = bufCatchupBatch[:0]
 			}
 		}
 	}
+	if err := sendBatch(bufCatchupBatch); err != nil {
+		return err
+	}
 
-	// Stream live changes.
+	// --- Live stream with credit-gated batched sends ---
 	authTicker := time.NewTicker(5 * time.Second)
 	defer authTicker.Stop()
 	for {
@@ -477,9 +635,75 @@ func (s *drReplicationPrimary) StreamChanges(req *StreamChangesRequest, stream g
 				return err
 			}
 		case entry := <-sub.ch:
-			if err := stream.Send(entryChangeFromPhysical(entry)); err != nil {
+			// Wait for at least one credit for the first entry.
+			if err := s.waitForCredit(ctx, sub); err != nil {
 				return err
 			}
+			// Build a batch: first entry is already credit-gated above.
+			batch := []*EntryChange{entryChangeFromPhysical(entry)}
+			// Drain additional entries while credits and channel permit.
+		drainLoop:
+			for len(batch) < drStreamSendBatchMaxEntries {
+				// Try to acquire another credit optimistically.
+				if sub.credits.Add(-1) < 0 {
+					sub.credits.Add(1) // undo
+					break drainLoop
+				}
+				// Credit acquired -- try to drain one entry.
+				select {
+				case e := <-sub.ch:
+					batch = append(batch, entryChangeFromPhysical(e))
+				default:
+					sub.credits.Add(1) // refund -- no entry queued
+					break drainLoop
+				}
+			}
+			if err := sendBatch(batch); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// waitForCredit blocks until the subscriber has at least one credit
+// available, or until the credit wait timeout / context cancellation.
+// Returns nil when a credit was successfully consumed.
+func (s *drReplicationPrimary) waitForCredit(ctx context.Context, sub *changeStreamSubscriber) error {
+	// Fast path: credit available.
+	if sub.credits.Add(-1) >= 0 {
+		return nil
+	}
+	// Undo the speculative decrement.
+	sub.credits.Add(1)
+
+	metrics.IncrCounter([]string{"replication", "dr", "stream", "credit_wait_total"}, 1)
+	s.logger.Debug("subscriber out of credits, waiting for replenishment",
+		"subscriber", sub.id)
+
+	timeout := s.creditWaitTimeout
+	if timeout <= 0 {
+		timeout = drCreditWaitTimeout
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			s.logger.Warn("subscriber credit wait timeout, cancelling",
+				"subscriber", sub.id,
+				"timeout", timeout)
+			return status.Errorf(codes.ResourceExhausted,
+				"subscriber %s: credit replenishment timeout after %v", sub.id, timeout)
+		case <-sub.creditCh:
+			// Credits may have arrived. Try to consume one.
+			if sub.credits.Add(-1) >= 0 {
+				return nil
+			}
+			sub.credits.Add(1)
+			// Spurious wake or credits consumed by catch-up; loop.
 		}
 	}
 }
@@ -537,8 +761,144 @@ func (s *drReplicationPrimary) RequestCheckpoint(ctx context.Context, req *Check
 	}
 }
 
-// ExchangeIBLT implements DRReplicationServer.ExchangeIBLT.
-func (s *drReplicationPrimary) ExchangeIBLT(ctx context.Context, req *IBLTMessage) (*IBLTMessage, error) {
+// ExchangeDirtyBitmap implements DRReplicationServer.ExchangeDirtyBitmap.
+func (s *drReplicationPrimary) ExchangeDirtyBitmap(ctx context.Context, req *DirtyBitmapMessage) (*DirtyBitmapMessage, error) {
+	s.dirtyMapMu.RLock()
+	defer s.dirtyMapMu.RUnlock()
+
+	bitmap := make([]byte, len(s.dirtyMap))
+
+	if s.dirtyMapStart == 0 {
+		// Pessimistic safety: the dirty bitmap has not been tracking
+		// since startup (fresh start or post-restart). Return an
+		// all-dirty bitmap so the secondary checks every range. This
+		// prevents silent data loss where a restart wipes the in-memory
+		// bitmap and the secondary incorrectly concludes nothing changed.
+		for i := range bitmap {
+			bitmap[i] = 0xFF
+		}
+		s.logger.Warn("dirty bitmap not initialized (post-restart or fresh start), returning all-dirty")
+	} else {
+		copy(bitmap, s.dirtyMap)
+	}
+
+	return &DirtyBitmapMessage{
+		RelationshipId:  req.RelationshipId,
+		CheckpointId:    req.CheckpointId,
+		CheckpointIndex: req.CheckpointIndex,
+		StartIndex:      s.dirtyMapStart,
+		Bitmap:          bitmap,
+	}, nil
+}
+
+// loadDirtyBitmap restores the dirty bitmap from physical storage after
+// a restart. If no persisted bitmap is found, the bitmap remains in its
+// default state (dirtyMapStart == 0) which causes ExchangeDirtyBitmap
+// to return an all-dirty bitmap for safety.
+func (s *drReplicationPrimary) loadDirtyBitmap(ctx context.Context) error {
+	entry, err := s.core.physical.Get(ctx, drDirtyBitmapStoragePath)
+	if err != nil {
+		return fmt.Errorf("failed to read dirty bitmap from storage: %w", err)
+	}
+	if entry == nil || len(entry.Value) < 8 {
+		s.logger.Info("no persisted dirty bitmap found, will default to all-dirty on next exchange")
+		return nil
+	}
+
+	s.dirtyMapMu.Lock()
+	defer s.dirtyMapMu.Unlock()
+
+	startIndex := binary.BigEndian.Uint64(entry.Value[:8])
+	bitmapData := entry.Value[8:]
+
+	if len(bitmapData) != drDirtyBitmapBytes {
+		s.logger.Warn("persisted dirty bitmap has unexpected size, ignoring",
+			"expected", drDirtyBitmapBytes, "got", len(bitmapData))
+		return nil
+	}
+
+	s.dirtyMapStart = startIndex
+	copy(s.dirtyMap, bitmapData)
+	s.logger.Info("loaded persisted dirty bitmap", "start_index", startIndex)
+	return nil
+}
+
+// persistDirtyBitmap saves the current dirty bitmap to physical storage
+// synchronously.  Caller must hold dirtyMapMu at least for reading.
+//
+// WARNING: Do NOT call this from within OnChange (the Raft FSM
+// applyBatch callback).  Use persistDirtyBitmapAsync instead.
+// A synchronous physical.Put from inside the FSM callback would submit
+// a new Raft log and block waiting for the FSM to apply it, but the
+// FSM cannot proceed because it is still inside the current
+// applyBatch -- causing a re-entrant deadlock.
+func (s *drReplicationPrimary) persistDirtyBitmap() {
+	if s.dirtyMapStart == 0 {
+		return // Nothing meaningful to persist yet.
+	}
+
+	buf := make([]byte, 8+drDirtyBitmapBytes)
+	binary.BigEndian.PutUint64(buf[:8], s.dirtyMapStart)
+	copy(buf[8:], s.dirtyMap)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := s.core.physical.Put(ctx, &physical.Entry{
+		Key:   drDirtyBitmapStoragePath,
+		Value: buf,
+	}); err != nil {
+		s.logger.Warn("failed to persist dirty bitmap", "error", err)
+		return
+	}
+	s.dirtyMapLastPersist = time.Now()
+}
+
+// persistDirtyBitmapAsync snapshots the dirty bitmap under the caller's
+// lock and writes it to physical storage in a background goroutine.
+// This is safe to call from within the FSM applyBatch path (OnChange).
+// Caller must hold dirtyMapMu at least for reading.
+func (s *drReplicationPrimary) persistDirtyBitmapAsync() {
+	if s.dirtyMapStart == 0 {
+		return // Nothing meaningful to persist yet.
+	}
+
+	// Snapshot the bitmap while the lock is held so the goroutine
+	// doesn't race with future OnChange updates.
+	buf := make([]byte, 8+drDirtyBitmapBytes)
+	binary.BigEndian.PutUint64(buf[:8], s.dirtyMapStart)
+	copy(buf[8:], s.dirtyMap)
+
+	// Mark the persist time immediately to prevent duplicate goroutines
+	// from being launched before the write completes.
+	s.dirtyMapLastPersist = time.Now()
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := s.core.physical.Put(ctx, &physical.Entry{
+			Key:   drDirtyBitmapStoragePath,
+			Value: buf,
+		}); err != nil {
+			s.logger.Warn("failed to persist dirty bitmap", "error", err)
+		}
+	}()
+}
+
+// maybePersistDirtyBitmap schedules an async bitmap persist if enough
+// time has elapsed since the last one. Must be called with dirtyMapMu held.
+//
+// This is called from OnChange (inside the FSM applyBatch path) so it
+// MUST use the async variant to avoid a re-entrant Raft write deadlock.
+func (s *drReplicationPrimary) maybePersistDirtyBitmap() {
+	if time.Since(s.dirtyMapLastPersist) >= drDirtyBitmapPersistInterval {
+		s.persistDirtyBitmapAsync()
+	}
+}
+
+// ExchangeRangeChecksums implements DRReplicationServer.ExchangeRangeChecksums.
+func (s *drReplicationPrimary) ExchangeRangeChecksums(ctx context.Context, req *RangeChecksumRequest) (*RangeChecksumResponse, error) {
 	cp, err := s.getCheckpoint(req.CheckpointId)
 	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "checkpoint not found: %v", err)
@@ -550,42 +910,54 @@ func (s *drReplicationPrimary) ExchangeIBLT(ctx context.Context, req *IBLTMessag
 		return nil, err
 	}
 
-	s.logger.Info("building IBLT from checkpoint cache",
-		"checkpoint_id", req.CheckpointId,
-		"requested_cells", req.NumCells)
+	// Calculate checksums for requested ranges.
+	checksums := make(map[uint64]*RangeChecksum)
+	for _, rid := range req.RangeIds {
+		checksums[rid] = &RangeChecksum{RangeId: rid}
+	}
+	allRanges := len(req.RangeIds) == 0
 
-	numCells := req.NumCells
-	if numCells < sketch.DefaultHashCount {
-		numCells = sketch.DefaultHashCount
-	}
-	if numCells > drRangeMaxIBLTCellsPerRange {
-		numCells = drRangeMaxIBLTCellsPerRange
-	}
+	crcTable := crc64.MakeTable(crc64.ISO)
 
-	span, hasSpan, err := parseRangeSpan(req.GetSpan())
-	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid range span: %v", err)
-	}
-	iblt := sketch.NewIBLT(numCells, sketch.DefaultHashCount)
-	if hasSpan {
-		iblt = reconciler.BuildRangeIBLTFromMap(cp.kidToVID, span, numCells)
-	} else {
-		for kid, vid := range cp.kidToVID {
-			iblt.Insert(kid, vid)
+	for kid, vid := range cp.kidToVID {
+		rangeID := (uint64(kid[0]) << 2) | (uint64(kid[1]) >> 6)
+
+		var rc *RangeChecksum
+		if allRanges {
+			var ok bool
+			rc, ok = checksums[rangeID]
+			if !ok {
+				rc = &RangeChecksum{RangeId: rangeID}
+				checksums[rangeID] = rc
+			}
+		} else {
+			var ok bool
+			rc, ok = checksums[rangeID]
+			if !ok {
+				continue
+			}
 		}
+
+		rc.Count++
+		// Simple XOR of CRC64(KID) ^ CRC64(VID)
+		kSum := crc64.Checksum(kid[:], crcTable)
+		vSum := crc64.Checksum(vid[:], crcTable)
+		rc.Checksum ^= (kSum ^ vSum)
 	}
 
-	return &IBLTMessage{
-		CheckpointId:    req.CheckpointId,
-		NumCells:        iblt.NumCells(),
-		IbltData:        iblt.Marshal(),
-		Span:            req.GetSpan(),
-		CheckpointIndex: cp.checkpoint.CommitIndex,
-	}, nil
+	resp := &RangeChecksumResponse{
+		Checksums: make([]*RangeChecksum, 0, len(checksums)),
+	}
+	for _, rc := range checksums {
+		resp.Checksums = append(resp.Checksums, rc)
+	}
+
+	return resp, nil
 }
 
 // ExchangeRangeDigests implements DRReplicationServer.ExchangeRangeDigests.
-// It returns digest metadata for explicit spans from an immutable checkpoint.
+// It performs fine-grained drill-down on a mismatched range by splitting
+// it in half and returning sub-range digests for each child.
 func (s *drReplicationPrimary) ExchangeRangeDigests(ctx context.Context, req *RangeDigestRequest) (*RangeDigestResponse, error) {
 	cp, err := s.getCheckpoint(req.CheckpointId)
 	if err != nil {
@@ -597,89 +969,57 @@ func (s *drReplicationPrimary) ExchangeRangeDigests(ctx context.Context, req *Ra
 	if err := s.authorizeCheckpoint(ctx, cp); err != nil {
 		return nil, err
 	}
-	if len(req.GetSpans()) == 0 {
-		return nil, status.Error(codes.InvalidArgument, "at least one span is required")
+
+	parentSpan := req.GetParentSpan()
+	if parentSpan == nil || len(parentSpan.StartKid) != 32 || len(parentSpan.EndKid) != 32 {
+		return nil, status.Errorf(codes.InvalidArgument, "parent_span must have valid 32-byte KID boundaries")
 	}
 
-	spans, err := parseRangeSpans(req.GetSpans())
-	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid spans: %v", err)
+	var start, end [32]byte
+	copy(start[:], parentSpan.StartKid)
+	copy(end[:], parentSpan.EndKid)
+	parent := reconciler.RangeSpan{
+		StartKID:   start,
+		EndKID:     end,
+		SplitDepth: parentSpan.SplitDepth,
 	}
 
-	resp := &RangeDigestResponse{
-		Ranges: make([]*RangeDigest, 0, len(spans)),
-	}
-	for _, span := range spans {
-		desc := reconciler.BuildRangeDigestFromMap(cp.kidToVID, nil, span, drRangeMaxIBLTCellsPerRange)
-		resp.Ranges = append(resp.Ranges, rangeDescriptorToProto(desc))
+	// Split the parent range into two children.
+	left, right, ok := reconciler.SplitRange(parent)
+	if !ok {
+		// Cannot split further -- return a single digest for the parent.
+		idx := reconciler.NewRangeMapIndex(cp.kidToVID, nil)
+		desc := reconciler.BuildRangeDigestFromIndex(idx, parent)
+		return &RangeDigestResponse{
+			Digests: []*RangeDigest{rangeDescriptorToProto(desc)},
+		}, nil
 	}
 
-	return resp, nil
+	idx := reconciler.NewRangeMapIndex(cp.kidToVID, nil)
+	leftDesc := reconciler.BuildRangeDigestFromIndex(idx, left)
+	rightDesc := reconciler.BuildRangeDigestFromIndex(idx, right)
+
+	return &RangeDigestResponse{
+		Digests: []*RangeDigest{
+			rangeDescriptorToProto(leftDesc),
+			rangeDescriptorToProto(rightDesc),
+		},
+	}, nil
 }
 
-// ExchangePrefixDigests implements DRReplicationServer.ExchangePrefixDigests.
-func (s *drReplicationPrimary) ExchangePrefixDigests(ctx context.Context, req *PrefixDigestRequest) (*PrefixDigestResponse, error) {
-	cp, err := s.getCheckpoint(req.CheckpointId)
-	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "checkpoint not found: %v", err)
+// rangeDescriptorToProto converts a reconciler.RangeDescriptor to the proto RangeDigest.
+func rangeDescriptorToProto(desc reconciler.RangeDescriptor) *RangeDigest {
+	return &RangeDigest{
+		Span: &RangeSpan{
+			StartKid:   desc.Span.StartKID[:],
+			EndKid:     desc.Span.EndKID[:],
+			SplitDepth: desc.Span.SplitDepth,
+		},
+		Count:            desc.Count,
+		XorKeyHash:       desc.XORKeyHash[:],
+		XorValueHash:     desc.XORValueHash[:],
+		ApproxValueBytes: desc.ApproxValueBytes,
 	}
-	if err := validateCheckpointTuple(req.CheckpointId, req.GetCheckpointIndex(), cp); err != nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "invalid checkpoint tuple: %v", err)
-	}
-	if err := s.authorizeCheckpoint(ctx, cp); err != nil {
-		return nil, err
-	}
-
-	s.logger.Info("building prefix digests from checkpoint cache",
-		"checkpoint_id", req.CheckpointId,
-		"prefix_length", req.PrefixLength)
-	span, hasSpan, err := parseRangeSpan(req.GetSpan())
-	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid range span: %v", err)
-	}
-
-	resp := &PrefixDigestResponse{
-		PrefixLength: req.PrefixLength,
-	}
-
-	prefixLen := req.PrefixLength
-	if prefixLen == 0 {
-		if cp.prefixDigest != nil {
-			prefixLen = cp.prefixDigest.PrefixLen()
-		} else {
-			prefixLen = 8
-		}
-	}
-	resp.PrefixLength = prefixLen
-
-	var pd *sketch.PrefixDigest
-	switch {
-	case hasSpan:
-		pd = reconciler.BuildRangePrefixDigestFromMap(cp.kidToVID, span, prefixLen)
-	case cp.prefixDigest != nil && cp.prefixDigest.PrefixLen() == prefixLen:
-		pd = cp.prefixDigest
-	default:
-		pd = reconciler.BuildRangePrefixDigestFromMap(cp.kidToVID, fullRangeSpan(), prefixLen)
-	}
-
-	numBuckets := pd.NumBuckets()
-	if len(req.BucketIndices) > 0 {
-		// Only return requested buckets.
-		for _, idx := range req.BucketIndices {
-			if idx < numBuckets {
-				b := pd.Bucket(idx)
-				resp.Buckets = append(resp.Buckets, bucketToProto(b))
-			}
-		}
-	} else {
-		// Return all buckets.
-		for i := uint32(0); i < numBuckets; i++ {
-			b := pd.Bucket(i)
-			resp.Buckets = append(resp.Buckets, bucketToProto(b))
-		}
-	}
-
-	return resp, nil
 }
 
 // FetchEntries implements DRReplicationServer.FetchEntries.
@@ -701,12 +1041,10 @@ func (s *drReplicationPrimary) FetchEntries(req *FetchEntriesRequest, stream grp
 		"checkpoint_id", req.CheckpointId,
 		"num_kids", len(req.Kids),
 		"num_items", len(req.Items),
-		"bucket_count", len(req.BucketIndices),
 		"range_count", len(req.Ranges))
 	if req.GetCheckpointIndex() > 0 &&
 		len(req.GetItems()) == 0 &&
 		len(req.GetKids()) > 0 &&
-		len(req.GetBucketIndices()) == 0 &&
 		len(req.GetRanges()) == 0 {
 		s.logger.Debug("fetch request missing explicit expected_vid items; falling back to checkpoint-only provenance",
 			"checkpoint_id", req.CheckpointId,
@@ -720,10 +1058,6 @@ func (s *drReplicationPrimary) FetchEntries(req *FetchEntriesRequest, stream grp
 	rangeSpans, err := parseRangeSpans(req.GetRanges())
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "invalid ranges: %v", err)
-	}
-	bucketSet := make(map[uint32]bool, len(req.BucketIndices))
-	for _, idx := range req.BucketIndices {
-		bucketSet[idx] = true
 	}
 
 	expectedVIDByKID := make(map[[32]byte][32]byte, len(req.Items))
@@ -763,17 +1097,11 @@ func (s *drReplicationPrimary) FetchEntries(req *FetchEntriesRequest, stream grp
 		return nil
 	}
 
-	// Range and/or bucket-based fetching. If both are set, entries must satisfy both predicates.
-	if len(rangeSpans) > 0 || (len(bucketSet) > 0 && req.BucketPrefixLength > 0) {
+	// Range-based fetching.
+	if len(rangeSpans) > 0 {
 		for kid := range cp.kidToVID {
-			if len(rangeSpans) > 0 && !kidInAnyRange(kid, rangeSpans) {
+			if !kidInAnyRange(kid, rangeSpans) {
 				continue
-			}
-			if len(bucketSet) > 0 && req.BucketPrefixLength > 0 {
-				bucketIdx := sketch.ParentBucket(kid, req.BucketPrefixLength)
-				if !bucketSet[bucketIdx] {
-					continue
-				}
 			}
 			sent[kid] = true
 			if err := emitFromCheckpoint(kid, nil); err != nil {
@@ -964,7 +1292,6 @@ func (s *drReplicationPrimary) reuseCheckpointResponse(relationshipID string, co
 	return &CheckpointResponse{
 		CheckpointId:     cp.checkpoint.ID,
 		CommitIndex:      cp.checkpoint.CommitIndex,
-		TopRanges:        rangeDescriptorsToProto(cp.topRanges),
 		RangePlanVersion: cp.rangePlanVersion,
 	}, true
 }
@@ -992,7 +1319,6 @@ func (s *drReplicationPrimary) buildAndCacheCheckpoint(ctx context.Context, rela
 		checkpoint:       checkpoint,
 		relationshipID:   relationshipID,
 		createdAt:        time.Now().UTC(),
-		prefixDigest:     rs.PrefixDigest,
 		kidToKey:         rs.KIDToKey,
 		kidToVID:         rs.KIDToVID,
 		rangePlanVersion: reconciler.RangePlanVersion,
@@ -1004,12 +1330,6 @@ func (s *drReplicationPrimary) buildAndCacheCheckpoint(ctx context.Context, rela
 		if err := s.checkpointArtifacts.build(ctx, entry, s.scanner, s.core.physical, s.rangePlanConfig); err != nil {
 			return nil, status.Errorf(codes.FailedPrecondition, "checkpoint artifact build failed: %v", err)
 		}
-	} else {
-		topRanges, rangeErr := reconciler.BuildRangeManifest(rs, s.rangePlanConfig)
-		if rangeErr != nil {
-			return nil, status.Errorf(codes.Internal, "failed to build range manifest: %v", rangeErr)
-		}
-		entry.topRanges = topRanges
 	}
 
 	if err := s.cacheCheckpoint(entry); err != nil {
@@ -1029,7 +1349,6 @@ func (s *drReplicationPrimary) buildAndCacheCheckpoint(ctx context.Context, rela
 	return &CheckpointResponse{
 		CheckpointId:     checkpointID,
 		CommitIndex:      commitIndex,
-		TopRanges:        rangeDescriptorsToProto(entry.topRanges),
 		RangePlanVersion: reconciler.RangePlanVersion,
 	}, nil
 }
@@ -1078,10 +1397,9 @@ func (s *drReplicationPrimary) snapshotIndexCheckpointSet(commitIndex uint64) (*
 		Checkpoint: reconciler.Checkpoint{
 			CommitIndex: s.indexApplied.Load(),
 		},
-		KIDToVID:     kidToVID,
-		KIDToKey:     kidToKey,
-		KeyCount:     len(kidToVID),
-		PrefixDigest: reconciler.BuildRangePrefixDigestFromMap(kidToVID, fullRangeSpan(), 8),
+		KIDToVID: kidToVID,
+		KIDToKey: kidToKey,
+		KeyCount: len(kidToVID),
 	}
 	return rs, true
 }
@@ -1237,41 +1555,6 @@ func (s *drReplicationPrimary) updateIndexFromChanges(entries []physical.ChangeS
 	}
 }
 
-func bucketToProto(b *sketch.Bucket) *BucketDigestProto {
-	return &BucketDigestProto{
-		Index:        b.Index,
-		Count:        b.Count,
-		XorKeyHash:   b.XORKeyHash[:],
-		XorValueHash: b.XORValueHash[:],
-	}
-}
-
-func rangeDescriptorsToProto(desc []reconciler.RangeDescriptor) []*RangeDigest {
-	if len(desc) == 0 {
-		return nil
-	}
-	out := make([]*RangeDigest, 0, len(desc))
-	for _, d := range desc {
-		out = append(out, rangeDescriptorToProto(d))
-	}
-	return out
-}
-
-func rangeDescriptorToProto(d reconciler.RangeDescriptor) *RangeDigest {
-	return &RangeDigest{
-		Span: &RangeSpan{
-			StartKid:   d.Span.StartKID[:],
-			EndKid:     d.Span.EndKID[:],
-			SplitDepth: d.Span.SplitDepth,
-		},
-		Count:              d.Count,
-		XorKeyHash:         d.XORKeyHash[:],
-		XorValueHash:       d.XORValueHash[:],
-		SuggestedIbltCells: d.SuggestedIBLTCells,
-		ApproxValueBytes:   d.ApproxValueBytes,
-	}
-}
-
 func parseRangeSpan(span *RangeSpan) (reconciler.RangeSpan, bool, error) {
 	if span == nil {
 		return reconciler.RangeSpan{}, false, nil
@@ -1313,43 +1596,23 @@ func kidInAnyRange(kid [32]byte, spans []reconciler.RangeSpan) bool {
 	return false
 }
 
-func fullRangeSpan() reconciler.RangeSpan {
-	var span reconciler.RangeSpan
-	for i := range span.EndKID {
-		span.EndKID[i] = 0xff
-	}
-	return span
-}
-
 func estimateCheckpointBytes(entry *drCheckpointCacheEntry) uint64 {
 	if entry == nil {
 		return 0
 	}
-	// Approximate cache footprint by component so status can expose pressure
 	// sources under sustained load.
 	var metaBytes uint64
 	var valueBytes uint64
-	var manifestBytes uint64
-	var derivedBytes uint64
 
-	if entry.prefixDigest != nil {
-		derivedBytes += uint64(entry.prefixDigest.NumBuckets()) * (8 + 32 + 32 + 16)
-	}
 	metaBytes += uint64(len(entry.kidToKey)) * (32 + 64)
 	metaBytes += uint64(len(entry.kidToVID)) * (32 + 32 + 16)
 	for _, key := range entry.kidToKey {
 		metaBytes += uint64(len(key))
 	}
-	manifestBytes += uint64(len(entry.topRanges)) * (32 + 32 + 32 + 32 + 8 + 8 + 16)
-	// Per-map and object overhead margin.
-	derivedBytes += uint64(len(entry.kidToKey)+len(entry.kidToVID)+len(entry.topRanges)) * 32
-
 	entry.metaBytes = metaBytes
 	entry.valueBytes = valueBytes
-	entry.manifestBytes = manifestBytes
-	entry.derivedBytes = derivedBytes
 
-	total := metaBytes + valueBytes + manifestBytes + derivedBytes
+	total := metaBytes + valueBytes
 	return total
 }
 
@@ -1382,16 +1645,7 @@ func (s *drReplicationPrimary) evictCheckpointLocked(id string) {
 	} else {
 		s.checkpointValueBytes = 0
 	}
-	if cp.manifestBytes <= s.checkpointManifestBytes {
-		s.checkpointManifestBytes -= cp.manifestBytes
-	} else {
-		s.checkpointManifestBytes = 0
-	}
-	if cp.derivedBytes <= s.checkpointDerivedBytes {
-		s.checkpointDerivedBytes -= cp.derivedBytes
-	} else {
-		s.checkpointDerivedBytes = 0
-	}
+
 	s.checkpointEvictions.Add(1)
 	metrics.IncrCounter([]string{"replication", "dr", "checkpoint", "cache_evictions"}, 1)
 	if cp != nil {
@@ -1524,23 +1778,11 @@ func (s *drReplicationPrimary) cacheCheckpoint(entry *drCheckpointCacheEntry) er
 		} else {
 			s.checkpointValueBytes = 0
 		}
-		if old.manifestBytes <= s.checkpointManifestBytes {
-			s.checkpointManifestBytes -= old.manifestBytes
-		} else {
-			s.checkpointManifestBytes = 0
-		}
-		if old.derivedBytes <= s.checkpointDerivedBytes {
-			s.checkpointDerivedBytes -= old.derivedBytes
-		} else {
-			s.checkpointDerivedBytes = 0
-		}
 	}
 	s.checkpoints[entry.checkpoint.ID] = entry
 	s.checkpointBytes += entry.estimatedBytes
 	s.checkpointMetaBytes += entry.metaBytes
 	s.checkpointValueBytes += entry.valueBytes
-	s.checkpointManifestBytes += entry.manifestBytes
-	s.checkpointDerivedBytes += entry.derivedBytes
 	s.setCheckpointCacheGaugesLocked()
 	return nil
 }

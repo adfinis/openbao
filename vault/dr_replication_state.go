@@ -14,6 +14,7 @@ import (
 
 	log "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-uuid"
+	raft "github.com/openbao/openbao/physical/raft"
 	"github.com/openbao/openbao/sdk/v2/helper/consts"
 	"github.com/openbao/openbao/sdk/v2/logical"
 	"github.com/openbao/openbao/sdk/v2/physical"
@@ -348,9 +349,22 @@ func (m *drRelationshipManager) LoadConfig(ctx context.Context) error {
 		m.primary = NewDRReplicationPrimary(m.core, config.ReplSalt, m.logger)
 		m.applyPrimaryTunablesLocked()
 
+		// Restore persisted dirty bitmap so post-restart reconciliation
+		// knows which ranges were modified before the crash.
+		if err := m.primary.loadDirtyBitmap(ctx); err != nil {
+			m.logger.Warn("failed to load persisted dirty bitmap", "error", err)
+		}
+
 		// Re-wire the change stream hook.
 		if csb, ok := m.core.underlyingPhysical.(physical.ChangeStreamBackend); ok {
 			csb.HookChangeStream(m.primary.OnChange)
+		}
+
+		// Seed indexApplied with the current Raft applied index so the
+		// checkpoint fence does not stall waiting for entries that were
+		// committed before the change stream hook was re-registered.
+		if rb, ok := m.core.underlyingPhysical.(*raft.RaftBackend); ok {
+			m.primary.SeedAppliedIndex(rb.AppliedIndex())
 		}
 
 		// Re-register the cluster handler.
@@ -467,6 +481,13 @@ func (m *drRelationshipManager) EnablePrimary(ctx context.Context) error {
 		csb.HookChangeStream(m.primary.OnChange)
 	}
 
+	// Seed indexApplied with the current Raft applied index so the
+	// checkpoint fence does not stall waiting for entries that were
+	// committed before the change stream hook was registered.
+	if rb, ok := m.core.underlyingPhysical.(*raft.RaftBackend); ok {
+		m.primary.SeedAppliedIndex(rb.AppliedIndex())
+	}
+
 	// Register the DR handler on the cluster listener for mTLS-secured gRPC.
 	m.handler = newDRReplicationClusterHandler(m.core, m.primary, m.logger)
 	registerDRHandler(m.core, m.handler)
@@ -495,6 +516,11 @@ func (m *drRelationshipManager) DisablePrimary(ctx context.Context) error {
 
 	// Unregister the DR handler from the cluster listener.
 	unregisterDRHandler(m.core)
+
+	// Stop the tombstone GC before releasing the primary.
+	if m.primary != nil && m.primary.tombstoneGC != nil {
+		m.primary.tombstoneGC.Stop()
+	}
 
 	m.primary = nil
 	m.handler = nil
