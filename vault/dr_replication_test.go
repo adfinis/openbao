@@ -686,26 +686,26 @@ func TestDRChangeStream_ApplyChange(t *testing.T) {
 	rand.Read(replSalt)
 	sec := newDRReplicationSecondary(core, replSalt, "test", core.logger)
 
-	// Test applying a Put via applyFetchedChange (simulates reconciliation path).
+	// Test applying a Put via applyFetchedChange (ciphertext-domain reconciliation path).
 	err := sec.applyFetchedChange(ctx, &EntryChange{
 		OpType: string(physical.PutOperation),
 		Key:    "test/key1",
-		Value:  []byte("value1"),
+		Value:  []byte("ciphertext-value1"),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Verify entry exists.
-	entry, err := core.barrier.Get(ctx, "test/key1")
+	// Verify entry exists in physical storage.
+	entry, err := core.physical.Get(ctx, "test/key1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if entry == nil {
 		t.Fatal("expected entry after apply")
 	}
-	if string(entry.Value) != "value1" {
-		t.Fatalf("expected value1, got %s", string(entry.Value))
+	if string(entry.Value) != "ciphertext-value1" {
+		t.Fatalf("expected ciphertext-value1, got %s", string(entry.Value))
 	}
 
 	// Test applying a Delete via applyFetchedChange.
@@ -718,7 +718,7 @@ func TestDRChangeStream_ApplyChange(t *testing.T) {
 	}
 
 	// Verify entry is deleted.
-	entry, err = core.barrier.Get(ctx, "test/key1")
+	entry, err = core.physical.Get(ctx, "test/key1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1186,17 +1186,25 @@ func TestDRPrimary_ReadCheckpointEntryChange_ExpectedVIDMismatch(t *testing.T) {
 	ctx := context.Background()
 
 	key := "secret/data/demo"
-	val := []byte("ciphertext-demo")
+	val := []byte("plaintext-demo")
 	if err := core.barrier.Put(ctx, &logical.StorageEntry{
 		Key:   key,
 		Value: val,
 	}); err != nil {
 		t.Fatal(err)
 	}
+	phys, err := core.physical.Get(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if phys == nil {
+		t.Fatalf("expected physical entry for %q", key)
+	}
 
 	kid, vid := primary.scanner.ComputeItemFromEntry(&physical.Entry{
-		Key:   key,
-		Value: val,
+		Key:      key,
+		Value:    phys.Value,
+		SealWrap: phys.SealWrap,
 	})
 	cp := &drCheckpointCacheEntry{
 		checkpoint: reconciler.Checkpoint{

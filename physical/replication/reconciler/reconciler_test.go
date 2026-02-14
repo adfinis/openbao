@@ -225,3 +225,37 @@ func TestScannerUsesTransactionHandleForGet(t *testing.T) {
 		t.Fatal("scanner should read entries from transactional snapshot, not parent storage")
 	}
 }
+
+func TestComputeVIDWithSealWrap_CiphertextDomain(t *testing.T) {
+	cfg := DefaultScanConfig([]byte("test-salt"))
+	cfg.ValueDomain = ValueDomainCiphertext
+	scanner := NewScanner(cfg)
+
+	value := []byte("ciphertext-bytes")
+
+	plain := scanner.ComputeVIDWithSealWrap(value, false)
+	wrapped := scanner.ComputeVIDWithSealWrap(value, true)
+
+	if plain == wrapped {
+		t.Fatal("expected ciphertext-domain VID to include seal-wrap flag")
+	}
+
+	other := scanner.ComputeVIDWithSealWrap([]byte("ciphertext-bytes-2"), false)
+	if plain == other {
+		t.Fatal("expected ciphertext-domain VID to differ for different values")
+	}
+}
+
+func TestComputeVIDWithSealWrap_PlaintextDomainIgnoresSealWrap(t *testing.T) {
+	cfg := DefaultScanConfig([]byte("test-salt"))
+	cfg.ValueDomain = ValueDomainPlaintext
+	scanner := NewScanner(cfg)
+
+	value := []byte("plaintext")
+	a := scanner.ComputeVIDWithSealWrap(value, false)
+	b := scanner.ComputeVIDWithSealWrap(value, true)
+
+	if a != b {
+		t.Fatal("expected plaintext-domain VID to ignore seal-wrap flag")
+	}
+}

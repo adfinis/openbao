@@ -681,26 +681,27 @@ func TestDRIntegration_StreamVsFetchApply(t *testing.T) {
 		t.Fatalf("expected physical value %q, got %q", physValue, phys.Value)
 	}
 
-	// applyFetchedChange writes through the barrier (encrypts).
+	// applyFetchedChange writes directly to physical storage in
+	// ciphertext-domain reconciliation.
 	err = sec.applyFetchedChange(ctx, &EntryChange{
 		OpType: string(physical.PutOperation),
 		Key:    "fetch-test/key1",
-		Value:  []byte("plaintext-value"),
+		Value:  []byte("fetched-ciphertext-value"),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Verify the value can be read back through the barrier (decrypted).
-	entry, err := core.barrier.Get(ctx, "fetch-test/key1")
+	// Verify fetched value was written to physical as-is.
+	entry, err := core.physical.Get(ctx, "fetch-test/key1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if entry == nil {
-		t.Fatal("expected barrier entry after fetch apply")
+		t.Fatal("expected physical entry after fetch apply")
 	}
-	if string(entry.Value) != "plaintext-value" {
-		t.Fatalf("expected plaintext-value, got %s", string(entry.Value))
+	if string(entry.Value) != "fetched-ciphertext-value" {
+		t.Fatalf("expected fetched-ciphertext-value, got %s", string(entry.Value))
 	}
 
 	// Verify stream-applied deletes go to physical.
@@ -923,18 +924,18 @@ func TestDRIntegration_KIDDeleteResolution(t *testing.T) {
 	rand.Read(replSalt)
 	sec := newDRReplicationSecondary(core, replSalt, "test", core.logger)
 
-	// Write an entry.
+	// Write an entry (ciphertext-domain apply path).
 	err := sec.applyFetchedChange(ctx, &EntryChange{
 		OpType: string(physical.PutOperation),
 		Key:    "kid-delete-test/entry1",
-		Value:  []byte("value1"),
+		Value:  []byte("ciphertext-value1"),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Verify entry exists.
-	entry, err := core.barrier.Get(ctx, "kid-delete-test/entry1")
+	// Verify entry exists in physical storage.
+	entry, err := core.physical.Get(ctx, "kid-delete-test/entry1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -957,7 +958,7 @@ func TestDRIntegration_KIDDeleteResolution(t *testing.T) {
 	}
 
 	// Verify entry is deleted.
-	entry, err = core.barrier.Get(ctx, "kid-delete-test/entry1")
+	entry, err = core.physical.Get(ctx, "kid-delete-test/entry1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2079,7 +2080,7 @@ func TestDRIntegration_RangeIBLTDecodeSuccess(t *testing.T) {
 	if sec.lastAppliedIndex.Load() != checkpoint.CommitIndex {
 		t.Fatalf("expected lastAppliedIndex=%d, got %d", checkpoint.CommitIndex, sec.lastAppliedIndex.Load())
 	}
-	entry, err := core.barrier.Get(context.Background(), "range/success")
+	entry, err := core.physical.Get(context.Background(), "range/success")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2269,7 +2270,7 @@ func TestDRIntegration_RangeRefinementPrefixFallback(t *testing.T) {
 	if err := sec.runRangePrefixRefinement(context.Background(), checkpoint, localSet, span, budget); err != nil {
 		t.Fatalf("expected in-range prefix refinement to succeed, got %v", err)
 	}
-	entry, err := core.barrier.Get(context.Background(), "range/refined")
+	entry, err := core.physical.Get(context.Background(), "range/refined")
 	if err != nil {
 		t.Fatal(err)
 	}
