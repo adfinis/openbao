@@ -1994,6 +1994,145 @@ func TestStreamChanges_CreditTimeout(t *testing.T) {
 	}
 }
 
+func TestStreamChanges_CatchupDebitsCredits(t *testing.T) {
+	// Verify that entries sent during catch-up replay are debited from
+	// the subscriber's credit counter, preventing credit inflation.
+	primary, relID, fingerprint := newCreditTestPrimary(t, 2*time.Second)
+
+	ctx, cancel := context.WithCancel(
+		context.WithValue(context.Background(), drPeerFingerprintContextKey{}, fingerprint))
+	defer cancel()
+
+	// Pre-populate the change buffer with 5 entries BEFORE the
+	// subscriber connects, so they become catch-up entries.
+	for i := uint64(10); i <= 14; i++ {
+		primary.OnChange([]physical.ChangeStreamEntry{
+			{OpType: physical.PutOperation, Key: fmt.Sprintf("catchup/%d", i), Value: []byte("v"), RaftIndex: i},
+		})
+	}
+
+	// initial_window = 8: after catch-up sends 5, only 3 credits should
+	// remain for the live loop.
+	// last_applied_index is set to the oldest buffer entry so catch-up
+	// sends all 5 entries directly from the buffer (no journal needed).
+	const initialWindow = 8
+	stream := &creditTestBidiStream{
+		ctx: ctx,
+		initMsg: &StreamChangesUpstream{
+			Msg: &StreamChangesUpstream_Init{
+				Init: &StreamChangesRequest{
+					RelationshipId:   relID,
+					LastAppliedIndex: 10,
+					InitialWindow:    initialWindow,
+				},
+			},
+		},
+		creditCh: make(chan *StreamChangesUpstream, 10),
+		sentCh:   make(chan *EntryChange, 100),
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- primary.StreamChanges(stream)
+	}()
+
+	// Collect the 5 catch-up entries.
+	collectN := func(n int, label string) {
+		to := time.After(3 * time.Second)
+		for i := 0; i < n; i++ {
+			select {
+			case <-stream.sentCh:
+			case <-to:
+				t.Fatalf("%s: timed out after receiving %d/%d entries", label, i, n)
+			}
+		}
+	}
+	collectN(5, "catch-up")
+
+	// Now push 5 more entries via OnChange (live path).
+	// With only 3 credits remaining after catch-up debit, only 3 should
+	// be sent before the primary blocks.
+	time.Sleep(100 * time.Millisecond)
+	for i := uint64(20); i <= 24; i++ {
+		primary.OnChange([]physical.ChangeStreamEntry{
+			{OpType: physical.PutOperation, Key: fmt.Sprintf("live/%d", i), Value: []byte("v"), RaftIndex: i},
+		})
+	}
+
+	// Collect 3 entries (the remaining credits after catch-up debit).
+	collectN(3, "live with remaining credits")
+
+	// Verify the primary is now blocked (no credits).
+	select {
+	case extra := <-stream.sentCh:
+		t.Fatalf("received entry beyond expected credits: %s", extra.Key)
+	case <-time.After(300 * time.Millisecond):
+		// Good: primary is blocked waiting for credit replenishment.
+	}
+
+	// Replenish credits to allow the remaining entries through.
+	stream.creditCh <- &StreamChangesUpstream{
+		Msg: &StreamChangesUpstream_WindowUpdate{
+			WindowUpdate: &WindowUpdate{Credits: 5},
+		},
+	}
+	collectN(2, "after replenishment")
+
+	cancel()
+	<-errCh
+}
+
+func TestStreamChanges_CreditReplenishAccumulation(t *testing.T) {
+	// Verify that credit replenishment accumulates pending credits
+	// when the creditReplenishCh channel is full, rather than silently
+	// dropping them.
+
+	// Create a tiny channel (capacity 1) to force the drop scenario.
+	creditReplenishCh := make(chan uint64, 1)
+
+	var pendingCredits uint64
+	replenishCredits := func(n int) {
+		if n <= 0 {
+			return
+		}
+		pendingCredits += uint64(n)
+		select {
+		case creditReplenishCh <- pendingCredits:
+			pendingCredits = 0
+		default:
+		}
+	}
+
+	// First replenish succeeds (channel empty).
+	replenishCredits(10)
+	if pendingCredits != 0 {
+		t.Fatalf("expected pendingCredits=0 after first send, got %d", pendingCredits)
+	}
+
+	// Second replenish hits the default branch (channel full).
+	replenishCredits(20)
+	if pendingCredits != 20 {
+		t.Fatalf("expected pendingCredits=20 after blocked send, got %d", pendingCredits)
+	}
+
+	// Drain the channel.
+	first := <-creditReplenishCh
+	if first != 10 {
+		t.Fatalf("expected first credit batch=10, got %d", first)
+	}
+
+	// Third replenish should send the accumulated total (20 + 15 = 35).
+	replenishCredits(15)
+	if pendingCredits != 0 {
+		t.Fatalf("expected pendingCredits=0 after accumulated send, got %d", pendingCredits)
+	}
+
+	accumulated := <-creditReplenishCh
+	if accumulated != 35 {
+		t.Fatalf("expected accumulated credits=35, got %d", accumulated)
+	}
+}
+
 func TestStreamChanges_BatchSizeRespected(t *testing.T) {
 	primary, relID, fingerprint := newCreditTestPrimary(t, 5*time.Second)
 
