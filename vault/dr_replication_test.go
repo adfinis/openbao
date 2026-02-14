@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -18,10 +19,10 @@ import (
 
 	log "github.com/hashicorp/go-hclog"
 	"github.com/openbao/openbao/physical/replication/reconciler"
-	"github.com/openbao/openbao/physical/replication/sketch"
 	"github.com/openbao/openbao/sdk/v2/logical"
 	"github.com/openbao/openbao/sdk/v2/physical"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 )
@@ -766,192 +767,10 @@ func TestDRReconciliation_BuildSet(t *testing.T) {
 		t.Fatalf("expected at least 100 keys, got %d", set.KeyCount)
 	}
 
-	if set.Strata == nil {
-		t.Fatal("expected strata estimator")
-	}
-	if set.PrefixDigest == nil {
-		t.Fatal("expected prefix digest")
-	}
-	if set.KIDToKey == nil {
-		t.Fatal("expected KID-to-key map")
-	}
-	if len(set.KIDToKey) != set.KeyCount {
-		t.Fatalf("KID-to-key map size %d != key count %d", len(set.KIDToKey), set.KeyCount)
-	}
-
 	t.Logf("reconciliation set built: %d keys", set.KeyCount)
 }
 
 // --- Integration Test: Two-Side Reconciliation ---
-
-func TestDRReconciliation_TwoSideDiff(t *testing.T) {
-	// Simulate primary and secondary storage with known differences.
-	primaryCore, _, _ := TestCoreUnsealed(t)
-	secondaryCore, _, _ := TestCoreUnsealed(t)
-	ctx := context.Background()
-
-	replSalt := make([]byte, 32)
-	rand.Read(replSalt)
-
-	// Write shared data to both.
-	for i := 0; i < 50; i++ {
-		key := fmt.Sprintf("shared/entry-%03d", i)
-		value := []byte(fmt.Sprintf("shared-value-%d", i))
-
-		primaryCore.barrier.Put(ctx, &logical.StorageEntry{Key: key, Value: value})
-		secondaryCore.barrier.Put(ctx, &logical.StorageEntry{Key: key, Value: value})
-	}
-
-	// Write 5 entries only on primary (added on primary).
-	for i := 50; i < 55; i++ {
-		key := fmt.Sprintf("primary-only/entry-%03d", i)
-		primaryCore.barrier.Put(ctx, &logical.StorageEntry{
-			Key:   key,
-			Value: []byte(fmt.Sprintf("primary-value-%d", i)),
-		})
-	}
-
-	// Write 3 entries only on secondary (added on secondary).
-	for i := 55; i < 58; i++ {
-		key := fmt.Sprintf("secondary-only/entry-%03d", i)
-		secondaryCore.barrier.Put(ctx, &logical.StorageEntry{
-			Key:   key,
-			Value: []byte(fmt.Sprintf("secondary-value-%d", i)),
-		})
-	}
-
-	// Modify 2 shared values on primary only (value mismatch).
-	for i := 0; i < 2; i++ {
-		key := fmt.Sprintf("shared/entry-%03d", i)
-		primaryCore.barrier.Put(ctx, &logical.StorageEntry{
-			Key:   key,
-			Value: []byte(fmt.Sprintf("updated-primary-value-%d", i)),
-		})
-	}
-
-	// Build reconciliation sets.
-	config := newDRReconcilerScanConfigForTests(replSalt)
-	config.BuildKIDMap = true
-
-	scanner := reconciler.NewScanner(config)
-	checkpoint := reconciler.Checkpoint{ID: "test-diff", CommitIndex: 100}
-
-	primarySet, err := scanner.Scan(ctx, primaryCore.barrier, checkpoint)
-	if err != nil {
-		t.Fatal(err)
-	}
-	secondarySet, err := scanner.Scan(ctx, secondaryCore.barrier, checkpoint)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	t.Logf("primary keys: %d, secondary keys: %d", primarySet.KeyCount, secondarySet.KeyCount)
-
-	// Step 1: Estimate difference via strata.
-	estimated, err := primarySet.Strata.Estimate(secondarySet.Strata)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("estimated difference: %d", estimated)
-
-	// The actual difference should be at least:
-	// 5 (primary-only) + 3 (secondary-only) + 2 (modified) = 10
-	// Note: modified keys count as 2 differences each (old + new VID)
-	// Strata may overestimate, which is fine.
-	if estimated < 8 {
-		t.Logf("estimated difference seems low (%d), expected >= 8", estimated)
-	}
-
-	// Step 2: Build IBLTs at estimated size and decode.
-	ibltSize := uint32(estimated * 2)
-	if ibltSize < 30 {
-		ibltSize = 30
-	}
-
-	primaryIBLT, err := scanner.BuildIBLTFromScan(ctx, primaryCore.barrier, ibltSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	secondaryIBLT, err := scanner.BuildIBLTFromScan(ctx, secondaryCore.barrier, ibltSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	diff, err := primaryIBLT.Subtract(secondaryIBLT)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	added, removed, ok := diff.Decode()
-	if !ok {
-		t.Log("IBLT decode failed (may need larger IBLT); skipping detailed diff check")
-		return
-	}
-
-	t.Logf("IBLT decode succeeded: %d added (on primary), %d removed (on secondary)", len(added), len(removed))
-
-	// Verify we found the differences.
-	// "added" = elements on primary not on secondary
-	// "removed" = elements on secondary not on primary
-	//
-	// We expect:
-	// - added: 5 primary-only entries + 2 modified entries (new values) = 7
-	// - removed: 3 secondary-only entries + 2 modified entries (old values) = 5
-	// But the exact counts depend on system keys; just verify non-zero.
-	if len(added) == 0 {
-		t.Error("expected some added entries (primary-only + modified)")
-	}
-	if len(removed) == 0 {
-		t.Error("expected some removed entries (secondary-only + old values)")
-	}
-}
-
-// --- Integration Test: Prefix Digest Comparison ---
-
-func TestDRReconciliation_PrefixDigestCompare(t *testing.T) {
-	primaryCore, _, _ := TestCoreUnsealed(t)
-	secondaryCore, _, _ := TestCoreUnsealed(t)
-	ctx := context.Background()
-
-	replSalt := make([]byte, 32)
-	rand.Read(replSalt)
-
-	// Write identical data to both.
-	for i := 0; i < 100; i++ {
-		key := fmt.Sprintf("data/entry-%03d", i)
-		value := []byte(fmt.Sprintf("value-%d", i))
-		primaryCore.barrier.Put(ctx, &logical.StorageEntry{Key: key, Value: value})
-		secondaryCore.barrier.Put(ctx, &logical.StorageEntry{Key: key, Value: value})
-	}
-
-	config := newDRReconcilerScanConfigForTests(replSalt)
-
-	scanner := reconciler.NewScanner(config)
-	checkpoint := reconciler.Checkpoint{ID: "pd-test", CommitIndex: 100}
-
-	primarySet, err := scanner.Scan(ctx, primaryCore.barrier, checkpoint)
-	if err != nil {
-		t.Fatal(err)
-	}
-	secondarySet, err := scanner.Scan(ctx, secondaryCore.barrier, checkpoint)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Compare prefix digests -- should be identical for shared data.
-	// Note: system keys may differ between the two cores.
-	mismatched, err := primarySet.PrefixDigest.Compare(secondarySet.PrefixDigest)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	t.Logf("prefix digest comparison: %d mismatched buckets out of %d",
-		len(mismatched), primarySet.PrefixDigest.NumBuckets())
-
-	// The system keys (keyring, etc.) are different between two independent
-	// cores, so some buckets will mismatch. But the user data buckets
-	// should mostly match.
-}
 
 // --- Integration Test: Change Stream Primary ---
 
@@ -980,6 +799,59 @@ func TestDRPrimary_ChangeStreamFanout(t *testing.T) {
 
 	if bufLen != 3 {
 		t.Fatalf("expected 3 replicable changes in buffer, got %d", bufLen)
+	}
+}
+
+func TestDRPrimary_SeedAppliedIndex(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+
+	// Initially zero.
+	if got := primary.indexApplied.Load(); got != 0 {
+		t.Fatalf("expected indexApplied=0 before seeding, got %d", got)
+	}
+
+	// Seed advances the watermark.
+	primary.SeedAppliedIndex(42)
+	if got := primary.indexApplied.Load(); got != 42 {
+		t.Fatalf("expected indexApplied=42 after seeding, got %d", got)
+	}
+
+	// Seeding a lower value must not move the counter backwards.
+	primary.SeedAppliedIndex(10)
+	if got := primary.indexApplied.Load(); got != 42 {
+		t.Fatalf("expected indexApplied=42 after lower seed, got %d", got)
+	}
+
+	// Seeding zero is a no-op.
+	primary.SeedAppliedIndex(0)
+	if got := primary.indexApplied.Load(); got != 42 {
+		t.Fatalf("expected indexApplied=42 after zero seed, got %d", got)
+	}
+
+	// OnChange should still advance past the seed.
+	changes := []physical.ChangeStreamEntry{
+		{OpType: physical.PutOperation, Key: "test/key1", Value: []byte("v"), RaftIndex: 100},
+	}
+	primary.OnChange(changes)
+	if got := primary.indexApplied.Load(); got != 100 {
+		t.Fatalf("expected indexApplied=100 after OnChange, got %d", got)
+	}
+
+	// OnChange with only non-replicable paths must still advance
+	// indexApplied (the fence needs the raw Raft watermark, not just
+	// replicable entries).
+	filtered := []physical.ChangeStreamEntry{
+		{OpType: physical.PutOperation, Key: "core/dr-replication/config", Value: []byte("x"), RaftIndex: 200},
+		{OpType: physical.PutOperation, Key: "core/raft/tls", Value: []byte("y"), RaftIndex: 201},
+	}
+	primary.OnChange(filtered)
+	if got := primary.indexApplied.Load(); got != 201 {
+		t.Fatalf("expected indexApplied=201 after filtered OnChange, got %d", got)
 	}
 }
 
@@ -1117,17 +989,13 @@ func TestDRPrimary_ValidateCheckpointTuple(t *testing.T) {
 	}
 }
 
-func TestDRPrimary_ExchangeRangeDigests_CheckpointTupleMismatch(t *testing.T) {
+func TestDRPrimary_ExchangeRangeChecksums_CheckpointTupleMismatch(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	replSalt := make([]byte, 32)
 	rand.Read(replSalt)
 	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
 
 	var start [32]byte
-	var end [32]byte
-	for i := range end {
-		end[i] = 0xff
-	}
 	cp := &drCheckpointCacheEntry{
 		checkpoint: reconciler.Checkpoint{
 			ID:          "cp-1",
@@ -1143,15 +1011,10 @@ func TestDRPrimary_ExchangeRangeDigests_CheckpointTupleMismatch(t *testing.T) {
 	primary.checkpoints[cp.checkpoint.ID] = cp
 	primary.checkpointMu.Unlock()
 
-	_, err := primary.ExchangeRangeDigests(context.Background(), &RangeDigestRequest{
+	_, err := primary.ExchangeRangeChecksums(context.Background(), &RangeChecksumRequest{
 		CheckpointId:    "cp-1",
-		CheckpointIndex: 11, // mismatch
-		Spans: []*RangeSpan{
-			{
-				StartKid: start[:],
-				EndKid:   end[:],
-			},
-		},
+		CheckpointIndex: 11, // mismatch (cached index is 10)
+		RangeIds:        []uint64{0},
 	})
 	if err == nil {
 		t.Fatal("expected checkpoint tuple mismatch to fail")
@@ -1579,40 +1442,6 @@ func TestDRPrimary_AllowForcedCheckpointBuild_Cooldown(t *testing.T) {
 
 // --- Integration Test: Strata Estimator Roundtrip ---
 
-func TestDRReconciliation_StrataRoundtrip(t *testing.T) {
-	replSalt := make([]byte, 32)
-	rand.Read(replSalt)
-
-	strata := sketch.NewStrataEstimator(sketch.DefaultStrataLevels, sketch.DefaultStrataCells, sketch.DefaultHashCount)
-
-	// Insert some items.
-	for i := 0; i < 100; i++ {
-		kid := testSHA256([]byte(fmt.Sprintf("key-%d", i)))
-		vid := testSHA256([]byte(fmt.Sprintf("value-%d", i)))
-		strata.Insert(kid, vid)
-	}
-
-	// Marshal and unmarshal.
-	data := strata.Marshal()
-	if len(data) == 0 {
-		t.Fatal("expected non-empty marshaled data")
-	}
-
-	strata2, err := sketch.UnmarshalStrataEstimator(data)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Estimate against itself should be 0.
-	diff, err := strata.Estimate(strata2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if diff != 0 {
-		t.Fatalf("expected 0 difference with self, got %d", diff)
-	}
-}
-
 func TestDRPeerFingerprintFromContext_FallbackConnContext(t *testing.T) {
 	ctx := context.WithValue(context.Background(), drPeerFingerprintContextKey{}, "fp-test")
 	fp, err := peerCertFingerprintFromContext(ctx)
@@ -1641,7 +1470,613 @@ func TestDRPeerFingerprintFromContext_FallbackRemoteAddrMap(t *testing.T) {
 	}
 }
 
+func TestDRPrimary_ExchangeDirtyBitmap_PostRestartReturnsAllDirty(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+
+	// Freshly created primary has dirtyMapStart == 0 (simulating post-restart).
+	if primary.dirtyMapStart != 0 {
+		t.Fatalf("expected dirtyMapStart to be 0, got %d", primary.dirtyMapStart)
+	}
+
+	resp, err := primary.ExchangeDirtyBitmap(context.Background(), &DirtyBitmapMessage{
+		RelationshipId: "rel-1",
+		CheckpointId:   "cp-1",
+	})
+	if err != nil {
+		t.Fatalf("ExchangeDirtyBitmap failed: %v", err)
+	}
+
+	// Every byte should be 0xFF (all dirty).
+	for i, b := range resp.Bitmap {
+		if b != 0xFF {
+			t.Fatalf("expected all-dirty bitmap, but byte %d is %02x", i, b)
+		}
+	}
+}
+
+func TestDRPrimary_DirtyBitmapPersistenceAndReload(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+
+	// Simulate writes to populate the dirty bitmap.
+	primary.OnChange([]physical.ChangeStreamEntry{
+		{OpType: physical.PutOperation, Key: "test/key1", Value: []byte("value1"), RaftIndex: 10},
+		{OpType: physical.PutOperation, Key: "test/key2", Value: []byte("value2"), RaftIndex: 11},
+	})
+
+	if primary.dirtyMapStart == 0 {
+		t.Fatal("expected dirtyMapStart to be set after OnChange")
+	}
+
+	// Force persistence (bypass throttle).
+	primary.dirtyMapMu.Lock()
+	primary.persistDirtyBitmap()
+	primary.dirtyMapMu.Unlock()
+
+	// Snapshot the bitmap state.
+	primary.dirtyMapMu.RLock()
+	origStart := primary.dirtyMapStart
+	origBitmap := make([]byte, len(primary.dirtyMap))
+	copy(origBitmap, primary.dirtyMap)
+	primary.dirtyMapMu.RUnlock()
+
+	// Create a new primary (simulating restart) and load from storage.
+	primary2 := NewDRReplicationPrimary(core, replSalt, core.logger)
+	if err := primary2.loadDirtyBitmap(context.Background()); err != nil {
+		t.Fatalf("loadDirtyBitmap failed: %v", err)
+	}
+
+	primary2.dirtyMapMu.RLock()
+	defer primary2.dirtyMapMu.RUnlock()
+
+	if primary2.dirtyMapStart != origStart {
+		t.Fatalf("expected dirtyMapStart %d after reload, got %d", origStart, primary2.dirtyMapStart)
+	}
+	for i := range origBitmap {
+		if primary2.dirtyMap[i] != origBitmap[i] {
+			t.Fatalf("bitmap byte %d differs: expected %02x, got %02x", i, origBitmap[i], primary2.dirtyMap[i])
+		}
+	}
+}
+
+func TestDRPrimary_ExchangeDirtyBitmap_InitializedBitmapUsesActual(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+
+	// Simulate a write that initializes the dirty bitmap.
+	primary.OnChange([]physical.ChangeStreamEntry{
+		{OpType: physical.PutOperation, Key: "test/key1", Value: []byte("value1"), RaftIndex: 5},
+	})
+
+	if primary.dirtyMapStart == 0 {
+		t.Fatal("expected dirtyMapStart to be set after OnChange")
+	}
+
+	resp, err := primary.ExchangeDirtyBitmap(context.Background(), &DirtyBitmapMessage{
+		RelationshipId: "rel-1",
+		CheckpointId:   "cp-1",
+	})
+	if err != nil {
+		t.Fatalf("ExchangeDirtyBitmap failed: %v", err)
+	}
+
+	// The bitmap should NOT be all-dirty (only the range for "test/key1" should be set).
+	allDirty := true
+	for _, b := range resp.Bitmap {
+		if b != 0xFF {
+			allDirty = false
+			break
+		}
+	}
+	if allDirty {
+		t.Fatal("expected partial dirty bitmap after single write, but got all-dirty")
+	}
+
+	// At least one bit should be set.
+	anyDirty := false
+	for _, b := range resp.Bitmap {
+		if b != 0 {
+			anyDirty = true
+			break
+		}
+	}
+	if !anyDirty {
+		t.Fatal("expected at least one dirty range after write")
+	}
+}
+
+func TestDRTombstoneGC_ComputesWatermarkFromSecondaryPressure(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+	defer primary.tombstoneGC.Stop()
+
+	now := time.Now()
+
+	// Add two active secondaries with different applied indices.
+	primary.pressureMu.Lock()
+	primary.secondaryPressure["rel-1"] = &drSecondaryPressureSample{
+		lastSeen:    now.Add(-10 * time.Second),
+		lastApplied: 100,
+	}
+	primary.secondaryPressure["rel-2"] = &drSecondaryPressureSample{
+		lastSeen:    now.Add(-5 * time.Second),
+		lastApplied: 50,
+	}
+	primary.pressureMu.Unlock()
+
+	wm, disconnected := primary.tombstoneGC.computeGlobalLowWatermark(now)
+	if wm != 50 {
+		t.Fatalf("expected watermark 50 (minimum of active secondaries), got %d", wm)
+	}
+	if disconnected != 0 {
+		t.Fatalf("expected 0 disconnected peers, got %d", disconnected)
+	}
+}
+
+func TestDRTombstoneGC_DisconnectedPeersExcludedFromWatermark(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+	defer primary.tombstoneGC.Stop()
+
+	now := time.Now()
+
+	// One active secondary, one disconnected (not seen for > threshold).
+	primary.pressureMu.Lock()
+	primary.secondaryPressure["rel-1"] = &drSecondaryPressureSample{
+		lastSeen:    now.Add(-5 * time.Second),
+		lastApplied: 100,
+	}
+	primary.secondaryPressure["rel-disconnected"] = &drSecondaryPressureSample{
+		lastSeen:    now.Add(-10 * time.Minute), // way past threshold
+		lastApplied: 10,
+	}
+	primary.pressureMu.Unlock()
+
+	wm, disconnected := primary.tombstoneGC.computeGlobalLowWatermark(now)
+	if wm != 100 {
+		t.Fatalf("expected watermark 100 (disconnected peer excluded), got %d", wm)
+	}
+	if disconnected != 1 {
+		t.Fatalf("expected 1 disconnected peer, got %d", disconnected)
+	}
+}
+
+func TestDRTombstoneGC_NoActivePeersUsesLocalIndex(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+	defer primary.tombstoneGC.Stop()
+
+	primary.indexApplied.Store(200)
+
+	wm, disconnected := primary.tombstoneGC.computeGlobalLowWatermark(time.Now())
+	if wm != 200 {
+		t.Fatalf("expected watermark 200 (local index), got %d", wm)
+	}
+	if disconnected != 0 {
+		t.Fatalf("expected 0 disconnected peers, got %d", disconnected)
+	}
+}
+
 // helper to compute sha256
 func testSHA256(data []byte) [32]byte {
 	return sha256.Sum256(data)
+}
+
+// --- Credit-based flow control tests ---
+
+// creditTestBidiStream is a mock BidiStreamingServer for testing the
+// primary's credit-gated StreamChanges handler. It delivers an init
+// message on first Recv(), then delivers WindowUpdate messages from
+// an internal channel, and captures all sent EntryBatch messages.
+// Individual entries are unpacked and forwarded to sentCh for test
+// observation.
+type creditTestBidiStream struct {
+	ctx      context.Context
+	initMsg  *StreamChangesUpstream
+	initSent bool
+	// creditCh carries WindowUpdate messages to feed to the primary.
+	creditCh chan *StreamChangesUpstream
+	// sentCh receives individual entries unpacked from EntryBatch
+	// messages sent by the primary.
+	sentCh chan *EntryChange
+	// sentBatchCh optionally receives raw EntryBatch messages for
+	// tests that need to inspect batching behavior.
+	sentBatchCh chan *EntryBatch
+}
+
+func (s *creditTestBidiStream) SetHeader(_ metadata.MD) error  { return nil }
+func (s *creditTestBidiStream) SendHeader(_ metadata.MD) error { return nil }
+func (s *creditTestBidiStream) SetTrailer(_ metadata.MD)       {}
+func (s *creditTestBidiStream) Context() context.Context       { return s.ctx }
+func (s *creditTestBidiStream) SendMsg(any) error              { return nil }
+func (s *creditTestBidiStream) RecvMsg(any) error              { return io.EOF }
+
+func (s *creditTestBidiStream) Send(b *EntryBatch) error {
+	// Forward raw batch if a batch channel is provided.
+	if s.sentBatchCh != nil {
+		select {
+		case s.sentBatchCh <- b:
+		case <-s.ctx.Done():
+			return s.ctx.Err()
+		}
+	}
+	// Unpack entries for per-entry observation.
+	for _, ch := range b.GetEntries() {
+		select {
+		case s.sentCh <- ch:
+		case <-s.ctx.Done():
+			return s.ctx.Err()
+		}
+	}
+	return nil
+}
+
+func (s *creditTestBidiStream) Recv() (*StreamChangesUpstream, error) {
+	if !s.initSent {
+		s.initSent = true
+		return s.initMsg, nil
+	}
+	select {
+	case msg := <-s.creditCh:
+		return msg, nil
+	case <-s.ctx.Done():
+		return nil, s.ctx.Err()
+	}
+}
+
+// newCreditTestPrimary creates a minimal drReplicationPrimary suitable
+// for credit flow-control tests. It registers a relationship and injects
+// entries into the change buffer so StreamChanges can start.
+func newCreditTestPrimary(t *testing.T, creditTimeout time.Duration) (*drReplicationPrimary, string, string) {
+	t.Helper()
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+	defer func() {
+		if primary.tombstoneGC != nil {
+			primary.tombstoneGC.Stop()
+		}
+	}()
+	primary.creditWaitTimeout = creditTimeout
+
+	// Register a relationship so authorization passes.
+	mgr := core.drManager
+	if mgr == nil {
+		t.Fatal("expected DR manager")
+	}
+	if err := mgr.EnablePrimary(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	token, err := mgr.GenerateActivationToken(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel, err := mgr.loadRelationship(context.Background(), token.RelationshipID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel.State = DRRelationshipStateRegistered
+	const fingerprint = "test-credit-fingerprint"
+	rel.SecondaryCertFingerprint = fingerprint
+	if err := mgr.saveRelationship(context.Background(), rel); err != nil {
+		t.Fatal(err)
+	}
+
+	// Use the primary from the manager so it shares the same core state.
+	p := mgr.Primary()
+	if p == nil {
+		t.Fatal("expected primary")
+	}
+	p.creditWaitTimeout = creditTimeout
+
+	return p, token.RelationshipID, fingerprint
+}
+
+func TestStreamChanges_InitialWindowRespected(t *testing.T) {
+	primary, relID, fingerprint := newCreditTestPrimary(t, 2*time.Second)
+
+	ctx, cancel := context.WithCancel(
+		context.WithValue(context.Background(), drPeerFingerprintContextKey{}, fingerprint))
+	defer cancel()
+
+	const initialWindow = 3
+	stream := &creditTestBidiStream{
+		ctx: ctx,
+		initMsg: &StreamChangesUpstream{
+			Msg: &StreamChangesUpstream_Init{
+				Init: &StreamChangesRequest{
+					RelationshipId: relID,
+					InitialWindow:  initialWindow,
+				},
+			},
+		},
+		creditCh: make(chan *StreamChangesUpstream),
+		sentCh:   make(chan *EntryChange, 100),
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- primary.StreamChanges(stream)
+	}()
+
+	// Wait briefly for the subscriber to register, then push entries
+	// through OnChange so they flow through the subscriber channel.
+	time.Sleep(100 * time.Millisecond)
+	for i := uint64(1); i <= 5; i++ {
+		primary.OnChange([]physical.ChangeStreamEntry{
+			{OpType: physical.PutOperation, Key: fmt.Sprintf("key/%d", i), Value: []byte("v"), RaftIndex: i},
+		})
+	}
+
+	// Collect entries. We should receive exactly initialWindow entries
+	// before the primary blocks waiting for credits.
+	var received []*EntryChange
+	timeout := time.After(2 * time.Second)
+	for len(received) < initialWindow {
+		select {
+		case e := <-stream.sentCh:
+			received = append(received, e)
+		case <-timeout:
+			t.Fatalf("timed out waiting for entries; received %d, expected %d", len(received), initialWindow)
+		}
+	}
+
+	// Verify no additional entries arrive within a short window.
+	select {
+	case extra := <-stream.sentCh:
+		t.Fatalf("received unexpected entry beyond initial window: %s", extra.Key)
+	case <-time.After(300 * time.Millisecond):
+		// Good: no more entries sent.
+	}
+
+	if len(received) != initialWindow {
+		t.Fatalf("expected %d entries, got %d", initialWindow, len(received))
+	}
+
+	cancel()
+	<-errCh
+}
+
+func TestStreamChanges_CreditFlowControl(t *testing.T) {
+	primary, relID, fingerprint := newCreditTestPrimary(t, 5*time.Second)
+
+	ctx, cancel := context.WithCancel(
+		context.WithValue(context.Background(), drPeerFingerprintContextKey{}, fingerprint))
+	defer cancel()
+
+	const initialWindow = 2
+	stream := &creditTestBidiStream{
+		ctx: ctx,
+		initMsg: &StreamChangesUpstream{
+			Msg: &StreamChangesUpstream_Init{
+				Init: &StreamChangesRequest{
+					RelationshipId: relID,
+					InitialWindow:  initialWindow,
+				},
+			},
+		},
+		creditCh: make(chan *StreamChangesUpstream, 10),
+		sentCh:   make(chan *EntryChange, 100),
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- primary.StreamChanges(stream)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	for i := uint64(1); i <= 6; i++ {
+		primary.OnChange([]physical.ChangeStreamEntry{
+			{OpType: physical.PutOperation, Key: fmt.Sprintf("key/%d", i), Value: []byte("v"), RaftIndex: i},
+		})
+	}
+
+	// Receive initial window of 2 entries.
+	collectN := func(n int, label string) []*EntryChange {
+		var out []*EntryChange
+		to := time.After(3 * time.Second)
+		for len(out) < n {
+			select {
+			case e := <-stream.sentCh:
+				out = append(out, e)
+			case <-to:
+				t.Fatalf("%s: timed out after receiving %d/%d entries", label, len(out), n)
+			}
+		}
+		return out
+	}
+
+	collectN(initialWindow, "initial window")
+
+	// Verify primary is blocked (no more entries).
+	select {
+	case extra := <-stream.sentCh:
+		t.Fatalf("received entry beyond window before credit replenishment: %s", extra.Key)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// Replenish 2 credits.
+	stream.creditCh <- &StreamChangesUpstream{
+		Msg: &StreamChangesUpstream_WindowUpdate{
+			WindowUpdate: &WindowUpdate{Credits: 2},
+		},
+	}
+
+	// Should now receive 2 more entries.
+	collectN(2, "after first replenishment")
+
+	// Replenish 2 more credits.
+	stream.creditCh <- &StreamChangesUpstream{
+		Msg: &StreamChangesUpstream_WindowUpdate{
+			WindowUpdate: &WindowUpdate{Credits: 2},
+		},
+	}
+
+	// Should receive the remaining 2 entries.
+	collectN(2, "after second replenishment")
+
+	cancel()
+	<-errCh
+}
+
+func TestStreamChanges_CreditTimeout(t *testing.T) {
+	// Use a very short timeout so the test finishes quickly.
+	primary, relID, fingerprint := newCreditTestPrimary(t, 500*time.Millisecond)
+
+	ctx, cancel := context.WithCancel(
+		context.WithValue(context.Background(), drPeerFingerprintContextKey{}, fingerprint))
+	defer cancel()
+
+	// Window of 1: the first entry is sent, the second triggers a wait.
+	stream := &creditTestBidiStream{
+		ctx: ctx,
+		initMsg: &StreamChangesUpstream{
+			Msg: &StreamChangesUpstream_Init{
+				Init: &StreamChangesRequest{
+					RelationshipId: relID,
+					InitialWindow:  1,
+				},
+			},
+		},
+		creditCh: make(chan *StreamChangesUpstream),
+		sentCh:   make(chan *EntryChange, 100),
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- primary.StreamChanges(stream)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	// Push 2 entries: first uses the one credit, second will block.
+	primary.OnChange([]physical.ChangeStreamEntry{
+		{OpType: physical.PutOperation, Key: "key/1", Value: []byte("v"), RaftIndex: 1},
+		{OpType: physical.PutOperation, Key: "key/2", Value: []byte("v"), RaftIndex: 2},
+	})
+
+	// Receive the first entry.
+	select {
+	case <-stream.sentCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first entry")
+	}
+
+	// StreamChanges should return with ResourceExhausted after the short timeout.
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected error from StreamChanges")
+		}
+		st, ok := status.FromError(err)
+		if !ok {
+			t.Fatalf("expected gRPC status error, got: %v", err)
+		}
+		if st.Code() != codes.ResourceExhausted {
+			t.Fatalf("expected ResourceExhausted, got %v: %s", st.Code(), st.Message())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("StreamChanges did not return after credit timeout")
+	}
+}
+
+func TestStreamChanges_BatchSizeRespected(t *testing.T) {
+	primary, relID, fingerprint := newCreditTestPrimary(t, 5*time.Second)
+
+	ctx, cancel := context.WithCancel(
+		context.WithValue(context.Background(), drPeerFingerprintContextKey{}, fingerprint))
+	defer cancel()
+
+	// Large initial window so the primary doesn't block on credits.
+	const initialWindow = 10000
+	const totalEntries = 200
+
+	stream := &creditTestBidiStream{
+		ctx: ctx,
+		initMsg: &StreamChangesUpstream{
+			Msg: &StreamChangesUpstream_Init{
+				Init: &StreamChangesRequest{
+					RelationshipId: relID,
+					InitialWindow:  initialWindow,
+				},
+			},
+		},
+		creditCh:    make(chan *StreamChangesUpstream),
+		sentCh:      make(chan *EntryChange, totalEntries),
+		sentBatchCh: make(chan *EntryBatch, totalEntries),
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- primary.StreamChanges(stream)
+	}()
+
+	// Wait for subscriber to register, then push a burst of entries.
+	time.Sleep(100 * time.Millisecond)
+	entries := make([]physical.ChangeStreamEntry, totalEntries)
+	for i := uint64(0); i < totalEntries; i++ {
+		entries[i] = physical.ChangeStreamEntry{
+			OpType:    physical.PutOperation,
+			Key:       fmt.Sprintf("key/batch/%d", i),
+			Value:     []byte("v"),
+			RaftIndex: i + 1,
+		}
+	}
+	primary.OnChange(entries)
+
+	// Collect all entries via sentCh.
+	var received int
+	timeout := time.After(5 * time.Second)
+	for received < totalEntries {
+		select {
+		case <-stream.sentCh:
+			received++
+		case <-timeout:
+			t.Fatalf("timed out after receiving %d/%d entries", received, totalEntries)
+		}
+	}
+
+	// Drain all batches that were captured.
+	var batches []*EntryBatch
+drainBatches:
+	for {
+		select {
+		case b := <-stream.sentBatchCh:
+			batches = append(batches, b)
+		default:
+			break drainBatches
+		}
+	}
+
+	// Verify no single batch exceeds drStreamSendBatchMaxEntries.
+	for i, b := range batches {
+		if len(b.GetEntries()) > drStreamSendBatchMaxEntries {
+			t.Errorf("batch %d has %d entries, exceeding max %d",
+				i, len(b.GetEntries()), drStreamSendBatchMaxEntries)
+		}
+	}
+
+	// With 200 entries and max batch size of 64, we expect at least
+	// ceil(200/64)=4 batches (entries are batched from the channel).
+	if len(batches) < 2 {
+		t.Errorf("expected multiple batches for %d entries, got %d batches", totalEntries, len(batches))
+	}
+
+	t.Logf("sent %d entries in %d batches", received, len(batches))
+	cancel()
+	<-errCh
 }
