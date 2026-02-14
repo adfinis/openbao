@@ -9,7 +9,10 @@ This RFC defines OpenBao Disaster Recovery (DR) replication as a native, cross-c
 The current architecture uses:
 - Two (or more) independent Raft clusters (primary and one or more secondaries)
 - Entry-level change streaming for normal operation
+- Disk-backed stream journal replay to extend reconnect horizon beyond in-memory ring depth
 - Hybrid range-first reconciliation for recovery
+- Ciphertext-domain reconciliation/apply below the barrier
+- Convergence controller with lag-slope/rate-ratio fallback triggering
 - Strict relationship authorization (cert fingerprint + relationship state)
 - Wrapped root-key bootstrap (no plaintext root-key transfer)
 - Strict mTLS transport model (no insecure fallback)
@@ -72,6 +75,7 @@ graph LR
 ### Runtime Modes
 1. Streaming mode:
    - Primary emits ordered `ChangeStreamEntry` mutations.
+   - Primary retains replay history in in-memory ring plus on-disk stream journal segments.
    - Secondary applies mutations and tracks `lastAppliedIndex`.
 
 2. Reconciliation mode:
@@ -187,7 +191,7 @@ No plaintext root key flow exists.
 ## Replication Data Model
 Reconciliation operates over encrypted storage identity pairs:
 - `KID = HMAC(repl_salt, canonical_storage_key)`
-- `VID = hash(ciphertext bytes / tombstone representation)`
+- `VID = SHA256(ciphertext_bytes || seal_wrap_flag)` for present entries, tombstone representation for deletes.
 
 This keeps reconciliation below the barrier while preserving confidentiality of key names and values.
 
@@ -246,9 +250,10 @@ Any unresolved failure is a reconciliation failure and retries later.
 To handle sustained lag where reconcile throughput cannot catch up with incoming writes, the secondary supports a hard-cutover fallback:
 
 1. Trigger conditions (configurable):
-   - `lastAppliedIndex` stall duration exceeded
+   - lag-growth window (`convergence_stall_seconds`) exceeded
+   - apply/write rate ratio (`secondary_apply_rate_eps / primary_write_rate_eps`) below `convergence_min_rate_ratio`
    - lag (`primary_index - last_applied_index`) above threshold
-   - failure window threshold reached for `budget_exceeded|stalled|decode_exhausted`
+   - and/or failure window threshold reached for `budget_exceeded|stalled|decode_exhausted`
 2. Secondary enters `resnapshotting` state.
 3. Secondary requests a fresh checkpoint and performs protocol-scoped full-copy fetch for full hash span.
 4. Secondary applies fetched entries, deletes local-only entries under checkpoint/session fencing, sets `lastAppliedIndex=checkpoint.commit_index`, and resumes streaming.
@@ -304,6 +309,11 @@ If admission still fails, `RequestCheckpoint` fails with precondition error.
 - Primary may temporarily deny `RequestCheckpoint` under high stream pressure (`budget_exceeded: primary stream pressure (...)`).
 - Throttling is bounded and bypassed periodically to prevent permanent starvation.
 - Status exposes throttle counters and stream-pressure telemetry.
+
+### Stream Replay Horizon (Primary)
+- In-memory ring remains the first replay source.
+- Disk-backed stream journal extends replay horizon and is consulted when catch-up start index is older than the oldest buffered entry.
+- Journal replay is relationship-authorized and index-ordered; if missing/expired, reconnect fails closed and secondary must reconcile.
 
 ### Reconcile Budgets (Secondary)
 - Top ranges max: 256
@@ -407,6 +417,16 @@ On failed validation:
 - `fallback_last_reason`
 - `fallback_last_at`
 - `reconcile_task_rate`
+- `primary_write_rate_eps`
+- `secondary_apply_rate_eps`
+- `lag_entries`
+- `lag_slope_eps`
+- `predicted_catchup_seconds`
+- `stream_journal_bytes`
+- `stream_journal_segments`
+- `stream_journal_oldest_index`
+- `reconcile_put_workers_active`
+- `reconcile_delete_phase_seconds`
 
 ### Metrics
 Representative metrics emitted include:
@@ -458,6 +478,7 @@ Alternatives rejected:
 2. Additive protocol evolution is used; no protocol version bump was required for current range fields.
 3. Change-stream replay intentionally includes entries at `last_applied_index` to safely recover reconnects that split same-index operation batches.
 4. Checkpoint cache is metadata-first; entry values are fetched on demand during `FetchEntries`, and cache metrics expose metadata/value byte split.
+5. No legacy compatibility reconciliation path is retained; `top_ranges` are required.
 
 ## Implementation Mapping
 
@@ -465,11 +486,13 @@ Alternatives rejected:
 | RFC Area | Primary Implementation | Secondary/Supporting Implementation |
 |---|---|---|
 | DR primary server and subscriber model | `vault/dr_replication.go` (`drReplicationPrimary`, `OnChange`, `StreamChanges`) | `vault/dr_replication_secondary.go` (`drReplicationSecondary`, `runStream`) |
+| Stream journal append/replay/retention | `vault/dr_replication.go` (`OnChange`, `StreamChanges`) | `vault/dr_stream_journal.go` |
 | Checkpoint creation and cache admission | `vault/dr_replication.go` (`RequestCheckpoint`, `cacheCheckpoint`, checkpoint eviction helpers) | `vault/dr_replication_secondary.go` (`runReconciliation`) |
 | Range manifest generation | `vault/dr_replication.go` (`RequestCheckpoint`) | `physical/replication/reconciler/range.go` (`BuildRangeManifest`) |
 | Range-scoped IBLT exchange | `vault/dr_replication.go` (`ExchangeIBLT`) | `vault/dr_replication_secondary.go` (`runRangeReconciliation`, `processRangeTask`) |
 | Range-scoped prefix refinement | `vault/dr_replication.go` (`ExchangePrefixDigests`) | `vault/dr_replication_secondary.go` (`runRangePrefixRefinement`) |
 | Range/range+bucket fetch semantics | `vault/dr_replication.go` (`FetchEntries`) | `vault/dr_replication_secondary.go` (`fetchEntriesForDiff`, `fetchAndApplyEntriesWithBudget`) |
+| Convergence telemetry and fallback triggering | `vault/dr_replication_secondary.go` (`updateConvergenceTelemetry`, `convergenceFallbackEligible`, `shouldTriggerFallback`) | `vault/dr_replication_secondary.go` (`performFallback`, `performResnapshot`) |
 
 ### Protocol Surface
 | RFC Area | Proto Definition |
@@ -511,7 +534,7 @@ Alternatives rejected:
 | Raft backend hook registration | `physical/raft/raft.go` (`HookChangeStream`) |
 | Ordered FSM batch hook emission | `physical/raft/fsm.go` (`hookChangeStream`, `ApplyBatch`) |
 | Seal-wrap propagation in transaction log ops | `physical/raft/raft.go` (`Put`) and `physical/raft/transaction.go` (`Put`, `Commit`) |
-| Strict scanner semantics | `physical/replication/reconciler/reconciler.go` (`Scan`, `BuildIBLTFromScan`, `beginScanSnapshot`) |
+| Strict scanner semantics + ciphertext domain | `physical/replication/reconciler/reconciler.go` (`Scan`, `ScanPhysical`, `BuildIBLTFromScan`, `beginScanSnapshot`, `beginScanSnapshotPhysical`) |
 
 ### Budgets and Defaults
 | RFC Area | Implementation |
