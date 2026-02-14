@@ -282,6 +282,10 @@ read_get() {
   if grep -qiE 'No value found|Code:[[:space:]]*404' <<<"$out"; then
     return 0
   fi
+  # Surface the actual error so sentinel-wait stalls are diagnosable.
+  if [[ -n "${SENTINEL_DIAG:-}" ]]; then
+    echo "[read_get] $role $key_path FAILED: $out" >&2
+  fi
   return 1
 }
 
@@ -392,18 +396,32 @@ wait_for_sentinel() {
   local role="$1"
   local path="$2"
   local timeout="$3"
-  local start now
+  local start now elapsed attempts=0
   start="$(date +%s)"
+  # Enable diagnostic output from read_get during sentinel polling.
+  SENTINEL_DIAG=1
+  echo "[sentinel] waiting for $path on $role (timeout=${timeout}s)" >&2
   while true; do
+    attempts=$((attempts + 1))
     if read_get "$role" "$path"; then
       now="$(date +%s)"
-      echo $((now - start))
+      elapsed=$((now - start))
+      echo "[sentinel] $role: found after ${elapsed}s ($attempts attempts)" >&2
+      SENTINEL_DIAG=""
+      echo "$elapsed"
       return 0
     fi
     now="$(date +%s)"
-    if (( now - start >= timeout )); then
+    elapsed=$((now - start))
+    if (( elapsed >= timeout )); then
+      echo "[sentinel] $role: TIMEOUT after ${elapsed}s ($attempts attempts)" >&2
+      SENTINEL_DIAG=""
       echo -1
       return 1
+    fi
+    # Log progress every 30 attempts (~30s).
+    if (( attempts % 30 == 0 )); then
+      echo "[sentinel] $role: still waiting after ${elapsed}s ($attempts attempts)..." >&2
     fi
     sleep 1
   done
