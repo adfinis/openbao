@@ -3,7 +3,6 @@
 
 // Package reconciler builds reconciliation sets from storage for
 // disaster recovery replication. It scans the full keyspace, computes
-// (KID, VID) pairs, and populates sketch data structures (IBLT,
 // strata estimator, prefix digest) for set reconciliation.
 package reconciler
 
@@ -15,7 +14,6 @@ import (
 	"sync"
 
 	log "github.com/hashicorp/go-hclog"
-	"github.com/openbao/openbao/physical/replication/sketch"
 	"github.com/openbao/openbao/sdk/v2/logical"
 	"github.com/openbao/openbao/sdk/v2/physical"
 )
@@ -54,21 +52,10 @@ type CheckpointArtifact struct {
 	RangeManifest []RangeDescriptor
 }
 
-// ReconciliationSet contains the sketch data structures built from
 // scanning the storage keyspace at a specific checkpoint.
 type ReconciliationSet struct {
 	// Checkpoint anchors this set to a specific point in time.
 	Checkpoint Checkpoint
-
-	// Strata is the strata estimator for difference size estimation.
-	Strata *sketch.StrataEstimator
-
-	// IBLT is an IBLT sized for a specific expected difference.
-	// May be nil if the caller only wanted strata/prefix digests.
-	IBLT *sketch.IBLT
-
-	// PrefixDigest is the prefix digest for bucket-level comparison.
-	PrefixDigest *sketch.PrefixDigest
 
 	// KeyCount is the total number of keys scanned.
 	KeyCount int
@@ -91,22 +78,6 @@ type ScanConfig struct {
 	// ReplSalt is the HMAC key used to derive KIDs from storage keys.
 	// Must be the same on primary and secondary.
 	ReplSalt []byte
-
-	// IBLTCells is the number of cells for the IBLT. If 0, no IBLT
-	// is built during the scan (use BuildIBLT after strata estimation).
-	IBLTCells uint32
-
-	// PrefixLen is the prefix length for the PrefixDigest.
-	// Default: 8 (256 buckets).
-	PrefixLen uint32
-
-	// StrataLevels is the number of strata estimator levels.
-	// Default: 32.
-	StrataLevels int
-
-	// StrataCells is the number of cells per stratum.
-	// Default: 80.
-	StrataCells uint32
 
 	// BuildKIDMap if true, populates ReconciliationSet.KIDToKey for
 	// reverse lookups. Should be true on the side that will serve
@@ -157,9 +128,6 @@ const (
 func DefaultScanConfig(replSalt []byte) ScanConfig {
 	return ScanConfig{
 		ReplSalt:                     replSalt,
-		PrefixLen:                    8,
-		StrataLevels:                 sketch.DefaultStrataLevels,
-		StrataCells:                  sketch.DefaultStrataCells,
 		BuildKIDMap:                  false,
 		RequireTransactionalSnapshot: false,
 		ValueDomain:                  ValueDomainPlaintext,
@@ -191,14 +159,8 @@ func (s *Scanner) Scan(ctx context.Context, storage logical.Storage, checkpoint 
 	s.logger.Info("starting reconciliation scan", "checkpoint_id", checkpoint.ID, "commit_index", checkpoint.CommitIndex)
 
 	rs := &ReconciliationSet{
-		Checkpoint:   checkpoint,
-		Strata:       sketch.NewStrataEstimator(s.config.StrataLevels, s.config.StrataCells, sketch.DefaultHashCount),
-		PrefixDigest: sketch.NewPrefixDigest(s.config.PrefixLen),
-		KIDToVID:     make(map[[32]byte][32]byte),
-	}
-
-	if s.config.IBLTCells > 0 {
-		rs.IBLT = sketch.NewIBLT(s.config.IBLTCells, sketch.DefaultHashCount)
+		Checkpoint: checkpoint,
+		KIDToVID:   make(map[[32]byte][32]byte),
 	}
 
 	if s.config.BuildKIDMap {
@@ -240,12 +202,8 @@ func (s *Scanner) Scan(ctx context.Context, storage logical.Storage, checkpoint 
 		}
 
 		mu.Lock()
-		rs.Strata.Insert(kid, vid)
-		rs.PrefixDigest.Insert(kid, vid)
 		rs.KIDToVID[kid] = vid
-		if rs.IBLT != nil {
-			rs.IBLT.Insert(kid, vid)
-		}
+
 		if rs.KIDToKey != nil {
 			rs.KIDToKey[kid] = path
 		}
@@ -270,62 +228,16 @@ func (s *Scanner) Scan(ctx context.Context, storage logical.Storage, checkpoint 
 	return rs, nil
 }
 
-// BuildIBLTFromScan builds an IBLT from a full storage scan. This is
-// used after strata estimation to create an IBLT sized appropriately
-// for the estimated difference.
-func (s *Scanner) BuildIBLTFromScan(ctx context.Context, storage logical.Storage, numCells uint32) (*sketch.IBLT, error) {
-	iblt := sketch.NewIBLT(numCells, sketch.DefaultHashCount)
-
-	scanStorage, rollback, err := s.beginScanSnapshot(ctx, storage)
-	if err != nil {
-		return nil, fmt.Errorf("reconciler: failed to begin IBLT snapshot: %w", err)
-	}
-	if rollback != nil {
-		defer rollback()
-	}
-
-	err = logical.ScanViewPaginated(ctx, scanStorage, s.logger, logical.DefaultScanViewPageLimit, func(_ int, _ int, path string) (bool, error) {
-		// Skip excluded paths.
-		if s.shouldExclude(path) {
-			return true, nil
-		}
-
-		entry, err := scanStorage.Get(ctx, path)
-		if err != nil {
-			return false, fmt.Errorf("failed to get entry for IBLT build for %q: %w", path, err)
-		}
-
-		kid := s.computeKID(path)
-		var vid [32]byte
-		if entry == nil {
-			vid = s.computeTombstoneVID(path)
-		} else {
-			vid = s.computeVIDWithSealWrap(entry.Value, entry.SealWrap)
-		}
-
-		iblt.Insert(kid, vid)
-		return true, nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("reconciler: IBLT build failed: %w", err)
-	}
-	return iblt, nil
-}
-
 // ScanPhysical iterates the full keyspace using a physical backend snapshot.
 // This is used by DR below-barrier reconciliation.
 func (s *Scanner) ScanPhysical(ctx context.Context, backend physical.Backend, checkpoint Checkpoint) (*ReconciliationSet, error) {
 	s.logger.Info("starting physical reconciliation scan", "checkpoint_id", checkpoint.ID, "commit_index", checkpoint.CommitIndex)
 
 	rs := &ReconciliationSet{
-		Checkpoint:   checkpoint,
-		Strata:       sketch.NewStrataEstimator(s.config.StrataLevels, s.config.StrataCells, sketch.DefaultHashCount),
-		PrefixDigest: sketch.NewPrefixDigest(s.config.PrefixLen),
-		KIDToVID:     make(map[[32]byte][32]byte),
+		Checkpoint: checkpoint,
+		KIDToVID:   make(map[[32]byte][32]byte),
 	}
-	if s.config.IBLTCells > 0 {
-		rs.IBLT = sketch.NewIBLT(s.config.IBLTCells, sketch.DefaultHashCount)
-	}
+
 	if s.config.BuildKIDMap {
 		rs.KIDToKey = make(map[[32]byte]string)
 	}
@@ -361,12 +273,8 @@ func (s *Scanner) ScanPhysical(ctx context.Context, backend physical.Backend, ch
 		}
 
 		mu.Lock()
-		rs.Strata.Insert(kid, vid)
-		rs.PrefixDigest.Insert(kid, vid)
 		rs.KIDToVID[kid] = vid
-		if rs.IBLT != nil {
-			rs.IBLT.Insert(kid, vid)
-		}
+
 		if rs.KIDToKey != nil {
 			rs.KIDToKey[kid] = path
 		}

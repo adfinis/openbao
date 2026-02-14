@@ -9,7 +9,6 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/openbao/openbao/physical/replication/sketch"
 	"github.com/openbao/openbao/sdk/v2/physical"
 )
 
@@ -84,34 +83,6 @@ func TestSplitRange(t *testing.T) {
 	}
 }
 
-func TestBuildRangeIBLTFromMap_Filtering(t *testing.T) {
-	kidToVID := make(map[[32]byte][32]byte)
-	for i := 0; i < 20; i++ {
-		kid := testKID(i)
-		vid := sha256.Sum256([]byte{byte(i)})
-		kidToVID[kid] = vid
-	}
-
-	span := RangeSpan{
-		StartKID: testKID(5),
-		EndKID:   testKID(12),
-	}
-	got := BuildRangeIBLTFromMap(kidToVID, span, 128)
-	want := sketch.NewIBLT(128, sketch.DefaultHashCount)
-	for i := 5; i <= 12; i++ {
-		kid := testKID(i)
-		want.Insert(kid, kidToVID[kid])
-	}
-
-	diff, err := got.Subtract(want)
-	if err != nil {
-		t.Fatalf("subtract failed: %v", err)
-	}
-	if !diff.IsEmpty() {
-		t.Fatalf("range-filtered IBLT does not match expected entries")
-	}
-}
-
 func TestBuildRangeManifest_NoSingleRangeCollapseForDistributedKIDs(t *testing.T) {
 	rs := &ReconciliationSet{
 		KIDToVID: make(map[[32]byte][32]byte),
@@ -124,7 +95,6 @@ func TestBuildRangeManifest_NoSingleRangeCollapseForDistributedKIDs(t *testing.T
 	}
 
 	cfg := DefaultRangePlanConfig()
-	cfg.TopLevelHashBits = 8
 	cfg.MaxTopRanges = 256
 
 	manifest, err := BuildRangeManifest(rs, cfg)
@@ -151,7 +121,6 @@ func TestBuildFixedHashRangeManifestFromItems(t *testing.T) {
 	}
 
 	cfg := DefaultRangePlanConfig()
-	cfg.TopLevelHashBits = 8
 	cfg.MaxTopRanges = 256
 
 	manifestA, err := BuildFixedHashRangeManifest(items, cfg)
