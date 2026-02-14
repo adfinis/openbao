@@ -1,18 +1,23 @@
 # DR Replication Manual Test Matrix
 
-This matrix is for manually validating DR replication in the current codebase.
+This matrix defines manual and automated validation for DR replication in this repository.
 
 ## Scope
 
-- Unit/integration test commands in this repository.
-- Manual end-to-end checks with the `openbao-dr` docker environment.
-- Failure scenarios: revoke, disconnect/reconcile, and failover behavior.
+- Unit and integration tests under `/Users/roelc/projects/secretz/openbao`.
+- End-to-end validation against a local multi-cluster Docker test environment.
+- Failure-path checks: reconnect/reconcile, revoke, failover, and sustained load.
 
 ## Environment Assumptions
 
-- Repo root: this directory.
-- DR docker env repo exists (example): `$DR_ENV_DIR`.
-- `docker`, `jq`, and `bao` are available.
+- OpenBao repo root: `/Users/roelc/projects/secretz/openbao`
+- DR environment repo path is exported as `DR_ENV_DIR`.
+- Tools available: `docker`, `jq`, `bao`, `rg`.
+- DR endpoints and tokens are exported (for example via `.envrc`):
+  - `DR_PRIMARY_ADDR`, `DR_PRIMARY_TOKEN`
+  - `DR_SECONDARY1_ADDR`, `DR_SECONDARY1_TOKEN`
+  - `DR_SECONDARY2_ADDR`, `DR_SECONDARY2_TOKEN`
+  - `DR_CA_CERT`
 
 ---
 
@@ -22,227 +27,187 @@ This matrix is for manually validating DR replication in the current codebase.
 |---|---|---|---|
 | A1 | DR unit suite | `go test ./vault -run 'TestDR' -count=1` | Pass |
 | A2 | DR integration suite | `go test ./vault -run 'TestDRIntegration' -count=1 -v` | Pass |
-| A3 | DR race subset | `go test -race ./vault -run 'TestDRIntegration_(StreamReplication|DisconnectAndReconcile|ReadOnlyEnforcement|GapDetection|BufferOverflowDetection)' -count=1` | Pass, no race |
+| A3 | DR race subset | `go test -race ./vault -run 'TestDRIntegration_(StreamReplication|DisconnectAndReconcile|ReadOnlyEnforcement|GapDetection|BufferOverflowDetection)' -count=1` | Pass, no races |
 | A4 | DR range reconciliation | `go test ./vault -run 'TestDRIntegration_(RangeManifestDeterminism|RangeIBLTDecodeSuccess|RangeIBLTDecodeAdaptiveSplit|RangeRefinementPrefixFallback|ReconcileFailsOnBudgetExceeded|NoIndexAdvanceOnPartialRangeFailure|MultiRelationshipRangeIsolation|RevokeDuringRangeReconcileAborts)' -count=1` | Pass |
 | A5 | DR stream cursor/replay correctness | `go test ./vault -run 'TestDRIntegration_(StreamAppliesSameRaftIndexBatchEntries|PrimaryStreamReplayIncludesLastAppliedIndex)' -count=1` | Pass |
 | A6 | DR bootstrap/authz hardening | `go test ./vault -run 'TestDR(RelationshipManager_BootstrapTokenExpires|RelationshipManager_BootstrapTokenAttemptLockout|RelationshipManager_BootstrapTokenSourceIPBinding|RelationshipManager_HeartbeatLastSeenWriteThrottle|Primary_RevokeRelationshipTerminatesOnlyMatchingStreams)' -count=1` | Pass |
-| A7 | DR manager persistence rollback hardening | `go test ./vault -run 'TestDRRelationshipManager_(EnablePrimary_SaveConfigFailureRollsBackState|EnableSecondary_SaveConfigFailureRollsBackState)' -count=1` | Pass |
+| A7 | DR manager persistence rollback | `go test ./vault -run 'TestDRRelationshipManager_(EnablePrimary_SaveConfigFailureRollsBackState|EnableSecondary_SaveConfigFailureRollsBackState|UpdateTuningAppliesSecondaryRuntime)' -count=1` | Pass |
 | A8 | Sketch package | `go test ./physical/replication/sketch -count=1` | Pass |
 | A9 | Reconciler package | `go test ./physical/replication/reconciler -count=1` | Pass |
 | A10 | Raft stream hooks | `go test ./physical/raft -run 'Test.*ChangeStream|Test.*HookChangeStream|Test.*ApplyBatch' -count=1` | Pass |
 
-Recommended pre-step:
+Recommended compile pre-step:
 
 ```bash
 go test ./... -run '^$' -count=1
 ```
 
-This verifies compile/link without running tests.
-
 ---
 
-## 2. Docker E2E Matrix (`openbao-dr`)
+## 2. Docker E2E Matrix
 
-Set environment:
+Set shell environment:
 
 ```bash
-OPENBAO_REPO_DIR="$(pwd)"
-DR_ENV_DIR="/path/to/openbao-dr"
-DR_CERTS_DIR="$DR_ENV_DIR/certs"
+OPENBAO_REPO_DIR="/Users/roelc/projects/secretz/openbao"
+DR_ENV_DIR="/path/to/dr-env"
 DR_RESULTS_DIR="$OPENBAO_REPO_DIR/dr-stress-results"
-cd "$DR_ENV_DIR"
+cd "$OPENBAO_REPO_DIR"
 ```
 
-Build + refresh clusters:
+Build OpenBao image and refresh test clusters:
 
 ```bash
-cd "$OPENBAO_REPO_DIR"
 make docker-dev
-
 cd "$DR_ENV_DIR"
 make fresh-bao
-PT=$(sed -n 's/^export BAO_TOKEN=//p' .envrc | head -n1)
 ```
 
-Initialize secondary once per fresh run:
+Configure DR relationships (from DR env repo):
 
 ```bash
-ST=$(docker exec rws-bao-10 bao operator init -format=json | jq -r '.root_token')
+cd "$DR_ENV_DIR"
+./dr-configuration.sh
 ```
 
-### E2E scenarios
+### E2E Scenarios
 
 | ID | Scenario | Steps | Expected |
 |---|---|---|---|
-| E1 | Baseline DR bootstrap | Enable primary, generate token, enable secondary, wait for `streaming`. | Secondary `mode=secondary`, `secondary_state=streaming`. |
-| E2 | Initial sync correctness | Verify secondary mounts include `kv/`; read `kv/dr-baseline` after sync. | `kv/` present and baseline value readable. |
-| E3 | Stream replication correctness | Write new key on primary (KV v2), read on secondary. | Value appears on secondary quickly. |
-| E4 | Revoke enforcement | Revoke relationship on primary while stream is active. | Primary state becomes `revoked`, stream terminated, secondary denied on DR RPCs. |
-| E5 | Re-enable after revoke | Disable secondary, generate new token, enable again. | Secondary returns to `streaming`; new writes replicate. |
-| E6 | Disconnect + reconcile | Stop primary node briefly, write during disruption, recover primary. | Secondary transitions through reconnect/reconcile and converges. |
-| E7 | Secondary read-only gate | Attempt write on secondary (`kv put`) before failover; attempt allowed control ops (`secondary/disable` or `secondary/promote`). | Data write denied with read-only error; allowed control ops are not blocked by DR read-only gate. |
-| E8 | Failover path | Promote secondary with `sys/replication/dr/secondary/promote`. | Secondary leaves DR-secondary behavior, serves writes, and DR status mode reports `disabled` after promotion. |
+| E1 | Baseline DR bootstrap | Enable primary, register/enable secondaries, wait for `streaming`. | Both secondaries: `mode=secondary`, `secondary_state=streaming`. |
+| E2 | Initial sync correctness | Verify `kv/` mount and baseline reads on both secondaries. | Baseline values readable on both. |
+| E3 | Stream replication correctness | Write new key on primary, read on both secondaries. | Value appears on both secondaries quickly. |
+| E4 | Revoke enforcement | Revoke one relationship while stream active. | Only revoked relationship terminated/denied; other remains healthy. |
+| E5 | Re-enable after revoke | Disable revoked secondary, issue new token, re-enable. | Secondary returns to `streaming`; new writes replicate. |
+| E6 | Disconnect + reconcile | Disrupt primary connectivity, continue writes, restore connectivity. | Secondary transitions through reconcile and converges. |
+| E7 | Secondary read-only gate | Attempt data write on secondary and DR control operation. | Data write denied; allowed control operation accepted. |
+| E8 | Failover path | Promote secondary with `sys/replication/dr/secondary/promote`. | DR mode disabled on promoted cluster; writes accepted locally. |
 
-### Command snippets
+### Command Snippets (address-based, no container-name dependency)
 
-Enable DR primary and seed KV:
+Enable DR primary and seed baseline key:
 
 ```bash
-docker exec -e BAO_TOKEN="$PT" bao-01 bao write -f sys/replication/dr/primary/enable
-docker exec -e BAO_TOKEN="$PT" bao-01 bao secrets enable -path=kv kv-v2 || true
-docker exec -e BAO_TOKEN="$PT" bao-01 bao kv put kv/dr-baseline msg=hello ts="$(date +%s)"
+BAO_ADDR="$DR_PRIMARY_ADDR" BAO_TOKEN="$DR_PRIMARY_TOKEN" BAO_CACERT="$DR_CA_CERT" bao write -f sys/replication/dr/primary/enable
+BAO_ADDR="$DR_PRIMARY_ADDR" BAO_TOKEN="$DR_PRIMARY_TOKEN" BAO_CACERT="$DR_CA_CERT" bao secrets enable -path=kv kv-v2 || true
+BAO_ADDR="$DR_PRIMARY_ADDR" BAO_TOKEN="$DR_PRIMARY_TOKEN" BAO_CACERT="$DR_CA_CERT" bao kv put kv/dr-baseline msg=hello ts="$(date +%s)"
 ```
 
-Enable DR secondary:
+Enable secondary #1:
 
 ```bash
-ACT=$(docker exec -e BAO_TOKEN="$PT" bao-01 bao write -f -format=json sys/replication/dr/primary/secondary-token | jq -r '.data.token')
-docker exec -e BAO_TOKEN="$ST" bao-10 bao write sys/replication/dr/secondary/enable token="$ACT"
+ACT1=$(BAO_ADDR="$DR_PRIMARY_ADDR" BAO_TOKEN="$DR_PRIMARY_TOKEN" BAO_CACERT="$DR_CA_CERT" bao write -f -format=json sys/replication/dr/primary/secondary-token | jq -r '.data.token')
+BAO_ADDR="$DR_SECONDARY1_ADDR" BAO_TOKEN="$DR_SECONDARY1_TOKEN" BAO_CACERT="$DR_CA_CERT" bao write sys/replication/dr/secondary/enable token="$ACT1"
 ```
 
-Wait for streaming:
+Enable secondary #2:
 
 ```bash
-for i in $(seq 1 90); do
-  S=$(docker exec -e BAO_TOKEN="$PT" bao-10 bao read -format=json sys/replication/dr/status | jq -r '.data.secondary_state // empty')
-  [ "$S" = "streaming" ] && break
-  sleep 1
-done
-docker exec -e BAO_TOKEN="$PT" bao-10 bao read sys/replication/dr/status
+ACT2=$(BAO_ADDR="$DR_PRIMARY_ADDR" BAO_TOKEN="$DR_PRIMARY_TOKEN" BAO_CACERT="$DR_CA_CERT" bao write -f -format=json sys/replication/dr/primary/secondary-token | jq -r '.data.token')
+BAO_ADDR="$DR_SECONDARY2_ADDR" BAO_TOKEN="$DR_SECONDARY2_TOKEN" BAO_CACERT="$DR_CA_CERT" bao write sys/replication/dr/secondary/enable token="$ACT2"
 ```
 
-Live stream verification:
+Live stream check:
 
 ```bash
-docker exec -e BAO_TOKEN="$PT" bao-01 bao kv put kv/dr-live ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)" src=primary
+BAO_ADDR="$DR_PRIMARY_ADDR" BAO_TOKEN="$DR_PRIMARY_TOKEN" BAO_CACERT="$DR_CA_CERT" bao kv put kv/dr-live ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)" src=primary
 sleep 2
-docker exec -e BAO_TOKEN="$PT" bao-10 bao read kv/data/dr-live
+BAO_ADDR="$DR_SECONDARY1_ADDR" BAO_TOKEN="$DR_SECONDARY1_TOKEN" BAO_CACERT="$DR_CA_CERT" bao read kv/data/dr-live
+BAO_ADDR="$DR_SECONDARY2_ADDR" BAO_TOKEN="$DR_SECONDARY2_TOKEN" BAO_CACERT="$DR_CA_CERT" bao read kv/data/dr-live
 ```
-
-Revoke scenario:
-
-```bash
-REL_ID=$(docker exec -e BAO_TOKEN="$PT" bao-01 bao read -format=json sys/replication/dr/primary/relationships | jq -r '.data.relationships[0].relationship_id')
-docker exec -e BAO_TOKEN="$PT" bao-01 bao write -f sys/replication/dr/primary/relationships/$REL_ID/revoke
-docker exec -e BAO_TOKEN="$PT" bao-01 bao read sys/replication/dr/primary/relationships/$REL_ID/status
-docker exec -e BAO_TOKEN="$PT" bao-10 bao read sys/replication/dr/status
-```
-
-Re-enable after revoke:
-
-```bash
-docker exec -e BAO_TOKEN="$PT" bao-10 bao write -f sys/replication/dr/secondary/disable
-ACT=$(docker exec -e BAO_TOKEN="$PT" bao-01 bao write -f -format=json sys/replication/dr/primary/secondary-token | jq -r '.data.token')
-docker exec -e BAO_TOKEN="$PT" bao-10 bao write sys/replication/dr/secondary/enable token="$ACT"
-```
-
-Primary outage simulation:
-
-```bash
-docker stop bao-01
-docker start bao-01
-docker exec -e BAO_TOKEN="$PT" bao-10 bao read sys/replication/dr/status
-```
-
-Read-only gate check on secondary:
-
-```bash
-docker exec -e BAO_TOKEN="$PT" bao-10 bao kv put kv/dr-should-fail msg=secondary-write
-docker exec -e BAO_TOKEN="$PT" bao-10 bao write -f sys/replication/dr/secondary/disable
-```
-
-Expected:
-- `kv put` returns a DR secondary read-only denial.
-- `secondary/disable` is allowed (not blocked by the read-only gate).
-
-Failover simulation:
-
-```bash
-docker exec -e BAO_TOKEN="$PT" bao-10 bao write -f sys/replication/dr/secondary/promote
-docker exec -e BAO_TOKEN="$PT" bao-10 bao read sys/replication/dr/status
-```
-
-Expected after promote:
-- `mode=disabled` in `sys/replication/dr/status`.
-- Cluster can serve writes as standalone.
 
 ---
 
 ## 3. Log Checks
 
-Secondary DR logs:
+Secondary logs:
 
 ```bash
-docker logs --since=10m bao-10 | rg 'dr-secondary|reconciliation|change stream|revok|PermissionDenied|gap detected'
+docker logs --since=10m bao-secondary-1 | rg 'dr-secondary|reconciliation|change stream|revoke|PermissionDenied|gap detected'
+docker logs --since=10m bao-secondary-2 | rg 'dr-secondary|reconciliation|change stream|revoke|PermissionDenied|gap detected'
 ```
 
-Primary DR logs:
+Primary logs:
 
 ```bash
-docker logs --since=10m bao-01 | rg 'dr-replication|checkpoint|change stream subscriber|revoked|terminated'
+docker logs --since=10m bao-primary-1 | rg 'dr-replication|checkpoint|change stream subscriber|revoked|terminated|lagging'
 ```
 
 ---
 
-## 4. Known Gotchas During Manual Runs
+## 4. Known Gotchas
 
-- Use `docker exec` commands for deterministic API access if host-side LB is noisy.
-- After relationship revoke, secondary may stay in reconcile retry loop until disabled/re-enabled.
-- If primary cert identity changes in your test env, strict TLS verification will correctly fail reconnect until re-registration with a fresh activation token.
+- `stream_buffer_entries` is retained ring-history depth, not ACK backlog.
+- `stream_lagging_subscribers_total` is cumulative; use `stream_lagging_subscribers_active` for current pressure.
+- If both secondaries enter long `reconciling` with flat `last_applied_index`, reduce write pressure or increase secondary reconcile/stream batch tuning.
+- Strict TLS and relationship authz are fail-closed; stale bootstrap/tokens/certs correctly break reconnect.
 
 ---
 
-## 5. Stress Harness Script
+## 5. Stress Test Matrix
 
-Use `"$OPENBAO_REPO_DIR/scripts/dr_stress_test.sh"` to run repeatable load tests and analyze results.
+Use scripts in `/Users/roelc/projects/secretz/openbao/scripts`.
 
-Single run example:
+| ID | Profile | Command Flags | Goal | Pass Criteria |
+|---|---|---|---|---|
+| S1 | Single-secondary baseline | `dr_stress_test.sh run --write-count 10000 --concurrency 24 --payload-bytes 1024` | Establish baseline throughput/lag | Sentinel replicated before timeout; no stuck reconcile loop |
+| S2 | Dual-secondary baseline | `dr_stress_dual_secondary.sh run --write-count 20000 --concurrency 32 --payload-bytes 1024` | Compare secondary lag under same workload | Both secondaries complete; bounded lag delta |
+| S3 | Dual-secondary heavy | `dr_stress_dual_secondary.sh run --write-count 100000 --concurrency 32 --payload-bytes 1024 --progress-interval 2` | Sustained load convergence | No indefinite flat `last_applied_index`; eventual catch-up |
+| S4 | Payload stress | `dr_stress_dual_secondary.sh run --write-count 30000 --concurrency 24 --payload-bytes 8192` | High byte pressure behavior | No crash/panic; explicit fail reasons if budgets exceeded |
+| S5 | Churn stress | Run S3 while periodically disrupting secondary network/leader | Reconnect + reconcile robustness | Bounded retries, no silent divergence |
+| S6 | Cancellation safety | Start any stress run, press `Ctrl-C`, verify no stray workers | Process hygiene | No lingering `dr_stress*`/`bao kv put` worker processes |
+
+### Stress Run Examples
+
+Single secondary:
 
 ```bash
-bash "$OPENBAO_REPO_DIR/scripts/dr_stress_test.sh" run \
-  --primary-addr https://localhost:8200 \
-  --primary-token "$PT" \
-  --secondary-addr https://localhost:8300 \
-  --secondary-token "$ST" \
-  --primary-cacert "$DR_CERTS_DIR/ca.pem" \
-  --secondary-cacert "$DR_CERTS_DIR/ca.pem" \
-  --write-count 5000 \
-  --concurrency 32 \
-  --payload-bytes 2048 \
+bash /Users/roelc/projects/secretz/openbao/scripts/dr_stress_test.sh run \
+  --primary-addr "$DR_PRIMARY_ADDR" \
+  --primary-token "$DR_PRIMARY_TOKEN" \
+  --secondary-addr "$DR_SECONDARY1_ADDR" \
+  --secondary-token "$DR_SECONDARY1_TOKEN" \
+  --primary-cacert "$DR_CA_CERT" \
+  --secondary-cacert "$DR_CA_CERT" \
+  --write-count 10000 \
+  --concurrency 24 \
+  --payload-bytes 1024 \
   --output-dir "$DR_RESULTS_DIR"
 ```
 
-Analyze all saved runs:
+Dual secondary:
 
 ```bash
-bash "$OPENBAO_REPO_DIR/scripts/dr_stress_test.sh" analyze \
-  --output-dir "$DR_RESULTS_DIR"
-```
-
-Dual-secondary comparison run (same workload, side-by-side lag delta):
-
-```bash
-bash "$OPENBAO_REPO_DIR/scripts/dr_stress_dual_secondary.sh" run \
-  --primary-addr https://localhost:8200 \
-  --primary-token "$PT" \
-  --secondary1-addr https://localhost:8300 \
-  --secondary1-token "$ST1" \
-  --secondary2-addr https://localhost:8400 \
-  --secondary2-token "$ST2" \
-  --primary-cacert "$DR_CERTS_DIR/ca.pem" \
-  --secondary1-cacert "$DR_CERTS_DIR/ca.pem" \
-  --secondary2-cacert "$DR_CERTS_DIR/ca.pem" \
+bash /Users/roelc/projects/secretz/openbao/scripts/dr_stress_dual_secondary.sh run \
+  --primary-addr "$DR_PRIMARY_ADDR" \
+  --primary-token "$DR_PRIMARY_TOKEN" \
+  --secondary1-addr "$DR_SECONDARY1_ADDR" \
+  --secondary1-token "$DR_SECONDARY1_TOKEN" \
+  --secondary2-addr "$DR_SECONDARY2_ADDR" \
+  --secondary2-token "$DR_SECONDARY2_TOKEN" \
+  --primary-cacert "$DR_CA_CERT" \
+  --secondary1-cacert "$DR_CA_CERT" \
+  --secondary2-cacert "$DR_CA_CERT" \
   --secondary1-name secondary-a \
   --secondary2-name secondary-b \
-  --write-count 8000 \
-  --concurrency 40 \
-  --payload-bytes 2048 \
+  --write-count 100000 \
+  --concurrency 32 \
+  --payload-bytes 1024 \
+  --progress-interval 2 \
   --output-dir "$DR_RESULTS_DIR"
 ```
 
-Analyze dual-secondary runs:
+Analyze all runs:
 
 ```bash
-bash "$OPENBAO_REPO_DIR/scripts/dr_stress_dual_secondary.sh" analyze \
-  --output-dir "$DR_RESULTS_DIR"
+bash /Users/roelc/projects/secretz/openbao/scripts/dr_stress_test.sh analyze --output-dir "$DR_RESULTS_DIR"
+bash /Users/roelc/projects/secretz/openbao/scripts/dr_stress_dual_secondary.sh analyze --output-dir "$DR_RESULTS_DIR"
 ```
+
+Cancellation check:
+
+```bash
+ps -Ao pid,ppid,pgid,command | rg 'dr_stress_dual_secondary\.sh run|dr_stress_test\.sh run|bao kv put .*(dr-stress|dr-stress-dual)'
+```
+
+Expected: no matches except the `rg` process itself.
