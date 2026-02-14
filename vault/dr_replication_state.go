@@ -78,6 +78,9 @@ type DRConfig struct {
 	ReconcileMaxRPCBytes        uint64 `json:"reconcile_max_rpc_bytes,omitempty"`
 	ReconcileMaxWallTimeSeconds int64  `json:"reconcile_max_wall_time_seconds,omitempty"`
 	ReconcileMaxInflightTasks   int    `json:"reconcile_max_inflight_tasks,omitempty"`
+	StreamBatchMaxEntries       int    `json:"stream_batch_max_entries,omitempty"`
+	StreamBatchMaxBytes         int    `json:"stream_batch_max_bytes,omitempty"`
+	StreamBatchMaxWaitMillis    int64  `json:"stream_batch_max_wait_milliseconds,omitempty"`
 	FallbackEnabled             bool   `json:"fallback_enabled,omitempty"`
 	FallbackStallSeconds        int64  `json:"fallback_stall_seconds,omitempty"`
 	FallbackFailureThreshold    int    `json:"fallback_failure_threshold,omitempty"`

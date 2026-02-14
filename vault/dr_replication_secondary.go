@@ -900,6 +900,15 @@ func (s *drReplicationSecondary) applyRuntimeTuning(cfg *DRConfig) {
 	if cfg.ReconcileMaxInflightTasks > 0 {
 		s.reconcileMaxInflightTasks = cfg.ReconcileMaxInflightTasks
 	}
+	if cfg.StreamBatchMaxEntries > 0 {
+		s.streamBatchMaxEntries = cfg.StreamBatchMaxEntries
+	}
+	if cfg.StreamBatchMaxBytes > 0 {
+		s.streamBatchMaxBytes = cfg.StreamBatchMaxBytes
+	}
+	if cfg.StreamBatchMaxWaitMillis > 0 {
+		s.streamBatchMaxWait = time.Duration(cfg.StreamBatchMaxWaitMillis) * time.Millisecond
+	}
 	if cfg.ReconcileMaxWallTimeSeconds > 0 {
 		// Stall abort should remain below wall-time to force controlled rollover.
 		wall := time.Duration(cfg.ReconcileMaxWallTimeSeconds) * time.Second

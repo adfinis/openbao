@@ -537,6 +537,9 @@ func TestDRRelationshipManager_UpdateTuningAppliesSecondaryRuntime(t *testing.T)
 	if err := mgr.UpdateTuning(ctx, func(cfg *DRConfig) error {
 		cfg.ReconcileMaxInflightTasks = 7
 		cfg.ReconcileMaxWallTimeSeconds = 120
+		cfg.StreamBatchMaxEntries = 1024
+		cfg.StreamBatchMaxBytes = 4 << 20
+		cfg.StreamBatchMaxWaitMillis = 20
 		cfg.FallbackEnabled = false
 		cfg.FallbackStallSeconds = 90
 		cfg.FallbackFailureThreshold = 4
@@ -555,8 +558,26 @@ func TestDRRelationshipManager_UpdateTuningAppliesSecondaryRuntime(t *testing.T)
 	if cfg.FallbackFailureThreshold != 4 {
 		t.Fatalf("expected fallback failure threshold=4, got %d", cfg.FallbackFailureThreshold)
 	}
+	if cfg.StreamBatchMaxEntries != 1024 {
+		t.Fatalf("expected stream batch max entries=1024, got %d", cfg.StreamBatchMaxEntries)
+	}
+	if cfg.StreamBatchMaxBytes != 4<<20 {
+		t.Fatalf("expected stream batch max bytes=%d, got %d", 4<<20, cfg.StreamBatchMaxBytes)
+	}
+	if cfg.StreamBatchMaxWaitMillis != 20 {
+		t.Fatalf("expected stream batch max wait millis=20, got %d", cfg.StreamBatchMaxWaitMillis)
+	}
 	if mgr.secondary.reconcileMaxInflightTasks != 7 {
 		t.Fatalf("expected runtime inflight=7, got %d", mgr.secondary.reconcileMaxInflightTasks)
+	}
+	if mgr.secondary.streamBatchMaxEntries != 1024 {
+		t.Fatalf("expected runtime stream batch max entries=1024, got %d", mgr.secondary.streamBatchMaxEntries)
+	}
+	if mgr.secondary.streamBatchMaxBytes != 4<<20 {
+		t.Fatalf("expected runtime stream batch max bytes=%d, got %d", 4<<20, mgr.secondary.streamBatchMaxBytes)
+	}
+	if mgr.secondary.streamBatchMaxWait != 20*time.Millisecond {
+		t.Fatalf("expected runtime stream batch max wait=%s, got %s", 20*time.Millisecond, mgr.secondary.streamBatchMaxWait)
 	}
 	if mgr.secondary.fallbackEnabled {
 		t.Fatal("expected runtime fallback to be disabled")

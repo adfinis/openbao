@@ -393,6 +393,18 @@ func (b *SystemBackend) drReplicationPaths() []*framework.Path {
 					Type:        framework.TypeInt,
 					Description: "Secondary max in-flight range tasks.",
 				},
+				"stream_batch_max_entries": {
+					Type:        framework.TypeInt,
+					Description: "Secondary stream apply batch max entries.",
+				},
+				"stream_batch_max_bytes": {
+					Type:        framework.TypeInt,
+					Description: "Secondary stream apply batch max bytes.",
+				},
+				"stream_batch_max_wait_milliseconds": {
+					Type:        framework.TypeInt,
+					Description: "Secondary stream apply batch max wait in milliseconds.",
+				},
 				"fallback_enabled": {
 					Type:        framework.TypeBool,
 					Description: "Enable automatic resnapshot fallback under sustained lag pressure.",
@@ -813,6 +825,9 @@ func (b *SystemBackend) handleDRTuningRead(ctx context.Context, req *logical.Req
 			"reconcile_max_rpc_bytes":                  cfg.ReconcileMaxRPCBytes,
 			"reconcile_max_wall_time_seconds":          cfg.ReconcileMaxWallTimeSeconds,
 			"reconcile_max_inflight_tasks":             cfg.ReconcileMaxInflightTasks,
+			"stream_batch_max_entries":                 cfg.StreamBatchMaxEntries,
+			"stream_batch_max_bytes":                   cfg.StreamBatchMaxBytes,
+			"stream_batch_max_wait_milliseconds":       cfg.StreamBatchMaxWaitMillis,
 			"fallback_enabled":                         cfg.FallbackEnabled,
 			"fallback_stall_seconds":                   cfg.FallbackStallSeconds,
 			"fallback_failure_threshold":               cfg.FallbackFailureThreshold,
@@ -852,6 +867,15 @@ func (b *SystemBackend) handleDRTuningWrite(ctx context.Context, req *logical.Re
 		}
 		if raw, ok := d.GetOk("reconcile_max_inflight_tasks"); ok {
 			cfg.ReconcileMaxInflightTasks = raw.(int)
+		}
+		if raw, ok := d.GetOk("stream_batch_max_entries"); ok {
+			cfg.StreamBatchMaxEntries = raw.(int)
+		}
+		if raw, ok := d.GetOk("stream_batch_max_bytes"); ok {
+			cfg.StreamBatchMaxBytes = raw.(int)
+		}
+		if raw, ok := d.GetOk("stream_batch_max_wait_milliseconds"); ok {
+			cfg.StreamBatchMaxWaitMillis = int64(raw.(int))
 		}
 		if raw, ok := d.GetOk("fallback_enabled"); ok {
 			cfg.FallbackEnabled = raw.(bool)
