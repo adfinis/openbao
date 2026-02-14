@@ -64,6 +64,52 @@ PY
   echo "$(( $(date +%s) * 1000 ))"
 }
 
+list_descendant_pids() {
+  local root_pid="$1"
+  local queue=("$root_pid")
+  local descendants=()
+  local current
+  while [[ "${#queue[@]}" -gt 0 ]]; do
+    current="${queue[0]}"
+    queue=("${queue[@]:1}")
+    local children=()
+    if command -v pgrep >/dev/null 2>&1; then
+      while IFS= read -r cpid; do
+        [[ -n "$cpid" ]] || continue
+        children+=("$cpid")
+      done < <(pgrep -P "$current" 2>/dev/null || true)
+    fi
+    if [[ "${#children[@]}" -gt 0 ]]; then
+      descendants+=("${children[@]}")
+      queue+=("${children[@]}")
+    fi
+  done
+  printf "%s\n" "${descendants[@]}" | awk 'NF' | sort -u
+}
+
+kill_pid_set() {
+  local signal="$1"
+  shift || true
+  local pid
+  for pid in "$@"; do
+    [[ -n "$pid" ]] || continue
+    kill "-$signal" "$pid" 2>/dev/null || true
+  done
+}
+
+terminate_descendants() {
+  local root_pid="$1"
+  local signal="$2"
+  local pids=()
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    pids+=("$pid")
+  done < <(list_descendant_pids "$root_pid")
+  if [[ "${#pids[@]}" -gt 0 ]]; then
+    kill_pid_set "$signal" "${pids[@]}"
+  fi
+}
+
 safe_int() {
   local name="$1"
   local value="$2"
@@ -138,7 +184,11 @@ write_key() {
 monitor_status_loop() {
   local timeline_file="$1"
   local stop_file="$2"
+  local parent_pid="$3"
   while [[ ! -f "$stop_file" ]]; do
+    if ! kill -0 "$parent_pid" 2>/dev/null; then
+      break
+    fi
     local ts p s
     ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     p="$(json_status_for_role primary)"
@@ -191,6 +241,7 @@ run_mode() {
   local result_file="$run_dir/result.json"
   local timeline_file="$run_dir/status_timeline.ndjson"
   local stop_file="$run_dir/.monitor_stop"
+  local worker_stop_file="$run_dir/.workers_stop"
 
   if [[ "$ENSURE_KV" == "true" ]]; then
     if ! bao_role primary secrets list -format=json | jq -e --arg p "${KV_MOUNT}/" 'has($p)' >/dev/null; then
@@ -212,16 +263,49 @@ run_mode() {
 
   : >"$timeline_file"
   rm -f "$stop_file"
-  monitor_status_loop "$timeline_file" "$stop_file" &
+  rm -f "$worker_stop_file"
+  local root_pid="$$"
+  monitor_status_loop "$timeline_file" "$stop_file" "$root_pid" &
   local monitor_pid=$!
+  local worker_pids=()
 
   local finished=0
+  local cleanup_started=0
+  local interrupted=0
   cleanup_run() {
+    if [[ "$cleanup_started" -eq 1 ]]; then
+      return
+    fi
+    cleanup_started=1
     if [[ "$finished" -eq 0 ]]; then
       touch "$stop_file" 2>/dev/null || true
+      touch "$worker_stop_file" 2>/dev/null || true
+      local pid
+      for pid in "${worker_pids[@]}"; do
+        kill -TERM "$pid" 2>/dev/null || true
+        terminate_descendants "$pid" TERM
+      done
+      if [[ "$monitor_pid" -gt 0 ]]; then
+        kill -TERM "$monitor_pid" 2>/dev/null || true
+        terminate_descendants "$monitor_pid" TERM
+      fi
+      terminate_descendants "$$" TERM
+      sleep 0.25
+      terminate_descendants "$$" KILL
       wait "$monitor_pid" 2>/dev/null || true
+      for pid in "${worker_pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+      done
     fi
   }
+  on_interrupt() {
+    interrupted=1
+    echo
+    echo "Received interrupt; stopping stress run and terminating workers..."
+    cleanup_run
+    exit 130
+  }
+  trap on_interrupt INT TERM HUP QUIT PIPE
   trap cleanup_run EXIT
 
   local start_ms write_done_ms sentinel_written_ms sentinel_seen_ms
@@ -230,14 +314,33 @@ run_mode() {
   local worker
   for worker in $(seq 0 $((CONCURRENCY - 1))); do
     (
+      trap 'exit 130' INT TERM HUP QUIT
       local idx=$((worker + 1))
       while [[ "$idx" -le "$WRITE_COUNT" ]]; do
+        if [[ -f "$worker_stop_file" ]] || ! kill -0 "$root_pid" 2>/dev/null; then
+          break
+        fi
         write_key "$idx" "$data_path"
+        if [[ -f "$worker_stop_file" ]] || ! kill -0 "$root_pid" 2>/dev/null; then
+          break
+        fi
         idx=$((idx + CONCURRENCY))
       done
     ) &
+    worker_pids+=("$!")
   done
-  wait
+  local worker_wait_failed=0
+  for worker in "${worker_pids[@]}"; do
+    if ! wait "$worker"; then
+      worker_wait_failed=1
+    fi
+  done
+  if [[ "$interrupted" -eq 1 ]]; then
+    return
+  fi
+  if [[ "$worker_wait_failed" -ne 0 ]]; then
+    echo "One or more workers exited non-zero; continuing with collected results." >&2
+  fi
 
   write_done_ms="$(now_epoch_ms)"
 
