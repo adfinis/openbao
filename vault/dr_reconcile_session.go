@@ -37,14 +37,14 @@ const (
 	drReconcileRetryCapUnknown            = uint64(6)
 )
 
-func (s *drReplicationSecondary) beginReconcileSession(checkpointID string, checkpointIndex uint64, manifestCount int) {
+func (s *drReplicationSecondary) beginReconcileSession(checkpointID string, checkpointIndex uint64) {
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
 	s.activeCheckpointID = checkpointID
 	s.activeCheckpointIndex = checkpointIndex
 	s.sessionStart = time.Now().UTC()
 	s.streamPausedAt = s.lastAppliedIndex.Load()
-	s.lastRangeManifestCount = manifestCount
+	s.lastRangeManifestCount = 0
 	s.lastReconcileActivityAt.Store(s.sessionStart.Unix())
 }
 

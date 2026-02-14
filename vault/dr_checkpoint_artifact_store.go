@@ -394,21 +394,6 @@ func (s *drCheckpointArtifactStore) build(
 	}
 
 	cp.kidToVID = kidToVID
-	rs := &reconciler.ReconciliationSet{
-		Checkpoint:   cp.checkpoint,
-		KIDToVID:     kidToVID,
-		KIDToKey:     cp.kidToKey,
-		KeyCount:     len(kidToVID),
-		PrefixDigest: reconciler.BuildRangePrefixDigestFromMap(kidToVID, fullRangeSpan(), 8),
-	}
-	topRanges, err := reconciler.BuildRangeManifest(rs, rangeCfg)
-	if err != nil {
-		_ = os.RemoveAll(finalPath)
-		return fmt.Errorf("build range manifest from checkpoint artifact: %w", err)
-	}
-
-	cp.prefixDigest = rs.PrefixDigest
-	cp.topRanges = topRanges
 
 	art := &drCheckpointArtifact{
 		CheckpointID:    cp.checkpoint.ID,
