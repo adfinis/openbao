@@ -10,6 +10,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -1211,6 +1213,7 @@ func TestDRPrimary_ReadCheckpointEntryChange_ExpectedVIDMismatch(t *testing.T) {
 			ID:          "cp-test",
 			CommitIndex: 7,
 		},
+		relationshipID: "rel-test",
 		kidToKey: map[[32]byte]string{
 			kid: key,
 		},
@@ -1218,6 +1221,14 @@ func TestDRPrimary_ReadCheckpointEntryChange_ExpectedVIDMismatch(t *testing.T) {
 			kid: vid,
 		},
 	}
+	seedDRCheckpointArtifactForTest(t, primary, cp, []drCheckpointArtifactRecord{
+		{
+			KID:      kid,
+			VID:      vid,
+			Key:      key,
+			SealWrap: phys.SealWrap,
+		},
+	}, map[[32]byte][]byte{kid: phys.Value})
 
 	change, err := primary.readCheckpointEntryChange(ctx, cp, kid, &vid, true)
 	if err != nil {
@@ -1235,6 +1246,258 @@ func TestDRPrimary_ReadCheckpointEntryChange_ExpectedVIDMismatch(t *testing.T) {
 	}
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("expected FailedPrecondition, got %v", status.Code(err))
+	}
+}
+
+func TestDRPrimary_ReadCheckpointEntryChange_UsesArtifactNotLiveStorage(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+	ctx := context.Background()
+
+	key := "secret/data/dr-artifact"
+	original := []byte("value-at-checkpoint")
+	if err := core.barrier.Put(ctx, &logical.StorageEntry{
+		Key:   key,
+		Value: original,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	phys, err := core.physical.Get(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if phys == nil {
+		t.Fatalf("expected physical entry for %q", key)
+	}
+	kid, vid := primary.scanner.ComputeItemFromEntry(&physical.Entry{
+		Key:      key,
+		Value:    phys.Value,
+		SealWrap: phys.SealWrap,
+	})
+
+	cp := &drCheckpointCacheEntry{
+		checkpoint: reconciler.Checkpoint{
+			ID:          "cp-artifact",
+			CommitIndex: 9,
+		},
+		relationshipID: "rel-test",
+		kidToKey: map[[32]byte]string{
+			kid: key,
+		},
+		kidToVID: map[[32]byte][32]byte{
+			kid: vid,
+		},
+	}
+	seedDRCheckpointArtifactForTest(t, primary, cp, []drCheckpointArtifactRecord{
+		{
+			KID:      kid,
+			VID:      vid,
+			Key:      key,
+			SealWrap: phys.SealWrap,
+		},
+	}, map[[32]byte][]byte{kid: phys.Value})
+
+	// Mutate live storage after checkpoint materialization. Fetch must still return
+	// the checkpoint artifact value.
+	if err := core.barrier.Put(ctx, &logical.StorageEntry{
+		Key:   key,
+		Value: []byte("value-after-checkpoint"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	change, err := primary.readCheckpointEntryChange(ctx, cp, kid, &vid, true)
+	if err != nil {
+		t.Fatalf("expected artifact-backed fetch to succeed: %v", err)
+	}
+	if change == nil {
+		t.Fatal("expected non-nil change")
+	}
+	if change.OpType != string(physical.PutOperation) {
+		t.Fatalf("expected put change, got %q", change.OpType)
+	}
+	if string(change.Value) != string(phys.Value) {
+		t.Fatalf("expected checkpoint artifact value, got live value")
+	}
+}
+
+func seedDRCheckpointArtifactForTest(t *testing.T, primary *drReplicationPrimary, cp *drCheckpointCacheEntry, records []drCheckpointArtifactRecord, values map[[32]byte][]byte) {
+	t.Helper()
+
+	if primary.checkpointArtifacts == nil {
+		t.Fatal("checkpoint artifact store is nil")
+	}
+	tmpDir := t.TempDir()
+	artifactDir := filepath.Join(tmpDir, cp.checkpoint.ID)
+	blobDir := filepath.Join(artifactDir, "blobs")
+	if err := os.MkdirAll(blobDir, 0o750); err != nil {
+		t.Fatalf("create test artifact dir: %v", err)
+	}
+
+	recMap := make(map[[32]byte]drCheckpointArtifactRecord, len(records))
+	var artifactBytes uint64
+	for _, rec := range records {
+		if !rec.Tombstone {
+			value := values[rec.KID]
+			ref := rec.ValueRef
+			if ref == "" {
+				h := sha256.New()
+				h.Write(value)
+				if rec.SealWrap {
+					h.Write([]byte{1})
+				} else {
+					h.Write([]byte{0})
+				}
+				ref = fmt.Sprintf("%x", h.Sum(nil))
+			}
+			rec.ValueRef = ref
+			if err := os.WriteFile(filepath.Join(blobDir, ref+".bin"), value, 0o600); err != nil {
+				t.Fatalf("write test artifact blob: %v", err)
+			}
+			artifactBytes += uint64(len(value))
+		}
+		recMap[rec.KID] = rec
+		artifactBytes += uint64(len(rec.Key) + len(rec.ValueRef) + 96)
+	}
+
+	if err := primary.checkpointArtifacts.putArtifact(&drCheckpointArtifact{
+		CheckpointID:    cp.checkpoint.ID,
+		CheckpointIndex: cp.checkpoint.CommitIndex,
+		RelationshipID:  cp.relationshipID,
+		CreatedAt:       time.Now().UTC(),
+		Path:            artifactDir,
+		Bytes:           artifactBytes,
+		Records:         recMap,
+	}); err != nil {
+		t.Fatalf("put test artifact: %v", err)
+	}
+}
+
+func TestDRCheckpointArtifactStore_EvictsByGlobalBudget(t *testing.T) {
+	store := newDRCheckpointArtifactStore(log.NewNullLogger(), t.TempDir())
+	store.configure(true, time.Hour, 128, 128, 64)
+
+	makeArtifact := func(id string, createdAt time.Time) *drCheckpointArtifact {
+		path := filepath.Join(t.TempDir(), id)
+		if err := os.MkdirAll(path, 0o750); err != nil {
+			t.Fatalf("mkdir artifact path: %v", err)
+		}
+		return &drCheckpointArtifact{
+			CheckpointID:    id,
+			CheckpointIndex: 1,
+			RelationshipID:  "rel-1",
+			CreatedAt:       createdAt,
+			Path:            path,
+			Bytes:           96,
+			Records:         map[[32]byte]drCheckpointArtifactRecord{},
+		}
+	}
+
+	art1 := makeArtifact("cp-1", time.Now().Add(-2*time.Minute))
+	if err := store.putArtifact(art1); err != nil {
+		t.Fatalf("put first artifact: %v", err)
+	}
+	art2 := makeArtifact("cp-2", time.Now().Add(-1*time.Minute))
+	if err := store.putArtifact(art2); err != nil {
+		t.Fatalf("put second artifact: %v", err)
+	}
+
+	store.mu.RLock()
+	_, hasOldest := store.artifacts["cp-1"]
+	_, hasNewest := store.artifacts["cp-2"]
+	store.mu.RUnlock()
+	if hasOldest {
+		t.Fatal("expected oldest artifact to be evicted")
+	}
+	if !hasNewest {
+		t.Fatal("expected newest artifact to remain")
+	}
+	_, items, evictions, _, _ := store.stats()
+	if items != 1 {
+		t.Fatalf("expected exactly one artifact after eviction, got %d", items)
+	}
+	if evictions == 0 {
+		t.Fatal("expected eviction counter to increment")
+	}
+}
+
+func TestDRCheckpointArtifactStore_RejectsOversizedArtifact(t *testing.T) {
+	store := newDRCheckpointArtifactStore(log.NewNullLogger(), t.TempDir())
+	store.configure(true, time.Hour, 64, 64, 64)
+
+	path := filepath.Join(t.TempDir(), "cp-too-large")
+	if err := os.MkdirAll(path, 0o750); err != nil {
+		t.Fatalf("mkdir artifact path: %v", err)
+	}
+	err := store.putArtifact(&drCheckpointArtifact{
+		CheckpointID:    "cp-too-large",
+		CheckpointIndex: 1,
+		RelationshipID:  "rel-1",
+		CreatedAt:       time.Now().UTC(),
+		Path:            path,
+		Bytes:           128,
+		Records:         map[[32]byte]drCheckpointArtifactRecord{},
+	})
+	if err == nil {
+		t.Fatal("expected oversized artifact to be rejected")
+	}
+	if !strings.Contains(err.Error(), "budget") {
+		t.Fatalf("expected budget error, got: %v", err)
+	}
+}
+
+func TestDRPrimary_AllowWriteRequest_BackpressureRejectsNonExempt(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+
+	primary.backpressureEnabled = true
+	primary.backpressureDegraded = 0.80
+	primary.backpressureCritical = 0.50
+	primary.backpressureMinLag = 1
+	primary.backpressureMinQPSDeg = 1
+	primary.backpressureMinQPSCrit = 1
+	primary.writeRateMu.Lock()
+	primary.writeRateEPS = 100
+	primary.writeRateMu.Unlock()
+	primary.pressureMu.Lock()
+	primary.secondaryPressure["rel-1"] = &drSecondaryPressureSample{
+		applyRateEPS: 1,
+		lagEntries:   100,
+		lastSeen:     time.Now().UTC(),
+	}
+	primary.pressureMu.Unlock()
+	primary.backpressureWindowSec = time.Now().UTC().Unix()
+	primary.backpressureCount = 0
+
+	if ok, _ := primary.allowWriteRequest("secret/data/demo"); !ok {
+		t.Fatal("expected first write request to be admitted under cap")
+	}
+	if ok, reason := primary.allowWriteRequest("secret/data/demo"); ok {
+		t.Fatal("expected second write request to be rejected under same-second cap")
+	} else if !strings.Contains(reason, "dr backpressure") {
+		t.Fatalf("expected backpressure reason, got %q", reason)
+	}
+}
+
+func TestDRBackpressureExemptPath(t *testing.T) {
+	exempt := []string{
+		"sys/health",
+		"sys/seal-status",
+		"sys/replication/dr/tuning",
+		"root/sys/replication/dr/secondary/promote",
+	}
+	for _, path := range exempt {
+		if !isDRBackpressureExemptPath(path) {
+			t.Fatalf("expected path %q to be backpressure exempt", path)
+		}
+	}
+	if isDRBackpressureExemptPath("secret/data/demo") {
+		t.Fatal("expected normal data path to be non-exempt")
 	}
 }
 

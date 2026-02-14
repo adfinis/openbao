@@ -652,6 +652,23 @@ func (c *Core) switchedLockHandleRequest(httpCtx context.Context, req *logical.R
 	}
 	ctx = namespace.ContextWithNamespace(ctx, ns)
 
+	// DR primary write backpressure: under sustained replication overload,
+	// bound external mutating request admission to preserve convergence.
+	if c.drManager != nil && c.drManager.Mode() == DRModePrimary {
+		if req.Operation == logical.UpdateOperation ||
+			req.Operation == logical.CreateOperation ||
+			req.Operation == logical.DeleteOperation ||
+			req.Operation == logical.PatchOperation {
+			if !isDRBackpressureExemptPath(req.Path) {
+				if primary := c.drManager.Primary(); primary != nil {
+					if ok, reason := primary.allowWriteRequest(req.Path); !ok {
+						return logical.ErrorResponse(reason), logical.ErrRateLimitQuotaExceeded
+					}
+				}
+			}
+		}
+	}
+
 	inFlightReqID, ok := httpCtx.Value(logical.CtxKeyInFlightRequestID{}).(string)
 	if ok {
 		ctx = context.WithValue(ctx, logical.CtxKeyInFlightRequestID{}, inFlightReqID)

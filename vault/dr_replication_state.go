@@ -96,6 +96,19 @@ type DRConfig struct {
 	FallbackMinLagEntries       uint64  `json:"fallback_min_lag_entries,omitempty"`
 	FallbackCooldownSeconds     int64   `json:"fallback_cooldown_seconds,omitempty"`
 	FallbackMaxPerHour          int     `json:"fallback_max_per_hour,omitempty"`
+
+	CheckpointArtifactEnabled           bool    `json:"checkpoint_artifact_enabled,omitempty"`
+	CheckpointArtifactGlobalBudgetBytes uint64  `json:"checkpoint_artifact_global_budget_bytes,omitempty"`
+	CheckpointArtifactPerRelBudgetBytes uint64  `json:"checkpoint_artifact_per_relationship_budget_bytes,omitempty"`
+	CheckpointArtifactTTLSeconds        int64   `json:"checkpoint_artifact_ttl_seconds,omitempty"`
+	CheckpointArtifactSegmentBytes      uint64  `json:"checkpoint_artifact_segment_bytes,omitempty"`
+	DRBackpressureEnabled               bool    `json:"dr_backpressure_enabled,omitempty"`
+	DRBackpressureDegradedRatio         float64 `json:"dr_backpressure_degraded_ratio,omitempty"`
+	DRBackpressureCriticalRatio         float64 `json:"dr_backpressure_critical_ratio,omitempty"`
+	DRBackpressureMinLagEntries         uint64  `json:"dr_backpressure_min_lag_entries,omitempty"`
+	DRBackpressureHorizonSeconds        int64   `json:"dr_backpressure_horizon_seconds,omitempty"`
+	DRBackpressureDegradedMinQPS        int64   `json:"dr_backpressure_degraded_min_qps,omitempty"`
+	DRBackpressureCriticalMinQPS        int64   `json:"dr_backpressure_critical_min_qps,omitempty"`
 }
 
 // DRActivationToken contains the information a secondary needs to
@@ -271,6 +284,39 @@ func applyDRConfigDefaults(cfg *DRConfig) {
 	if cfg.ConvergenceStallSeconds <= 0 {
 		cfg.ConvergenceStallSeconds = int64(drDefaultConvergenceStall / time.Second)
 	}
+	if cfg.Mode != DRModeDisabled && !cfg.CheckpointArtifactEnabled {
+		cfg.CheckpointArtifactEnabled = true
+	}
+	if cfg.CheckpointArtifactGlobalBudgetBytes == 0 {
+		cfg.CheckpointArtifactGlobalBudgetBytes = drCheckpointArtifactDefaultGlobalBudget
+	}
+	if cfg.CheckpointArtifactPerRelBudgetBytes == 0 {
+		cfg.CheckpointArtifactPerRelBudgetBytes = drCheckpointArtifactDefaultPerRelBudget
+	}
+	if cfg.CheckpointArtifactTTLSeconds == 0 {
+		cfg.CheckpointArtifactTTLSeconds = int64(drCheckpointArtifactDefaultTTL / time.Second)
+	}
+	if cfg.CheckpointArtifactSegmentBytes == 0 {
+		cfg.CheckpointArtifactSegmentBytes = drCheckpointArtifactDefaultSegmentBytes
+	}
+	if cfg.Mode != DRModeDisabled && !cfg.DRBackpressureEnabled {
+		cfg.DRBackpressureEnabled = drBackpressureDefaultEnabled
+	}
+	if cfg.DRBackpressureDegradedRatio <= 0 {
+		cfg.DRBackpressureDegradedRatio = drBackpressureDefaultDegradedRatio
+	}
+	if cfg.DRBackpressureCriticalRatio <= 0 {
+		cfg.DRBackpressureCriticalRatio = drBackpressureDefaultCriticalRatio
+	}
+	if cfg.DRBackpressureHorizonSeconds <= 0 {
+		cfg.DRBackpressureHorizonSeconds = drBackpressureDefaultHorizonSeconds
+	}
+	if cfg.DRBackpressureDegradedMinQPS <= 0 {
+		cfg.DRBackpressureDegradedMinQPS = drBackpressureDefaultDegradedMinQPS
+	}
+	if cfg.DRBackpressureCriticalMinQPS <= 0 {
+		cfg.DRBackpressureCriticalMinQPS = drBackpressureDefaultCriticalMinQPS
+	}
 }
 
 // LoadConfig loads the DR configuration from storage and restores
@@ -389,11 +435,22 @@ func (m *drRelationshipManager) EnablePrimary(ctx context.Context) error {
 		ClusterID: clusterID,
 		ReplSalt:  replSalt,
 
-		FallbackEnabled:          drDefaultFallbackEnabled,
-		FallbackStallSeconds:     int64(drDefaultFallbackStall / time.Second),
-		FallbackFailureThreshold: drDefaultFallbackFailureThreshold,
-		FallbackCooldownSeconds:  int64(drDefaultFallbackCooldown / time.Second),
-		FallbackMaxPerHour:       drDefaultFallbackMaxPerHour,
+		FallbackEnabled:                     drDefaultFallbackEnabled,
+		FallbackStallSeconds:                int64(drDefaultFallbackStall / time.Second),
+		FallbackFailureThreshold:            drDefaultFallbackFailureThreshold,
+		FallbackCooldownSeconds:             int64(drDefaultFallbackCooldown / time.Second),
+		FallbackMaxPerHour:                  drDefaultFallbackMaxPerHour,
+		CheckpointArtifactEnabled:           true,
+		CheckpointArtifactGlobalBudgetBytes: drCheckpointArtifactDefaultGlobalBudget,
+		CheckpointArtifactPerRelBudgetBytes: drCheckpointArtifactDefaultPerRelBudget,
+		CheckpointArtifactTTLSeconds:        int64(drCheckpointArtifactDefaultTTL / time.Second),
+		CheckpointArtifactSegmentBytes:      drCheckpointArtifactDefaultSegmentBytes,
+		DRBackpressureEnabled:               true,
+		DRBackpressureDegradedRatio:         drBackpressureDefaultDegradedRatio,
+		DRBackpressureCriticalRatio:         drBackpressureDefaultCriticalRatio,
+		DRBackpressureHorizonSeconds:        drBackpressureDefaultHorizonSeconds,
+		DRBackpressureDegradedMinQPS:        drBackpressureDefaultDegradedMinQPS,
+		DRBackpressureCriticalMinQPS:        drBackpressureDefaultCriticalMinQPS,
 	}
 
 	if err := m.saveConfig(ctx); err != nil {

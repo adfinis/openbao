@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,7 +39,41 @@ const (
 	drCheckpointLaggingActiveWindow        = 10 * time.Second
 	drCheckpointForceBuildInterval         = 15 * time.Second
 	drCheckpointIndexFullScanInterval      = 10 * time.Minute
+
+	drBackpressureDefaultEnabled        = true
+	drBackpressureDefaultDegradedRatio  = 0.80
+	drBackpressureDefaultCriticalRatio  = 0.50
+	drBackpressureDefaultHorizonSeconds = int64(180)
+	drBackpressureDefaultDegradedMinQPS = int64(50)
+	drBackpressureDefaultCriticalMinQPS = int64(10)
 )
+
+type drBackpressureState uint32
+
+const (
+	drBackpressureHealthy drBackpressureState = iota
+	drBackpressureDegraded
+	drBackpressureCritical
+)
+
+func (s drBackpressureState) String() string {
+	switch s {
+	case drBackpressureDegraded:
+		return "degraded"
+	case drBackpressureCritical:
+		return "critical"
+	default:
+		return "healthy"
+	}
+}
+
+type drSecondaryPressureSample struct {
+	lastSeen     time.Time
+	lastApplied  uint64
+	lastPrimary  uint64
+	applyRateEPS float64
+	lagEntries   uint64
+}
 
 // drReplicationPrimary implements the DRReplicationServer gRPC interface
 // on the primary side. It provides:
@@ -111,8 +146,31 @@ type drReplicationPrimary struct {
 	indexKIDToVID      map[[32]byte][32]byte
 	indexKIDToKey      map[[32]byte]string
 	indexResyncSkipped atomic.Uint64
+	indexApplied       atomic.Uint64
 
 	streamJournal *drStreamJournal
+
+	checkpointArtifacts *drCheckpointArtifactStore
+
+	// Journal replay health counters.
+	journalReplayAttempts atomic.Uint64
+	journalReplaySuccess  atomic.Uint64
+	journalRangeTooOld    atomic.Uint64
+
+	pressureMu             sync.Mutex
+	secondaryPressure      map[string]*drSecondaryPressureSample
+	backpressureEnabled    bool
+	backpressureState      atomic.Uint32
+	backpressureDegraded   float64
+	backpressureCritical   float64
+	backpressureMinLag     uint64
+	backpressureHorizonSec int64
+	backpressureMinQPSDeg  int64
+	backpressureMinQPSCrit int64
+	backpressureWindowSec  int64
+	backpressureCount      int64
+	backpressureCapQPS     atomic.Int64
+	backpressureRejected   atomic.Uint64
 }
 
 type drCheckpointBuildResult struct {
@@ -193,10 +251,19 @@ func NewDRReplicationPrimary(core *Core, replSalt []byte, logger log.Logger) *dr
 		indexKIDToVID:                           make(map[[32]byte][32]byte),
 		indexKIDToKey:                           make(map[[32]byte]string),
 		streamJournal:                           newDRStreamJournal(logger, ""),
+		checkpointArtifacts:                     newDRCheckpointArtifactStore(logger, ""),
+		secondaryPressure:                       make(map[string]*drSecondaryPressureSample),
+		backpressureEnabled:                     drBackpressureDefaultEnabled,
+		backpressureDegraded:                    drBackpressureDefaultDegradedRatio,
+		backpressureCritical:                    drBackpressureDefaultCriticalRatio,
+		backpressureHorizonSec:                  drBackpressureDefaultHorizonSeconds,
+		backpressureMinQPSDeg:                   drBackpressureDefaultDegradedMinQPS,
+		backpressureMinQPSCrit:                  drBackpressureDefaultCriticalMinQPS,
 	}
 	if err := primary.streamJournal.configure(true, drDefaultStreamJournalMaxBytes, drDefaultStreamJournalSegmentBytes, drDefaultStreamJournalRetention); err != nil {
 		primary.logger.Warn("failed to initialize DR stream journal", "error", err)
 	}
+	primary.checkpointArtifacts.configure(true, drCheckpointArtifactDefaultTTL, drCheckpointArtifactDefaultGlobalBudget, drCheckpointArtifactDefaultPerRelBudget, drCheckpointArtifactDefaultSegmentBytes)
 	return primary
 }
 
@@ -218,6 +285,10 @@ func (s *drReplicationPrimary) OnChange(entries []physical.ChangeStreamEntry) {
 
 	// Keep metadata index in sync with committed changes.
 	s.updateIndexFromChanges(replicableEntries)
+	last := replicableEntries[len(replicableEntries)-1].RaftIndex
+	if last > 0 {
+		s.indexApplied.Store(last)
+	}
 
 	if s.streamJournal != nil {
 		if err := s.streamJournal.append(replicableEntries); err != nil {
@@ -358,10 +429,14 @@ func (s *drReplicationPrimary) StreamChanges(req *StreamChangesRequest, stream g
 		oldestIdx := bufferSnapshot[0].RaftIndex
 		if bufferStart < oldestIdx {
 			if s.streamJournal != nil {
+				s.journalReplayAttempts.Add(1)
+				metrics.IncrCounter([]string{"replication", "dr", "stream", "journal_replay_attempts_total"}, 1)
 				if err := s.streamJournal.replayRange(bufferStart, oldestIdx, func(e physical.ChangeStreamEntry) error {
 					return stream.Send(entryChangeFromPhysical(e))
 				}); err != nil {
 					if errors.Is(err, errDRStreamJournalRangeTooOld) {
+						s.journalRangeTooOld.Add(1)
+						metrics.IncrCounter([]string{"replication", "dr", "stream", "journal_range_too_old_total"}, 1)
 						s.logger.Warn("journal cannot satisfy catch-up, secondary needs reconciliation",
 							"requested_from", bufferStart,
 							"oldest_buffered", oldestIdx)
@@ -370,6 +445,8 @@ func (s *drReplicationPrimary) StreamChanges(req *StreamChangesRequest, stream g
 					}
 					return status.Errorf(codes.Internal, "journal catch-up failed: %v", err)
 				}
+				s.journalReplaySuccess.Add(1)
+				metrics.IncrCounter([]string{"replication", "dr", "stream", "journal_replay_success_total"}, 1)
 			} else {
 				s.logger.Warn("buffer cannot satisfy catch-up, secondary needs reconciliation",
 					"requested_from", bufferStart,
@@ -757,6 +834,7 @@ func (s *drReplicationPrimary) Heartbeat(ctx context.Context, req *DRHeartbeatRe
 		primaryIndex = rb.AppliedIndex()
 		primaryTerm = rb.Term()
 	}
+	s.recordSecondaryPressure(req.RelationshipId, primaryIndex, req.GetAppliedIndex(), time.Now().UTC())
 
 	return &DRHeartbeatResponse{
 		PrimaryIndex:     primaryIndex,
@@ -906,9 +984,8 @@ func (s *drReplicationPrimary) buildAndCacheCheckpoint(ctx context.Context, rela
 	if err != nil {
 		return nil, err
 	}
-	topRanges, err := reconciler.BuildRangeManifest(rs, s.rangePlanConfig)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to build range manifest: %v", err)
+	if rs != nil && rs.Checkpoint.CommitIndex > 0 {
+		checkpoint.CommitIndex = rs.Checkpoint.CommitIndex
 	}
 
 	entry := &drCheckpointCacheEntry{
@@ -918,9 +995,23 @@ func (s *drReplicationPrimary) buildAndCacheCheckpoint(ctx context.Context, rela
 		prefixDigest:     rs.PrefixDigest,
 		kidToKey:         rs.KIDToKey,
 		kidToVID:         rs.KIDToVID,
-		topRanges:        topRanges,
 		rangePlanVersion: reconciler.RangePlanVersion,
 	}
+	if s.checkpointArtifacts != nil && s.checkpointArtifacts.enabled {
+		if err := s.checkpointArtifacts.waitForIndexFence(&s.indexApplied, checkpoint.CommitIndex, drCheckpointArtifactBuildFenceTimeout); err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "checkpoint index fence failed: %v", err)
+		}
+		if err := s.checkpointArtifacts.build(ctx, entry, s.scanner, s.core.physical, s.rangePlanConfig); err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "checkpoint artifact build failed: %v", err)
+		}
+	} else {
+		topRanges, rangeErr := reconciler.BuildRangeManifest(rs, s.rangePlanConfig)
+		if rangeErr != nil {
+			return nil, status.Errorf(codes.Internal, "failed to build range manifest: %v", rangeErr)
+		}
+		entry.topRanges = topRanges
+	}
+
 	if err := s.cacheCheckpoint(entry); err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "checkpoint cache pressure: %v", err)
 	}
@@ -938,13 +1029,17 @@ func (s *drReplicationPrimary) buildAndCacheCheckpoint(ctx context.Context, rela
 	return &CheckpointResponse{
 		CheckpointId:     checkpointID,
 		CommitIndex:      commitIndex,
-		TopRanges:        rangeDescriptorsToProto(topRanges),
+		TopRanges:        rangeDescriptorsToProto(entry.topRanges),
 		RangePlanVersion: reconciler.RangePlanVersion,
 	}, nil
 }
 
 func (s *drReplicationPrimary) buildCheckpointSet(ctx context.Context, checkpoint reconciler.Checkpoint) (*reconciler.ReconciliationSet, error) {
-	if rs, ok := s.snapshotIndexCheckpointSet(); ok {
+	if err := s.checkpointArtifacts.waitForIndexFence(&s.indexApplied, checkpoint.CommitIndex, drCheckpointArtifactBuildFenceTimeout); err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "checkpoint index fence failed: %v", err)
+	}
+
+	if rs, ok := s.snapshotIndexCheckpointSet(checkpoint.CommitIndex); ok {
 		return rs, nil
 	}
 
@@ -955,13 +1050,17 @@ func (s *drReplicationPrimary) buildCheckpointSet(ctx context.Context, checkpoin
 		return nil, status.Errorf(codes.Internal, "failed to build checkpoint snapshot: %v", err)
 	}
 	s.resetIndexFromSet(rs)
+	s.indexApplied.Store(checkpoint.CommitIndex)
 	return rs, nil
 }
 
-func (s *drReplicationPrimary) snapshotIndexCheckpointSet() (*reconciler.ReconciliationSet, bool) {
+func (s *drReplicationPrimary) snapshotIndexCheckpointSet(commitIndex uint64) (*reconciler.ReconciliationSet, bool) {
 	s.indexMu.RLock()
 	defer s.indexMu.RUnlock()
 	if !s.indexInitialized {
+		return nil, false
+	}
+	if commitIndex > 0 && s.indexApplied.Load() < commitIndex {
 		return nil, false
 	}
 	if !s.indexLastFullScan.IsZero() && time.Since(s.indexLastFullScan) > drCheckpointIndexFullScanInterval {
@@ -976,6 +1075,9 @@ func (s *drReplicationPrimary) snapshotIndexCheckpointSet() (*reconciler.Reconci
 		kidToKey[kid] = key
 	}
 	rs := &reconciler.ReconciliationSet{
+		Checkpoint: reconciler.Checkpoint{
+			CommitIndex: s.indexApplied.Load(),
+		},
 		KIDToVID:     kidToVID,
 		KIDToKey:     kidToKey,
 		KeyCount:     len(kidToVID),
@@ -1049,6 +1151,58 @@ func (s *drReplicationPrimary) applyRuntimeTuning(cfg *DRConfig) {
 			if err := s.streamJournal.configure(cfg.StreamJournalEnabled, cfg.StreamJournalMaxBytes, cfg.StreamJournalSegmentBytes, retention); err != nil {
 				s.logger.Warn("failed to apply stream journal tuning", "error", err)
 			}
+		}
+	}
+
+	if s.checkpointArtifacts != nil {
+		artifactEnabled := cfg.CheckpointArtifactEnabled
+		if !artifactEnabled &&
+			cfg.CheckpointArtifactGlobalBudgetBytes == 0 &&
+			cfg.CheckpointArtifactPerRelBudgetBytes == 0 &&
+			cfg.CheckpointArtifactTTLSeconds == 0 &&
+			cfg.CheckpointArtifactSegmentBytes == 0 {
+			artifactEnabled = true
+		}
+		ttl := s.checkpointTTL
+		if cfg.CheckpointArtifactTTLSeconds > 0 {
+			ttl = time.Duration(cfg.CheckpointArtifactTTLSeconds) * time.Second
+		}
+		global := cfg.CheckpointArtifactGlobalBudgetBytes
+		if global == 0 {
+			global = drCheckpointArtifactDefaultGlobalBudget
+		}
+		perRel := cfg.CheckpointArtifactPerRelBudgetBytes
+		if perRel == 0 {
+			perRel = drCheckpointArtifactDefaultPerRelBudget
+		}
+		seg := cfg.CheckpointArtifactSegmentBytes
+		if seg == 0 {
+			seg = drCheckpointArtifactDefaultSegmentBytes
+		}
+		s.checkpointArtifacts.configure(artifactEnabled, ttl, global, perRel, seg)
+	}
+
+	if cfg.DRBackpressureEnabled || cfg.DRBackpressureDegradedRatio > 0 || cfg.DRBackpressureCriticalRatio > 0 ||
+		cfg.DRBackpressureMinLagEntries > 0 || cfg.DRBackpressureHorizonSeconds > 0 ||
+		cfg.DRBackpressureDegradedMinQPS > 0 || cfg.DRBackpressureCriticalMinQPS > 0 {
+		s.backpressureEnabled = cfg.DRBackpressureEnabled
+		if cfg.DRBackpressureDegradedRatio > 0 {
+			s.backpressureDegraded = cfg.DRBackpressureDegradedRatio
+		}
+		if cfg.DRBackpressureCriticalRatio > 0 {
+			s.backpressureCritical = cfg.DRBackpressureCriticalRatio
+		}
+		if cfg.DRBackpressureMinLagEntries > 0 {
+			s.backpressureMinLag = cfg.DRBackpressureMinLagEntries
+		}
+		if cfg.DRBackpressureHorizonSeconds > 0 {
+			s.backpressureHorizonSec = cfg.DRBackpressureHorizonSeconds
+		}
+		if cfg.DRBackpressureDegradedMinQPS > 0 {
+			s.backpressureMinQPSDeg = cfg.DRBackpressureDegradedMinQPS
+		}
+		if cfg.DRBackpressureCriticalMinQPS > 0 {
+			s.backpressureMinQPSCrit = cfg.DRBackpressureCriticalMinQPS
 		}
 	}
 }
@@ -1208,6 +1362,9 @@ func (s *drReplicationPrimary) evictCheckpointLocked(id string) {
 	cp, ok := s.checkpoints[id]
 	if !ok {
 		return
+	}
+	if s.checkpointArtifacts != nil {
+		s.checkpointArtifacts.delete(id)
 	}
 	delete(s.checkpoints, id)
 	if cp.estimatedBytes <= s.checkpointBytes {
@@ -1551,6 +1708,184 @@ func (s *drReplicationPrimary) streamJournalSnapshot() (bytes uint64, segments i
 	return
 }
 
+func (s *drReplicationPrimary) streamJournalReplayStats() (attempts, success, tooOld uint64) {
+	return s.journalReplayAttempts.Load(), s.journalReplaySuccess.Load(), s.journalRangeTooOld.Load()
+}
+
+func (s *drReplicationPrimary) checkpointArtifactStats() (bytes uint64, items int, evictions uint64, buildSeconds float64, storageDriftConflicts uint64) {
+	if s.checkpointArtifacts == nil {
+		return 0, 0, 0, 0, 0
+	}
+	return s.checkpointArtifacts.stats()
+}
+
+func (s *drReplicationPrimary) recordSecondaryPressure(relationshipID string, primaryIndex uint64, appliedIndex uint64, now time.Time) {
+	if relationshipID == "" {
+		return
+	}
+	s.pressureMu.Lock()
+	defer s.pressureMu.Unlock()
+
+	sample, ok := s.secondaryPressure[relationshipID]
+	if !ok {
+		sample = &drSecondaryPressureSample{}
+		s.secondaryPressure[relationshipID] = sample
+	}
+	if !sample.lastSeen.IsZero() {
+		dt := now.Sub(sample.lastSeen).Seconds()
+		if dt > 0 {
+			var delta int64
+			if appliedIndex >= sample.lastApplied {
+				delta = int64(appliedIndex - sample.lastApplied)
+			}
+			rate := float64(delta) / dt
+			if sample.applyRateEPS == 0 {
+				sample.applyRateEPS = rate
+			} else {
+				sample.applyRateEPS = (sample.applyRateEPS * 0.7) + (rate * 0.3)
+			}
+		}
+	}
+
+	sample.lastSeen = now
+	sample.lastApplied = appliedIndex
+	sample.lastPrimary = primaryIndex
+	if primaryIndex > appliedIndex {
+		sample.lagEntries = primaryIndex - appliedIndex
+	} else {
+		sample.lagEntries = 0
+	}
+}
+
+func (s *drReplicationPrimary) pressureSnapshot(now time.Time) (drBackpressureState, int64, float64, float64, uint64, int64) {
+	if !s.backpressureEnabled {
+		return drBackpressureHealthy, 0, 0, 0, 0, 0
+	}
+	p := s.writeRate()
+	if p <= 0 {
+		return drBackpressureHealthy, 0, p, 0, 0, 0
+	}
+
+	s.pressureMu.Lock()
+	defer s.pressureMu.Unlock()
+
+	minApply := -1.0
+	var maxLag uint64
+	active := 0
+	for rel, sample := range s.secondaryPressure {
+		if sample == nil {
+			delete(s.secondaryPressure, rel)
+			continue
+		}
+		if now.Sub(sample.lastSeen) > drCheckpointArtifactStaleHeartbeatWindow {
+			delete(s.secondaryPressure, rel)
+			continue
+		}
+		active++
+		if minApply < 0 || sample.applyRateEPS < minApply {
+			minApply = sample.applyRateEPS
+		}
+		if sample.lagEntries > maxLag {
+			maxLag = sample.lagEntries
+		}
+	}
+	if active == 0 {
+		s.backpressureState.Store(uint32(drBackpressureHealthy))
+		s.backpressureCapQPS.Store(0)
+		return drBackpressureHealthy, 0, p, 0, 0, s.streamBufferHorizonSeconds()
+	}
+	if minApply < 0 {
+		minApply = 0
+	}
+
+	minLag := s.backpressureMinLag
+	if minLag == 0 {
+		s.bufMu.RLock()
+		minLag = uint64(2 * s.bufMaxSize)
+		s.bufMu.RUnlock()
+	}
+	horizon := s.streamBufferHorizonSeconds()
+	state := drBackpressureHealthy
+	ratio := 1.0
+	if p > 0 {
+		ratio = minApply / p
+	}
+	if ratio < s.backpressureDegraded && maxLag >= minLag {
+		state = drBackpressureDegraded
+	}
+	if ratio < s.backpressureCritical && maxLag >= (2*minLag) && horizon > 0 && horizon <= s.backpressureHorizonSec {
+		state = drBackpressureCritical
+	}
+
+	var capQPS int64
+	switch state {
+	case drBackpressureCritical:
+		capQPS = int64(minApply * 0.6)
+		if capQPS < s.backpressureMinQPSCrit {
+			capQPS = s.backpressureMinQPSCrit
+		}
+	case drBackpressureDegraded:
+		capQPS = int64(minApply * 0.9)
+		if capQPS < s.backpressureMinQPSDeg {
+			capQPS = s.backpressureMinQPSDeg
+		}
+	default:
+		capQPS = 0
+	}
+	s.backpressureState.Store(uint32(state))
+	s.backpressureCapQPS.Store(capQPS)
+	return state, capQPS, p, minApply, maxLag, horizon
+}
+
+func (s *drReplicationPrimary) backpressureStatus() (state string, rejections uint64, capQPS int64) {
+	return drBackpressureState(s.backpressureState.Load()).String(), s.backpressureRejected.Load(), s.backpressureCapQPS.Load()
+}
+
+func (s *drReplicationPrimary) allowWriteRequest(path string) (bool, string) {
+	now := time.Now().UTC()
+	state, capQPS, p, a, lag, horizon := s.pressureSnapshot(now)
+	if state == drBackpressureHealthy || capQPS <= 0 {
+		return true, ""
+	}
+
+	sec := now.Unix()
+	s.pressureMu.Lock()
+	if s.backpressureWindowSec != sec {
+		s.backpressureWindowSec = sec
+		s.backpressureCount = 0
+	}
+	allowed := s.backpressureCount < capQPS
+	if allowed {
+		s.backpressureCount++
+	}
+	s.pressureMu.Unlock()
+	if allowed {
+		return true, ""
+	}
+
+	s.backpressureRejected.Add(1)
+	metrics.IncrCounter([]string{"replication", "dr", "backpressure", "rejections_total"}, 1)
+	return false, fmt.Sprintf(
+		"dr backpressure (%s): path=%s primary_write_eps=%.3f secondary_apply_eps=%.3f lag_entries=%d horizon_seconds=%d qps_cap=%d",
+		state.String(), path, p, a, lag, horizon, capQPS,
+	)
+}
+
+func isDRBackpressureExemptPath(path string) bool {
+	if path == "" {
+		return true
+	}
+	if path == "sys/health" || path == "sys/seal-status" ||
+		strings.HasPrefix(path, "sys/replication/dr/") {
+		return true
+	}
+	if strings.HasSuffix(path, "/sys/health") || strings.HasSuffix(path, "/sys/seal-status") ||
+		strings.Contains(path, "/sys/replication/dr/") {
+		return true
+	}
+	return false
+}
+
 func (s *drReplicationPrimary) RevokeRelationship(relationshipID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1648,57 +1983,55 @@ func validateCheckpointTuple(checkpointID string, checkpointIndex uint64, cp *dr
 }
 
 func (s *drReplicationPrimary) readCheckpointEntryChange(ctx context.Context, cp *drCheckpointCacheEntry, kid [32]byte, expectedVID *[32]byte, includeDeletes bool) (*EntryChange, error) {
+	_ = ctx
 	cpVID, ok := cp.kidToVID[kid]
 	if !ok {
 		if includeDeletes {
-			return &EntryChange{
-				OpType: string(physical.DeleteOperation),
-				Kid:    kid[:],
-			}, nil
+			return &EntryChange{OpType: string(physical.DeleteOperation), Kid: kid[:]}, nil
 		}
 		return nil, nil
 	}
 	if expectedVID != nil && *expectedVID != cpVID {
-		return nil, status.Error(codes.FailedPrecondition, "checkpoint conflict: expected_vid does not match checkpoint artifact")
+		return nil, status.Error(codes.FailedPrecondition, "checkpoint_provenance_mismatch: expected_vid does not match checkpoint artifact")
+	}
+	if s.checkpointArtifacts == nil {
+		return nil, status.Error(codes.FailedPrecondition, "checkpoint_artifact_missing: checkpoint artifacts are not enabled")
 	}
 
-	key, ok := cp.kidToKey[kid]
-	if !ok || key == "" {
-		return nil, status.Error(codes.FailedPrecondition, "checkpoint conflict: missing KID->key mapping")
-	}
-
-	entry, err := s.core.physical.Get(ctx, key)
+	rec, found, err := s.checkpointArtifacts.getRecord(cp.checkpoint.ID, kid)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read physical entry %q: %w", key, err)
+		return nil, status.Errorf(codes.FailedPrecondition, "checkpoint_artifact_missing: %v", err)
 	}
-
-	var currentVID [32]byte
-	if entry == nil {
-		_, currentVID = s.scanner.ComputeItemFromEntry(&physical.Entry{Key: key})
-	} else {
-		currentVID = s.scanner.ComputeVIDWithSealWrap(entry.Value, entry.SealWrap)
+	if !found {
+		if includeDeletes {
+			return &EntryChange{OpType: string(physical.DeleteOperation), Kid: kid[:]}, nil
+		}
+		return nil, nil
 	}
-
-	if currentVID != cpVID {
-		return nil, status.Errorf(codes.FailedPrecondition, "checkpoint conflict: storage changed for key %q", key)
+	if rec.VID != cpVID {
+		return nil, status.Error(codes.FailedPrecondition, "checkpoint_provenance_mismatch: artifact VID does not match checkpoint metadata")
 	}
-
-	if entry == nil {
+	if rec.Tombstone {
 		if includeDeletes {
 			return &EntryChange{
 				OpType: string(physical.DeleteOperation),
-				Key:    key,
+				Key:    rec.Key,
 				Kid:    kid[:],
 			}, nil
 		}
 		return nil, nil
 	}
 
+	value, err := s.checkpointArtifacts.readValue(cp.checkpoint.ID, rec.ValueRef)
+	if err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "checkpoint_artifact_missing: %v", err)
+	}
 	return &EntryChange{
 		OpType:   string(physical.PutOperation),
-		Key:      key,
-		Value:    entry.Value,
-		SealWrap: entry.SealWrap,
+		Key:      rec.Key,
+		Value:    value,
+		SealWrap: rec.SealWrap,
+		Kid:      kid[:],
 	}, nil
 }
 

@@ -27,6 +27,38 @@ func TestWrapReconcileFailure_PreservesBudgetClass(t *testing.T) {
 	}
 }
 
+func TestClassifyReconcileFailure_CheckpointClasses(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want drReconcileFailureClass
+	}{
+		{
+			name: "tuple mismatch",
+			err:  errors.New("checkpoint_tuple_mismatch: checkpoint tuple missing"),
+			want: drReconcileFailureCheckpointTuple,
+		},
+		{
+			name: "artifact missing",
+			err:  errors.New("checkpoint_artifact_missing: checkpoint artifact expired"),
+			want: drReconcileFailureCheckpointArtifact,
+		},
+		{
+			name: "provenance mismatch",
+			err:  errors.New("checkpoint_provenance_mismatch: expected_vid does not match checkpoint artifact"),
+			want: drReconcileFailureCheckpointProof,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyReconcileFailure(tc.err); got != tc.want {
+				t.Fatalf("expected %q, got %q", tc.want, got)
+			}
+		})
+	}
+}
+
 func TestFallbackTriggerWindow_LagAndFailures(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	replSalt := make([]byte, 32)

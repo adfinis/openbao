@@ -465,6 +465,54 @@ func (b *SystemBackend) drReplicationPaths() []*framework.Path {
 					Type:        framework.TypeInt,
 					Description: "Maximum fallback runs per hour.",
 				},
+				"checkpoint_artifact_enabled": {
+					Type:        framework.TypeBool,
+					Description: "Enable immutable disk-backed checkpoint artifacts for DR fetches.",
+				},
+				"checkpoint_artifact_global_budget_bytes": {
+					Type:        framework.TypeInt,
+					Description: "Global checkpoint artifact budget in bytes.",
+				},
+				"checkpoint_artifact_per_relationship_budget_bytes": {
+					Type:        framework.TypeInt,
+					Description: "Per-relationship checkpoint artifact budget in bytes.",
+				},
+				"checkpoint_artifact_ttl_seconds": {
+					Type:        framework.TypeInt,
+					Description: "Checkpoint artifact TTL in seconds.",
+				},
+				"checkpoint_artifact_segment_bytes": {
+					Type:        framework.TypeInt,
+					Description: "Checkpoint artifact segment size in bytes.",
+				},
+				"dr_backpressure_enabled": {
+					Type:        framework.TypeBool,
+					Description: "Enable DR-aware bounded write backpressure on primary.",
+				},
+				"dr_backpressure_degraded_ratio": {
+					Type:        framework.TypeFloat,
+					Description: "Apply-rate ratio threshold for degraded backpressure state.",
+				},
+				"dr_backpressure_critical_ratio": {
+					Type:        framework.TypeFloat,
+					Description: "Apply-rate ratio threshold for critical backpressure state.",
+				},
+				"dr_backpressure_min_lag_entries": {
+					Type:        framework.TypeInt,
+					Description: "Minimum lag entries before backpressure can engage.",
+				},
+				"dr_backpressure_horizon_seconds": {
+					Type:        framework.TypeInt,
+					Description: "Stream horizon threshold used for critical backpressure state.",
+				},
+				"dr_backpressure_degraded_min_qps": {
+					Type:        framework.TypeInt,
+					Description: "Minimum admitted QPS in degraded backpressure state.",
+				},
+				"dr_backpressure_critical_min_qps": {
+					Type:        framework.TypeInt,
+					Description: "Minimum admitted QPS in critical backpressure state.",
+				},
 			},
 			Operations: map[logical.Operation]framework.OperationHandler{
 				logical.ReadOperation: &framework.PathOperation{
@@ -525,6 +573,7 @@ func (b *SystemBackend) handleDRStatus(ctx context.Context, req *logical.Request
 		data["reconcile_decode_failures_total"] = status.ReconcileDecodeFailuresTotal
 		data["reconcile_stalled_total"] = status.ReconcileStalledTotal
 		data["reconcile_stuck_seconds"] = status.ReconcileStuckSeconds
+		data["reconcile_phase"] = status.ReconcilePhase
 		data["last_applied_age_seconds"] = status.LastAppliedAgeSeconds
 		data["reconcile_max_rpc_bytes"] = status.ReconcileMaxRPCBytes
 		data["reconcile_max_wall_time_seconds"] = status.ReconcileMaxWallTimeSeconds
@@ -576,6 +625,20 @@ func (b *SystemBackend) handleDRStatus(ctx context.Context, req *logical.Request
 		data["stream_journal_bytes"] = journalBytes
 		data["stream_journal_segments"] = journalSegments
 		data["stream_journal_oldest_index"] = journalOldest
+		replayAttempts, replaySuccess, replayTooOld := primary.streamJournalReplayStats()
+		data["journal_replay_attempts_total"] = replayAttempts
+		data["journal_replay_success_total"] = replaySuccess
+		data["journal_range_too_old_total"] = replayTooOld
+		artifactBytes, artifactItems, artifactEvictions, artifactBuildSeconds, artifactStorageDrift := primary.checkpointArtifactStats()
+		data["checkpoint_artifact_bytes"] = artifactBytes
+		data["checkpoint_artifact_items"] = artifactItems
+		data["checkpoint_artifact_evictions"] = artifactEvictions
+		data["checkpoint_artifact_build_seconds"] = artifactBuildSeconds
+		data["checkpoint_conflicts_storage_drift_total"] = artifactStorageDrift
+		backpressureState, backpressureRejected, backpressureCap := primary.backpressureStatus()
+		data["dr_backpressure_state"] = backpressureState
+		data["dr_backpressure_rejections_total"] = backpressureRejected
+		data["dr_backpressure_effective_qps_cap"] = backpressureCap
 	}
 
 	if config.Mode == DRModePrimary {
@@ -865,32 +928,44 @@ func (b *SystemBackend) handleDRTuningRead(ctx context.Context, req *logical.Req
 	cfg := mgr.Config()
 	return &logical.Response{
 		Data: map[string]interface{}{
-			"checkpoint_ttl_seconds":                   cfg.CheckpointTTLSeconds,
-			"checkpoint_global_budget_bytes":           cfg.CheckpointGlobalBudgetBytes,
-			"checkpoint_per_relationship_budget_bytes": cfg.CheckpointPerRelBudgetBytes,
-			"stream_buffer_max_entries":                cfg.StreamBufferMaxEntries,
-			"stream_buffer_max_bytes":                  cfg.StreamBufferMaxBytes,
-			"reconcile_max_rpc_bytes":                  cfg.ReconcileMaxRPCBytes,
-			"reconcile_max_wall_time_seconds":          cfg.ReconcileMaxWallTimeSeconds,
-			"reconcile_max_inflight_tasks":             cfg.ReconcileMaxInflightTasks,
-			"stream_batch_max_entries":                 cfg.StreamBatchMaxEntries,
-			"stream_batch_max_bytes":                   cfg.StreamBatchMaxBytes,
-			"stream_batch_max_wait_milliseconds":       cfg.StreamBatchMaxWaitMillis,
-			"stream_journal_enabled":                   cfg.StreamJournalEnabled,
-			"stream_journal_max_bytes":                 cfg.StreamJournalMaxBytes,
-			"stream_journal_segment_bytes":             cfg.StreamJournalSegmentBytes,
-			"stream_journal_retention_seconds":         cfg.StreamJournalRetentionSecs,
-			"reconcile_apply_workers":                  cfg.ReconcileApplyWorkers,
-			"reconcile_put_batch_max_entries":          cfg.ReconcilePutBatchMaxEntries,
-			"reconcile_put_batch_max_bytes":            cfg.ReconcilePutBatchMaxBytes,
-			"convergence_min_rate_ratio":               cfg.ConvergenceMinRateRatio,
-			"convergence_stall_seconds":                cfg.ConvergenceStallSeconds,
-			"fallback_enabled":                         cfg.FallbackEnabled,
-			"fallback_stall_seconds":                   cfg.FallbackStallSeconds,
-			"fallback_failure_threshold":               cfg.FallbackFailureThreshold,
-			"fallback_min_lag_entries":                 cfg.FallbackMinLagEntries,
-			"fallback_cooldown_seconds":                cfg.FallbackCooldownSeconds,
-			"fallback_max_per_hour":                    cfg.FallbackMaxPerHour,
+			"checkpoint_ttl_seconds":                            cfg.CheckpointTTLSeconds,
+			"checkpoint_global_budget_bytes":                    cfg.CheckpointGlobalBudgetBytes,
+			"checkpoint_per_relationship_budget_bytes":          cfg.CheckpointPerRelBudgetBytes,
+			"stream_buffer_max_entries":                         cfg.StreamBufferMaxEntries,
+			"stream_buffer_max_bytes":                           cfg.StreamBufferMaxBytes,
+			"reconcile_max_rpc_bytes":                           cfg.ReconcileMaxRPCBytes,
+			"reconcile_max_wall_time_seconds":                   cfg.ReconcileMaxWallTimeSeconds,
+			"reconcile_max_inflight_tasks":                      cfg.ReconcileMaxInflightTasks,
+			"stream_batch_max_entries":                          cfg.StreamBatchMaxEntries,
+			"stream_batch_max_bytes":                            cfg.StreamBatchMaxBytes,
+			"stream_batch_max_wait_milliseconds":                cfg.StreamBatchMaxWaitMillis,
+			"stream_journal_enabled":                            cfg.StreamJournalEnabled,
+			"stream_journal_max_bytes":                          cfg.StreamJournalMaxBytes,
+			"stream_journal_segment_bytes":                      cfg.StreamJournalSegmentBytes,
+			"stream_journal_retention_seconds":                  cfg.StreamJournalRetentionSecs,
+			"reconcile_apply_workers":                           cfg.ReconcileApplyWorkers,
+			"reconcile_put_batch_max_entries":                   cfg.ReconcilePutBatchMaxEntries,
+			"reconcile_put_batch_max_bytes":                     cfg.ReconcilePutBatchMaxBytes,
+			"convergence_min_rate_ratio":                        cfg.ConvergenceMinRateRatio,
+			"convergence_stall_seconds":                         cfg.ConvergenceStallSeconds,
+			"fallback_enabled":                                  cfg.FallbackEnabled,
+			"fallback_stall_seconds":                            cfg.FallbackStallSeconds,
+			"fallback_failure_threshold":                        cfg.FallbackFailureThreshold,
+			"fallback_min_lag_entries":                          cfg.FallbackMinLagEntries,
+			"fallback_cooldown_seconds":                         cfg.FallbackCooldownSeconds,
+			"fallback_max_per_hour":                             cfg.FallbackMaxPerHour,
+			"checkpoint_artifact_enabled":                       cfg.CheckpointArtifactEnabled,
+			"checkpoint_artifact_global_budget_bytes":           cfg.CheckpointArtifactGlobalBudgetBytes,
+			"checkpoint_artifact_per_relationship_budget_bytes": cfg.CheckpointArtifactPerRelBudgetBytes,
+			"checkpoint_artifact_ttl_seconds":                   cfg.CheckpointArtifactTTLSeconds,
+			"checkpoint_artifact_segment_bytes":                 cfg.CheckpointArtifactSegmentBytes,
+			"dr_backpressure_enabled":                           cfg.DRBackpressureEnabled,
+			"dr_backpressure_degraded_ratio":                    cfg.DRBackpressureDegradedRatio,
+			"dr_backpressure_critical_ratio":                    cfg.DRBackpressureCriticalRatio,
+			"dr_backpressure_min_lag_entries":                   cfg.DRBackpressureMinLagEntries,
+			"dr_backpressure_horizon_seconds":                   cfg.DRBackpressureHorizonSeconds,
+			"dr_backpressure_degraded_min_qps":                  cfg.DRBackpressureDegradedMinQPS,
+			"dr_backpressure_critical_min_qps":                  cfg.DRBackpressureCriticalMinQPS,
 		},
 	}, nil
 }
@@ -978,6 +1053,42 @@ func (b *SystemBackend) handleDRTuningWrite(ctx context.Context, req *logical.Re
 		}
 		if raw, ok := d.GetOk("fallback_max_per_hour"); ok {
 			cfg.FallbackMaxPerHour = raw.(int)
+		}
+		if raw, ok := d.GetOk("checkpoint_artifact_enabled"); ok {
+			cfg.CheckpointArtifactEnabled = raw.(bool)
+		}
+		if raw, ok := d.GetOk("checkpoint_artifact_global_budget_bytes"); ok {
+			cfg.CheckpointArtifactGlobalBudgetBytes = uint64(raw.(int))
+		}
+		if raw, ok := d.GetOk("checkpoint_artifact_per_relationship_budget_bytes"); ok {
+			cfg.CheckpointArtifactPerRelBudgetBytes = uint64(raw.(int))
+		}
+		if raw, ok := d.GetOk("checkpoint_artifact_ttl_seconds"); ok {
+			cfg.CheckpointArtifactTTLSeconds = int64(raw.(int))
+		}
+		if raw, ok := d.GetOk("checkpoint_artifact_segment_bytes"); ok {
+			cfg.CheckpointArtifactSegmentBytes = uint64(raw.(int))
+		}
+		if raw, ok := d.GetOk("dr_backpressure_enabled"); ok {
+			cfg.DRBackpressureEnabled = raw.(bool)
+		}
+		if raw, ok := d.GetOk("dr_backpressure_degraded_ratio"); ok {
+			cfg.DRBackpressureDegradedRatio = raw.(float64)
+		}
+		if raw, ok := d.GetOk("dr_backpressure_critical_ratio"); ok {
+			cfg.DRBackpressureCriticalRatio = raw.(float64)
+		}
+		if raw, ok := d.GetOk("dr_backpressure_min_lag_entries"); ok {
+			cfg.DRBackpressureMinLagEntries = uint64(raw.(int))
+		}
+		if raw, ok := d.GetOk("dr_backpressure_horizon_seconds"); ok {
+			cfg.DRBackpressureHorizonSeconds = int64(raw.(int))
+		}
+		if raw, ok := d.GetOk("dr_backpressure_degraded_min_qps"); ok {
+			cfg.DRBackpressureDegradedMinQPS = int64(raw.(int))
+		}
+		if raw, ok := d.GetOk("dr_backpressure_critical_min_qps"); ok {
+			cfg.DRBackpressureCriticalMinQPS = int64(raw.(int))
 		}
 		return nil
 	}); err != nil {

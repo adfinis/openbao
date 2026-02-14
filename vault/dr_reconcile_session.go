@@ -17,7 +17,9 @@ const (
 	drReconcileFailureBudgetExceeded     drReconcileFailureClass = "budget_exceeded"
 	drReconcileFailureStalled            drReconcileFailureClass = "stalled"
 	drReconcileFailureDecodeExhausted    drReconcileFailureClass = "decode_exhausted"
-	drReconcileFailureCheckpointConflict drReconcileFailureClass = "checkpoint_conflict"
+	drReconcileFailureCheckpointTuple    drReconcileFailureClass = "checkpoint_tuple_mismatch"
+	drReconcileFailureCheckpointArtifact drReconcileFailureClass = "checkpoint_artifact_missing"
+	drReconcileFailureCheckpointProof    drReconcileFailureClass = "checkpoint_provenance_mismatch"
 	drReconcileFailureApplyFailed        drReconcileFailureClass = "apply_failed"
 	drReconcileFailureAuthRevoked        drReconcileFailureClass = "auth_revoked"
 	drReconcileFailureUnknown            drReconcileFailureClass = "unknown"
@@ -27,7 +29,9 @@ const (
 	drReconcileRetryCapBudgetExceeded     = uint64(8)
 	drReconcileRetryCapStalled            = uint64(8)
 	drReconcileRetryCapDecodeExhausted    = uint64(8)
-	drReconcileRetryCapCheckpointConflict = uint64(10)
+	drReconcileRetryCapCheckpointTuple    = uint64(10)
+	drReconcileRetryCapCheckpointArtifact = uint64(10)
+	drReconcileRetryCapCheckpointProof    = uint64(10)
 	drReconcileRetryCapApplyFailed        = uint64(6)
 	drReconcileRetryCapAuthRevoked        = uint64(4)
 	drReconcileRetryCapUnknown            = uint64(6)
@@ -66,7 +70,7 @@ func (s *drReplicationSecondary) markReconcileFailure(err error) drReconcileFail
 	classKey := string(class)
 
 	switch class {
-	case drReconcileFailureCheckpointConflict:
+	case drReconcileFailureCheckpointTuple, drReconcileFailureCheckpointArtifact, drReconcileFailureCheckpointProof:
 		s.checkpointConflicts.Add(1)
 	case drReconcileFailureDecodeExhausted:
 		s.reconcileDecodeFailures.Add(1)
@@ -100,7 +104,7 @@ func (s *drReplicationSecondary) nextReconcileRetryDelay(class drReconcileFailur
 		base = time.Second
 	case drReconcileFailureStalled:
 		base = 1500 * time.Millisecond
-	case drReconcileFailureCheckpointConflict:
+	case drReconcileFailureCheckpointTuple, drReconcileFailureCheckpointArtifact, drReconcileFailureCheckpointProof:
 		base = 2 * time.Second
 	case drReconcileFailureAuthRevoked:
 		base = 5 * time.Second
@@ -148,8 +152,12 @@ func (s *drReplicationSecondary) reconcileRetryCap(class drReconcileFailureClass
 		return drReconcileRetryCapStalled
 	case drReconcileFailureDecodeExhausted:
 		return drReconcileRetryCapDecodeExhausted
-	case drReconcileFailureCheckpointConflict:
-		return drReconcileRetryCapCheckpointConflict
+	case drReconcileFailureCheckpointTuple:
+		return drReconcileRetryCapCheckpointTuple
+	case drReconcileFailureCheckpointArtifact:
+		return drReconcileRetryCapCheckpointArtifact
+	case drReconcileFailureCheckpointProof:
+		return drReconcileRetryCapCheckpointProof
 	case drReconcileFailureApplyFailed:
 		return drReconcileRetryCapApplyFailed
 	case drReconcileFailureAuthRevoked:
@@ -161,7 +169,7 @@ func (s *drReplicationSecondary) reconcileRetryCap(class drReconcileFailureClass
 
 func (s *drReplicationSecondary) retryCapCooldown(class drReconcileFailureClass) time.Duration {
 	switch class {
-	case drReconcileFailureCheckpointConflict:
+	case drReconcileFailureCheckpointTuple, drReconcileFailureCheckpointArtifact, drReconcileFailureCheckpointProof:
 		return 15 * time.Second
 	case drReconcileFailureStalled:
 		return 15 * time.Second
@@ -186,8 +194,12 @@ func classifyReconcileFailure(err error) drReconcileFailureClass {
 		return drReconcileFailureBudgetExceeded
 	case strings.Contains(msg, "decode_exhausted"):
 		return drReconcileFailureDecodeExhausted
-	case strings.Contains(msg, "checkpoint conflict"), strings.Contains(msg, "checkpoint tuple"):
-		return drReconcileFailureCheckpointConflict
+	case strings.Contains(msg, "checkpoint_tuple_mismatch"), strings.Contains(msg, "checkpoint tuple mismatch"):
+		return drReconcileFailureCheckpointTuple
+	case strings.Contains(msg, "checkpoint_artifact_missing"), strings.Contains(msg, "checkpoint artifact missing"):
+		return drReconcileFailureCheckpointArtifact
+	case strings.Contains(msg, "checkpoint_provenance_mismatch"), strings.Contains(msg, "expected_vid does not match checkpoint artifact"):
+		return drReconcileFailureCheckpointProof
 	case strings.Contains(msg, "apply_failed"), strings.Contains(msg, "failed to apply"), strings.Contains(msg, "delete failed"):
 		return drReconcileFailureApplyFailed
 	case strings.Contains(msg, "permissiondenied"), strings.Contains(msg, "revoked"), strings.Contains(msg, "authorization failed"):
@@ -201,13 +213,13 @@ func (s *drReplicationSecondary) assertActiveCheckpoint(checkpointID string, che
 	s.sessionMu.RLock()
 	defer s.sessionMu.RUnlock()
 	if checkpointID == "" || checkpointIndex == 0 {
-		return fmt.Errorf("checkpoint tuple missing")
+		return fmt.Errorf("checkpoint_tuple_mismatch: checkpoint tuple missing")
 	}
 	if s.activeCheckpointID == "" || s.activeCheckpointIndex == 0 {
-		return fmt.Errorf("no active reconciliation session")
+		return fmt.Errorf("checkpoint_tuple_mismatch: no active reconciliation session")
 	}
 	if s.activeCheckpointID != checkpointID || s.activeCheckpointIndex != checkpointIndex {
-		return fmt.Errorf("checkpoint tuple mismatch: active=(%s,%d) got=(%s,%d)",
+		return fmt.Errorf("checkpoint_tuple_mismatch: active=(%s,%d) got=(%s,%d)",
 			s.activeCheckpointID, s.activeCheckpointIndex, checkpointID, checkpointIndex)
 	}
 	return nil

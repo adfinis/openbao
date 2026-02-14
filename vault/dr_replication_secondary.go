@@ -10,6 +10,7 @@ import (
 	"crypto/ecdh"
 	"crypto/rand"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -115,6 +116,34 @@ const (
 	DRSecondaryPromoting                       // Failover in progress
 	DRSecondaryStandalone                      // Post-promotion: now an independent primary
 )
+
+type drReconcilePhase uint32
+
+const (
+	drReconcilePhaseIdle drReconcilePhase = iota
+	drReconcilePhaseRangeTasks
+	drReconcilePhaseApplyPuts
+	drReconcilePhaseApplyDeletes
+	drReconcilePhaseFinalize
+	drReconcilePhaseResnapshot
+)
+
+func (p drReconcilePhase) String() string {
+	switch p {
+	case drReconcilePhaseRangeTasks:
+		return "range_tasks"
+	case drReconcilePhaseApplyPuts:
+		return "apply_puts"
+	case drReconcilePhaseApplyDeletes:
+		return "apply_deletes"
+	case drReconcilePhaseFinalize:
+		return "finalize"
+	case drReconcilePhaseResnapshot:
+		return "resnapshot"
+	default:
+		return "idle"
+	}
+}
 
 const (
 	drRangeTargetKeysPerRange            = 12000
@@ -233,6 +262,7 @@ type drReplicationSecondary struct {
 	reconcileQueueDepth          atomic.Int64
 	reconcileStalled             atomic.Uint64
 	lastReconcileActivityAt      atomic.Int64 // unix timestamp
+	lastReconcileApplyAt         atomic.Int64 // unix timestamp
 
 	sessionMu                  sync.RWMutex
 	activeCheckpointID         string
@@ -300,6 +330,7 @@ type drReplicationSecondary struct {
 
 	reconcileTasksHandled   atomic.Uint64
 	reconcileTaskRateMillis atomic.Uint64
+	reconcilePhase          atomic.Uint32
 }
 
 // newDRReplicationSecondary creates a new secondary replication manager.
@@ -357,6 +388,7 @@ func newDRReplicationSecondary(core *Core, replSalt []byte, relationshipID strin
 	now := time.Now().UTC().Unix()
 	sec.lastAppliedAt.Store(now)
 	sec.lastReconcileActivityAt.Store(now)
+	sec.lastReconcileApplyAt.Store(now)
 	return sec
 }
 
@@ -533,13 +565,14 @@ func (s *drReplicationSecondary) Start(ctx context.Context) error {
 			s.setState(DRSecondaryStreaming)
 
 		case DRSecondaryResnapshotting:
+			s.setReconcilePhase(drReconcilePhaseResnapshot)
 			reason := s.getFallbackLastReason()
 			if reason == "" {
 				reason = "manual"
 			}
 			if err := s.performResnapshot(ctx, reason); err != nil {
 				s.logger.Error("resnapshot fallback failed", "error", err)
-				class := s.markReconcileFailure(wrapReconcileFailure(drReconcileFailureApplyFailed, "resnapshot", err))
+				class := s.markReconcileFailure(err)
 				s.reconcileRetries.Add(1)
 				time.Sleep(s.nextReconcileRetryDelay(class))
 				s.setState(DRSecondaryReconciling)
@@ -765,6 +798,9 @@ func (s *drReplicationSecondary) setState(state DRSecondaryState) {
 	if old != state {
 		s.logger.Info("state transition", "from", old.String(), "to", state.String())
 	}
+	if state != DRSecondaryReconciling && state != DRSecondaryResnapshotting {
+		s.setReconcilePhase(drReconcilePhaseIdle)
+	}
 }
 
 func (s *drReplicationSecondary) setLastAppliedIndex(index uint64) {
@@ -772,8 +808,22 @@ func (s *drReplicationSecondary) setLastAppliedIndex(index uint64) {
 	s.lastAppliedAt.Store(time.Now().UTC().Unix())
 }
 
+func (s *drReplicationSecondary) setReconcilePhase(phase drReconcilePhase) {
+	s.reconcilePhase.Store(uint32(phase))
+}
+
+func (s *drReplicationSecondary) reconcilePhaseString() string {
+	return drReconcilePhase(s.reconcilePhase.Load()).String()
+}
+
 func (s *drReplicationSecondary) markReconcileActivityNow() {
 	s.lastReconcileActivityAt.Store(time.Now().UTC().Unix())
+}
+
+func (s *drReplicationSecondary) markReconcileApplyNow() {
+	now := time.Now().UTC().Unix()
+	s.lastReconcileApplyAt.Store(now)
+	s.lastReconcileActivityAt.Store(now)
 }
 
 func (s *drReplicationSecondary) reconcileStuckSeconds(now time.Time) int64 {
@@ -794,6 +844,10 @@ func (s *drReplicationSecondary) isReconcileStalled(now time.Time) (bool, time.D
 		return false, 0
 	}
 	lastActivity := s.lastReconcileActivityAt.Load()
+	lastApply := s.lastReconcileApplyAt.Load()
+	if lastApply > lastActivity {
+		lastActivity = lastApply
+	}
 	if lastActivity <= 0 {
 		return false, 0
 	}
@@ -817,7 +871,7 @@ func (s *drReplicationSecondary) Status() DRSecondaryStatus {
 		}
 	}
 	reconcileStuckSeconds := int64(0)
-	if s.State() == DRSecondaryReconciling {
+	if state := s.State(); state == DRSecondaryReconciling || state == DRSecondaryResnapshotting {
 		reconcileStuckSeconds = s.reconcileStuckSeconds(now)
 	}
 	s.sessionMu.RLock()
@@ -856,6 +910,7 @@ func (s *drReplicationSecondary) Status() DRSecondaryStatus {
 		ReconcileDecodeFailuresTotal:   s.reconcileDecodeFailures.Load(),
 		ReconcileStalledTotal:          s.reconcileStalled.Load(),
 		ReconcileStuckSeconds:          reconcileStuckSeconds,
+		ReconcilePhase:                 s.reconcilePhaseString(),
 		LastAppliedAgeSeconds:          lastAppliedAgeSeconds,
 		ReconcileMaxRPCBytes:           s.reconcileMaxRPCBytes,
 		ReconcileMaxWallTimeSeconds:    int64(s.reconcileMaxWallTime / time.Second),
@@ -906,6 +961,7 @@ type DRSecondaryStatus struct {
 	ReconcileDecodeFailuresTotal   uint64
 	ReconcileStalledTotal          uint64
 	ReconcileStuckSeconds          int64
+	ReconcilePhase                 string
 	LastAppliedAgeSeconds          int64
 	ReconcileMaxRPCBytes           uint64
 	ReconcileMaxWallTimeSeconds    int64
@@ -1170,12 +1226,65 @@ func (s *drReplicationSecondary) recordFallbackFailure(class drReconcileFailureC
 	s.fallbackFailureEvents = append(dst, now)
 }
 
+func (s *drReplicationSecondary) hardStallFallbackEligible(now time.Time) bool {
+	primary := s.primaryIndex.Load()
+	local := s.lastAppliedIndex.Load()
+	if primary <= local {
+		return false
+	}
+	lag := primary - local
+	minLag := s.fallbackMinLagEntries
+	if minLag == 0 {
+		minLag = uint64(2 * drStreamBufferMaxEntries)
+	}
+	if lag < minLag {
+		return false
+	}
+	stall := s.reconcileStallAbort
+	if stall <= 0 {
+		stall = s.fallbackStall
+	}
+	if stall <= 0 {
+		stall = drDefaultFallbackStall
+	}
+	lastActivity := s.lastReconcileActivityAt.Load()
+	if lastActivity <= 0 {
+		return false
+	}
+	return now.Sub(time.Unix(lastActivity, 0)) >= stall
+}
+
+func (s *drReplicationSecondary) fallbackRateAllowed(now time.Time) bool {
+	s.fallbackMu.Lock()
+	defer s.fallbackMu.Unlock()
+
+	cooldown := s.fallbackCooldown
+	if cooldown <= 0 {
+		cooldown = drDefaultFallbackCooldown
+	}
+	lastFallbackAt := s.fallbackLastAt.Load()
+	if lastFallbackAt > 0 && now.Sub(time.Unix(lastFallbackAt, 0)) < cooldown {
+		return false
+	}
+
+	hourCutoff := now.Add(-1 * time.Hour)
+	triggers := s.fallbackTriggerEvents[:0]
+	for _, ts := range s.fallbackTriggerEvents {
+		if ts.After(hourCutoff) {
+			triggers = append(triggers, ts)
+		}
+	}
+	s.fallbackTriggerEvents = triggers
+	maxPerHour := s.fallbackMaxPerHour
+	if maxPerHour <= 0 {
+		maxPerHour = drDefaultFallbackMaxPerHour
+	}
+	return len(s.fallbackTriggerEvents) < maxPerHour
+}
+
 func (s *drReplicationSecondary) shouldTriggerFallback(class drReconcileFailureClass) bool {
 	if !s.fallbackEnabled {
 		return false
-	}
-	if class == drReconcileFailureStalled && s.convergenceFallbackEligible(time.Now().UTC()) {
-		return true
 	}
 	switch class {
 	case drReconcileFailureBudgetExceeded, drReconcileFailureStalled, drReconcileFailureDecodeExhausted:
@@ -1184,6 +1293,10 @@ func (s *drReplicationSecondary) shouldTriggerFallback(class drReconcileFailureC
 	}
 
 	now := time.Now().UTC()
+	if class == drReconcileFailureStalled &&
+		(s.convergenceFallbackEligible(now) || s.hardStallFallbackEligible(now)) {
+		return s.fallbackRateAllowed(now)
+	}
 	stall := s.fallbackStall
 	if stall <= 0 {
 		stall = drDefaultFallbackStall
@@ -1228,32 +1341,7 @@ func (s *drReplicationSecondary) shouldTriggerFallback(class drReconcileFailureC
 	if len(s.fallbackFailureEvents) < threshold {
 		return false
 	}
-
-	cooldown := s.fallbackCooldown
-	if cooldown <= 0 {
-		cooldown = drDefaultFallbackCooldown
-	}
-	lastFallbackAt := s.fallbackLastAt.Load()
-	if lastFallbackAt > 0 && now.Sub(time.Unix(lastFallbackAt, 0)) < cooldown {
-		return false
-	}
-
-	hourCutoff := now.Add(-1 * time.Hour)
-	triggers := s.fallbackTriggerEvents[:0]
-	for _, ts := range s.fallbackTriggerEvents {
-		if ts.After(hourCutoff) {
-			triggers = append(triggers, ts)
-		}
-	}
-	s.fallbackTriggerEvents = triggers
-	maxPerHour := s.fallbackMaxPerHour
-	if maxPerHour <= 0 {
-		maxPerHour = drDefaultFallbackMaxPerHour
-	}
-	if len(s.fallbackTriggerEvents) >= maxPerHour {
-		return false
-	}
-	return true
+	return s.fallbackRateAllowed(now)
 }
 
 func (s *drReplicationSecondary) noteFallbackTriggered(reason string) {
@@ -1275,6 +1363,12 @@ func (s *drReplicationSecondary) performResnapshot(ctx context.Context, reason s
 	s.noteFallbackTriggered(reason)
 	defer s.fallbackActive.Store(false)
 	s.markReconcileActivityNow()
+	s.reconcileQueueDepth.Store(0)
+	s.reconcileRangesInflight.Store(0)
+	s.reconcileRPCBytesUsed.Store(0)
+	s.reconcileTaskRateMillis.Store(0)
+	s.reconcileDeletePhaseMS.Store(0)
+	s.reconcileBudgetRemainingByte.Store(int64(s.reconcileMaxRPCBytes))
 
 	rpcCtx, cancel := s.rpcContext(ctx)
 	checkpoint, err := s.client.RequestCheckpoint(rpcCtx, &CheckpointRequest{RelationshipId: s.relationshipID})
@@ -1296,6 +1390,52 @@ func (s *drReplicationSecondary) performResnapshot(ctx context.Context, reason s
 		fetchTimeout = drDefaultReconcileMaxWallTime
 	}
 	fetchCtx, fetchCancel := context.WithTimeout(ctx, fetchTimeout)
+	defer fetchCancel()
+
+	stallAfter := s.reconcileStallAbort
+	if stallAfter <= 0 {
+		stallAfter = 2 * time.Minute
+	}
+	var stallTriggered atomic.Bool
+	progressAt := atomic.Int64{}
+	markProgress := func() {
+		now := time.Now().UTC()
+		progressAt.Store(now.Unix())
+		s.markReconcileActivityNow()
+	}
+	markProgress()
+
+	watchdogStop := make(chan struct{})
+	defer close(watchdogStop)
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-watchdogStop:
+				return
+			case <-fetchCtx.Done():
+				return
+			case <-ticker.C:
+				last := progressAt.Load()
+				if last <= 0 {
+					continue
+				}
+				since := time.Since(time.Unix(last, 0))
+				if since >= stallAfter {
+					if stallTriggered.CompareAndSwap(false, true) {
+						s.logger.Warn("resnapshot stalled, aborting session",
+							"stall_for", since.Round(time.Second),
+							"checkpoint_id", checkpoint.CheckpointId,
+							"checkpoint_index", checkpoint.CommitIndex)
+						fetchCancel()
+					}
+					return
+				}
+			}
+		}
+	}()
+
 	stream, err := s.client.FetchEntries(fetchCtx, &FetchEntriesRequest{
 		CheckpointId:    checkpoint.CheckpointId,
 		CheckpointIndex: checkpoint.CommitIndex,
@@ -1303,16 +1443,21 @@ func (s *drReplicationSecondary) performResnapshot(ctx context.Context, reason s
 		IncludeDeletes:  true,
 	})
 	if err != nil {
-		fetchCancel()
+		if stallTriggered.Load() || errors.Is(fetchCtx.Err(), context.Canceled) {
+			return wrapReconcileFailure(drReconcileFailureStalled, "resnapshot fetch start", fmt.Errorf("no resnapshot progress for %s", stallAfter.Round(time.Second)))
+		}
 		return fmt.Errorf("failed to start resnapshot fetch: %w", err)
 	}
-	defer fetchCancel()
+	markProgress()
 
 	remoteKeys := make(map[string]struct{}, 1024)
 	applied := 0
-	applyPipeline := newDRPutApplyPipeline(ctx, s, nil)
+	applyPipeline := newDRPutApplyPipeline(fetchCtx, s, nil, markProgress)
+	pipelineClosed := false
 	defer func() {
-		_ = applyPipeline.closeAndWait()
+		if !pipelineClosed {
+			_ = applyPipeline.closeAndWait()
+		}
 	}()
 	for {
 		batch, recvErr := stream.Recv()
@@ -1320,8 +1465,15 @@ func (s *drReplicationSecondary) performResnapshot(ctx context.Context, reason s
 			break
 		}
 		if recvErr != nil {
+			if stallTriggered.Load() || errors.Is(fetchCtx.Err(), context.Canceled) {
+				return wrapReconcileFailure(drReconcileFailureStalled, "resnapshot fetch stream", fmt.Errorf("no resnapshot progress for %s", stallAfter.Round(time.Second)))
+			}
+			if errors.Is(fetchCtx.Err(), context.DeadlineExceeded) {
+				return wrapReconcileFailure(drReconcileFailureStalled, "resnapshot fetch stream", fmt.Errorf("resnapshot exceeded max wall time %s", fetchTimeout.Round(time.Second)))
+			}
 			return fmt.Errorf("resnapshot fetch stream failed: %w", recvErr)
 		}
+		markProgress()
 		if err := s.assertActiveCheckpoint(batch.GetCheckpointId(), batch.GetCheckpointIndex()); err != nil {
 			return fmt.Errorf("checkpoint conflict: %w", err)
 		}
@@ -1329,13 +1481,18 @@ func (s *drReplicationSecondary) performResnapshot(ctx context.Context, reason s
 			return fmt.Errorf("resnapshot fetch returned failed_kids: %d", len(batch.GetFailedKids()))
 		}
 		if len(batch.GetEntries()) > 0 {
+			s.reconcileRPCBytesUsed.Add(uint64(len(batch.GetEntries())) * 128)
 			entries := make([]*EntryChange, 0, len(batch.GetEntries()))
 			for _, e := range batch.GetEntries() {
 				entries = append(entries, cloneEntryChange(e))
 			}
 			if err := applyPipeline.submit(entries); err != nil {
+				if stallTriggered.Load() || errors.Is(fetchCtx.Err(), context.Canceled) {
+					return wrapReconcileFailure(drReconcileFailureStalled, "resnapshot apply queue", fmt.Errorf("no resnapshot progress for %s", stallAfter.Round(time.Second)))
+				}
 				return fmt.Errorf("resnapshot apply queue failed: %w", err)
 			}
+			markProgress()
 			applied += len(entries)
 			for _, e := range entries {
 				if e != nil && e.Key != "" {
@@ -1344,19 +1501,29 @@ func (s *drReplicationSecondary) performResnapshot(ctx context.Context, reason s
 			}
 		}
 	}
+	s.setReconcilePhase(drReconcilePhaseApplyPuts)
 	if err := applyPipeline.closeAndWait(); err != nil {
+		if stallTriggered.Load() || errors.Is(fetchCtx.Err(), context.Canceled) {
+			return wrapReconcileFailure(drReconcileFailureStalled, "resnapshot apply", fmt.Errorf("no resnapshot progress for %s", stallAfter.Round(time.Second)))
+		}
 		return fmt.Errorf("resnapshot apply failed: %w", err)
 	}
+	pipelineClosed = true
+	markProgress()
 
 	localCheckpoint := reconciler.Checkpoint{
 		ID:          checkpoint.CheckpointId,
 		CommitIndex: checkpoint.CommitIndex,
 	}
-	localSet, err := s.scanner.ScanPhysical(ctx, s.core.physical, localCheckpoint)
+	localSet, err := s.scanner.ScanPhysical(fetchCtx, s.core.physical, localCheckpoint)
 	if err != nil {
+		if stallTriggered.Load() || errors.Is(fetchCtx.Err(), context.Canceled) {
+			return wrapReconcileFailure(drReconcileFailureStalled, "resnapshot local scan", fmt.Errorf("no resnapshot progress for %s", stallAfter.Round(time.Second)))
+		}
 		s.scanFailures.Add(1)
 		return fmt.Errorf("failed to scan local state after resnapshot fetch: %w", err)
 	}
+	markProgress()
 
 	removeKeys := make([]string, 0, 256)
 	for _, key := range localSet.KIDToKey {
@@ -1369,15 +1536,26 @@ func (s *drReplicationSecondary) performResnapshot(ctx context.Context, reason s
 		removeKeys = append(removeKeys, key)
 	}
 	if len(removeKeys) > 0 {
-		if err := s.applyRemovedKeys(ctx, checkpoint.CheckpointId, checkpoint.CommitIndex, removeKeys); err != nil {
+		s.setReconcilePhase(drReconcilePhaseApplyDeletes)
+		deleteCtx, deleteCancel := context.WithTimeout(fetchCtx, stallAfter)
+		err := s.applyRemovedKeys(deleteCtx, checkpoint.CheckpointId, checkpoint.CommitIndex, removeKeys)
+		deleteCancel()
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(deleteCtx.Err(), context.DeadlineExceeded) {
+			return wrapReconcileFailure(drReconcileFailureStalled, "resnapshot delete phase", fmt.Errorf("delete phase exceeded %s", stallAfter.Round(time.Second)))
+		}
+		if err != nil {
 			return fmt.Errorf("resnapshot delete phase failed: %w", err)
 		}
+		markProgress()
 	}
 
+	s.setReconcilePhase(drReconcilePhaseFinalize)
 	s.setLastAppliedIndex(checkpoint.CommitIndex)
 	s.entriesApplied.Add(uint64(applied))
 	s.reconcileCount.Add(1)
 	s.lastReconcileAt.Store(time.Now().Unix())
+	s.reconcileQueueDepth.Store(0)
+	s.reconcileRangesInflight.Store(0)
 	s.logger.Info("resnapshot fallback complete",
 		"reason", reason,
 		"checkpoint_id", checkpoint.CheckpointId,
@@ -1923,11 +2101,13 @@ func (s *drReplicationSecondary) applyFetchedChangeWithKIDMap(ctx context.Contex
 func (s *drReplicationSecondary) runReconciliation(ctx context.Context) error {
 	s.logger.Info("starting reconciliation")
 	startTime := time.Now()
+	s.setReconcilePhase(drReconcilePhaseRangeTasks)
 	s.reconcileRPCBytesUsed.Store(0)
 	s.rangeSplitCount.Store(0)
 	s.reconcileBudgetRemainingByte.Store(int64(s.reconcileMaxRPCBytes))
 	s.reconcileQueueDepth.Store(0)
 	defer func() {
+		s.setReconcilePhase(drReconcilePhaseIdle)
 		metrics.MeasureSince([]string{"replication", "dr", "secondary", "reconciliation_duration"}, startTime)
 		metrics.IncrCounter([]string{"replication", "dr", "secondary", "reconciliation_count"}, 1)
 	}()
@@ -2059,6 +2239,7 @@ type drPutApplyPipeline struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	kidToKey  map[[32]byte]string
+	onApply   func()
 
 	shards []chan *EntryChange
 	wg     sync.WaitGroup
@@ -2068,7 +2249,7 @@ type drPutApplyPipeline struct {
 	closed bool
 }
 
-func newDRPutApplyPipeline(ctx context.Context, secondary *drReplicationSecondary, kidToKey map[[32]byte]string) *drPutApplyPipeline {
+func newDRPutApplyPipeline(ctx context.Context, secondary *drReplicationSecondary, kidToKey map[[32]byte]string, onApply func()) *drPutApplyPipeline {
 	workers := secondary.reconcileApplyWorkers
 	if workers <= 0 {
 		workers = 1
@@ -2083,6 +2264,7 @@ func newDRPutApplyPipeline(ctx context.Context, secondary *drReplicationSecondar
 		ctx:       workerCtx,
 		cancel:    cancel,
 		kidToKey:  kidToKey,
+		onApply:   onApply,
 		shards:    make([]chan *EntryChange, workers),
 	}
 	for i := 0; i < workers; i++ {
@@ -2117,11 +2299,30 @@ func (p *drPutApplyPipeline) runWorker(ch <-chan *EntryChange) {
 		if len(batch) == 0 {
 			return
 		}
+		coalesced := make([]*EntryChange, 0, len(batch))
+		putPosByKey := make(map[string]int, len(batch))
 		for _, change := range batch {
+			if change == nil {
+				continue
+			}
+			if change.OpType == string(physical.PutOperation) && change.Key != "" {
+				if pos, ok := putPosByKey[change.Key]; ok {
+					coalesced[pos] = change
+					continue
+				}
+				putPosByKey[change.Key] = len(coalesced)
+			}
+			coalesced = append(coalesced, change)
+		}
+		for _, change := range coalesced {
 			if err := p.secondary.applyFetchedChange(p.ctx, change, p.kidToKey); err != nil {
 				p.setErr(fmt.Errorf("reconcile apply worker failed: %w", err))
 				return
 			}
+		}
+		p.secondary.markReconcileApplyNow()
+		if p.onApply != nil {
+			p.onApply()
 		}
 		batch = batch[:0]
 		batchBytes = 0
@@ -2180,7 +2381,22 @@ func (p *drPutApplyPipeline) closeAndWait() error {
 	for _, ch := range chans {
 		close(ch)
 	}
-	p.wg.Wait()
+	done := make(chan struct{})
+	go func() {
+		p.wg.Wait()
+		close(done)
+	}()
+	timeout := p.secondary.reconcileStallAbort
+	if timeout <= 0 {
+		timeout = 2 * time.Minute
+	}
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		p.setErr(fmt.Errorf("apply phase exceeded %s", timeout.Round(time.Second)))
+		p.cancel()
+		return p.Err()
+	}
 	p.cancel()
 	return p.Err()
 }
@@ -2226,6 +2442,7 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 	if ownedSession {
 		defer s.endReconcileSession()
 	}
+	s.setReconcilePhase(drReconcilePhaseRangeTasks)
 	s.logger.Info("starting range-first reconciliation",
 		"checkpoint_id", checkpoint.CheckpointId,
 		"top_ranges", len(checkpoint.TopRanges),
@@ -2345,7 +2562,7 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 	updateWorkloadMetrics()
 	var ibltCellsUsed uint64
 	s.reconcileDeletePhaseMS.Store(0)
-	applyPipeline := newDRPutApplyPipeline(ctx, s, localSet.KIDToKey)
+	applyPipeline := newDRPutApplyPipeline(ctx, s, localSet.KIDToKey, s.markReconcileActivityNow)
 	defer func() {
 		_ = applyPipeline.closeAndWait()
 	}()
@@ -2496,22 +2713,36 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 		updateWorkloadMetrics()
 	}
 	workerCancel()
+	s.setReconcilePhase(drReconcilePhaseApplyPuts)
 	if err := applyPipeline.closeAndWait(); err != nil {
 		s.reconcileRangesFailed.Add(1)
-		return wrapReconcileFailure(drReconcileFailureApplyFailed, "apply pipeline", err)
+		return wrapReconcileFailure(drReconcileFailureStalled, "apply pipeline", err)
 	}
 	if len(pendingDeletes) > 0 {
+		s.setReconcilePhase(drReconcilePhaseApplyDeletes)
 		deletePhaseStart := time.Now()
 		keys := make([]string, 0, len(pendingDeletes))
 		for key := range pendingDeletes {
 			keys = append(keys, key)
 		}
-		if err := s.applyRemovedKeys(ctx, checkpoint.CheckpointId, checkpoint.CommitIndex, keys); err != nil {
+		deleteTimeout := s.reconcileStallAbort
+		if deleteTimeout <= 0 {
+			deleteTimeout = 2 * time.Minute
+		}
+		deleteCtx, cancel := context.WithTimeout(ctx, deleteTimeout)
+		err := s.applyRemovedKeys(deleteCtx, checkpoint.CheckpointId, checkpoint.CommitIndex, keys)
+		cancel()
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(deleteCtx.Err(), context.DeadlineExceeded) {
+			s.reconcileRangesFailed.Add(1)
+			return wrapReconcileFailure(drReconcileFailureStalled, "apply removed keys", fmt.Errorf("delete phase exceeded %s", deleteTimeout.Round(time.Second)))
+		}
+		if err != nil {
 			s.reconcileRangesFailed.Add(1)
 			return wrapReconcileFailure(drReconcileFailureApplyFailed, "apply removed keys", err)
 		}
 		s.reconcileDeletePhaseMS.Store(uint64(time.Since(deletePhaseStart) / time.Millisecond))
 	}
+	s.setReconcilePhase(drReconcilePhaseFinalize)
 	s.reconcileRangesInflight.Store(0)
 	s.reconcileQueueDepth.Store(0)
 	if budget.rpcBytes >= s.reconcileMaxRPCBytes {
