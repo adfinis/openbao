@@ -1103,13 +1103,33 @@ func (b *SystemBackend) handleDRSecondaryPromote(ctx context.Context, req *logic
 		return logical.ErrorResponse("DR replication not initialized"), nil
 	}
 
+	// Capture data loss metrics before promotion stops the secondary.
+	var lastAppliedIndex, lastKnownPrimaryIndex uint64
+	var estimatedDataLossEntries uint64
+	if sec := mgr.Secondary(); sec != nil {
+		lastAppliedIndex = sec.lastAppliedIndex.Load()
+		lastKnownPrimaryIndex = sec.primaryIndex.Load()
+		if lastKnownPrimaryIndex > lastAppliedIndex {
+			estimatedDataLossEntries = lastKnownPrimaryIndex - lastAppliedIndex
+		}
+	}
+
 	if err := mgr.PromoteSecondary(ctx); err != nil {
 		return logical.ErrorResponse(err.Error()), nil
 	}
 
-	return &logical.Response{
-		Data: map[string]interface{}{
-			"message": "DR secondary promoted to standalone primary",
-		},
-	}, nil
+	data := map[string]interface{}{
+		"message":                     "DR secondary promoted to standalone primary",
+		"last_applied_index":          lastAppliedIndex,
+		"last_known_primary_index":    lastKnownPrimaryIndex,
+		"estimated_data_loss_entries": estimatedDataLossEntries,
+	}
+	if estimatedDataLossEntries > 0 {
+		data["warning"] = fmt.Sprintf(
+			"approximately %d entries may not have been replicated before promotion",
+			estimatedDataLossEntries,
+		)
+	}
+
+	return &logical.Response{Data: data}, nil
 }
