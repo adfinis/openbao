@@ -68,6 +68,22 @@ type DRConfig struct {
 	// PrimaryCACert is the primary's TLS CA certificate (DER-encoded).
 	// Persisted so the secondary can re-establish mTLS after a restart.
 	PrimaryCACert []byte `json:"primary_ca_cert,omitempty"`
+
+	// Optional DR runtime tuning knobs. Zero values mean "use defaults".
+	CheckpointTTLSeconds        int64  `json:"checkpoint_ttl_seconds,omitempty"`
+	CheckpointGlobalBudgetBytes uint64 `json:"checkpoint_global_budget_bytes,omitempty"`
+	CheckpointPerRelBudgetBytes uint64 `json:"checkpoint_per_relationship_budget_bytes,omitempty"`
+	StreamBufferMaxEntries      int    `json:"stream_buffer_max_entries,omitempty"`
+	StreamBufferMaxBytes        uint64 `json:"stream_buffer_max_bytes,omitempty"`
+	ReconcileMaxRPCBytes        uint64 `json:"reconcile_max_rpc_bytes,omitempty"`
+	ReconcileMaxWallTimeSeconds int64  `json:"reconcile_max_wall_time_seconds,omitempty"`
+	ReconcileMaxInflightTasks   int    `json:"reconcile_max_inflight_tasks,omitempty"`
+	FallbackEnabled             bool   `json:"fallback_enabled,omitempty"`
+	FallbackStallSeconds        int64  `json:"fallback_stall_seconds,omitempty"`
+	FallbackFailureThreshold    int    `json:"fallback_failure_threshold,omitempty"`
+	FallbackMinLagEntries       uint64 `json:"fallback_min_lag_entries,omitempty"`
+	FallbackCooldownSeconds     int64  `json:"fallback_cooldown_seconds,omitempty"`
+	FallbackMaxPerHour          int    `json:"fallback_max_per_hour,omitempty"`
 }
 
 // DRActivationToken contains the information a secondary needs to
@@ -194,6 +210,27 @@ func newDRRelationshipManager(core *Core, logger log.Logger) *drRelationshipMana
 	}
 }
 
+func applyDRConfigDefaults(cfg *DRConfig) {
+	if cfg == nil {
+		return
+	}
+	if cfg.FallbackStallSeconds <= 0 {
+		cfg.FallbackStallSeconds = int64(drDefaultFallbackStall / time.Second)
+	}
+	if cfg.FallbackFailureThreshold <= 0 {
+		cfg.FallbackFailureThreshold = drDefaultFallbackFailureThreshold
+	}
+	if cfg.FallbackCooldownSeconds <= 0 {
+		cfg.FallbackCooldownSeconds = int64(drDefaultFallbackCooldown / time.Second)
+	}
+	if cfg.FallbackMaxPerHour <= 0 {
+		cfg.FallbackMaxPerHour = drDefaultFallbackMaxPerHour
+	}
+	if cfg.Mode != DRModeDisabled && !cfg.FallbackEnabled {
+		cfg.FallbackEnabled = drDefaultFallbackEnabled
+	}
+}
+
 // LoadConfig loads the DR configuration from storage and restores
 // the primary or secondary replication state if previously enabled.
 func (m *drRelationshipManager) LoadConfig(ctx context.Context) error {
@@ -213,6 +250,7 @@ func (m *drRelationshipManager) LoadConfig(ctx context.Context) error {
 	if err := json.Unmarshal(entry.Value, &config); err != nil {
 		return fmt.Errorf("failed to unmarshal DR config: %w", err)
 	}
+	applyDRConfigDefaults(&config)
 	m.config = &config
 
 	// Restore replication state based on persisted config.
@@ -220,6 +258,7 @@ func (m *drRelationshipManager) LoadConfig(ctx context.Context) error {
 	case DRModePrimary:
 		m.logger.Info("restoring DR primary mode from config", "cluster_id", config.ClusterID)
 		m.primary = NewDRReplicationPrimary(m.core, config.ReplSalt, m.logger)
+		m.applyPrimaryTunablesLocked()
 
 		// Re-wire the change stream hook.
 		if csb, ok := m.core.underlyingPhysical.(physical.ChangeStreamBackend); ok {
@@ -252,6 +291,7 @@ func (m *drRelationshipManager) LoadConfig(ctx context.Context) error {
 			config.RelationshipID,
 			m.logger,
 		)
+		m.applySecondaryTunablesLocked()
 
 		// Restore the primary's CA cert so mTLS works after restart.
 		if len(config.PrimaryCACert) > 0 {
@@ -301,18 +341,27 @@ func (m *drRelationshipManager) EnablePrimary(ctx context.Context) error {
 		return fmt.Errorf("failed to generate replication salt: %w", err)
 	}
 
+	oldConfig := m.config
 	m.config = &DRConfig{
 		Mode:      DRModePrimary,
 		ClusterID: clusterID,
 		ReplSalt:  replSalt,
+
+		FallbackEnabled:          drDefaultFallbackEnabled,
+		FallbackStallSeconds:     int64(drDefaultFallbackStall / time.Second),
+		FallbackFailureThreshold: drDefaultFallbackFailureThreshold,
+		FallbackCooldownSeconds:  int64(drDefaultFallbackCooldown / time.Second),
+		FallbackMaxPerHour:       drDefaultFallbackMaxPerHour,
 	}
 
 	if err := m.saveConfig(ctx); err != nil {
+		m.config = oldConfig
 		return err
 	}
 
 	// Initialize the primary-side gRPC server.
 	m.primary = NewDRReplicationPrimary(m.core, replSalt, m.logger)
+	m.applyPrimaryTunablesLocked()
 
 	// Wire up the change stream hook.
 	if csb, ok := m.core.underlyingPhysical.(physical.ChangeStreamBackend); ok {
@@ -338,8 +387,10 @@ func (m *drRelationshipManager) DisablePrimary(ctx context.Context) error {
 		return fmt.Errorf("not in DR primary mode")
 	}
 
+	oldConfig := m.config
 	m.config = &DRConfig{Mode: DRModeDisabled}
 	if err := m.saveConfig(ctx); err != nil {
+		m.config = oldConfig
 		return err
 	}
 
@@ -366,6 +417,7 @@ func (m *drRelationshipManager) EnableSecondary(ctx context.Context, token *DRAc
 		return fmt.Errorf("activation token missing relationship_id")
 	}
 
+	oldConfig := m.config
 	m.config = &DRConfig{
 		Mode:           DRModeSecondary,
 		ClusterID:      token.ClusterID,
@@ -373,9 +425,16 @@ func (m *drRelationshipManager) EnableSecondary(ctx context.Context, token *DRAc
 		ReplSalt:       token.ReplSalt,
 		PrimaryAddr:    token.PrimaryAddr,
 		PrimaryCACert:  token.CACert,
+
+		FallbackEnabled:          drDefaultFallbackEnabled,
+		FallbackStallSeconds:     int64(drDefaultFallbackStall / time.Second),
+		FallbackFailureThreshold: drDefaultFallbackFailureThreshold,
+		FallbackCooldownSeconds:  int64(drDefaultFallbackCooldown / time.Second),
+		FallbackMaxPerHour:       drDefaultFallbackMaxPerHour,
 	}
 
 	if err := m.saveConfig(ctx); err != nil {
+		m.config = oldConfig
 		return err
 	}
 
@@ -386,6 +445,7 @@ func (m *drRelationshipManager) EnableSecondary(ctx context.Context, token *DRAc
 		token.RelationshipID,
 		m.logger,
 	)
+	m.applySecondaryTunablesLocked()
 	m.secondary.primaryCACert = token.CACert
 
 	m.core.replicationState.Store(uint32(consts.ReplicationDRSecondary))
@@ -420,6 +480,13 @@ func (m *drRelationshipManager) DisableSecondary(ctx context.Context) error {
 		return fmt.Errorf("not in DR secondary mode")
 	}
 
+	oldConfig := m.config
+	m.config = &DRConfig{Mode: DRModeDisabled}
+	if err := m.saveConfig(ctx); err != nil {
+		m.config = oldConfig
+		return err
+	}
+
 	if m.secondary != nil {
 		if m.secondaryLoopCancel != nil {
 			m.secondaryLoopCancel()
@@ -427,11 +494,6 @@ func (m *drRelationshipManager) DisableSecondary(ctx context.Context) error {
 		}
 		m.secondary.Stop()
 		m.secondary = nil
-	}
-
-	m.config = &DRConfig{Mode: DRModeDisabled}
-	if err := m.saveConfig(ctx); err != nil {
-		return err
 	}
 
 	m.core.replicationState.Store(uint32(consts.ReplicationDRDisabled))
@@ -479,6 +541,8 @@ func (m *drRelationshipManager) PromoteSecondary(ctx context.Context) error {
 var drSecondaryAllowedPaths = []string{
 	"sys/replication/dr/secondary/promote",
 	"sys/replication/dr/secondary/disable",
+	"sys/replication/dr/secondary/resnapshot",
+	"sys/replication/dr/tuning",
 	"sys/replication/dr/status",
 	"sys/seal",
 	"sys/step-down",
@@ -500,6 +564,20 @@ func isDRSecondaryAllowedPath(path string) bool {
 		}
 	}
 	return false
+}
+
+func (m *drRelationshipManager) applyPrimaryTunablesLocked() {
+	if m.primary == nil || m.config == nil {
+		return
+	}
+	m.primary.applyRuntimeTuning(m.config)
+}
+
+func (m *drRelationshipManager) applySecondaryTunablesLocked() {
+	if m.secondary == nil || m.config == nil {
+		return
+	}
+	m.secondary.applyRuntimeTuning(m.config)
 }
 
 // Mode returns the current DR mode.
@@ -528,6 +606,39 @@ func (m *drRelationshipManager) Secondary() *drReplicationSecondary {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.secondary
+}
+
+// UpdateTuning updates persisted DR tuning values and applies them at runtime.
+func (m *drRelationshipManager) UpdateTuning(ctx context.Context, apply func(cfg *DRConfig) error) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.config == nil {
+		return fmt.Errorf("DR config not initialized")
+	}
+
+	previous := *m.config
+	if err := apply(m.config); err != nil {
+		return err
+	}
+	if err := m.saveConfig(ctx); err != nil {
+		*m.config = previous
+		return err
+	}
+	m.applyPrimaryTunablesLocked()
+	m.applySecondaryTunablesLocked()
+	return nil
+}
+
+// RequestSecondaryResnapshot asks the active secondary controller to perform a
+// hard-cutover resnapshot on its next reconcile cycle.
+func (m *drRelationshipManager) RequestSecondaryResnapshot(reason string) error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.config == nil || m.config.Mode != DRModeSecondary || m.secondary == nil {
+		return fmt.Errorf("not in DR secondary mode")
+	}
+	m.secondary.RequestResnapshot(reason)
+	return nil
 }
 
 // Handler returns the cluster handler (nil if not primary).

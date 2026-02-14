@@ -32,6 +32,11 @@ const (
 	drCheckpointMaxPerRelationship         = 8
 	drCheckpointTTL                        = 30 * time.Minute
 	drRangeMaxIBLTCellsPerRange            = 32768
+	drStreamBufferMaxEntries               = 10000
+	drStreamBufferMaxBytes                 = 64 << 20 // 64 MiB
+	drCheckpointThrottleBufferPct          = 85
+	drCheckpointLaggingActiveWindow        = 10 * time.Second
+	drCheckpointForceBuildInterval         = 15 * time.Second
 )
 
 // drReplicationPrimary implements the DRReplicationServer gRPC interface
@@ -55,9 +60,17 @@ type drReplicationPrimary struct {
 	bufMu        sync.RWMutex
 	changeBuffer []physical.ChangeStreamEntry
 	bufMaxSize   int
+	bufMaxBytes  uint64
+	bufBytes     uint64
 
 	// metrics
 	entriesDropped atomic.Uint64
+	scanFailures   atomic.Uint64
+	// streamLaggingSubscribers counts forced disconnects due to subscriber lag.
+	streamLaggingSubscribers atomic.Uint64
+	// streamLaggingSubscribersActive tracks recent lagging pressure in a short window.
+	streamLaggingSubscribersActive atomic.Uint64
+	streamLaggingLastEventUnix     atomic.Int64
 
 	checkpointMu                    sync.RWMutex
 	checkpoints                     map[string]*drCheckpointCacheEntry
@@ -70,12 +83,32 @@ type drReplicationPrimary struct {
 	checkpointDerivedBytes          uint64
 	checkpointEvictions             atomic.Uint64
 	checkpointAdmissionFailures     atomic.Uint64
+	checkpointThrottleTotal         atomic.Uint64
 	checkpointGlobalBudget          uint64
 	checkpointPerRelationshipBudget uint64
 	maxCheckpointsPerRelationship   int
 	rangePlanConfig                 reconciler.RangePlanConfig
+	// checkpointBuildInFlight de-amplifies parallel checkpoint requests
+	// for the same relationship.
+	checkpointBuildInFlight        map[string]*drCheckpointBuildResult
+	latestCheckpointByRelationship map[string]string
+	// checkpointLastForcedBuildByRelationship prevents permanent reconcile
+	// starvation under sustained stream pressure by allowing occasional builds.
+	checkpointLastForcedBuildByRelationship map[string]time.Time
 
-	revokedStreamsTerminated atomic.Uint64
+	revokedStreamsTerminated      atomic.Uint64
+	checkpointThrottleBypassTotal atomic.Uint64
+
+	writeRateMu            sync.Mutex
+	writeRateWindowStart   time.Time
+	writeRateWindowEntries uint64
+	writeRateEPS           float64
+}
+
+type drCheckpointBuildResult struct {
+	done chan struct{}
+	resp *CheckpointResponse
+	err  error
 }
 
 type drCheckpointCacheEntry struct {
@@ -87,7 +120,6 @@ type drCheckpointCacheEntry struct {
 	valueBytes       uint64
 	manifestBytes    uint64
 	derivedBytes     uint64
-	strataData       []byte
 	prefixDigest     *sketch.PrefixDigest
 	kidToKey         map[[32]byte]string
 	kidToVID         map[[32]byte][32]byte
@@ -115,6 +147,7 @@ func NewDRReplicationPrimary(core *Core, replSalt []byte, logger log.Logger) *dr
 	config.BuildKIDMap = true // Primary needs reverse KID -> key mapping
 	// Use metadata-first checkpoints to avoid retaining full values in cache.
 	config.BuildEntryMap = false
+	config.RequireTransactionalSnapshot = true
 	config.Logger = logger.Named("reconciler")
 	config.ExcludePaths = map[string]bool{
 		"core/keyring":                 true,
@@ -129,19 +162,23 @@ func NewDRReplicationPrimary(core *Core, replSalt []byte, logger log.Logger) *dr
 	config.ExcludePathFunc = isDRReconcileExcludedPath
 
 	return &drReplicationPrimary{
-		logger:                          logger.Named("dr-replication"),
-		scanner:                         reconciler.NewScanner(config),
-		core:                            core,
-		subscribers:                     make(map[string]*changeStreamSubscriber),
-		changeBuffer:                    make([]physical.ChangeStreamEntry, 0, 10000),
-		bufMaxSize:                      10000,
-		checkpoints:                     make(map[string]*drCheckpointCacheEntry),
-		checkpointTTL:                   drCheckpointTTL,
-		maxCheckpoints:                  16,
-		checkpointGlobalBudget:          drCheckpointGlobalBudgetBytes,
-		checkpointPerRelationshipBudget: drCheckpointPerRelationshipBudgetBytes,
-		maxCheckpointsPerRelationship:   drCheckpointMaxPerRelationship,
-		rangePlanConfig:                 reconciler.DefaultRangePlanConfig(),
+		logger:                                  logger.Named("dr-replication"),
+		scanner:                                 reconciler.NewScanner(config),
+		core:                                    core,
+		subscribers:                             make(map[string]*changeStreamSubscriber),
+		changeBuffer:                            make([]physical.ChangeStreamEntry, 0, drStreamBufferMaxEntries),
+		bufMaxSize:                              drStreamBufferMaxEntries,
+		bufMaxBytes:                             drStreamBufferMaxBytes,
+		checkpoints:                             make(map[string]*drCheckpointCacheEntry),
+		checkpointTTL:                           drCheckpointTTL,
+		maxCheckpoints:                          16,
+		checkpointGlobalBudget:                  drCheckpointGlobalBudgetBytes,
+		checkpointPerRelationshipBudget:         drCheckpointPerRelationshipBudgetBytes,
+		maxCheckpointsPerRelationship:           drCheckpointMaxPerRelationship,
+		rangePlanConfig:                         reconciler.DefaultRangePlanConfig(),
+		checkpointBuildInFlight:                 make(map[string]*drCheckpointBuildResult),
+		latestCheckpointByRelationship:          make(map[string]string),
+		checkpointLastForcedBuildByRelationship: make(map[string]time.Time),
 	}
 }
 
@@ -149,24 +186,65 @@ func NewDRReplicationPrimary(core *Core, replSalt []byte, logger log.Logger) *dr
 // mutations are applied. It distributes changes to all subscribers
 // and appends to the ring buffer.
 func (s *drReplicationPrimary) OnChange(entries []physical.ChangeStreamEntry) {
-	// Append to ring buffer.
-	s.bufMu.Lock()
+	// Filter out cluster-local keys that are never replicated.
+	replicableEntries := make([]physical.ChangeStreamEntry, 0, len(entries))
 	for _, e := range entries {
-		if len(s.changeBuffer) >= s.bufMaxSize {
-			// Drop oldest entry.
-			s.changeBuffer = s.changeBuffer[1:]
+		if isDRNeverReplicatePath(e.Key) {
+			continue
 		}
+		replicableEntries = append(replicableEntries, e)
+	}
+	if len(replicableEntries) == 0 {
+		return
+	}
+
+	// Append to ring buffer.
+	now := time.Now().UTC()
+	s.bufMu.Lock()
+	for _, e := range replicableEntries {
 		s.changeBuffer = append(s.changeBuffer, e)
+		s.bufBytes += entryChangeBytes(e)
+	}
+	for len(s.changeBuffer) > 0 && (len(s.changeBuffer) > s.bufMaxSize || s.bufBytes > s.bufMaxBytes) {
+		dropped := s.changeBuffer[0]
+		s.changeBuffer = s.changeBuffer[1:]
+		dropBytes := entryChangeBytes(dropped)
+		if dropBytes <= s.bufBytes {
+			s.bufBytes -= dropBytes
+		} else {
+			s.bufBytes = 0
+		}
 	}
 	metrics.SetGauge([]string{"replication", "dr", "stream", "entries_buffered"}, float32(len(s.changeBuffer)))
+	metrics.SetGauge([]string{"replication", "dr", "stream", "buffer_bytes"}, float32(s.bufBytes))
 	s.bufMu.Unlock()
+
+	// Update a rolling write-rate estimate used to expose stream horizon.
+	s.writeRateMu.Lock()
+	if s.writeRateWindowStart.IsZero() {
+		s.writeRateWindowStart = now
+	}
+	s.writeRateWindowEntries += uint64(len(replicableEntries))
+	window := now.Sub(s.writeRateWindowStart)
+	if window >= 5*time.Second {
+		instant := float64(s.writeRateWindowEntries) / window.Seconds()
+		if s.writeRateEPS <= 0 {
+			s.writeRateEPS = instant
+		} else {
+			// Light smoothing to keep status stable while responsive.
+			s.writeRateEPS = (s.writeRateEPS * 0.6) + (instant * 0.4)
+		}
+		s.writeRateWindowStart = now
+		s.writeRateWindowEntries = 0
+	}
+	s.writeRateMu.Unlock()
 
 	// Fan out to subscribers with backpressure.
 	s.mu.RLock()
 	metrics.SetGauge([]string{"replication", "dr", "stream", "subscribers"}, float32(len(s.subscribers)))
 	var laggingSubs []string
 	for _, sub := range s.subscribers {
-		for _, e := range entries {
+		for _, e := range replicableEntries {
 			select {
 			case sub.ch <- e:
 				// Sent successfully.
@@ -178,7 +256,9 @@ func (s *drReplicationPrimary) OnChange(entries []physical.ChangeStreamEntry) {
 				sub.cancel()
 				laggingSubs = append(laggingSubs, sub.id)
 				s.entriesDropped.Add(1)
+				s.streamLaggingSubscribers.Add(1)
 				metrics.IncrCounter([]string{"replication", "dr", "stream", "entries_dropped"}, 1)
+				metrics.IncrCounter([]string{"replication", "dr", "stream", "lagging_subscribers"}, 1)
 				break
 			}
 		}
@@ -187,11 +267,14 @@ func (s *drReplicationPrimary) OnChange(entries []physical.ChangeStreamEntry) {
 
 	// Remove lagging subscribers outside the RLock.
 	if len(laggingSubs) > 0 {
+		now := time.Now().UTC()
 		s.mu.Lock()
 		for _, id := range laggingSubs {
 			delete(s.subscribers, id)
 		}
 		s.mu.Unlock()
+		s.streamLaggingSubscribersActive.Store(uint64(len(laggingSubs)))
+		s.streamLaggingLastEventUnix.Store(now.Unix())
 	}
 }
 
@@ -213,7 +296,7 @@ func (s *drReplicationPrimary) StreamChanges(req *StreamChangesRequest, stream g
 	sub := &changeStreamSubscriber{
 		id:             subID,
 		relationshipID: req.RelationshipId,
-		ch:             make(chan physical.ChangeStreamEntry, 10000),
+		ch:             make(chan physical.ChangeStreamEntry, s.bufMaxSize),
 		cancel:         cancel,
 	}
 
@@ -233,21 +316,26 @@ func (s *drReplicationPrimary) StreamChanges(req *StreamChangesRequest, stream g
 		"last_applied_index", req.LastAppliedIndex)
 
 	// Check if the buffer can satisfy catch-up, and send buffered changes.
+	//
+	// Resume is inclusive on last_applied_index because EntryChange is emitted
+	// per storage operation while the cursor is a Raft index. A reconnect may
+	// occur after applying one operation at index N but before applying the
+	// remaining operations at the same index.
 	s.bufMu.RLock()
-	if len(s.changeBuffer) > 0 && req.LastAppliedIndex > 0 {
+	if len(s.changeBuffer) > 0 {
 		oldestIdx := s.changeBuffer[0].RaftIndex
-		missingFrom := req.LastAppliedIndex + 1
-		if missingFrom < oldestIdx {
+		resumeFrom := req.LastAppliedIndex
+		if resumeFrom < oldestIdx {
 			s.bufMu.RUnlock()
 			s.logger.Warn("buffer cannot satisfy catch-up, secondary needs reconciliation",
-				"requested_from", missingFrom,
+				"requested_from", resumeFrom,
 				"oldest_buffered", oldestIdx)
-			return status.Errorf(codes.FailedPrecondition, "buffer too old: secondary missing from %d, oldest buffered %d; reconciliation required",
-				missingFrom, oldestIdx)
+			return status.Errorf(codes.FailedPrecondition, "buffer too old: secondary missing from %d (inclusive), oldest buffered %d; reconciliation required",
+				resumeFrom, oldestIdx)
 		}
 	}
 	for _, e := range s.changeBuffer {
-		if e.RaftIndex > req.LastAppliedIndex {
+		if e.RaftIndex >= req.LastAppliedIndex {
 			if err := stream.Send(entryChangeFromPhysical(e)); err != nil {
 				s.bufMu.RUnlock()
 				return err
@@ -281,83 +369,51 @@ func (s *drReplicationPrimary) RequestCheckpoint(ctx context.Context, req *Check
 		return nil, err
 	}
 
-	checkpointID, err := uuid.GenerateUUID()
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate checkpoint ID: %w", err)
-	}
-
 	// Get current Raft commit index from the underlying backend.
 	var commitIndex uint64
 	if rb, ok := s.core.underlyingPhysical.(*raft.RaftBackend); ok {
 		commitIndex = rb.AppliedIndex()
 	}
 
-	checkpoint := reconciler.Checkpoint{
-		ID:          checkpointID,
-		CommitIndex: commitIndex,
-	}
+	for {
+		if resp, ok := s.reuseCheckpointResponse(req.RelationshipId, commitIndex); ok {
+			return resp, nil
+		}
+		if throttle, reason := s.shouldThrottleCheckpointBuild(); throttle {
+			if s.allowForcedCheckpointBuild(req.RelationshipId) {
+				s.checkpointThrottleBypassTotal.Add(1)
+				metrics.IncrCounter([]string{"replication", "dr", "checkpoint", "throttle_bypass"}, 1)
+				s.logger.Warn("overriding checkpoint throttle to preserve reconcile progress",
+					"relationship_id", req.RelationshipId,
+					"reason", reason)
+			} else {
+				s.checkpointThrottleTotal.Add(1)
+				metrics.IncrCounter([]string{"replication", "dr", "checkpoint", "throttled"}, 1)
+				s.logger.Warn("throttling checkpoint build due to stream pressure",
+					"relationship_id", req.RelationshipId,
+					"reason", reason)
+				return nil, status.Errorf(codes.FailedPrecondition, "budget_exceeded: primary stream pressure (%s); retry", reason)
+			}
+		}
 
-	rs, err := s.scanner.Scan(ctx, s.core.barrier, checkpoint)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to build checkpoint snapshot: %v", err)
-	}
-	topRanges, err := reconciler.BuildRangeManifest(rs, s.rangePlanConfig)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to build range manifest: %v", err)
-	}
+		wait, owner := s.claimCheckpointBuild(req.RelationshipId)
+		if !owner {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-wait.done:
+				if wait.err != nil {
+					return nil, wait.err
+				}
+				// Try reuse after the in-flight build completes.
+				continue
+			}
+		}
 
-	if err := s.cacheCheckpoint(&drCheckpointCacheEntry{
-		checkpoint:       checkpoint,
-		relationshipID:   req.RelationshipId,
-		createdAt:        time.Now().UTC(),
-		strataData:       rs.Strata.Marshal(),
-		prefixDigest:     rs.PrefixDigest,
-		kidToKey:         rs.KIDToKey,
-		kidToVID:         rs.KIDToVID,
-		topRanges:        topRanges,
-		rangePlanVersion: reconciler.RangePlanVersion,
-	}); err != nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "checkpoint cache pressure: %v", err)
+		resp, err := s.buildAndCacheCheckpoint(ctx, req.RelationshipId, commitIndex)
+		s.finishCheckpointBuild(req.RelationshipId, wait, resp, err)
+		return resp, err
 	}
-
-	s.logger.Info("checkpoint created",
-		"checkpoint_id", checkpointID,
-		"commit_index", commitIndex,
-		"relationship_id", req.RelationshipId,
-		"keys", rs.KeyCount)
-
-	return &CheckpointResponse{
-		CheckpointId:     checkpointID,
-		CommitIndex:      commitIndex,
-		TopRanges:        rangeDescriptorsToProto(topRanges),
-		RangePlanVersion: reconciler.RangePlanVersion,
-	}, nil
-}
-
-// ExchangeStrataEstimator implements DRReplicationServer.ExchangeStrataEstimator.
-// The secondary sends its strata estimator; the primary responds with its own.
-func (s *drReplicationPrimary) ExchangeStrataEstimator(ctx context.Context, req *StrataMessage) (*StrataMessage, error) {
-	defer metrics.MeasureSince([]string{"replication", "dr", "reconciliation", "duration"}, time.Now())
-	cp, err := s.getCheckpoint(req.CheckpointId)
-	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "checkpoint not found: %v", err)
-	}
-	if err := validateCheckpointTuple(req.CheckpointId, req.GetCheckpointIndex(), cp); err != nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "invalid checkpoint tuple: %v", err)
-	}
-	if err := s.authorizeCheckpoint(ctx, cp); err != nil {
-		return nil, err
-	}
-
-	s.logger.Info("serving strata estimator from checkpoint",
-		"checkpoint_id", req.CheckpointId,
-		"relationship_id", cp.relationshipID)
-
-	return &StrataMessage{
-		CheckpointId:    req.CheckpointId,
-		StrataData:      cp.strataData,
-		CheckpointIndex: cp.checkpoint.CommitIndex,
-	}, nil
 }
 
 // ExchangeIBLT implements DRReplicationServer.ExchangeIBLT.
@@ -405,6 +461,39 @@ func (s *drReplicationPrimary) ExchangeIBLT(ctx context.Context, req *IBLTMessag
 		Span:            req.GetSpan(),
 		CheckpointIndex: cp.checkpoint.CommitIndex,
 	}, nil
+}
+
+// ExchangeRangeDigests implements DRReplicationServer.ExchangeRangeDigests.
+// It returns digest metadata for explicit spans from an immutable checkpoint.
+func (s *drReplicationPrimary) ExchangeRangeDigests(ctx context.Context, req *RangeDigestRequest) (*RangeDigestResponse, error) {
+	cp, err := s.getCheckpoint(req.CheckpointId)
+	if err != nil {
+		return nil, status.Errorf(codes.NotFound, "checkpoint not found: %v", err)
+	}
+	if err := validateCheckpointTuple(req.CheckpointId, req.GetCheckpointIndex(), cp); err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "invalid checkpoint tuple: %v", err)
+	}
+	if err := s.authorizeCheckpoint(ctx, cp); err != nil {
+		return nil, err
+	}
+	if len(req.GetSpans()) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "at least one span is required")
+	}
+
+	spans, err := parseRangeSpans(req.GetSpans())
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid spans: %v", err)
+	}
+
+	resp := &RangeDigestResponse{
+		Ranges: make([]*RangeDigest, 0, len(spans)),
+	}
+	for _, span := range spans {
+		desc := reconciler.BuildRangeDigestFromMap(cp.kidToVID, nil, span, drRangeMaxIBLTCellsPerRange)
+		resp.Ranges = append(resp.Ranges, rangeDescriptorToProto(desc))
+	}
+
+	return resp, nil
 }
 
 // ExchangePrefixDigests implements DRReplicationServer.ExchangePrefixDigests.
@@ -711,6 +800,149 @@ func (s *drReplicationPrimary) SyncKeyring(ctx context.Context, req *SyncKeyring
 
 // --- Helpers ---
 
+func (s *drReplicationPrimary) claimCheckpointBuild(relationshipID string) (*drCheckpointBuildResult, bool) {
+	s.checkpointMu.Lock()
+	defer s.checkpointMu.Unlock()
+	if in, ok := s.checkpointBuildInFlight[relationshipID]; ok {
+		return in, false
+	}
+	in := &drCheckpointBuildResult{done: make(chan struct{})}
+	s.checkpointBuildInFlight[relationshipID] = in
+	return in, true
+}
+
+func (s *drReplicationPrimary) finishCheckpointBuild(relationshipID string, in *drCheckpointBuildResult, resp *CheckpointResponse, err error) {
+	s.checkpointMu.Lock()
+	defer s.checkpointMu.Unlock()
+	in.resp = resp
+	in.err = err
+	close(in.done)
+	delete(s.checkpointBuildInFlight, relationshipID)
+}
+
+func (s *drReplicationPrimary) reuseCheckpointResponse(relationshipID string, commitIndex uint64) (*CheckpointResponse, bool) {
+	s.checkpointMu.Lock()
+	defer s.checkpointMu.Unlock()
+
+	now := time.Now().UTC()
+	s.pruneCheckpointsLocked(now)
+
+	latestID := s.latestCheckpointByRelationship[relationshipID]
+	if latestID == "" {
+		return nil, false
+	}
+	cp, ok := s.checkpoints[latestID]
+	if !ok || cp.relationshipID != relationshipID {
+		return nil, false
+	}
+	if cp.checkpoint.CommitIndex != commitIndex {
+		return nil, false
+	}
+
+	return &CheckpointResponse{
+		CheckpointId:     cp.checkpoint.ID,
+		CommitIndex:      cp.checkpoint.CommitIndex,
+		TopRanges:        rangeDescriptorsToProto(cp.topRanges),
+		RangePlanVersion: cp.rangePlanVersion,
+	}, true
+}
+
+func (s *drReplicationPrimary) buildAndCacheCheckpoint(ctx context.Context, relationshipID string, commitIndex uint64) (*CheckpointResponse, error) {
+	checkpointID, err := uuid.GenerateUUID()
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate checkpoint ID: %w", err)
+	}
+
+	checkpoint := reconciler.Checkpoint{
+		ID:          checkpointID,
+		CommitIndex: commitIndex,
+	}
+
+	rs, err := s.scanner.Scan(ctx, s.core.barrier, checkpoint)
+	if err != nil {
+		s.scanFailures.Add(1)
+		metrics.IncrCounter([]string{"replication", "dr", "checkpoint", "scan_failures"}, 1)
+		return nil, status.Errorf(codes.Internal, "failed to build checkpoint snapshot: %v", err)
+	}
+	topRanges, err := reconciler.BuildRangeManifest(rs, s.rangePlanConfig)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to build range manifest: %v", err)
+	}
+
+	entry := &drCheckpointCacheEntry{
+		checkpoint:       checkpoint,
+		relationshipID:   relationshipID,
+		createdAt:        time.Now().UTC(),
+		prefixDigest:     rs.PrefixDigest,
+		kidToKey:         rs.KIDToKey,
+		kidToVID:         rs.KIDToVID,
+		topRanges:        topRanges,
+		rangePlanVersion: reconciler.RangePlanVersion,
+	}
+	if err := s.cacheCheckpoint(entry); err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "checkpoint cache pressure: %v", err)
+	}
+
+	s.checkpointMu.Lock()
+	s.latestCheckpointByRelationship[relationshipID] = checkpointID
+	s.checkpointMu.Unlock()
+
+	s.logger.Info("checkpoint created",
+		"checkpoint_id", checkpointID,
+		"commit_index", commitIndex,
+		"relationship_id", relationshipID,
+		"keys", rs.KeyCount)
+
+	return &CheckpointResponse{
+		CheckpointId:     checkpointID,
+		CommitIndex:      commitIndex,
+		TopRanges:        rangeDescriptorsToProto(topRanges),
+		RangePlanVersion: reconciler.RangePlanVersion,
+	}, nil
+}
+
+func (s *drReplicationPrimary) applyRuntimeTuning(cfg *DRConfig) {
+	if cfg == nil {
+		return
+	}
+
+	s.checkpointMu.Lock()
+	if cfg.CheckpointTTLSeconds > 0 {
+		s.checkpointTTL = time.Duration(cfg.CheckpointTTLSeconds) * time.Second
+	}
+	if cfg.CheckpointGlobalBudgetBytes > 0 {
+		s.checkpointGlobalBudget = cfg.CheckpointGlobalBudgetBytes
+	}
+	if cfg.CheckpointPerRelBudgetBytes > 0 {
+		s.checkpointPerRelationshipBudget = cfg.CheckpointPerRelBudgetBytes
+	}
+	s.checkpointMu.Unlock()
+
+	s.bufMu.Lock()
+	if cfg.StreamBufferMaxEntries > 0 {
+		s.bufMaxSize = cfg.StreamBufferMaxEntries
+	}
+	if cfg.StreamBufferMaxBytes > 0 {
+		s.bufMaxBytes = cfg.StreamBufferMaxBytes
+	}
+	// Re-enforce bounds after runtime update.
+	for len(s.changeBuffer) > 0 && (len(s.changeBuffer) > s.bufMaxSize || s.bufBytes > s.bufMaxBytes) {
+		dropped := s.changeBuffer[0]
+		s.changeBuffer = s.changeBuffer[1:]
+		dropBytes := entryChangeBytes(dropped)
+		if dropBytes <= s.bufBytes {
+			s.bufBytes -= dropBytes
+		} else {
+			s.bufBytes = 0
+		}
+	}
+	s.bufMu.Unlock()
+}
+
+func entryChangeBytes(e physical.ChangeStreamEntry) uint64 {
+	return uint64(len(e.Key) + len(e.Value) + 48)
+}
+
 func entryChangeFromPhysical(e physical.ChangeStreamEntry) *EntryChange {
 	return &EntryChange{
 		OpType:    string(e.OpType),
@@ -736,20 +968,24 @@ func rangeDescriptorsToProto(desc []reconciler.RangeDescriptor) []*RangeDigest {
 	}
 	out := make([]*RangeDigest, 0, len(desc))
 	for _, d := range desc {
-		out = append(out, &RangeDigest{
-			Span: &RangeSpan{
-				StartKid:   d.Span.StartKID[:],
-				EndKid:     d.Span.EndKID[:],
-				SplitDepth: d.Span.SplitDepth,
-			},
-			Count:              d.Count,
-			XorKeyHash:         d.XORKeyHash[:],
-			XorValueHash:       d.XORValueHash[:],
-			SuggestedIbltCells: d.SuggestedIBLTCells,
-			ApproxValueBytes:   d.ApproxValueBytes,
-		})
+		out = append(out, rangeDescriptorToProto(d))
 	}
 	return out
+}
+
+func rangeDescriptorToProto(d reconciler.RangeDescriptor) *RangeDigest {
+	return &RangeDigest{
+		Span: &RangeSpan{
+			StartKid:   d.Span.StartKID[:],
+			EndKid:     d.Span.EndKID[:],
+			SplitDepth: d.Span.SplitDepth,
+		},
+		Count:              d.Count,
+		XorKeyHash:         d.XORKeyHash[:],
+		XorValueHash:       d.XORValueHash[:],
+		SuggestedIbltCells: d.SuggestedIBLTCells,
+		ApproxValueBytes:   d.ApproxValueBytes,
+	}
 }
 
 func parseRangeSpan(span *RangeSpan) (reconciler.RangeSpan, bool, error) {
@@ -812,7 +1048,6 @@ func estimateCheckpointBytes(entry *drCheckpointCacheEntry) uint64 {
 	var manifestBytes uint64
 	var derivedBytes uint64
 
-	derivedBytes += uint64(len(entry.strataData))
 	if entry.prefixDigest != nil {
 		derivedBytes += uint64(entry.prefixDigest.NumBuckets()) * (8 + 32 + 32 + 16)
 	}
@@ -872,6 +1107,11 @@ func (s *drReplicationPrimary) evictCheckpointLocked(id string) {
 	}
 	s.checkpointEvictions.Add(1)
 	metrics.IncrCounter([]string{"replication", "dr", "checkpoint", "cache_evictions"}, 1)
+	if cp != nil {
+		if latest, ok := s.latestCheckpointByRelationship[cp.relationshipID]; ok && latest == id {
+			delete(s.latestCheckpointByRelationship, cp.relationshipID)
+		}
+	}
 }
 
 func (s *drReplicationPrimary) relationshipBytesLocked(relationshipID string) uint64 {
@@ -940,12 +1180,12 @@ func (s *drReplicationPrimary) cacheCheckpoint(entry *drCheckpointCacheEntry) er
 	if entry.estimatedBytes > s.checkpointPerRelationshipBudget {
 		s.checkpointAdmissionFailures.Add(1)
 		s.setCheckpointCacheGaugesLocked()
-		return fmt.Errorf("checkpoint size %d exceeds per-relationship budget %d", entry.estimatedBytes, s.checkpointPerRelationshipBudget)
+		return fmt.Errorf("size_exceeded: checkpoint size %d exceeds per-relationship budget %d", entry.estimatedBytes, s.checkpointPerRelationshipBudget)
 	}
 	if entry.estimatedBytes > s.checkpointGlobalBudget {
 		s.checkpointAdmissionFailures.Add(1)
 		s.setCheckpointCacheGaugesLocked()
-		return fmt.Errorf("checkpoint size %d exceeds global budget %d", entry.estimatedBytes, s.checkpointGlobalBudget)
+		return fmt.Errorf("size_exceeded: checkpoint size %d exceeds global budget %d", entry.estimatedBytes, s.checkpointGlobalBudget)
 	}
 
 	for s.countRelationshipCheckpointsLocked(entry.relationshipID) >= s.maxCheckpointsPerRelationship {
@@ -969,12 +1209,12 @@ func (s *drReplicationPrimary) cacheCheckpoint(entry *drCheckpointCacheEntry) er
 	if s.relationshipBytesLocked(entry.relationshipID)+entry.estimatedBytes > s.checkpointPerRelationshipBudget {
 		s.checkpointAdmissionFailures.Add(1)
 		s.setCheckpointCacheGaugesLocked()
-		return fmt.Errorf("per-relationship checkpoint budget exhausted")
+		return fmt.Errorf("per_rel_budget_exhausted: per-relationship checkpoint budget exhausted")
 	}
 	if s.checkpointBytes+entry.estimatedBytes > s.checkpointGlobalBudget {
 		s.checkpointAdmissionFailures.Add(1)
 		s.setCheckpointCacheGaugesLocked()
-		return fmt.Errorf("global checkpoint cache budget exhausted")
+		return fmt.Errorf("global_budget_exhausted: global checkpoint cache budget exhausted")
 	}
 
 	if len(s.checkpoints) >= s.maxCheckpoints {
@@ -1030,7 +1270,7 @@ func (s *drReplicationPrimary) getCheckpoint(id string) (*drCheckpointCacheEntry
 		return nil, fmt.Errorf("unknown checkpoint id %q", id)
 	}
 	if now.Sub(entry.createdAt) > s.checkpointTTL {
-		delete(s.checkpoints, id)
+		s.evictCheckpointLocked(id)
 		return nil, fmt.Errorf("checkpoint %q expired", id)
 	}
 	return entry, nil
@@ -1049,6 +1289,122 @@ func (s *drReplicationPrimary) checkpointCacheStats() (bytes uint64, items int, 
 	s.checkpointMu.RLock()
 	defer s.checkpointMu.RUnlock()
 	return s.checkpointBytes, len(s.checkpoints), s.checkpointEvictions.Load(), s.checkpointMetaBytes, s.checkpointValueBytes, s.checkpointAdmissionFailures.Load()
+}
+
+func (s *drReplicationPrimary) streamBufferStats() (entries int, bytes uint64) {
+	s.bufMu.RLock()
+	defer s.bufMu.RUnlock()
+	return len(s.changeBuffer), s.bufBytes
+}
+
+func (s *drReplicationPrimary) streamBufferLimits() (entries int, bytes uint64) {
+	s.bufMu.RLock()
+	defer s.bufMu.RUnlock()
+	return s.bufMaxSize, s.bufMaxBytes
+}
+
+func (s *drReplicationPrimary) streamBufferHorizonSeconds() int64 {
+	entries, _ := s.streamBufferStats()
+	if entries <= 0 {
+		return 0
+	}
+	s.writeRateMu.Lock()
+	eps := s.writeRateEPS
+	s.writeRateMu.Unlock()
+	if eps <= 0 {
+		return 0
+	}
+	seconds := float64(entries) / eps
+	if seconds < 0 {
+		return 0
+	}
+	return int64(seconds)
+}
+
+func (s *drReplicationPrimary) shouldThrottleCheckpointBuild() (bool, string) {
+	entries, bytes := s.streamBufferStats()
+	maxEntries, maxBytes := s.streamBufferLimits()
+	laggingActive := s.laggingSubscribersActiveCount()
+	activeSubscribers := s.subscriberCount()
+	if maxEntries <= 0 || maxBytes == 0 {
+		return false, ""
+	}
+	entryPct := (entries * 100) / maxEntries
+	bytePct := (bytes * 100) / maxBytes
+	if (entryPct >= drCheckpointThrottleBufferPct || bytePct >= drCheckpointThrottleBufferPct) &&
+		laggingActive > 0 && activeSubscribers > 0 {
+		return true, fmt.Sprintf("buffer=%d%% bytes=%d%% lagging_active=%d subscribers=%d",
+			entryPct, bytePct, laggingActive, activeSubscribers)
+	}
+	return false, ""
+}
+
+func (s *drReplicationPrimary) scanFailuresCount() uint64 {
+	return s.scanFailures.Load()
+}
+
+func (s *drReplicationPrimary) laggingSubscribersCount() uint64 {
+	return s.streamLaggingSubscribers.Load()
+}
+
+func (s *drReplicationPrimary) laggingSubscribersActiveCount() uint64 {
+	active := s.streamLaggingSubscribersActive.Load()
+	if active == 0 {
+		return 0
+	}
+	lastUnix := s.streamLaggingLastEventUnix.Load()
+	if lastUnix <= 0 {
+		return 0
+	}
+	if time.Since(time.Unix(lastUnix, 0)) > drCheckpointLaggingActiveWindow {
+		s.streamLaggingSubscribersActive.Store(0)
+		return 0
+	}
+	return active
+}
+
+func (s *drReplicationPrimary) subscriberCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.subscribers)
+}
+
+func (s *drReplicationPrimary) allowForcedCheckpointBuild(relationshipID string) bool {
+	if relationshipID == "" {
+		return false
+	}
+	now := time.Now().UTC()
+	s.checkpointMu.Lock()
+	defer s.checkpointMu.Unlock()
+	last := s.checkpointLastForcedBuildByRelationship[relationshipID]
+	if !last.IsZero() && now.Sub(last) < drCheckpointForceBuildInterval {
+		return false
+	}
+	s.checkpointLastForcedBuildByRelationship[relationshipID] = now
+	return true
+}
+
+func (s *drReplicationPrimary) checkpointThrottleCount() uint64 {
+	return s.checkpointThrottleTotal.Load()
+}
+
+func (s *drReplicationPrimary) checkpointThrottleBypassCount() uint64 {
+	return s.checkpointThrottleBypassTotal.Load()
+}
+
+func (s *drReplicationPrimary) tuningSnapshot() (checkpointTTLSeconds int64, checkpointGlobalBudget uint64, checkpointPerRelationshipBudget uint64, streamBufferMaxEntries int, streamBufferMaxBytes uint64) {
+	s.checkpointMu.RLock()
+	checkpointTTLSeconds = int64(s.checkpointTTL / time.Second)
+	checkpointGlobalBudget = s.checkpointGlobalBudget
+	checkpointPerRelationshipBudget = s.checkpointPerRelationshipBudget
+	s.checkpointMu.RUnlock()
+
+	s.bufMu.RLock()
+	streamBufferMaxEntries = s.bufMaxSize
+	streamBufferMaxBytes = s.bufMaxBytes
+	s.bufMu.RUnlock()
+
+	return
 }
 
 func (s *drReplicationPrimary) RevokeRelationship(relationshipID string) {

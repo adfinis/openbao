@@ -1309,12 +1309,20 @@ func (ns *NamespaceStore) clearNamespacePolicies(ctx context.Context, namespace 
 // header combined with the request path, returning the namespace and the
 // "trimmed" request path devoid of any namespace components.
 func (ns *NamespaceStore) ResolveNamespaceFromRequest(nsHeader, reqPath string) (*namespace.Namespace, string) {
+	if ns == nil {
+		return nil, ""
+	}
+
 	nsHeader = namespace.Canonicalize(nsHeader)
 	// Naively stack header ahead of request path.
 	reqPath = nsHeader + reqPath
 	// Find namespace that matches the longest prefix of reqPath.
 	ns.lock.RLock()
 	_, resolvedNs, trimmedPath := ns.namespacesByPath.LongestPrefix(reqPath)
+	if resolvedNs == nil {
+		ns.lock.RUnlock()
+		return nil, ""
+	}
 	resolvedNs.Tainted = resolvedNs.Tainted || ns.creationDeletionMap[resolvedNs.UUID]
 	ns.lock.RUnlock()
 

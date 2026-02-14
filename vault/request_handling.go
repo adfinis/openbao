@@ -621,7 +621,7 @@ func (c *Core) switchedLockHandleRequest(httpCtx context.Context, req *logical.R
 	if err != nil {
 		// If the above is not the case, resolve the namespace from header & request path.
 		nsHeader = namespace.HeaderFromContext(httpCtx)
-		ns, req.Path = c.namespaceStore.ResolveNamespaceFromRequest(nsHeader, req.Path)
+		ns, req.Path = c.ResolveNamespaceFromRequest(nsHeader, req.Path)
 		if ns == nil {
 			return nil, logical.CodedError(http.StatusNotFound, "namespace not found")
 		}
@@ -737,7 +737,7 @@ func (c *Core) handleInlineAuth(ctx context.Context, req *logical.Request, nsHea
 	}
 
 	var authNs *namespace.Namespace
-	authNs, authReq.Path = c.namespaceStore.ResolveNamespaceFromRequest(authNamespace[0], authReq.Path)
+	authNs, authReq.Path = c.ResolveNamespaceFromRequest(authNamespace[0], authReq.Path)
 	if authNs == nil {
 		return nil, fmt.Errorf("inline auth namespace was not found")
 	}

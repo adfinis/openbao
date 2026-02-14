@@ -442,34 +442,30 @@ func (x *RangeDigest) GetApproxValueBytes() uint64 {
 	return 0
 }
 
-// StrataMessage carries a serialized strata estimator.
-type StrataMessage struct {
-	state        protoimpl.MessageState `protogen:"open.v1"`
-	CheckpointId string                 `protobuf:"bytes,1,opt,name=checkpoint_id,json=checkpointId,proto3" json:"checkpoint_id,omitempty"`
-	// strata_data is the serialized StrataEstimator.
-	StrataData []byte `protobuf:"bytes,2,opt,name=strata_data,json=strataData,proto3" json:"strata_data,omitempty"`
-	// checkpoint_index is the primary commit index associated with this
-	// checkpoint. All reconciliation phase requests must carry the same
-	// checkpoint tuple (id + index).
-	CheckpointIndex uint64 `protobuf:"varint,3,opt,name=checkpoint_index,json=checkpointIndex,proto3" json:"checkpoint_index,omitempty"`
+// RangeDigestRequest asks the primary for digest metadata of explicit spans.
+type RangeDigestRequest struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	CheckpointId    string                 `protobuf:"bytes,1,opt,name=checkpoint_id,json=checkpointId,proto3" json:"checkpoint_id,omitempty"`
+	CheckpointIndex uint64                 `protobuf:"varint,2,opt,name=checkpoint_index,json=checkpointIndex,proto3" json:"checkpoint_index,omitempty"`
+	Spans           []*RangeSpan           `protobuf:"bytes,3,rep,name=spans,proto3" json:"spans,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
 
-func (x *StrataMessage) Reset() {
-	*x = StrataMessage{}
+func (x *RangeDigestRequest) Reset() {
+	*x = RangeDigestRequest{}
 	mi := &file_vault_dr_replication_service_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *StrataMessage) String() string {
+func (x *RangeDigestRequest) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*StrataMessage) ProtoMessage() {}
+func (*RangeDigestRequest) ProtoMessage() {}
 
-func (x *StrataMessage) ProtoReflect() protoreflect.Message {
+func (x *RangeDigestRequest) ProtoReflect() protoreflect.Message {
 	mi := &file_vault_dr_replication_service_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -481,30 +477,75 @@ func (x *StrataMessage) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use StrataMessage.ProtoReflect.Descriptor instead.
-func (*StrataMessage) Descriptor() ([]byte, []int) {
+// Deprecated: Use RangeDigestRequest.ProtoReflect.Descriptor instead.
+func (*RangeDigestRequest) Descriptor() ([]byte, []int) {
 	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{6}
 }
 
-func (x *StrataMessage) GetCheckpointId() string {
+func (x *RangeDigestRequest) GetCheckpointId() string {
 	if x != nil {
 		return x.CheckpointId
 	}
 	return ""
 }
 
-func (x *StrataMessage) GetStrataData() []byte {
-	if x != nil {
-		return x.StrataData
-	}
-	return nil
-}
-
-func (x *StrataMessage) GetCheckpointIndex() uint64 {
+func (x *RangeDigestRequest) GetCheckpointIndex() uint64 {
 	if x != nil {
 		return x.CheckpointIndex
 	}
 	return 0
+}
+
+func (x *RangeDigestRequest) GetSpans() []*RangeSpan {
+	if x != nil {
+		return x.Spans
+	}
+	return nil
+}
+
+// RangeDigestResponse returns one digest per requested span.
+type RangeDigestResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Ranges        []*RangeDigest         `protobuf:"bytes,1,rep,name=ranges,proto3" json:"ranges,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RangeDigestResponse) Reset() {
+	*x = RangeDigestResponse{}
+	mi := &file_vault_dr_replication_service_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RangeDigestResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RangeDigestResponse) ProtoMessage() {}
+
+func (x *RangeDigestResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_vault_dr_replication_service_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RangeDigestResponse.ProtoReflect.Descriptor instead.
+func (*RangeDigestResponse) Descriptor() ([]byte, []int) {
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *RangeDigestResponse) GetRanges() []*RangeDigest {
+	if x != nil {
+		return x.Ranges
+	}
+	return nil
 }
 
 // IBLTMessage carries a serialized IBLT.
@@ -526,7 +567,7 @@ type IBLTMessage struct {
 
 func (x *IBLTMessage) Reset() {
 	*x = IBLTMessage{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[7]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -538,7 +579,7 @@ func (x *IBLTMessage) String() string {
 func (*IBLTMessage) ProtoMessage() {}
 
 func (x *IBLTMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[7]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -551,7 +592,7 @@ func (x *IBLTMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use IBLTMessage.ProtoReflect.Descriptor instead.
 func (*IBLTMessage) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{7}
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *IBLTMessage) GetCheckpointId() string {
@@ -609,7 +650,7 @@ type PrefixDigestRequest struct {
 
 func (x *PrefixDigestRequest) Reset() {
 	*x = PrefixDigestRequest{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[8]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -621,7 +662,7 @@ func (x *PrefixDigestRequest) String() string {
 func (*PrefixDigestRequest) ProtoMessage() {}
 
 func (x *PrefixDigestRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[8]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -634,7 +675,7 @@ func (x *PrefixDigestRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PrefixDigestRequest.ProtoReflect.Descriptor instead.
 func (*PrefixDigestRequest) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{8}
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *PrefixDigestRequest) GetCheckpointId() string {
@@ -683,7 +724,7 @@ type PrefixDigestResponse struct {
 
 func (x *PrefixDigestResponse) Reset() {
 	*x = PrefixDigestResponse{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[9]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -695,7 +736,7 @@ func (x *PrefixDigestResponse) String() string {
 func (*PrefixDigestResponse) ProtoMessage() {}
 
 func (x *PrefixDigestResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[9]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -708,7 +749,7 @@ func (x *PrefixDigestResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PrefixDigestResponse.ProtoReflect.Descriptor instead.
 func (*PrefixDigestResponse) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{9}
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *PrefixDigestResponse) GetPrefixLength() uint32 {
@@ -738,7 +779,7 @@ type BucketDigestProto struct {
 
 func (x *BucketDigestProto) Reset() {
 	*x = BucketDigestProto{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[10]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -750,7 +791,7 @@ func (x *BucketDigestProto) String() string {
 func (*BucketDigestProto) ProtoMessage() {}
 
 func (x *BucketDigestProto) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[10]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -763,7 +804,7 @@ func (x *BucketDigestProto) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BucketDigestProto.ProtoReflect.Descriptor instead.
 func (*BucketDigestProto) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{10}
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *BucketDigestProto) GetIndex() uint32 {
@@ -808,7 +849,7 @@ type FetchItem struct {
 
 func (x *FetchItem) Reset() {
 	*x = FetchItem{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[11]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -820,7 +861,7 @@ func (x *FetchItem) String() string {
 func (*FetchItem) ProtoMessage() {}
 
 func (x *FetchItem) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[11]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -833,7 +874,7 @@ func (x *FetchItem) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FetchItem.ProtoReflect.Descriptor instead.
 func (*FetchItem) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{11}
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *FetchItem) GetKid() []byte {
@@ -879,7 +920,7 @@ type FetchEntriesRequest struct {
 
 func (x *FetchEntriesRequest) Reset() {
 	*x = FetchEntriesRequest{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[12]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -891,7 +932,7 @@ func (x *FetchEntriesRequest) String() string {
 func (*FetchEntriesRequest) ProtoMessage() {}
 
 func (x *FetchEntriesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[12]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -904,7 +945,7 @@ func (x *FetchEntriesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FetchEntriesRequest.ProtoReflect.Descriptor instead.
 func (*FetchEntriesRequest) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{12}
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *FetchEntriesRequest) GetCheckpointId() string {
@@ -980,7 +1021,7 @@ type EntryBatch struct {
 
 func (x *EntryBatch) Reset() {
 	*x = EntryBatch{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[13]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -992,7 +1033,7 @@ func (x *EntryBatch) String() string {
 func (*EntryBatch) ProtoMessage() {}
 
 func (x *EntryBatch) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[13]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1005,7 +1046,7 @@ func (x *EntryBatch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EntryBatch.ProtoReflect.Descriptor instead.
 func (*EntryBatch) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{13}
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *EntryBatch) GetEntries() []*EntryChange {
@@ -1049,7 +1090,7 @@ type DRHeartbeatRequest struct {
 
 func (x *DRHeartbeatRequest) Reset() {
 	*x = DRHeartbeatRequest{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[14]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1061,7 +1102,7 @@ func (x *DRHeartbeatRequest) String() string {
 func (*DRHeartbeatRequest) ProtoMessage() {}
 
 func (x *DRHeartbeatRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[14]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1074,7 +1115,7 @@ func (x *DRHeartbeatRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DRHeartbeatRequest.ProtoReflect.Descriptor instead.
 func (*DRHeartbeatRequest) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{14}
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *DRHeartbeatRequest) GetRelationshipId() string {
@@ -1117,7 +1158,7 @@ type DRHeartbeatResponse struct {
 
 func (x *DRHeartbeatResponse) Reset() {
 	*x = DRHeartbeatResponse{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[15]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1129,7 +1170,7 @@ func (x *DRHeartbeatResponse) String() string {
 func (*DRHeartbeatResponse) ProtoMessage() {}
 
 func (x *DRHeartbeatResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[15]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1142,7 +1183,7 @@ func (x *DRHeartbeatResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DRHeartbeatResponse.ProtoReflect.Descriptor instead.
 func (*DRHeartbeatResponse) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{15}
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *DRHeartbeatResponse) GetPrimaryIndex() uint64 {
@@ -1179,7 +1220,7 @@ type SyncKeyringRequest struct {
 
 func (x *SyncKeyringRequest) Reset() {
 	*x = SyncKeyringRequest{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[16]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1191,7 +1232,7 @@ func (x *SyncKeyringRequest) String() string {
 func (*SyncKeyringRequest) ProtoMessage() {}
 
 func (x *SyncKeyringRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[16]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1204,7 +1245,7 @@ func (x *SyncKeyringRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncKeyringRequest.ProtoReflect.Descriptor instead.
 func (*SyncKeyringRequest) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{16}
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *SyncKeyringRequest) GetRelationshipId() string {
@@ -1252,7 +1293,7 @@ type SyncKeyringResponse struct {
 
 func (x *SyncKeyringResponse) Reset() {
 	*x = SyncKeyringResponse{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[17]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1264,7 +1305,7 @@ func (x *SyncKeyringResponse) String() string {
 func (*SyncKeyringResponse) ProtoMessage() {}
 
 func (x *SyncKeyringResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[17]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1277,7 +1318,7 @@ func (x *SyncKeyringResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncKeyringResponse.ProtoReflect.Descriptor instead.
 func (*SyncKeyringResponse) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{17}
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *SyncKeyringResponse) GetKeyringEntry() []byte {
@@ -1358,12 +1399,13 @@ const file_vault_dr_replication_service_proto_rawDesc = "" +
 	"xorKeyHash\x12$\n" +
 	"\x0exor_value_hash\x18\x04 \x01(\fR\fxorValueHash\x120\n" +
 	"\x14suggested_iblt_cells\x18\x05 \x01(\rR\x12suggestedIbltCells\x12,\n" +
-	"\x12approx_value_bytes\x18\x06 \x01(\x04R\x10approxValueBytes\"\x80\x01\n" +
-	"\rStrataMessage\x12#\n" +
-	"\rcheckpoint_id\x18\x01 \x01(\tR\fcheckpointId\x12\x1f\n" +
-	"\vstrata_data\x18\x02 \x01(\fR\n" +
-	"strataData\x12)\n" +
-	"\x10checkpoint_index\x18\x03 \x01(\x04R\x0fcheckpointIndex\"\xbd\x01\n" +
+	"\x12approx_value_bytes\x18\x06 \x01(\x04R\x10approxValueBytes\"\x8c\x01\n" +
+	"\x12RangeDigestRequest\x12#\n" +
+	"\rcheckpoint_id\x18\x01 \x01(\tR\fcheckpointId\x12)\n" +
+	"\x10checkpoint_index\x18\x02 \x01(\x04R\x0fcheckpointIndex\x12&\n" +
+	"\x05spans\x18\x03 \x03(\v2\x10.vault.RangeSpanR\x05spans\"A\n" +
+	"\x13RangeDigestResponse\x12*\n" +
+	"\x06ranges\x18\x01 \x03(\v2\x12.vault.RangeDigestR\x06ranges\"\xbd\x01\n" +
 	"\vIBLTMessage\x12#\n" +
 	"\rcheckpoint_id\x18\x01 \x01(\tR\fcheckpointId\x12\x1b\n" +
 	"\tnum_cells\x18\x02 \x01(\rR\bnumCells\x12\x1b\n" +
@@ -1424,12 +1466,12 @@ const file_vault_dr_replication_service_proto_rawDesc = "" +
 	"\x17server_ephemeral_pubkey\x18\x04 \x01(\fR\x15serverEphemeralPubkey\x12\x1d\n" +
 	"\n" +
 	"wrap_nonce\x18\x05 \x01(\fR\twrapNonce\x12(\n" +
-	"\x10wrap_aad_version\x18\x06 \x01(\rR\x0ewrapAadVersion2\xc9\x04\n" +
+	"\x10wrap_aad_version\x18\x06 \x01(\rR\x0ewrapAadVersion2\xd1\x04\n" +
 	"\rDRReplication\x12D\n" +
 	"\rStreamChanges\x12\x1b.vault.StreamChangesRequest\x1a\x12.vault.EntryChange\"\x000\x01\x12J\n" +
-	"\x11RequestCheckpoint\x12\x18.vault.CheckpointRequest\x1a\x19.vault.CheckpointResponse\"\x00\x12G\n" +
-	"\x17ExchangeStrataEstimator\x12\x14.vault.StrataMessage\x1a\x14.vault.StrataMessage\"\x00\x128\n" +
-	"\fExchangeIBLT\x12\x12.vault.IBLTMessage\x1a\x12.vault.IBLTMessage\"\x00\x12R\n" +
+	"\x11RequestCheckpoint\x12\x18.vault.CheckpointRequest\x1a\x19.vault.CheckpointResponse\"\x00\x128\n" +
+	"\fExchangeIBLT\x12\x12.vault.IBLTMessage\x1a\x12.vault.IBLTMessage\"\x00\x12O\n" +
+	"\x14ExchangeRangeDigests\x12\x19.vault.RangeDigestRequest\x1a\x1a.vault.RangeDigestResponse\"\x00\x12R\n" +
 	"\x15ExchangePrefixDigests\x12\x1a.vault.PrefixDigestRequest\x1a\x1b.vault.PrefixDigestResponse\"\x00\x12A\n" +
 	"\fFetchEntries\x12\x1a.vault.FetchEntriesRequest\x1a\x11.vault.EntryBatch\"\x000\x01\x12D\n" +
 	"\tHeartbeat\x12\x19.vault.DRHeartbeatRequest\x1a\x1a.vault.DRHeartbeatResponse\"\x00\x12F\n" +
@@ -1447,7 +1489,7 @@ func file_vault_dr_replication_service_proto_rawDescGZIP() []byte {
 	return file_vault_dr_replication_service_proto_rawDescData
 }
 
-var file_vault_dr_replication_service_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
+var file_vault_dr_replication_service_proto_msgTypes = make([]protoimpl.MessageInfo, 19)
 var file_vault_dr_replication_service_proto_goTypes = []any{
 	(*EntryChange)(nil),          // 0: vault.EntryChange
 	(*StreamChangesRequest)(nil), // 1: vault.StreamChangesRequest
@@ -1455,49 +1497,52 @@ var file_vault_dr_replication_service_proto_goTypes = []any{
 	(*CheckpointResponse)(nil),   // 3: vault.CheckpointResponse
 	(*RangeSpan)(nil),            // 4: vault.RangeSpan
 	(*RangeDigest)(nil),          // 5: vault.RangeDigest
-	(*StrataMessage)(nil),        // 6: vault.StrataMessage
-	(*IBLTMessage)(nil),          // 7: vault.IBLTMessage
-	(*PrefixDigestRequest)(nil),  // 8: vault.PrefixDigestRequest
-	(*PrefixDigestResponse)(nil), // 9: vault.PrefixDigestResponse
-	(*BucketDigestProto)(nil),    // 10: vault.BucketDigestProto
-	(*FetchItem)(nil),            // 11: vault.FetchItem
-	(*FetchEntriesRequest)(nil),  // 12: vault.FetchEntriesRequest
-	(*EntryBatch)(nil),           // 13: vault.EntryBatch
-	(*DRHeartbeatRequest)(nil),   // 14: vault.DRHeartbeatRequest
-	(*DRHeartbeatResponse)(nil),  // 15: vault.DRHeartbeatResponse
-	(*SyncKeyringRequest)(nil),   // 16: vault.SyncKeyringRequest
-	(*SyncKeyringResponse)(nil),  // 17: vault.SyncKeyringResponse
+	(*RangeDigestRequest)(nil),   // 6: vault.RangeDigestRequest
+	(*RangeDigestResponse)(nil),  // 7: vault.RangeDigestResponse
+	(*IBLTMessage)(nil),          // 8: vault.IBLTMessage
+	(*PrefixDigestRequest)(nil),  // 9: vault.PrefixDigestRequest
+	(*PrefixDigestResponse)(nil), // 10: vault.PrefixDigestResponse
+	(*BucketDigestProto)(nil),    // 11: vault.BucketDigestProto
+	(*FetchItem)(nil),            // 12: vault.FetchItem
+	(*FetchEntriesRequest)(nil),  // 13: vault.FetchEntriesRequest
+	(*EntryBatch)(nil),           // 14: vault.EntryBatch
+	(*DRHeartbeatRequest)(nil),   // 15: vault.DRHeartbeatRequest
+	(*DRHeartbeatResponse)(nil),  // 16: vault.DRHeartbeatResponse
+	(*SyncKeyringRequest)(nil),   // 17: vault.SyncKeyringRequest
+	(*SyncKeyringResponse)(nil),  // 18: vault.SyncKeyringResponse
 }
 var file_vault_dr_replication_service_proto_depIdxs = []int32{
 	5,  // 0: vault.CheckpointResponse.top_ranges:type_name -> vault.RangeDigest
 	4,  // 1: vault.RangeDigest.span:type_name -> vault.RangeSpan
-	4,  // 2: vault.IBLTMessage.span:type_name -> vault.RangeSpan
-	4,  // 3: vault.PrefixDigestRequest.span:type_name -> vault.RangeSpan
-	10, // 4: vault.PrefixDigestResponse.buckets:type_name -> vault.BucketDigestProto
-	4,  // 5: vault.FetchEntriesRequest.ranges:type_name -> vault.RangeSpan
-	11, // 6: vault.FetchEntriesRequest.items:type_name -> vault.FetchItem
-	0,  // 7: vault.EntryBatch.entries:type_name -> vault.EntryChange
-	1,  // 8: vault.DRReplication.StreamChanges:input_type -> vault.StreamChangesRequest
-	2,  // 9: vault.DRReplication.RequestCheckpoint:input_type -> vault.CheckpointRequest
-	6,  // 10: vault.DRReplication.ExchangeStrataEstimator:input_type -> vault.StrataMessage
-	7,  // 11: vault.DRReplication.ExchangeIBLT:input_type -> vault.IBLTMessage
-	8,  // 12: vault.DRReplication.ExchangePrefixDigests:input_type -> vault.PrefixDigestRequest
-	12, // 13: vault.DRReplication.FetchEntries:input_type -> vault.FetchEntriesRequest
-	14, // 14: vault.DRReplication.Heartbeat:input_type -> vault.DRHeartbeatRequest
-	16, // 15: vault.DRReplication.SyncKeyring:input_type -> vault.SyncKeyringRequest
-	0,  // 16: vault.DRReplication.StreamChanges:output_type -> vault.EntryChange
-	3,  // 17: vault.DRReplication.RequestCheckpoint:output_type -> vault.CheckpointResponse
-	6,  // 18: vault.DRReplication.ExchangeStrataEstimator:output_type -> vault.StrataMessage
-	7,  // 19: vault.DRReplication.ExchangeIBLT:output_type -> vault.IBLTMessage
-	9,  // 20: vault.DRReplication.ExchangePrefixDigests:output_type -> vault.PrefixDigestResponse
-	13, // 21: vault.DRReplication.FetchEntries:output_type -> vault.EntryBatch
-	15, // 22: vault.DRReplication.Heartbeat:output_type -> vault.DRHeartbeatResponse
-	17, // 23: vault.DRReplication.SyncKeyring:output_type -> vault.SyncKeyringResponse
-	16, // [16:24] is the sub-list for method output_type
-	8,  // [8:16] is the sub-list for method input_type
-	8,  // [8:8] is the sub-list for extension type_name
-	8,  // [8:8] is the sub-list for extension extendee
-	0,  // [0:8] is the sub-list for field type_name
+	4,  // 2: vault.RangeDigestRequest.spans:type_name -> vault.RangeSpan
+	5,  // 3: vault.RangeDigestResponse.ranges:type_name -> vault.RangeDigest
+	4,  // 4: vault.IBLTMessage.span:type_name -> vault.RangeSpan
+	4,  // 5: vault.PrefixDigestRequest.span:type_name -> vault.RangeSpan
+	11, // 6: vault.PrefixDigestResponse.buckets:type_name -> vault.BucketDigestProto
+	4,  // 7: vault.FetchEntriesRequest.ranges:type_name -> vault.RangeSpan
+	12, // 8: vault.FetchEntriesRequest.items:type_name -> vault.FetchItem
+	0,  // 9: vault.EntryBatch.entries:type_name -> vault.EntryChange
+	1,  // 10: vault.DRReplication.StreamChanges:input_type -> vault.StreamChangesRequest
+	2,  // 11: vault.DRReplication.RequestCheckpoint:input_type -> vault.CheckpointRequest
+	8,  // 12: vault.DRReplication.ExchangeIBLT:input_type -> vault.IBLTMessage
+	6,  // 13: vault.DRReplication.ExchangeRangeDigests:input_type -> vault.RangeDigestRequest
+	9,  // 14: vault.DRReplication.ExchangePrefixDigests:input_type -> vault.PrefixDigestRequest
+	13, // 15: vault.DRReplication.FetchEntries:input_type -> vault.FetchEntriesRequest
+	15, // 16: vault.DRReplication.Heartbeat:input_type -> vault.DRHeartbeatRequest
+	17, // 17: vault.DRReplication.SyncKeyring:input_type -> vault.SyncKeyringRequest
+	0,  // 18: vault.DRReplication.StreamChanges:output_type -> vault.EntryChange
+	3,  // 19: vault.DRReplication.RequestCheckpoint:output_type -> vault.CheckpointResponse
+	8,  // 20: vault.DRReplication.ExchangeIBLT:output_type -> vault.IBLTMessage
+	7,  // 21: vault.DRReplication.ExchangeRangeDigests:output_type -> vault.RangeDigestResponse
+	10, // 22: vault.DRReplication.ExchangePrefixDigests:output_type -> vault.PrefixDigestResponse
+	14, // 23: vault.DRReplication.FetchEntries:output_type -> vault.EntryBatch
+	16, // 24: vault.DRReplication.Heartbeat:output_type -> vault.DRHeartbeatResponse
+	18, // 25: vault.DRReplication.SyncKeyring:output_type -> vault.SyncKeyringResponse
+	18, // [18:26] is the sub-list for method output_type
+	10, // [10:18] is the sub-list for method input_type
+	10, // [10:10] is the sub-list for extension type_name
+	10, // [10:10] is the sub-list for extension extendee
+	0,  // [0:10] is the sub-list for field type_name
 }
 
 func init() { file_vault_dr_replication_service_proto_init() }
@@ -1511,7 +1556,7 @@ func file_vault_dr_replication_service_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_vault_dr_replication_service_proto_rawDesc), len(file_vault_dr_replication_service_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   18,
+			NumMessages:   19,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

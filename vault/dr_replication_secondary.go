@@ -4,6 +4,8 @@
 package vault
 
 import (
+	"bytes"
+	"container/heap"
 	"context"
 	"crypto/ecdh"
 	"crypto/rand"
@@ -11,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,6 +42,12 @@ var drNeverReplicateExactPaths = map[string]bool{
 	"core/local-mounts":            true, // local mount table root
 	"core/local-auth":              true, // local auth mount table root
 	"core/local-audit":             true, // local audit mount table root
+	"core/lock":                    true, // local init/leadership coordination lock
+	"core/initialize-lock":         true, // local init lock state
+	"core/recovery-config":         true, // local recovery seal config
+	"core/recovery-key":            true, // local recovery key material
+	"core/cluster/local/info":      true, // local cluster identity info
+	"core/dr-replication/config":   true, // local DR manager mode/config
 }
 
 // drNeverReplicatePrefixes lists path prefixes that must never be
@@ -47,6 +56,10 @@ var drNeverReplicatePrefixes = []string{
 	"core/local-mounts/",
 	"core/local-auth/",
 	"core/local-audit/",
+	"core/cluster/local/",
+	"core/leader/",
+	"core/raft/",
+	"core/dr-replication/",
 }
 
 // drReconcileExcludeExactPaths lists storage paths excluded from
@@ -92,13 +105,14 @@ func drPathMatches(path string, exact map[string]bool, prefixes []string) bool {
 type DRSecondaryState int32
 
 const (
-	DRSecondaryIdle          DRSecondaryState = iota
-	DRSecondaryBootstrapping                  // Initial setup / token exchange
-	DRSecondaryInitialSync                    // First full sync from primary
-	DRSecondaryStreaming                      // Normal mode: receiving change stream
-	DRSecondaryReconciling                    // Recovery mode: IBLT/prefix digest reconciliation
-	DRSecondaryPromoting                      // Failover in progress
-	DRSecondaryStandalone                     // Post-promotion: now an independent primary
+	DRSecondaryIdle           DRSecondaryState = iota
+	DRSecondaryBootstrapping                   // Initial setup / token exchange
+	DRSecondaryInitialSync                     // First full sync from primary
+	DRSecondaryStreaming                       // Normal mode: receiving change stream
+	DRSecondaryReconciling                     // Recovery mode: IBLT/prefix digest reconciliation
+	DRSecondaryResnapshotting                  // Hard-cutover full copy fallback
+	DRSecondaryPromoting                       // Failover in progress
+	DRSecondaryStandalone                      // Post-promotion: now an independent primary
 )
 
 const (
@@ -106,12 +120,26 @@ const (
 	drRangeTargetValueBytes              = 8 << 20 // 8 MiB
 	drRangeMaxTopRanges                  = 256
 	drRangeMaxTotalRanges                = 1024
+	drRangeMaxOutstandingTasks           = 384
+	drRangeMaxSessionSplits              = 192
 	drRangeMaxSplitDepth                 = 6
 	drSecondaryRangeMaxIBLTCellsPerRange = 32768
 
-	drRangeMaxReconcileRPCBytes = 512 << 20
-	drRangeMaxReconcileWallTime = 30 * time.Minute
-	drRangeMaxInflightTasks     = 16
+	drDefaultReconcileMaxRPCBytes      = 128 << 20
+	drDefaultReconcileMaxWallTime      = 30 * time.Minute
+	drDefaultReconcileMaxInflightTasks = 16
+	drDefaultReconcileStallAbort       = 90 * time.Second
+	drDefaultRPCDeadline               = 30 * time.Second
+	drDefaultStreamBatchMaxEntries     = 256
+	drDefaultStreamBatchMaxBytes       = 1 << 20 // 1 MiB
+	drDefaultStreamBatchMaxWait        = 10 * time.Millisecond
+
+	drDefaultFallbackEnabled          = true
+	drDefaultFallbackStall            = 180 * time.Second
+	drDefaultFallbackFailureThreshold = 3
+	drDefaultFallbackWindow           = 10 * time.Minute
+	drDefaultFallbackCooldown         = 10 * time.Minute
+	drDefaultFallbackMaxPerHour       = 2
 )
 
 func (s DRSecondaryState) String() string {
@@ -126,6 +154,8 @@ func (s DRSecondaryState) String() string {
 		return "streaming"
 	case DRSecondaryReconciling:
 		return "reconciling"
+	case DRSecondaryResnapshotting:
+		return "resnapshotting"
 	case DRSecondaryPromoting:
 		return "promoting"
 	case DRSecondaryStandalone:
@@ -152,12 +182,16 @@ type drReplicationSecondary struct {
 	// conn is the underlying gRPC connection (for cleanup).
 	conn *grpc.ClientConn
 
+	streamMu     sync.Mutex
+	streamCancel context.CancelFunc
+
 	// state tracks the secondary's replication state.
 	state atomic.Int32
 
 	// lastAppliedIndex is the primary's Raft index of the last
 	// successfully applied entry.
 	lastAppliedIndex atomic.Uint64
+	lastAppliedAt    atomic.Int64 // unix timestamp
 
 	// relationshipID identifies this DR relationship.
 	relationshipID string
@@ -190,6 +224,9 @@ type drReplicationSecondary struct {
 	reconcileBudgetRemainingByte atomic.Int64
 	rangeSplitCount              atomic.Uint64
 	reconcileRPCBytesUsed        atomic.Uint64
+	reconcileQueueDepth          atomic.Int64
+	reconcileStalled             atomic.Uint64
+	lastReconcileActivityAt      atomic.Int64 // unix timestamp
 
 	sessionMu                  sync.RWMutex
 	activeCheckpointID         string
@@ -199,6 +236,46 @@ type drReplicationSecondary struct {
 	lastReconcileFailReason    string
 	lastRangeManifestCount     int
 	lastReconcileFailureByType map[string]uint64
+
+	// Additional heavy-load observability counters.
+	scanFailures            atomic.Uint64
+	checkpointConflicts     atomic.Uint64
+	reconcileRetries        atomic.Uint64
+	reconcileTaskRetries    atomic.Uint64
+	reconcileDecodeFailures atomic.Uint64
+
+	// Runtime tunables.
+	reconcileMaxRPCBytes      uint64
+	reconcileMaxWallTime      time.Duration
+	reconcileMaxInflightTasks int
+	reconcileStallAbort       time.Duration
+	rpcDeadline               time.Duration
+	streamBatchMaxEntries     int
+	streamBatchMaxBytes       int
+	streamBatchMaxWait        time.Duration
+
+	primaryIndex atomic.Uint64
+
+	fallbackEnabled          bool
+	fallbackStall            time.Duration
+	fallbackFailureThreshold int
+	fallbackMinLagEntries    uint64
+	fallbackCooldown         time.Duration
+	fallbackMaxPerHour       int
+	fallbackWindow           time.Duration
+	fallbackActive           atomic.Bool
+	fallbackCount            atomic.Uint64
+	fallbackLastAt           atomic.Int64
+
+	fallbackMu             sync.Mutex
+	fallbackFailureEvents  []time.Time
+	fallbackTriggerEvents  []time.Time
+	fallbackLastReason     string
+	manualResnapshotReason string
+	manualResnapshotReq    atomic.Bool
+
+	reconcileTasksHandled   atomic.Uint64
+	reconcileTaskRateMillis atomic.Uint64
 }
 
 // newDRReplicationSecondary creates a new secondary replication manager.
@@ -209,6 +286,7 @@ func newDRReplicationSecondary(core *Core, replSalt []byte, relationshipID strin
 
 	config := reconciler.DefaultScanConfig(replSalt)
 	config.BuildKIDMap = true // Secondary needs reverse KID->key mapping for deletes
+	config.RequireTransactionalSnapshot = true
 	config.Logger = logger.Named("reconciler")
 
 	// Keep exact exclusions for hot-path lookup and include predicate-based
@@ -223,7 +301,7 @@ func newDRReplicationSecondary(core *Core, replSalt []byte, relationshipID strin
 	config.ExcludePaths = excludePaths
 	config.ExcludePathFunc = isDRReconcileExcludedPath
 
-	return &drReplicationSecondary{
+	sec := &drReplicationSecondary{
 		logger:                     logger.Named("dr-secondary"),
 		core:                       core,
 		scanner:                    reconciler.NewScanner(config),
@@ -231,7 +309,25 @@ func newDRReplicationSecondary(core *Core, replSalt []byte, relationshipID strin
 		replSalt:                   replSalt,
 		stopCh:                     make(chan struct{}),
 		lastReconcileFailureByType: make(map[string]uint64),
+		reconcileMaxRPCBytes:       drDefaultReconcileMaxRPCBytes,
+		reconcileMaxWallTime:       drDefaultReconcileMaxWallTime,
+		reconcileMaxInflightTasks:  drDefaultReconcileMaxInflightTasks,
+		reconcileStallAbort:        drDefaultReconcileStallAbort,
+		rpcDeadline:                drDefaultRPCDeadline,
+		streamBatchMaxEntries:      drDefaultStreamBatchMaxEntries,
+		streamBatchMaxBytes:        drDefaultStreamBatchMaxBytes,
+		streamBatchMaxWait:         drDefaultStreamBatchMaxWait,
+		fallbackEnabled:            drDefaultFallbackEnabled,
+		fallbackStall:              drDefaultFallbackStall,
+		fallbackFailureThreshold:   drDefaultFallbackFailureThreshold,
+		fallbackCooldown:           drDefaultFallbackCooldown,
+		fallbackMaxPerHour:         drDefaultFallbackMaxPerHour,
+		fallbackWindow:             drDefaultFallbackWindow,
 	}
+	now := time.Now().UTC().Unix()
+	sec.lastAppliedAt.Store(now)
+	sec.lastReconcileActivityAt.Store(now)
+	return sec
 }
 
 // Connect establishes the gRPC connection to the primary.
@@ -297,6 +393,9 @@ func (s *drReplicationSecondary) Start(ctx context.Context) error {
 	if !s.transportReady.Load() {
 		return fmt.Errorf("DR secondary transport not initialized")
 	}
+	heartbeatCtx, heartbeatCancel := context.WithCancel(ctx)
+	defer heartbeatCancel()
+	go s.runHeartbeatLoop(heartbeatCtx)
 
 	for {
 		select {
@@ -323,6 +422,15 @@ func (s *drReplicationSecondary) Start(ctx context.Context) error {
 			if err := s.runReconciliation(ctx); err != nil {
 				s.logger.Error("initial reconciliation failed", "error", err)
 				class := s.markReconcileFailure(err)
+				s.reconcileRetries.Add(1)
+				if !s.shouldRetryReconcile(class) {
+					cooldown := s.retryCapCooldown(class)
+					s.logger.Warn("reconciliation retry cap reached; entering cooldown",
+						"class", class,
+						"cooldown", cooldown)
+					time.Sleep(cooldown)
+					continue
+				}
 				time.Sleep(s.nextReconcileRetryDelay(class))
 				continue
 			}
@@ -346,6 +454,10 @@ func (s *drReplicationSecondary) Start(ctx context.Context) error {
 			s.setState(DRSecondaryStreaming)
 
 		case DRSecondaryStreaming:
+			if requested, _ := s.consumeResnapshotRequest(); requested {
+				s.setState(DRSecondaryResnapshotting)
+				continue
+			}
 			// Connect to change stream.
 			if err := s.runStream(ctx); err != nil {
 				s.logger.Warn("change stream disconnected", "error", err)
@@ -357,10 +469,50 @@ func (s *drReplicationSecondary) Start(ctx context.Context) error {
 			}
 
 		case DRSecondaryReconciling:
+			if requested, reason := s.consumeResnapshotRequest(); requested {
+				s.setState(DRSecondaryResnapshotting)
+				s.setFallbackLastReason(reason)
+				continue
+			}
 			if err := s.runReconciliation(ctx); err != nil {
 				s.logger.Error("reconciliation failed", "error", err)
 				class := s.markReconcileFailure(err)
+				s.recordFallbackFailure(class)
+				if s.shouldTriggerFallback(class) {
+					s.logger.Warn("triggering automatic resnapshot fallback",
+						"class", class,
+						"last_applied_index", s.lastAppliedIndex.Load(),
+						"primary_index", s.primaryIndex.Load())
+					s.setFallbackLastReason(fmt.Sprintf("auto:%s", class))
+					s.setState(DRSecondaryResnapshotting)
+					continue
+				}
+				s.reconcileRetries.Add(1)
+				if !s.shouldRetryReconcile(class) {
+					cooldown := s.retryCapCooldown(class)
+					s.logger.Warn("reconciliation retry cap reached; entering cooldown",
+						"class", class,
+						"cooldown", cooldown)
+					time.Sleep(cooldown)
+					continue
+				}
 				time.Sleep(s.nextReconcileRetryDelay(class))
+				continue
+			}
+			s.markReconcileSuccess()
+			s.setState(DRSecondaryStreaming)
+
+		case DRSecondaryResnapshotting:
+			reason := s.getFallbackLastReason()
+			if reason == "" {
+				reason = "manual"
+			}
+			if err := s.performResnapshot(ctx, reason); err != nil {
+				s.logger.Error("resnapshot fallback failed", "error", err)
+				class := s.markReconcileFailure(wrapReconcileFailure(drReconcileFailureApplyFailed, "resnapshot", err))
+				s.reconcileRetries.Add(1)
+				time.Sleep(s.nextReconcileRetryDelay(class))
+				s.setState(DRSecondaryReconciling)
 				continue
 			}
 			s.markReconcileSuccess()
@@ -391,12 +543,67 @@ func (s *drReplicationSecondary) Stop() {
 	if s.conn != nil {
 		s.conn.Close()
 	}
+	s.cancelActiveStream()
 
 	// Remove the mTLS client from the cluster listener to avoid
 	// leaking a stale client after stop or promote.
 	if cl := s.core.getClusterListener(); cl != nil {
 		cl.RemoveClient(consts.DRReplicationALPN)
 	}
+}
+
+func (s *drReplicationSecondary) setActiveStreamCancel(cancel context.CancelFunc) {
+	s.streamMu.Lock()
+	defer s.streamMu.Unlock()
+	s.streamCancel = cancel
+}
+
+func (s *drReplicationSecondary) cancelActiveStream() {
+	s.streamMu.Lock()
+	cancel := s.streamCancel
+	s.streamCancel = nil
+	s.streamMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// RequestResnapshot asks the secondary loop to perform a full-copy fallback.
+func (s *drReplicationSecondary) RequestResnapshot(reason string) {
+	if reason == "" {
+		reason = "manual"
+	}
+	s.fallbackMu.Lock()
+	s.manualResnapshotReason = reason
+	s.fallbackMu.Unlock()
+	s.manualResnapshotReq.Store(true)
+	s.cancelActiveStream()
+}
+
+func (s *drReplicationSecondary) consumeResnapshotRequest() (bool, string) {
+	if !s.manualResnapshotReq.Swap(false) {
+		return false, ""
+	}
+	s.fallbackMu.Lock()
+	defer s.fallbackMu.Unlock()
+	reason := s.manualResnapshotReason
+	s.manualResnapshotReason = ""
+	if reason == "" {
+		reason = "manual"
+	}
+	return true, reason
+}
+
+func (s *drReplicationSecondary) setFallbackLastReason(reason string) {
+	s.fallbackMu.Lock()
+	s.fallbackLastReason = reason
+	s.fallbackMu.Unlock()
+}
+
+func (s *drReplicationSecondary) getFallbackLastReason() string {
+	s.fallbackMu.Lock()
+	defer s.fallbackMu.Unlock()
+	return s.fallbackLastReason
 }
 
 // Promote transitions the secondary to a standalone primary.
@@ -530,11 +737,58 @@ func (s *drReplicationSecondary) setState(state DRSecondaryState) {
 	}
 }
 
+func (s *drReplicationSecondary) setLastAppliedIndex(index uint64) {
+	s.lastAppliedIndex.Store(index)
+	s.lastAppliedAt.Store(time.Now().UTC().Unix())
+}
+
+func (s *drReplicationSecondary) markReconcileActivityNow() {
+	s.lastReconcileActivityAt.Store(time.Now().UTC().Unix())
+}
+
+func (s *drReplicationSecondary) reconcileStuckSeconds(now time.Time) int64 {
+	lastActivity := s.lastReconcileActivityAt.Load()
+	if lastActivity <= 0 {
+		return 0
+	}
+	secs := int64(now.Sub(time.Unix(lastActivity, 0)).Seconds())
+	if secs < 0 {
+		return 0
+	}
+	return secs
+}
+
+func (s *drReplicationSecondary) isReconcileStalled(now time.Time) (bool, time.Duration) {
+	stallAfter := s.reconcileStallAbort
+	if stallAfter <= 0 {
+		return false, 0
+	}
+	lastActivity := s.lastReconcileActivityAt.Load()
+	if lastActivity <= 0 {
+		return false, 0
+	}
+	since := now.Sub(time.Unix(lastActivity, 0))
+	return since >= stallAfter, since
+}
+
 // Status returns a snapshot of the secondary's replication status.
 func (s *drReplicationSecondary) Status() DRSecondaryStatus {
 	remaining := s.reconcileBudgetRemainingByte.Load()
 	if remaining < 0 {
 		remaining = 0
+	}
+	now := time.Now().UTC()
+	lastAppliedAt := s.lastAppliedAt.Load()
+	lastAppliedAgeSeconds := int64(0)
+	if lastAppliedAt > 0 {
+		lastAppliedAgeSeconds = int64(now.Sub(time.Unix(lastAppliedAt, 0)).Seconds())
+		if lastAppliedAgeSeconds < 0 {
+			lastAppliedAgeSeconds = 0
+		}
+	}
+	reconcileStuckSeconds := int64(0)
+	if s.State() == DRSecondaryReconciling {
+		reconcileStuckSeconds = s.reconcileStuckSeconds(now)
 	}
 	s.sessionMu.RLock()
 	activeID := s.activeCheckpointID
@@ -542,9 +796,12 @@ func (s *drReplicationSecondary) Status() DRSecondaryStatus {
 	failReason := s.lastReconcileFailReason
 	rangeManifestCount := s.lastRangeManifestCount
 	s.sessionMu.RUnlock()
+	fallbackLastAt := time.Unix(s.fallbackLastAt.Load(), 0)
+	taskRate := float64(s.reconcileTaskRateMillis.Load()) / 1000.0
 	return DRSecondaryStatus{
 		State:                          s.State().String(),
 		RelationshipID:                 s.relationshipID,
+		PrimaryIndex:                   s.primaryIndex.Load(),
 		LastAppliedIndex:               s.lastAppliedIndex.Load(),
 		EntriesApplied:                 s.entriesApplied.Load(),
 		ReconcileCount:                 s.reconcileCount.Load(),
@@ -560,6 +817,26 @@ func (s *drReplicationSecondary) Status() DRSecondaryStatus {
 		RangeManifestCount:             rangeManifestCount,
 		RangeSplitCount:                s.rangeSplitCount.Load(),
 		ReconcileRPCBytesUsed:          s.reconcileRPCBytesUsed.Load(),
+		ScanFailuresTotal:              s.scanFailures.Load(),
+		CheckpointConflictsTotal:       s.checkpointConflicts.Load(),
+		ReconcileRetriesTotal:          s.reconcileRetries.Load(),
+		ReconcileQueueDepth:            s.reconcileQueueDepth.Load(),
+		ReconcileTaskRetriesTotal:      s.reconcileTaskRetries.Load(),
+		ReconcileDecodeFailuresTotal:   s.reconcileDecodeFailures.Load(),
+		ReconcileStalledTotal:          s.reconcileStalled.Load(),
+		ReconcileStuckSeconds:          reconcileStuckSeconds,
+		LastAppliedAgeSeconds:          lastAppliedAgeSeconds,
+		ReconcileMaxRPCBytes:           s.reconcileMaxRPCBytes,
+		ReconcileMaxWallTimeSeconds:    int64(s.reconcileMaxWallTime / time.Second),
+		ReconcileMaxInflightTasks:      s.reconcileMaxInflightTasks,
+		StreamBatchMaxEntries:          s.streamBatchMaxEntries,
+		StreamBatchMaxBytes:            s.streamBatchMaxBytes,
+		StreamBatchMaxWaitMilliseconds: int64(s.streamBatchMaxWait / time.Millisecond),
+		FallbackActive:                 s.fallbackActive.Load(),
+		FallbackCount:                  s.fallbackCount.Load(),
+		FallbackLastReason:             s.getFallbackLastReason(),
+		FallbackLastAt:                 fallbackLastAt,
+		ReconcileTaskRate:              taskRate,
 	}
 }
 
@@ -567,6 +844,7 @@ func (s *drReplicationSecondary) Status() DRSecondaryStatus {
 type DRSecondaryStatus struct {
 	State                          string
 	RelationshipID                 string
+	PrimaryIndex                   uint64
 	LastAppliedIndex               uint64
 	EntriesApplied                 uint64
 	ReconcileCount                 uint64
@@ -582,6 +860,342 @@ type DRSecondaryStatus struct {
 	RangeManifestCount             int
 	RangeSplitCount                uint64
 	ReconcileRPCBytesUsed          uint64
+	ScanFailuresTotal              uint64
+	CheckpointConflictsTotal       uint64
+	ReconcileRetriesTotal          uint64
+	ReconcileQueueDepth            int64
+	ReconcileTaskRetriesTotal      uint64
+	ReconcileDecodeFailuresTotal   uint64
+	ReconcileStalledTotal          uint64
+	ReconcileStuckSeconds          int64
+	LastAppliedAgeSeconds          int64
+	ReconcileMaxRPCBytes           uint64
+	ReconcileMaxWallTimeSeconds    int64
+	ReconcileMaxInflightTasks      int
+	StreamBatchMaxEntries          int
+	StreamBatchMaxBytes            int
+	StreamBatchMaxWaitMilliseconds int64
+	FallbackActive                 bool
+	FallbackCount                  uint64
+	FallbackLastReason             string
+	FallbackLastAt                 time.Time
+	ReconcileTaskRate              float64
+}
+
+func (s *drReplicationSecondary) applyRuntimeTuning(cfg *DRConfig) {
+	if cfg == nil {
+		return
+	}
+	// Bool needs an explicit default; keep existing if config did not
+	// set any fallback fields and fallback_enabled is false-by-zero.
+	if cfg.FallbackEnabled || cfg.FallbackStallSeconds > 0 || cfg.FallbackFailureThreshold > 0 || cfg.FallbackMinLagEntries > 0 || cfg.FallbackCooldownSeconds > 0 || cfg.FallbackMaxPerHour > 0 {
+		s.fallbackEnabled = cfg.FallbackEnabled
+	}
+	if cfg.ReconcileMaxRPCBytes > 0 {
+		s.reconcileMaxRPCBytes = cfg.ReconcileMaxRPCBytes
+	}
+	if cfg.ReconcileMaxWallTimeSeconds > 0 {
+		s.reconcileMaxWallTime = time.Duration(cfg.ReconcileMaxWallTimeSeconds) * time.Second
+	}
+	if cfg.ReconcileMaxInflightTasks > 0 {
+		s.reconcileMaxInflightTasks = cfg.ReconcileMaxInflightTasks
+	}
+	if cfg.ReconcileMaxWallTimeSeconds > 0 {
+		// Stall abort should remain below wall-time to force controlled rollover.
+		wall := time.Duration(cfg.ReconcileMaxWallTimeSeconds) * time.Second
+		if wall > 0 {
+			stall := wall / 3
+			if stall < 30*time.Second {
+				stall = 30 * time.Second
+			}
+			if stall > 2*time.Minute {
+				stall = 2 * time.Minute
+			}
+			s.reconcileStallAbort = stall
+		}
+	}
+	if cfg.FallbackStallSeconds > 0 {
+		s.fallbackStall = time.Duration(cfg.FallbackStallSeconds) * time.Second
+	}
+	if cfg.FallbackFailureThreshold > 0 {
+		s.fallbackFailureThreshold = cfg.FallbackFailureThreshold
+	}
+	if cfg.FallbackMinLagEntries > 0 {
+		s.fallbackMinLagEntries = cfg.FallbackMinLagEntries
+	}
+	if cfg.FallbackCooldownSeconds > 0 {
+		s.fallbackCooldown = time.Duration(cfg.FallbackCooldownSeconds) * time.Second
+	}
+	if cfg.FallbackMaxPerHour > 0 {
+		s.fallbackMaxPerHour = cfg.FallbackMaxPerHour
+	}
+}
+
+func (s *drReplicationSecondary) rpcContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	deadline := s.rpcDeadline
+	if deadline <= 0 {
+		deadline = drDefaultRPCDeadline
+	}
+	return context.WithTimeout(ctx, deadline)
+}
+
+func (s *drReplicationSecondary) runHeartbeatLoop(ctx context.Context) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+		}
+
+		if s.client == nil {
+			continue
+		}
+		rpcCtx, cancel := s.rpcContext(ctx)
+		resp, err := s.client.Heartbeat(rpcCtx, &DRHeartbeatRequest{
+			RelationshipId: s.relationshipID,
+			AppliedIndex:   s.lastAppliedIndex.Load(),
+		})
+		cancel()
+		if err != nil || resp == nil {
+			continue
+		}
+		s.primaryIndex.Store(resp.PrimaryIndex)
+	}
+}
+
+func (s *drReplicationSecondary) recordFallbackFailure(class drReconcileFailureClass) {
+	switch class {
+	case drReconcileFailureBudgetExceeded, drReconcileFailureStalled, drReconcileFailureDecodeExhausted:
+	default:
+		return
+	}
+	now := time.Now().UTC()
+	window := s.fallbackWindow
+	if window <= 0 {
+		window = drDefaultFallbackWindow
+	}
+
+	s.fallbackMu.Lock()
+	defer s.fallbackMu.Unlock()
+	cutoff := now.Add(-window)
+	dst := s.fallbackFailureEvents[:0]
+	for _, ts := range s.fallbackFailureEvents {
+		if ts.After(cutoff) {
+			dst = append(dst, ts)
+		}
+	}
+	s.fallbackFailureEvents = append(dst, now)
+}
+
+func (s *drReplicationSecondary) shouldTriggerFallback(class drReconcileFailureClass) bool {
+	if !s.fallbackEnabled {
+		return false
+	}
+	switch class {
+	case drReconcileFailureBudgetExceeded, drReconcileFailureStalled, drReconcileFailureDecodeExhausted:
+	default:
+		return false
+	}
+
+	now := time.Now().UTC()
+	stall := s.fallbackStall
+	if stall <= 0 {
+		stall = drDefaultFallbackStall
+	}
+	lastAppliedAt := s.lastAppliedAt.Load()
+	if lastAppliedAt > 0 && now.Sub(time.Unix(lastAppliedAt, 0)) < stall {
+		return false
+	}
+
+	primary := s.primaryIndex.Load()
+	local := s.lastAppliedIndex.Load()
+	if primary <= local {
+		return false
+	}
+	lag := primary - local
+	minLag := s.fallbackMinLagEntries
+	if minLag == 0 {
+		minLag = uint64(2 * drStreamBufferMaxEntries)
+	}
+	if lag < minLag {
+		return false
+	}
+
+	s.fallbackMu.Lock()
+	defer s.fallbackMu.Unlock()
+	window := s.fallbackWindow
+	if window <= 0 {
+		window = drDefaultFallbackWindow
+	}
+	cutoff := now.Add(-window)
+	failures := s.fallbackFailureEvents[:0]
+	for _, ts := range s.fallbackFailureEvents {
+		if ts.After(cutoff) {
+			failures = append(failures, ts)
+		}
+	}
+	s.fallbackFailureEvents = failures
+	threshold := s.fallbackFailureThreshold
+	if threshold <= 0 {
+		threshold = drDefaultFallbackFailureThreshold
+	}
+	if len(s.fallbackFailureEvents) < threshold {
+		return false
+	}
+
+	cooldown := s.fallbackCooldown
+	if cooldown <= 0 {
+		cooldown = drDefaultFallbackCooldown
+	}
+	lastFallbackAt := s.fallbackLastAt.Load()
+	if lastFallbackAt > 0 && now.Sub(time.Unix(lastFallbackAt, 0)) < cooldown {
+		return false
+	}
+
+	hourCutoff := now.Add(-1 * time.Hour)
+	triggers := s.fallbackTriggerEvents[:0]
+	for _, ts := range s.fallbackTriggerEvents {
+		if ts.After(hourCutoff) {
+			triggers = append(triggers, ts)
+		}
+	}
+	s.fallbackTriggerEvents = triggers
+	maxPerHour := s.fallbackMaxPerHour
+	if maxPerHour <= 0 {
+		maxPerHour = drDefaultFallbackMaxPerHour
+	}
+	if len(s.fallbackTriggerEvents) >= maxPerHour {
+		return false
+	}
+	return true
+}
+
+func (s *drReplicationSecondary) noteFallbackTriggered(reason string) {
+	now := time.Now().UTC()
+	s.fallbackActive.Store(true)
+	s.fallbackCount.Add(1)
+	s.fallbackLastAt.Store(now.Unix())
+	s.setFallbackLastReason(reason)
+
+	s.fallbackMu.Lock()
+	s.fallbackTriggerEvents = append(s.fallbackTriggerEvents, now)
+	s.fallbackMu.Unlock()
+}
+
+func (s *drReplicationSecondary) performResnapshot(ctx context.Context, reason string) error {
+	if reason == "" {
+		reason = "manual"
+	}
+	s.noteFallbackTriggered(reason)
+	defer s.fallbackActive.Store(false)
+	s.markReconcileActivityNow()
+
+	rpcCtx, cancel := s.rpcContext(ctx)
+	checkpoint, err := s.client.RequestCheckpoint(rpcCtx, &CheckpointRequest{RelationshipId: s.relationshipID})
+	cancel()
+	if err != nil {
+		return fmt.Errorf("failed to request checkpoint for resnapshot: %w", err)
+	}
+
+	s.beginReconcileSession(checkpoint.CheckpointId, checkpoint.CommitIndex, len(checkpoint.GetTopRanges()))
+	defer s.endReconcileSession()
+
+	full := reconciler.RangeSpan{}
+	for i := range full.EndKID {
+		full.EndKID[i] = 0xff
+	}
+
+	fetchTimeout := s.reconcileMaxWallTime
+	if fetchTimeout <= 0 {
+		fetchTimeout = drDefaultReconcileMaxWallTime
+	}
+	fetchCtx, fetchCancel := context.WithTimeout(ctx, fetchTimeout)
+	stream, err := s.client.FetchEntries(fetchCtx, &FetchEntriesRequest{
+		CheckpointId:    checkpoint.CheckpointId,
+		CheckpointIndex: checkpoint.CommitIndex,
+		Ranges:          []*RangeSpan{rangeSpanToProto(full)},
+		IncludeDeletes:  true,
+	})
+	if err != nil {
+		fetchCancel()
+		return fmt.Errorf("failed to start resnapshot fetch: %w", err)
+	}
+	defer fetchCancel()
+
+	remoteKeys := make(map[string]struct{}, 1024)
+	applied := 0
+	for {
+		batch, recvErr := stream.Recv()
+		if recvErr == io.EOF {
+			break
+		}
+		if recvErr != nil {
+			return fmt.Errorf("resnapshot fetch stream failed: %w", recvErr)
+		}
+		if err := s.assertActiveCheckpoint(batch.GetCheckpointId(), batch.GetCheckpointIndex()); err != nil {
+			return fmt.Errorf("checkpoint conflict: %w", err)
+		}
+		if len(batch.GetFailedKids()) > 0 {
+			return fmt.Errorf("resnapshot fetch returned failed_kids: %d", len(batch.GetFailedKids()))
+		}
+		if len(batch.GetEntries()) > 0 {
+			entries := make([]*EntryChange, 0, len(batch.GetEntries()))
+			for _, e := range batch.GetEntries() {
+				entries = append(entries, cloneEntryChange(e))
+			}
+			if err := s.applyFetchedEntriesDeterministic(ctx, nil, entries); err != nil {
+				return fmt.Errorf("resnapshot apply failed: %w", err)
+			}
+			applied += len(entries)
+			for _, e := range entries {
+				if e != nil && e.Key != "" {
+					remoteKeys[e.Key] = struct{}{}
+				}
+			}
+		}
+	}
+
+	localCheckpoint := reconciler.Checkpoint{
+		ID:          checkpoint.CheckpointId,
+		CommitIndex: checkpoint.CommitIndex,
+	}
+	localSet, err := s.scanner.Scan(ctx, s.core.barrier, localCheckpoint)
+	if err != nil {
+		s.scanFailures.Add(1)
+		return fmt.Errorf("failed to scan local state after resnapshot fetch: %w", err)
+	}
+
+	removeKeys := make([]string, 0, 256)
+	for _, key := range localSet.KIDToKey {
+		if key == "" || isDRNeverReplicatePath(key) {
+			continue
+		}
+		if _, ok := remoteKeys[key]; ok {
+			continue
+		}
+		removeKeys = append(removeKeys, key)
+	}
+	if len(removeKeys) > 0 {
+		if err := s.applyRemovedKeys(ctx, checkpoint.CheckpointId, checkpoint.CommitIndex, removeKeys); err != nil {
+			return fmt.Errorf("resnapshot delete phase failed: %w", err)
+		}
+	}
+
+	s.setLastAppliedIndex(checkpoint.CommitIndex)
+	s.entriesApplied.Add(uint64(applied))
+	s.reconcileCount.Add(1)
+	s.lastReconcileAt.Store(time.Now().Unix())
+	s.logger.Info("resnapshot fallback complete",
+		"reason", reason,
+		"checkpoint_id", checkpoint.CheckpointId,
+		"checkpoint_index", checkpoint.CommitIndex,
+		"applied_entries", applied,
+		"removed_entries", len(removeKeys))
+	return nil
 }
 
 // --- Keyring bootstrap ---
@@ -808,7 +1422,14 @@ func (s *drReplicationSecondary) runStream(ctx context.Context) error {
 	s.logger.Info("starting change stream",
 		"last_applied_index", s.lastAppliedIndex.Load())
 
-	stream, err := s.client.StreamChanges(ctx, &StreamChangesRequest{
+	streamCtx, streamCancel := context.WithCancel(ctx)
+	s.setActiveStreamCancel(streamCancel)
+	defer func() {
+		streamCancel()
+		s.setActiveStreamCancel(nil)
+	}()
+
+	stream, err := s.client.StreamChanges(streamCtx, &StreamChangesRequest{
 		RelationshipId:   s.relationshipID,
 		LastAppliedIndex: s.lastAppliedIndex.Load(),
 	})
@@ -816,35 +1437,56 @@ func (s *drReplicationSecondary) runStream(ctx context.Context) error {
 		return fmt.Errorf("failed to open change stream: %w", err)
 	}
 
-	// Track the expected next index for gap detection.
-	expectedNext := s.lastAppliedIndex.Load() + 1
+	applyQueueSize := s.streamBatchMaxEntries * 4
+	if applyQueueSize < 1024 {
+		applyQueueSize = 1024
+	}
+	applyCh := make(chan *EntryChange, applyQueueSize)
+	applyErrCh := make(chan error, 1)
+	go func() {
+		applyErrCh <- s.runStreamApplyWorker(ctx, applyCh)
+	}()
 
+	expectedNext := s.lastAppliedIndex.Load() + 1
 	for {
 		select {
 		case <-ctx.Done():
+			close(applyCh)
+			<-applyErrCh
 			return ctx.Err()
 		case <-s.stopCh:
+			close(applyCh)
+			<-applyErrCh
+			return nil
+		case err := <-applyErrCh:
+			if err != nil {
+				return fmt.Errorf("stream apply worker failed: %w", err)
+			}
 			return nil
 		default:
 		}
 
 		change, err := stream.Recv()
 		if err == io.EOF {
+			close(applyCh)
+			if applyErr := <-applyErrCh; applyErr != nil {
+				return fmt.Errorf("change stream ended with apply error: %w", applyErr)
+			}
 			return fmt.Errorf("change stream ended")
 		}
 		if err != nil {
+			close(applyCh)
+			if applyErr := <-applyErrCh; applyErr != nil {
+				return fmt.Errorf("change stream error: %v (apply worker: %w)", err, applyErr)
+			}
 			return fmt.Errorf("change stream error: %w", err)
-		}
-
-		current := s.lastAppliedIndex.Load()
-		if change.RaftIndex < current {
-			// Stale delivery on reconnect/buffer replay.
-			continue
 		}
 
 		// Gap detection: if we receive an index higher than expected,
 		// entries were dropped. Fall back to reconciliation.
 		if change.RaftIndex > expectedNext {
+			close(applyCh)
+			_ = <-applyErrCh
 			s.logger.Warn("gap detected in change stream, falling back to reconciliation",
 				"expected_index", expectedNext,
 				"received_index", change.RaftIndex,
@@ -854,17 +1496,85 @@ func (s *drReplicationSecondary) runStream(ctx context.Context) error {
 				expectedNext, change.RaftIndex)
 		}
 
+		if next := change.RaftIndex + 1; next > expectedNext {
+			expectedNext = next
+		}
+
+		select {
+		case applyCh <- change:
+		default:
+			close(applyCh)
+			_ = <-applyErrCh
+			return fmt.Errorf("change stream apply queue full (capacity=%d); reconciliation required", cap(applyCh))
+		}
+	}
+}
+
+func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, applyCh <-chan *EntryChange) error {
+	maxEntries := s.streamBatchMaxEntries
+	if maxEntries <= 0 {
+		maxEntries = drDefaultStreamBatchMaxEntries
+	}
+	maxBytes := s.streamBatchMaxBytes
+	if maxBytes <= 0 {
+		maxBytes = drDefaultStreamBatchMaxBytes
+	}
+	maxWait := s.streamBatchMaxWait
+	if maxWait <= 0 {
+		maxWait = drDefaultStreamBatchMaxWait
+	}
+
+	batch := make([]*EntryChange, 0, maxEntries)
+	batchBytes := 0
+	ticker := time.NewTicker(maxWait)
+	defer ticker.Stop()
+
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
 		applyStart := time.Now()
-		if err := s.applyStreamChange(ctx, change); err != nil {
-			return fmt.Errorf("failed to apply change: %w", err)
+		for _, change := range batch {
+			current := s.lastAppliedIndex.Load()
+			if change.RaftIndex < current {
+				continue
+			}
+			if err := s.applyStreamChange(ctx, change); err != nil {
+				return fmt.Errorf("failed to apply change: %w", err)
+			}
+			s.setLastAppliedIndex(change.RaftIndex)
+			s.entriesApplied.Add(1)
+			metrics.IncrCounter([]string{"replication", "dr", "secondary", "entries_applied"}, 1)
+			metrics.SetGauge([]string{"replication", "dr", "secondary", "last_applied_index"}, float32(change.RaftIndex))
 		}
 		metrics.MeasureSince([]string{"replication", "dr", "secondary", "apply_latency"}, applyStart)
+		batch = batch[:0]
+		batchBytes = 0
+		return nil
+	}
 
-		s.lastAppliedIndex.Store(change.RaftIndex)
-		s.entriesApplied.Add(1)
-		metrics.IncrCounter([]string{"replication", "dr", "secondary", "entries_applied"}, 1)
-		metrics.SetGauge([]string{"replication", "dr", "secondary", "last_applied_index"}, float32(change.RaftIndex))
-		expectedNext = change.RaftIndex + 1
+	for {
+		select {
+		case <-ctx.Done():
+			return flush()
+		case <-s.stopCh:
+			return flush()
+		case <-ticker.C:
+			if err := flush(); err != nil {
+				return err
+			}
+		case change, ok := <-applyCh:
+			if !ok {
+				return flush()
+			}
+			batch = append(batch, change)
+			batchBytes += int(len(change.Key) + len(change.Value) + 48)
+			if len(batch) >= maxEntries || batchBytes >= maxBytes {
+				if err := flush(); err != nil {
+					return err
+				}
+			}
+		}
 	}
 }
 
@@ -1026,16 +1736,19 @@ func (s *drReplicationSecondary) runReconciliation(ctx context.Context) error {
 	startTime := time.Now()
 	s.reconcileRPCBytesUsed.Store(0)
 	s.rangeSplitCount.Store(0)
-	s.reconcileBudgetRemainingByte.Store(int64(drRangeMaxReconcileRPCBytes))
+	s.reconcileBudgetRemainingByte.Store(int64(s.reconcileMaxRPCBytes))
+	s.reconcileQueueDepth.Store(0)
 	defer func() {
 		metrics.MeasureSince([]string{"replication", "dr", "secondary", "reconciliation_duration"}, startTime)
 		metrics.IncrCounter([]string{"replication", "dr", "secondary", "reconciliation_count"}, 1)
 	}()
 
 	// Step 1: Request a checkpoint from the primary.
-	checkpoint, err := s.client.RequestCheckpoint(ctx, &CheckpointRequest{
+	rpcCtx, cancel := s.rpcContext(ctx)
+	checkpoint, err := s.client.RequestCheckpoint(rpcCtx, &CheckpointRequest{
 		RelationshipId: s.relationshipID,
 	})
+	cancel()
 	if err != nil {
 		return fmt.Errorf("failed to request checkpoint: %w", err)
 	}
@@ -1052,129 +1765,71 @@ func (s *drReplicationSecondary) runReconciliation(ctx context.Context) error {
 	}
 	localSet, err := s.scanner.Scan(ctx, s.core.barrier, localCheckpoint)
 	if err != nil {
+		s.scanFailures.Add(1)
 		return fmt.Errorf("failed to scan local storage: %w", err)
 	}
 	s.logger.Info("local scan complete", "keys", localSet.KeyCount)
 
-	// Range-first reconciliation path (primary advertises deterministic
-	// top-level ranges). Falls back to legacy global strata/IBLT flow when
-	// top_ranges are not provided.
-	if len(checkpoint.GetTopRanges()) > 0 {
-		if err := s.runRangeReconciliation(ctx, checkpoint, localSet, startTime); err != nil {
-			return err
-		}
-		return nil
+	if len(checkpoint.GetTopRanges()) == 0 {
+		return fmt.Errorf("reconcile failure [checkpoint_conflict]: checkpoint %q missing top_ranges (range manifest required)", checkpoint.CheckpointId)
 	}
 
-	// Step 3: Exchange strata estimators to estimate difference size.
-	primaryStrata, err := s.client.ExchangeStrataEstimator(ctx, &StrataMessage{
-		CheckpointId:    checkpoint.CheckpointId,
-		StrataData:      localSet.Strata.Marshal(),
-		CheckpointIndex: checkpoint.CommitIndex,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to exchange strata: %w", err)
+	if err := s.runRangeReconciliation(ctx, checkpoint, localSet, startTime); err != nil {
+		return err
 	}
-	if err := s.assertActiveCheckpoint(primaryStrata.GetCheckpointId(), primaryStrata.GetCheckpointIndex()); err != nil {
-		return fmt.Errorf("checkpoint conflict: %w", err)
-	}
-
-	remoteStrata, err := sketch.UnmarshalStrataEstimator(primaryStrata.StrataData)
-	if err != nil {
-		return fmt.Errorf("failed to unmarshal primary strata: %w", err)
-	}
-
-	estimatedDiff, err := localSet.Strata.Estimate(remoteStrata)
-	if err != nil {
-		return fmt.Errorf("failed to estimate difference: %w", err)
-	}
-	s.logger.Info("difference estimated", "estimated_diff", estimatedDiff)
-
-	if estimatedDiff == 0 {
-		s.logger.Info("no differences detected; reconciliation complete",
-			"duration", time.Since(startTime))
-		s.lastAppliedIndex.Store(checkpoint.CommitIndex)
-		s.reconcileCount.Add(1)
-		s.lastReconcileAt.Store(time.Now().Unix())
-		return nil
-	}
-
-	// Step 4: Exchange IBLTs to decode the actual differences.
-	ibltCells := uint32(math.Ceil(float64(estimatedDiff) * 1.5))
-	if ibltCells < 3 {
-		ibltCells = 3
-	}
-
-	// Build local IBLT at the right size.
-	localIBLT, err := s.scanner.BuildIBLTFromScan(ctx, s.core.barrier, ibltCells)
-	if err != nil {
-		return fmt.Errorf("failed to build local IBLT: %w", err)
-	}
-
-	primaryIBLTMsg, err := s.client.ExchangeIBLT(ctx, &IBLTMessage{
-		CheckpointId:    checkpoint.CheckpointId,
-		NumCells:        ibltCells,
-		CheckpointIndex: checkpoint.CommitIndex,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to exchange IBLT: %w", err)
-	}
-	if err := s.assertActiveCheckpoint(primaryIBLTMsg.GetCheckpointId(), primaryIBLTMsg.GetCheckpointIndex()); err != nil {
-		return fmt.Errorf("checkpoint conflict: %w", err)
-	}
-
-	remoteIBLT, err := sketch.UnmarshalIBLT(primaryIBLTMsg.IbltData)
-	if err != nil {
-		return fmt.Errorf("failed to unmarshal primary IBLT: %w", err)
-	}
-
-	// Subtract: primary - secondary to find differences.
-	diff, err := remoteIBLT.Subtract(localIBLT)
-	if err != nil {
-		return fmt.Errorf("IBLT subtract failed: %w", err)
-	}
-
-	added, removed, ok := diff.Decode()
-	if !ok {
-		s.logger.Warn("IBLT decode failed; falling back to prefix digest reconciliation")
-		return s.runPrefixDigestReconciliation(ctx, checkpoint)
-	}
-
-	s.logger.Info("IBLT decode succeeded",
-		"added_on_primary", len(added),
-		"removed_on_primary", len(removed))
-
-	// Step 5: Fetch entries for KIDs that exist on primary but not secondary
-	// (or have different values).
-	if len(added) > 0 {
-		if err := s.fetchAndApplyEntries(ctx, checkpoint.CheckpointId, checkpoint.CommitIndex, added, localSet.KIDToKey); err != nil {
-			return fmt.Errorf("failed to fetch entries: %w", err)
-		}
-	}
-
-	// Step 6: Delete entries that exist on secondary but not primary.
-	if len(removed) > 0 {
-		s.logger.Info("removing entries not on primary", "count", len(removed))
-		if err := s.applyRemovedEntries(ctx, checkpoint.CheckpointId, checkpoint.CommitIndex, localSet, removed); err != nil {
-			return err
-		}
-	}
-
-	s.lastAppliedIndex.Store(checkpoint.CommitIndex)
-	s.reconcileCount.Add(1)
-	s.lastReconcileAt.Store(time.Now().Unix())
-
-	s.logger.Info("reconciliation complete",
-		"added", len(added),
-		"removed", len(removed),
-		"duration", time.Since(startTime))
-
 	return nil
 }
 
 type drRangeTask struct {
-	span   reconciler.RangeSpan
-	remote reconciler.RangeDescriptor
+	span           reconciler.RangeSpan
+	remote         reconciler.RangeDescriptor
+	baseSplitDepth uint32
+	priorityHint   int
+}
+
+type drQueuedRangeTask struct {
+	id       int
+	priority int
+	task     drRangeTask
+}
+
+type drRangeTaskResult struct {
+	id                   int
+	task                 drRangeTask
+	rpcBytes             uint64
+	ibltCells            uint64
+	fetchedEntries       []*EntryChange
+	removedKeys          []string
+	needsPrefixRefine    bool
+	splitTasks           []drRangeTask
+	decodeFailedForSplit bool
+	err                  error
+}
+
+type drRangeTaskQueue []drQueuedRangeTask
+
+func (q drRangeTaskQueue) Len() int { return len(q) }
+
+func (q drRangeTaskQueue) Less(i, j int) bool {
+	// Max-heap: larger priority first; stable-ish by task id.
+	if q[i].priority == q[j].priority {
+		return q[i].id < q[j].id
+	}
+	return q[i].priority > q[j].priority
+}
+
+func (q drRangeTaskQueue) Swap(i, j int) { q[i], q[j] = q[j], q[i] }
+
+func (q *drRangeTaskQueue) Push(x interface{}) {
+	*q = append(*q, x.(drQueuedRangeTask))
+}
+
+func (q *drRangeTaskQueue) Pop() interface{} {
+	old := *q
+	n := len(old)
+	item := old[n-1]
+	*q = old[:n-1]
+	return item
 }
 
 type drRangeBudget struct {
@@ -1182,14 +1837,25 @@ type drRangeBudget struct {
 	rpcBytes      uint64
 	rangesHandled int
 	rangesSplit   int
+	maxRPCBytes   uint64
+	maxWallTime   time.Duration
 }
 
 func (b *drRangeBudget) check() error {
-	if time.Since(b.start) > drRangeMaxReconcileWallTime {
+	if b.start.IsZero() {
+		b.start = time.Now()
+	}
+	if b.maxWallTime <= 0 {
+		b.maxWallTime = drDefaultReconcileMaxWallTime
+	}
+	if b.maxRPCBytes == 0 {
+		b.maxRPCBytes = drDefaultReconcileMaxRPCBytes
+	}
+	if time.Since(b.start) > b.maxWallTime {
 		return fmt.Errorf("budget_exceeded: reconciliation wall-time exceeded")
 	}
-	if b.rpcBytes > drRangeMaxReconcileRPCBytes {
-		return fmt.Errorf("budget_exceeded: reconcile RPC bytes exceeded (%d > %d)", b.rpcBytes, drRangeMaxReconcileRPCBytes)
+	if b.rpcBytes > b.maxRPCBytes {
+		return fmt.Errorf("budget_exceeded: reconcile RPC bytes exceeded (%d > %d)", b.rpcBytes, b.maxRPCBytes)
 	}
 	return nil
 }
@@ -1215,156 +1881,267 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 	s.logger.Debug("range reconcile profile",
 		"target_keys_per_range", drRangeTargetKeysPerRange,
 		"target_value_bytes", drRangeTargetValueBytes,
-		"max_inflight_range_tasks", drRangeMaxInflightTasks)
+		"max_inflight_range_tasks", s.reconcileMaxInflightTasks)
 	if len(checkpoint.TopRanges) > drRangeMaxTopRanges {
 		return fmt.Errorf("reconcile failure [invalid_range_manifest]: top range count %d exceeds max %d", len(checkpoint.TopRanges), drRangeMaxTopRanges)
 	}
 
-	budget := &drRangeBudget{start: startTime}
-	queue := make([]drRangeTask, 0, len(checkpoint.TopRanges))
+	budget := &drRangeBudget{
+		start:       startTime,
+		maxRPCBytes: s.reconcileMaxRPCBytes,
+		maxWallTime: s.reconcileMaxWallTime,
+	}
+	localIndex := reconciler.NewRangeMapIndex(localSet.KIDToVID, localSet.Entries)
+	queue := make(drRangeTaskQueue, 0, len(checkpoint.TopRanges))
+	heap.Init(&queue)
+	nextTaskID := 1
+	enqueueTask := func(task drRangeTask, priority int) {
+		if priority < 1 {
+			priority = 1
+		}
+		task.priorityHint = priority
+		heap.Push(&queue, drQueuedRangeTask{
+			id:       nextTaskID,
+			priority: priority,
+			task:     task,
+		})
+		nextTaskID++
+	}
 	s.reconcileRangesFailed.Store(0)
 	s.reconcileRangesInflight.Store(0)
-	s.reconcileBudgetRemainingByte.Store(int64(drRangeMaxReconcileRPCBytes))
+	s.reconcileBudgetRemainingByte.Store(int64(s.reconcileMaxRPCBytes))
 	s.rangeSplitCount.Store(0)
 	s.reconcileRPCBytesUsed.Store(0)
+	s.reconcileQueueDepth.Store(0)
+	s.reconcileTasksHandled.Store(0)
+	s.reconcileTaskRateMillis.Store(0)
 
 	for _, rd := range checkpoint.TopRanges {
 		remote, err := protoRangeDigestToDescriptor(rd)
 		if err != nil {
 			return fmt.Errorf("reconcile failure [invalid_range_manifest]: %w", err)
 		}
-		local := reconciler.BuildRangeDigest(localSet, remote.Span, drSecondaryRangeMaxIBLTCellsPerRange)
+		local := reconciler.BuildRangeDigestFromIndex(localIndex, remote.Span, drSecondaryRangeMaxIBLTCellsPerRange)
 		if !local.EqualDigest(remote) {
-			queue = append(queue, drRangeTask{span: remote.Span, remote: remote})
+			enqueueTask(drRangeTask{
+				span:           remote.Span,
+				remote:         remote,
+				baseSplitDepth: remote.Span.SplitDepth,
+			}, estimateRangeDiff(local, remote))
 		}
 	}
+	if queue.Len() > drRangeMaxOutstandingTasks {
+		return fmt.Errorf("reconcile failure [budget_exceeded]: mismatched range count %d exceeds cap %d", queue.Len(), drRangeMaxOutstandingTasks)
+	}
+	s.markReconcileActivityNow()
 
 	metrics.SetGauge([]string{"replication", "dr", "reconcile", "ranges_total"}, float32(len(checkpoint.TopRanges)))
-	metrics.SetGauge([]string{"replication", "dr", "reconcile", "ranges_mismatched"}, float32(len(queue)))
-	s.reconcileRangesInflight.Store(int64(len(queue)))
-	metrics.SetGauge([]string{"replication", "dr", "reconcile", "ranges_inflight"}, float32(len(queue)))
+	metrics.SetGauge([]string{"replication", "dr", "reconcile", "ranges_mismatched"}, float32(queue.Len()))
 
-	if len(queue) == 0 {
-		s.reconcileBudgetRemainingByte.Store(int64(drRangeMaxReconcileRPCBytes))
-		s.lastAppliedIndex.Store(checkpoint.CommitIndex)
+	if queue.Len() == 0 {
+		s.reconcileBudgetRemainingByte.Store(int64(s.reconcileMaxRPCBytes))
+		s.setLastAppliedIndex(checkpoint.CommitIndex)
 		s.reconcileCount.Add(1)
 		s.lastReconcileAt.Store(time.Now().Unix())
 		s.logger.Info("range reconciliation: no mismatched ranges")
 		return nil
 	}
-	var ibltCellsUsed uint64
 
-	for i := 0; i < len(queue); i++ {
-		if err := budget.check(); err != nil {
+	maxWorkers := s.reconcileMaxInflightTasks
+	if maxWorkers <= 0 {
+		maxWorkers = 1
+	}
+	workerCtx, workerCancel := context.WithCancel(ctx)
+	defer workerCancel()
+
+	workCh := make(chan drQueuedRangeTask, maxWorkers*2)
+	resultCh := make(chan drRangeTaskResult, maxWorkers*2)
+	var workerWG sync.WaitGroup
+	for i := 0; i < maxWorkers; i++ {
+		workerWG.Add(1)
+		go func() {
+			defer workerWG.Done()
+			for {
+				select {
+				case <-workerCtx.Done():
+					return
+				case queued, ok := <-workCh:
+					if !ok {
+						return
+					}
+					res := s.processRangeTask(workerCtx, checkpoint, localSet, localIndex, queued)
+					select {
+					case resultCh <- res:
+					case <-workerCtx.Done():
+						return
+					}
+				}
+			}
+		}()
+	}
+	defer func() {
+		close(workCh)
+		workerWG.Wait()
+	}()
+
+	inflight := 0
+	updateWorkloadMetrics := func() {
+		s.reconcileRangesInflight.Store(int64(inflight))
+		s.reconcileQueueDepth.Store(int64(queue.Len() + inflight))
+		metrics.SetGauge([]string{"replication", "dr", "reconcile", "ranges_inflight"}, float32(inflight))
+	}
+	updateWorkloadMetrics()
+	var ibltCellsUsed uint64
+	for queue.Len() > 0 || inflight > 0 {
+		if stalled, since := s.isReconcileStalled(time.Now().UTC()); stalled {
+			workerCancel()
+			s.reconcileRangesFailed.Add(1)
+			s.reconcileStalled.Add(1)
+			metrics.IncrCounter([]string{"replication", "dr", "reconcile", "stalled_total"}, 1)
+			return fmt.Errorf("reconcile failure [stalled]: stalled without task progress for %s", since.Round(time.Second))
+		}
+		for inflight < maxWorkers && queue.Len() > 0 {
+			if err := budget.check(); err != nil {
+				workerCancel()
+				metrics.IncrCounter([]string{"replication", "dr", "reconcile", "budget_exceeded_total"}, 1)
+				s.reconcileRangesFailed.Add(1)
+				return fmt.Errorf("reconcile failure [budget_exceeded]: %w", err)
+			}
+			task := heap.Pop(&queue).(drQueuedRangeTask)
+			select {
+			case workCh <- task:
+				inflight++
+				s.markReconcileActivityNow()
+			case <-workerCtx.Done():
+				s.reconcileRangesFailed.Add(1)
+				return workerCtx.Err()
+			}
+		}
+		updateWorkloadMetrics()
+
+		var res drRangeTaskResult
+		select {
+		case <-ctx.Done():
+			workerCancel()
+			s.reconcileRangesFailed.Add(1)
+			return ctx.Err()
+		case res = <-resultCh:
+			inflight--
+			s.markReconcileActivityNow()
+		}
+		updateWorkloadMetrics()
+
+		task := res.task
+		if res.err != nil {
+			workerCancel()
+			s.reconcileRangesFailed.Add(1)
+			return res.err
+		}
+
+		if res.decodeFailedForSplit {
+			metrics.IncrCounter([]string{"replication", "dr", "reconcile", "range_decode_failures"}, 1)
+			s.reconcileDecodeFailures.Add(1)
+		}
+
+		if err := budget.addRPC(res.rpcBytes); err != nil {
+			workerCancel()
 			metrics.IncrCounter([]string{"replication", "dr", "reconcile", "budget_exceeded_total"}, 1)
 			s.reconcileRangesFailed.Add(1)
-			s.reconcileRangesInflight.Store(int64(len(queue) - i))
 			return fmt.Errorf("reconcile failure [budget_exceeded]: %w", err)
 		}
-
-		task := queue[i]
-		remainingQueue := len(queue) - i - 1
-		if remainingQueue < 0 {
-			remainingQueue = 0
+		s.reconcileRPCBytesUsed.Store(budget.rpcBytes)
+		metrics.SetGauge([]string{"replication", "dr", "reconcile", "rpc_bytes_used"}, float32(budget.rpcBytes))
+		if budget.rpcBytes >= s.reconcileMaxRPCBytes {
+			s.reconcileBudgetRemainingByte.Store(0)
+		} else {
+			s.reconcileBudgetRemainingByte.Store(int64(s.reconcileMaxRPCBytes - budget.rpcBytes))
 		}
-		s.reconcileRangesInflight.Store(int64(remainingQueue))
-		metrics.SetGauge([]string{"replication", "dr", "reconcile", "ranges_inflight"}, float32(remainingQueue))
+
+		if res.ibltCells > 0 {
+			ibltCellsUsed += res.ibltCells
+			metrics.SetGauge([]string{"replication", "dr", "reconcile", "iblt_cells_used"}, float32(ibltCellsUsed))
+		}
+
 		budget.rangesHandled++
+		s.reconcileTasksHandled.Store(uint64(budget.rangesHandled))
+		elapsed := time.Since(startTime).Seconds()
+		if elapsed > 0 {
+			rateMillis := uint64((float64(budget.rangesHandled) / elapsed) * 1000.0)
+			s.reconcileTaskRateMillis.Store(rateMillis)
+		}
 		if budget.rangesHandled > drRangeMaxTotalRanges {
+			workerCancel()
 			metrics.IncrCounter([]string{"replication", "dr", "reconcile", "budget_exceeded_total"}, 1)
 			s.reconcileRangesFailed.Add(1)
 			return fmt.Errorf("reconcile failure [budget_exceeded]: range task count exceeded")
 		}
 
-		localDesc := reconciler.BuildRangeDigest(localSet, task.span, drSecondaryRangeMaxIBLTCellsPerRange)
-		estimatedDiff := estimateRangeDiff(localDesc, task.remote)
-		ibltCells := clampIBLTCells(uint32(math.Ceil(float64(estimatedDiff)*1.5)), drSecondaryRangeMaxIBLTCellsPerRange)
-
-		localIBLT := reconciler.BuildRangeIBLT(localSet, task.span, ibltCells)
-		req := &IBLTMessage{
-			CheckpointId:    checkpoint.CheckpointId,
-			NumCells:        ibltCells,
-			Span:            rangeSpanToProto(task.span),
-			CheckpointIndex: checkpoint.CommitIndex,
-		}
-		primaryIBLTMsg, err := s.client.ExchangeIBLT(ctx, req)
-		if err != nil {
-			s.reconcileRangesFailed.Add(1)
-			return fmt.Errorf("reconcile failure [rpc_failed]: exchange IBLT failed: %w", err)
-		}
-		if err := s.assertActiveCheckpoint(primaryIBLTMsg.GetCheckpointId(), primaryIBLTMsg.GetCheckpointIndex()); err != nil {
-			s.reconcileRangesFailed.Add(1)
-			return fmt.Errorf("reconcile failure [checkpoint_conflict]: %w", err)
-		}
-		ibltCellsUsed += uint64(ibltCells)
-		metrics.SetGauge([]string{"replication", "dr", "reconcile", "iblt_cells_used"}, float32(ibltCellsUsed))
-		if err := budget.addRPC(uint64(len(primaryIBLTMsg.GetIbltData()) + 256)); err != nil {
-			metrics.IncrCounter([]string{"replication", "dr", "reconcile", "budget_exceeded_total"}, 1)
-			s.reconcileRangesFailed.Add(1)
-			return fmt.Errorf("reconcile failure [budget_exceeded]: %w", err)
-		}
-		metrics.SetGauge([]string{"replication", "dr", "reconcile", "rpc_bytes_used"}, float32(budget.rpcBytes))
-		s.reconcileRPCBytesUsed.Store(budget.rpcBytes)
-		if budget.rpcBytes >= drRangeMaxReconcileRPCBytes {
-			s.reconcileBudgetRemainingByte.Store(0)
-		} else {
-			s.reconcileBudgetRemainingByte.Store(int64(drRangeMaxReconcileRPCBytes - budget.rpcBytes))
-		}
-
-		remoteIBLT, err := sketch.UnmarshalIBLT(primaryIBLTMsg.IbltData)
-		if err != nil {
-			s.reconcileRangesFailed.Add(1)
-			return fmt.Errorf("reconcile failure [decode_failed]: unmarshal IBLT: %w", err)
-		}
-		diff, err := remoteIBLT.Subtract(localIBLT)
-		if err != nil {
-			s.reconcileRangesFailed.Add(1)
-			return fmt.Errorf("reconcile failure [decode_failed]: IBLT subtract: %w", err)
-		}
-		added, removed, ok := diff.Decode()
-		if ok {
-			if len(added) > 0 {
-				if err := s.fetchAndApplyEntriesWithBudget(ctx, checkpoint.CheckpointId, checkpoint.CommitIndex, added, localSet.KIDToKey, budget); err != nil {
-					s.reconcileRangesFailed.Add(1)
-					return fmt.Errorf("reconcile failure [apply_failed]: %w", err)
-				}
+		if len(res.splitTasks) > 0 {
+			if budget.rangesSplit+1 > drRangeMaxSessionSplits {
+				workerCancel()
+				metrics.IncrCounter([]string{"replication", "dr", "reconcile", "budget_exceeded_total"}, 1)
+				s.reconcileRangesFailed.Add(1)
+				return fmt.Errorf("reconcile failure [budget_exceeded]: split count exceeded (%d > %d)", budget.rangesSplit+1, drRangeMaxSessionSplits)
 			}
-			if len(removed) > 0 {
-				if err := s.applyRemovedEntries(ctx, checkpoint.CheckpointId, checkpoint.CommitIndex, localSet, removed); err != nil {
-					s.reconcileRangesFailed.Add(1)
-					return fmt.Errorf("reconcile failure [apply_failed]: %w", err)
-				}
+			outstanding := queue.Len() + inflight + len(res.splitTasks)
+			if outstanding > drRangeMaxOutstandingTasks {
+				workerCancel()
+				metrics.IncrCounter([]string{"replication", "dr", "reconcile", "budget_exceeded_total"}, 1)
+				s.reconcileRangesFailed.Add(1)
+				return fmt.Errorf("reconcile failure [budget_exceeded]: outstanding range tasks exceeded (%d > %d)", outstanding, drRangeMaxOutstandingTasks)
 			}
+			for _, child := range res.splitTasks {
+				enqueueTask(child, child.priorityHint)
+			}
+			budget.rangesSplit++
+			s.rangeSplitCount.Store(uint64(budget.rangesSplit))
+			metrics.IncrCounter([]string{"replication", "dr", "reconcile", "ranges_split"}, 1)
+			if budget.rpcBytes > (s.reconcileMaxRPCBytes*8)/10 && queue.Len() > maxWorkers*3 {
+				workerCancel()
+				s.reconcileRangesFailed.Add(1)
+				metrics.IncrCounter([]string{"replication", "dr", "reconcile", "budget_exceeded_total"}, 1)
+				return fmt.Errorf("reconcile failure [budget_exceeded]: forcing checkpoint rollover under pressure (rpc_bytes=%d queue=%d)", budget.rpcBytes, queue.Len())
+			}
+			updateWorkloadMetrics()
 			continue
 		}
 
-		metrics.IncrCounter([]string{"replication", "dr", "reconcile", "range_decode_failures"}, 1)
-		// Adaptive split first.
-		if task.span.SplitDepth < drRangeMaxSplitDepth && len(queue)+1 < drRangeMaxTotalRanges {
-			left, right, splitOK := reconciler.SplitRange(task.span)
-			if splitOK {
-				queue = append(queue, drRangeTask{span: left}, drRangeTask{span: right})
-				budget.rangesSplit++
-				s.rangeSplitCount.Store(uint64(budget.rangesSplit))
-				metrics.IncrCounter([]string{"replication", "dr", "reconcile", "ranges_split"}, 1)
-				continue
+		if res.needsPrefixRefine {
+			if err := s.runRangePrefixRefinement(ctx, checkpoint, localSet, task.span, budget); err != nil {
+				workerCancel()
+				s.reconcileRangesFailed.Add(1)
+				return wrapReconcileFailure(drReconcileFailureDecodeExhausted, "prefix refinement", err)
+			}
+			updateWorkloadMetrics()
+			continue
+		}
+
+		if len(res.fetchedEntries) > 0 {
+			if err := s.applyFetchedEntriesDeterministic(ctx, localSet.KIDToKey, res.fetchedEntries); err != nil {
+				workerCancel()
+				s.reconcileRangesFailed.Add(1)
+				return wrapReconcileFailure(drReconcileFailureApplyFailed, "apply fetched entries", err)
 			}
 		}
-
-		// Optional in-range prefix refinement for stubborn ranges.
-		if err := s.runRangePrefixRefinement(ctx, checkpoint, localSet, task.span, budget); err != nil {
-			s.reconcileRangesFailed.Add(1)
-			return fmt.Errorf("reconcile failure [decode_exhausted]: %w", err)
+		if len(res.removedKeys) > 0 {
+			if err := s.applyRemovedKeys(ctx, checkpoint.CheckpointId, checkpoint.CommitIndex, res.removedKeys); err != nil {
+				workerCancel()
+				s.reconcileRangesFailed.Add(1)
+				return wrapReconcileFailure(drReconcileFailureApplyFailed, "apply removed keys", err)
+			}
 		}
+		updateWorkloadMetrics()
 	}
+	workerCancel()
 	s.reconcileRangesInflight.Store(0)
-	if budget.rpcBytes >= drRangeMaxReconcileRPCBytes {
+	s.reconcileQueueDepth.Store(0)
+	if budget.rpcBytes >= s.reconcileMaxRPCBytes {
 		s.reconcileBudgetRemainingByte.Store(0)
 	} else {
-		s.reconcileBudgetRemainingByte.Store(int64(drRangeMaxReconcileRPCBytes - budget.rpcBytes))
+		s.reconcileBudgetRemainingByte.Store(int64(s.reconcileMaxRPCBytes - budget.rpcBytes))
 	}
 
-	s.lastAppliedIndex.Store(checkpoint.CommitIndex)
+	s.setLastAppliedIndex(checkpoint.CommitIndex)
 	s.reconcileCount.Add(1)
 	s.lastReconcileAt.Store(time.Now().Unix())
 	s.logger.Info("range-first reconciliation complete",
@@ -1375,18 +2152,402 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 	return nil
 }
 
+func (s *drReplicationSecondary) processRangeTask(ctx context.Context, checkpoint *CheckpointResponse, localSet *reconciler.ReconciliationSet, localIndex *reconciler.RangeMapIndex, queued drQueuedRangeTask) drRangeTaskResult {
+	task := queued.task
+	result := drRangeTaskResult{
+		id:   queued.id,
+		task: task,
+	}
+
+	localDesc := reconciler.BuildRangeDigestFromIndex(localIndex, task.span, drSecondaryRangeMaxIBLTCellsPerRange)
+	estimatedDiff := estimateRangeDiff(localDesc, task.remote)
+	baseCells := clampIBLTCells(uint32(math.Ceil(float64(estimatedDiff)*1.5)), drSecondaryRangeMaxIBLTCellsPerRange)
+	cellAttempts := make([]uint32, 0, 3)
+	for _, candidate := range []uint32{
+		baseCells,
+		clampIBLTCells(baseCells*2, drSecondaryRangeMaxIBLTCellsPerRange),
+		clampIBLTCells(baseCells*4, drSecondaryRangeMaxIBLTCellsPerRange),
+	} {
+		if len(cellAttempts) == 0 || cellAttempts[len(cellAttempts)-1] != candidate {
+			cellAttempts = append(cellAttempts, candidate)
+		}
+	}
+
+	for _, ibltCells := range cellAttempts {
+		localIBLT := reconciler.BuildRangeIBLTFromIndex(localIndex, task.span, ibltCells)
+		req := &IBLTMessage{
+			CheckpointId:    checkpoint.CheckpointId,
+			NumCells:        ibltCells,
+			Span:            rangeSpanToProto(task.span),
+			CheckpointIndex: checkpoint.CommitIndex,
+		}
+
+		var primaryIBLTMsg *IBLTMessage
+		var err error
+		for attempt := 0; attempt < 3; attempt++ {
+			rpcCtx, cancel := s.rpcContext(ctx)
+			primaryIBLTMsg, err = s.client.ExchangeIBLT(rpcCtx, req)
+			cancel()
+			if err == nil {
+				break
+			}
+			if attempt < 2 {
+				s.reconcileTaskRetries.Add(1)
+				time.Sleep(time.Duration(50*(attempt+1)) * time.Millisecond)
+			}
+		}
+		if err != nil {
+			result.err = fmt.Errorf("reconcile failure [rpc_failed]: exchange IBLT failed: %w", err)
+			return result
+		}
+		if err := s.assertActiveCheckpoint(primaryIBLTMsg.GetCheckpointId(), primaryIBLTMsg.GetCheckpointIndex()); err != nil {
+			result.err = fmt.Errorf("reconcile failure [checkpoint_conflict]: %w", err)
+			return result
+		}
+		result.rpcBytes += uint64(len(primaryIBLTMsg.GetIbltData()) + 256)
+		result.ibltCells += uint64(ibltCells)
+
+		remoteIBLT, err := sketch.UnmarshalIBLT(primaryIBLTMsg.IbltData)
+		if err != nil {
+			result.err = fmt.Errorf("reconcile failure [decode_exhausted]: unmarshal IBLT: %w", err)
+			return result
+		}
+		diff, err := remoteIBLT.Subtract(localIBLT)
+		if err != nil {
+			result.err = fmt.Errorf("reconcile failure [decode_exhausted]: IBLT subtract: %w", err)
+			return result
+		}
+
+		added, removed, ok := diff.Decode()
+		if !ok {
+			continue
+		}
+
+		if len(added) > 0 {
+			entries, rpcBytes, fetchErr := s.fetchEntriesForDiff(ctx, checkpoint.CheckpointId, checkpoint.CommitIndex, added)
+			if fetchErr != nil {
+				result.err = wrapReconcileFailure(drReconcileFailureApplyFailed, "fetch entries for diff", fetchErr)
+				return result
+			}
+			result.fetchedEntries = entries
+			result.rpcBytes += rpcBytes
+		}
+		if len(removed) > 0 {
+			result.removedKeys = resolveRemovedKeys(localSet, removed)
+		}
+		return result
+	}
+
+	result.decodeFailedForSplit = true
+	if task.span.SplitDepth < task.maxSplitDepth() {
+		left, right, splitOK := reconciler.SplitRange(task.span)
+		if splitOK {
+			rpcCtx, cancel := s.rpcContext(ctx)
+			digestResp, err := s.client.ExchangeRangeDigests(rpcCtx, &RangeDigestRequest{
+				CheckpointId:    checkpoint.CheckpointId,
+				CheckpointIndex: checkpoint.CommitIndex,
+				Spans: []*RangeSpan{
+					rangeSpanToProto(left),
+					rangeSpanToProto(right),
+				},
+			})
+			cancel()
+			if err != nil {
+				result.err = fmt.Errorf("reconcile failure [rpc_failed]: exchange child range digests failed: %w", err)
+				return result
+			}
+			result.rpcBytes += uint64(len(digestResp.GetRanges())*128 + 128)
+			if len(digestResp.GetRanges()) != 2 {
+				result.err = fmt.Errorf("reconcile failure [decode_exhausted]: expected 2 child range digests, got %d", len(digestResp.GetRanges()))
+				return result
+			}
+
+			children := make([]drRangeTask, 0, 2)
+			for _, remoteRange := range digestResp.GetRanges() {
+				remoteChild, convErr := protoRangeDigestToDescriptor(remoteRange)
+				if convErr != nil {
+					result.err = fmt.Errorf("reconcile failure [decode_exhausted]: invalid child range digest: %w", convErr)
+					return result
+				}
+				localChild := reconciler.BuildRangeDigestFromIndex(localIndex, remoteChild.Span, drSecondaryRangeMaxIBLTCellsPerRange)
+				if localChild.EqualDigest(remoteChild) {
+					continue
+				}
+				children = append(children, drRangeTask{
+					span:           remoteChild.Span,
+					remote:         remoteChild,
+					baseSplitDepth: task.baseSplitDepth,
+					priorityHint:   estimateRangeDiff(localChild, remoteChild),
+				})
+			}
+			if len(children) > 0 {
+				result.splitTasks = children
+				return result
+			}
+		}
+	}
+	result.needsPrefixRefine = true
+	return result
+}
+
+func (t drRangeTask) maxSplitDepth() uint32 {
+	// Split-depth budget is relative to the top-level range depth to keep
+	// adaptive splitting available even when manifests use non-zero depth.
+	base := t.baseSplitDepth
+	limit := base + uint32(drRangeMaxSplitDepth)
+	if limit < base {
+		return ^uint32(0)
+	}
+	return limit
+}
+
+func wrapReconcileFailure(defaultClass drReconcileFailureClass, op string, err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "reconcile failure [") {
+		return err
+	}
+	class := classifyReconcileFailure(err)
+	if class == drReconcileFailureUnknown {
+		class = defaultClass
+	}
+	if op == "" {
+		return fmt.Errorf("reconcile failure [%s]: %w", class, err)
+	}
+	return fmt.Errorf("reconcile failure [%s]: %s: %w", class, op, err)
+}
+
+func (s *drReplicationSecondary) fetchEntriesForDiff(ctx context.Context, checkpointID string, checkpointIndex uint64, entries []sketch.DiffEntry) ([]*EntryChange, uint64, error) {
+	kids := make([][]byte, len(entries))
+	items := make([]*FetchItem, 0, len(entries))
+	expectedByKid := make(map[[32]byte][32]byte, len(entries))
+	for i, e := range entries {
+		kids[i] = make([]byte, 32)
+		copy(kids[i], e.KID[:])
+		item := &FetchItem{
+			Kid:         make([]byte, 32),
+			ExpectedVid: make([]byte, 32),
+		}
+		copy(item.Kid, e.KID[:])
+		copy(item.ExpectedVid, e.VID[:])
+		items = append(items, item)
+		expectedByKid[e.KID] = e.VID
+	}
+
+	stream, err := s.client.FetchEntries(ctx, &FetchEntriesRequest{
+		CheckpointId:    checkpointID,
+		CheckpointIndex: checkpointIndex,
+		Kids:            kids,
+		Items:           items,
+		IncludeDeletes:  true,
+	})
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to open fetch stream: %w", err)
+	}
+
+	var rpcBytes uint64
+	var out []*EntryChange
+	var failedKids [][]byte
+	for {
+		batch, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, rpcBytes, fmt.Errorf("fetch stream error: %w", err)
+		}
+		if err := s.assertActiveCheckpoint(batch.GetCheckpointId(), batch.GetCheckpointIndex()); err != nil {
+			return nil, rpcBytes, fmt.Errorf("checkpoint conflict: %w", err)
+		}
+		rpcBytes += uint64(len(batch.Entries)*128 + len(batch.FailedKids)*32)
+		for _, e := range batch.Entries {
+			out = append(out, cloneEntryChange(e))
+		}
+		if len(batch.FailedKids) > 0 {
+			failedKids = append(failedKids, batch.FailedKids...)
+		}
+	}
+
+	if len(failedKids) == 0 {
+		return out, rpcBytes, nil
+	}
+
+	retryItems := make([]*FetchItem, 0, len(failedKids))
+	for _, kidBytes := range failedKids {
+		if len(kidBytes) != 32 {
+			continue
+		}
+		var kid [32]byte
+		copy(kid[:], kidBytes)
+		if vid, ok := expectedByKid[kid]; ok {
+			retryItems = append(retryItems, &FetchItem{
+				Kid:         append([]byte(nil), kidBytes...),
+				ExpectedVid: append([]byte(nil), vid[:]...),
+			})
+		}
+	}
+
+	retryStream, err := s.client.FetchEntries(ctx, &FetchEntriesRequest{
+		CheckpointId:    checkpointID,
+		CheckpointIndex: checkpointIndex,
+		Kids:            failedKids,
+		Items:           retryItems,
+		IncludeDeletes:  true,
+	})
+	if err != nil {
+		return nil, rpcBytes, fmt.Errorf("failed to retry fetch for failed kids: %w", err)
+	}
+
+	failedKids = failedKids[:0]
+	for {
+		batch, err := retryStream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, rpcBytes, fmt.Errorf("retry fetch stream error: %w", err)
+		}
+		if err := s.assertActiveCheckpoint(batch.GetCheckpointId(), batch.GetCheckpointIndex()); err != nil {
+			return nil, rpcBytes, fmt.Errorf("checkpoint conflict: %w", err)
+		}
+		rpcBytes += uint64(len(batch.Entries)*128 + len(batch.FailedKids)*32)
+		for _, e := range batch.Entries {
+			out = append(out, cloneEntryChange(e))
+		}
+		if len(batch.FailedKids) > 0 {
+			failedKids = append(failedKids, batch.FailedKids...)
+		}
+	}
+	if len(failedKids) > 0 {
+		return nil, rpcBytes, fmt.Errorf("fetch failed for %d keys after retry", len(failedKids))
+	}
+
+	return out, rpcBytes, nil
+}
+
+func resolveRemovedKeys(localSet *reconciler.ReconciliationSet, removed []sketch.DiffEntry) []string {
+	if len(removed) == 0 || localSet.KIDToKey == nil {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(removed))
+	keys := make([]string, 0, len(removed))
+	for _, entry := range removed {
+		key, ok := localSet.KIDToKey[entry.KID]
+		if !ok || key == "" || isDRNeverReplicatePath(key) {
+			continue
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func cloneEntryChange(in *EntryChange) *EntryChange {
+	if in == nil {
+		return nil
+	}
+	out := &EntryChange{
+		OpType:    in.OpType,
+		Key:       in.Key,
+		SealWrap:  in.SealWrap,
+		RaftIndex: in.RaftIndex,
+	}
+	if len(in.Value) > 0 {
+		out.Value = append([]byte(nil), in.Value...)
+	}
+	if len(in.Kid) > 0 {
+		out.Kid = append([]byte(nil), in.Kid...)
+	}
+	return out
+}
+
+func (s *drReplicationSecondary) applyFetchedEntriesDeterministic(ctx context.Context, kidToKey map[[32]byte]string, entries []*EntryChange) error {
+	sort.SliceStable(entries, func(i, j int) bool {
+		if entries[i] == nil || entries[j] == nil {
+			return entries[i] != nil
+		}
+		if entries[i].Key != entries[j].Key {
+			return entries[i].Key < entries[j].Key
+		}
+		if cmp := bytes.Compare(entries[i].Kid, entries[j].Kid); cmp != 0 {
+			return cmp < 0
+		}
+		if entries[i].RaftIndex != entries[j].RaftIndex {
+			return entries[i].RaftIndex < entries[j].RaftIndex
+		}
+		return entries[i].OpType < entries[j].OpType
+	})
+
+	failures := 0
+	examples := make([]string, 0, 5)
+	for _, entry := range entries {
+		if entry == nil {
+			continue
+		}
+		if err := s.applyFetchedChange(ctx, entry, kidToKey); err != nil {
+			failures++
+			label := entry.Key
+			if label == "" && len(entry.Kid) >= 8 {
+				label = fmt.Sprintf("kid:%x", entry.Kid[:8])
+			}
+			if len(examples) < cap(examples) {
+				examples = append(examples, label)
+			}
+		}
+	}
+	if failures > 0 {
+		return fmt.Errorf("failed to apply %d fetched entries (examples: %v)", failures, examples)
+	}
+	return nil
+}
+
+func (s *drReplicationSecondary) applyRemovedKeys(ctx context.Context, checkpointID string, checkpointIndex uint64, keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	if err := s.validateDeleteSafety(checkpointID, checkpointIndex); err != nil {
+		return fmt.Errorf("checkpoint conflict: %w", err)
+	}
+	sort.Strings(keys)
+	failures := 0
+	examples := make([]string, 0, 5)
+	for _, key := range keys {
+		if isDRNeverReplicatePath(key) {
+			continue
+		}
+		if err := s.core.barrier.Delete(ctx, key); err != nil {
+			failures++
+			if len(examples) < cap(examples) {
+				examples = append(examples, key)
+			}
+		}
+	}
+	if failures > 0 {
+		return fmt.Errorf("reconciliation delete failed for %d entries (examples: %v)", failures, examples)
+	}
+	return nil
+}
+
 func (s *drReplicationSecondary) runRangePrefixRefinement(ctx context.Context, checkpoint *CheckpointResponse, localSet *reconciler.ReconciliationSet, span reconciler.RangeSpan, budget *drRangeBudget) error {
 	var finalPrefix uint32
 	var mismatched []uint32
 
 	for _, p := range []uint32{8, 12, 16} {
 		localPD := reconciler.BuildRangePrefixDigest(localSet, span, p)
-		resp, err := s.client.ExchangePrefixDigests(ctx, &PrefixDigestRequest{
+		rpcCtx, cancel := s.rpcContext(ctx)
+		resp, err := s.client.ExchangePrefixDigests(rpcCtx, &PrefixDigestRequest{
 			CheckpointId:    checkpoint.CheckpointId,
 			PrefixLength:    p,
 			Span:            rangeSpanToProto(span),
 			CheckpointIndex: checkpoint.CommitIndex,
 		})
+		cancel()
 		if err != nil {
 			return fmt.Errorf("prefix refinement RPC failed: %w", err)
 		}
@@ -1616,221 +2777,6 @@ func (s *drReplicationSecondary) applyRemovedEntries(ctx context.Context, checkp
 	if deleteFailures > 0 {
 		return fmt.Errorf("reconciliation delete failed for %d entries (examples: %v)", deleteFailures, deleteExamples)
 	}
-	return nil
-}
-
-// runPrefixDigestReconciliation is the fallback when IBLT decode fails.
-// It uses adaptive prefix digest drill-down to identify divergent
-// regions, then fetches entries for those regions.
-func (s *drReplicationSecondary) runPrefixDigestReconciliation(ctx context.Context, checkpoint *CheckpointResponse) error {
-	s.logger.Info("starting prefix digest reconciliation",
-		"checkpoint_id", checkpoint.CheckpointId)
-
-	// Build local prefix digest at p=8.
-	localCheckpoint := reconciler.Checkpoint{
-		ID:          checkpoint.CheckpointId,
-		CommitIndex: checkpoint.CommitIndex,
-	}
-	localSet, err := s.scanner.Scan(ctx, s.core.barrier, localCheckpoint)
-	if err != nil {
-		return fmt.Errorf("failed to scan for prefix digest: %w", err)
-	}
-
-	// Get primary's prefix digests.
-	resp, err := s.client.ExchangePrefixDigests(ctx, &PrefixDigestRequest{
-		CheckpointId:    checkpoint.CheckpointId,
-		PrefixLength:    localSet.PrefixDigest.PrefixLen(),
-		CheckpointIndex: checkpoint.CommitIndex,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to exchange prefix digests: %w", err)
-	}
-
-	// Compare buckets to find mismatches.
-	remotePD := sketch.NewPrefixDigest(resp.PrefixLength)
-	for _, b := range resp.Buckets {
-		var xorKey, xorVal [32]byte
-		copy(xorKey[:], b.XorKeyHash)
-		copy(xorVal[:], b.XorValueHash)
-
-		bucket := remotePD.Bucket(b.Index)
-		if bucket != nil {
-			bucket.Count = b.Count
-			bucket.XORKeyHash = xorKey
-			bucket.XORValueHash = xorVal
-		}
-	}
-
-	mismatched, err := localSet.PrefixDigest.Compare(remotePD)
-	if err != nil {
-		return fmt.Errorf("prefix digest compare failed: %w", err)
-	}
-
-	s.logger.Info("prefix digest comparison",
-		"mismatched_buckets", len(mismatched),
-		"total_buckets", localSet.PrefixDigest.NumBuckets())
-
-	if len(mismatched) == 0 {
-		s.logger.Info("no differences found via prefix digest")
-		s.lastAppliedIndex.Store(checkpoint.CommitIndex)
-		s.reconcileCount.Add(1)
-		s.lastReconcileAt.Store(time.Now().Unix())
-		return nil
-	}
-
-	// Request ALL entries in mismatched buckets from the primary using
-	// bucket-based fetching. This ensures primary-only entries (not known
-	// to the secondary) are included in the response.
-	s.logger.Info("fetching entries for mismatched buckets",
-		"bucket_count", len(mismatched),
-		"prefix_length", localSet.PrefixDigest.PrefixLen())
-
-	fetchStream, err := s.client.FetchEntries(ctx, &FetchEntriesRequest{
-		CheckpointId:       checkpoint.CheckpointId,
-		IncludeDeletes:     true,
-		BucketPrefixLength: localSet.PrefixDigest.PrefixLen(),
-		BucketIndices:      mismatched,
-		CheckpointIndex:    checkpoint.CommitIndex,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to fetch entries: %w", err)
-	}
-
-	// Track which keys the primary sent so we can delete local-only
-	// entries in the mismatched buckets afterwards.
-	primaryKeys := make(map[string]bool)
-	appliedCount := 0
-	applyFailures := 0
-	applyExamples := make([]string, 0, 5)
-	var failedKids [][]byte
-
-	for {
-		batch, err := fetchStream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("fetch stream error: %w", err)
-		}
-		if err := s.assertActiveCheckpoint(batch.GetCheckpointId(), batch.GetCheckpointIndex()); err != nil {
-			return fmt.Errorf("checkpoint conflict: %w", err)
-		}
-
-		for _, entry := range batch.Entries {
-			if err := s.applyFetchedChange(ctx, entry, localSet.KIDToKey); err != nil {
-				applyFailures++
-				label := entry.Key
-				if label == "" && len(entry.Kid) >= 8 {
-					label = fmt.Sprintf("kid:%x", entry.Kid[:8])
-				}
-				if len(applyExamples) < cap(applyExamples) {
-					applyExamples = append(applyExamples, label)
-				}
-			}
-			if entry.Key != "" {
-				primaryKeys[entry.Key] = true
-			}
-			appliedCount++
-		}
-
-		if len(batch.FailedKids) > 0 {
-			failedKids = append(failedKids, batch.FailedKids...)
-		}
-	}
-	if len(failedKids) > 0 {
-		retryStream, err := s.client.FetchEntries(ctx, &FetchEntriesRequest{
-			CheckpointId:    checkpoint.CheckpointId,
-			Kids:            failedKids,
-			IncludeDeletes:  true,
-			CheckpointIndex: checkpoint.CommitIndex,
-		})
-		if err != nil {
-			return fmt.Errorf("failed to retry prefix-digest failed kids: %w", err)
-		}
-		failedKids = failedKids[:0]
-		for {
-			batch, err := retryStream.Recv()
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				return fmt.Errorf("prefix-digest retry fetch stream error: %w", err)
-			}
-			if err := s.assertActiveCheckpoint(batch.GetCheckpointId(), batch.GetCheckpointIndex()); err != nil {
-				return fmt.Errorf("checkpoint conflict: %w", err)
-			}
-			for _, entry := range batch.Entries {
-				if err := s.applyFetchedChange(ctx, entry, localSet.KIDToKey); err != nil {
-					applyFailures++
-					label := entry.Key
-					if label == "" && len(entry.Kid) >= 8 {
-						label = fmt.Sprintf("kid:%x", entry.Kid[:8])
-					}
-					if len(applyExamples) < cap(applyExamples) {
-						applyExamples = append(applyExamples, label)
-					}
-				}
-			}
-			if len(batch.FailedKids) > 0 {
-				failedKids = append(failedKids, batch.FailedKids...)
-			}
-		}
-		if len(failedKids) > 0 {
-			return fmt.Errorf("prefix-digest fetch failed for %d keys after retry", len(failedKids))
-		}
-	}
-	if applyFailures > 0 {
-		return fmt.Errorf("failed to apply %d fetched prefix-digest entries (examples: %v)", applyFailures, applyExamples)
-	}
-
-	// Delete entries that exist locally in mismatched buckets but
-	// were not sent by the primary (secondary-only entries).
-	if localSet.KIDToKey != nil {
-		if err := s.validateDeleteSafety(checkpoint.CheckpointId, checkpoint.CommitIndex); err != nil {
-			return fmt.Errorf("checkpoint conflict: %w", err)
-		}
-		mismatchSet := make(map[uint32]bool, len(mismatched))
-		for _, idx := range mismatched {
-			mismatchSet[idx] = true
-		}
-		deletedCount := 0
-		deleteFailures := 0
-		deleteExamples := make([]string, 0, 5)
-		for kid, key := range localSet.KIDToKey {
-			bucketIdx := sketch.ParentBucket(kid, localSet.PrefixDigest.PrefixLen())
-			if !mismatchSet[bucketIdx] {
-				continue
-			}
-			if primaryKeys[key] {
-				continue // Primary also has this key; keep it.
-			}
-			if isDRNeverReplicatePath(key) {
-				continue
-			}
-			if err := s.core.barrier.Delete(ctx, key); err != nil {
-				deleteFailures++
-				if len(deleteExamples) < cap(deleteExamples) {
-					deleteExamples = append(deleteExamples, key)
-				}
-			} else {
-				deletedCount++
-			}
-		}
-		if deleteFailures > 0 {
-			return fmt.Errorf("failed to delete %d secondary-only entries (examples: %v)", deleteFailures, deleteExamples)
-		}
-		if deletedCount > 0 {
-			s.logger.Info("deleted secondary-only entries in mismatched buckets",
-				"count", deletedCount)
-		}
-	}
-
-	s.lastAppliedIndex.Store(checkpoint.CommitIndex)
-	s.reconcileCount.Add(1)
-	s.lastReconcileAt.Store(time.Now().Unix())
-
-	s.logger.Info("prefix digest reconciliation complete",
-		"applied", appliedCount)
 	return nil
 }
 

@@ -15,11 +15,22 @@ type drReconcileFailureClass string
 
 const (
 	drReconcileFailureBudgetExceeded     drReconcileFailureClass = "budget_exceeded"
+	drReconcileFailureStalled            drReconcileFailureClass = "stalled"
 	drReconcileFailureDecodeExhausted    drReconcileFailureClass = "decode_exhausted"
 	drReconcileFailureCheckpointConflict drReconcileFailureClass = "checkpoint_conflict"
 	drReconcileFailureApplyFailed        drReconcileFailureClass = "apply_failed"
 	drReconcileFailureAuthRevoked        drReconcileFailureClass = "auth_revoked"
 	drReconcileFailureUnknown            drReconcileFailureClass = "unknown"
+)
+
+const (
+	drReconcileRetryCapBudgetExceeded     = uint64(8)
+	drReconcileRetryCapStalled            = uint64(8)
+	drReconcileRetryCapDecodeExhausted    = uint64(8)
+	drReconcileRetryCapCheckpointConflict = uint64(10)
+	drReconcileRetryCapApplyFailed        = uint64(6)
+	drReconcileRetryCapAuthRevoked        = uint64(4)
+	drReconcileRetryCapUnknown            = uint64(6)
 )
 
 func (s *drReplicationSecondary) beginReconcileSession(checkpointID string, checkpointIndex uint64, manifestCount int) {
@@ -30,6 +41,7 @@ func (s *drReplicationSecondary) beginReconcileSession(checkpointID string, chec
 	s.sessionStart = time.Now().UTC()
 	s.streamPausedAt = s.lastAppliedIndex.Load()
 	s.lastRangeManifestCount = manifestCount
+	s.lastReconcileActivityAt.Store(s.sessionStart.Unix())
 }
 
 func (s *drReplicationSecondary) endReconcileSession() {
@@ -52,6 +64,13 @@ func (s *drReplicationSecondary) markReconcileSuccess() {
 func (s *drReplicationSecondary) markReconcileFailure(err error) drReconcileFailureClass {
 	class := classifyReconcileFailure(err)
 	classKey := string(class)
+
+	switch class {
+	case drReconcileFailureCheckpointConflict:
+		s.checkpointConflicts.Add(1)
+	case drReconcileFailureDecodeExhausted:
+		s.reconcileDecodeFailures.Add(1)
+	}
 
 	s.sessionMu.Lock()
 	s.lastReconcileFailReason = classKey
@@ -77,11 +96,26 @@ func (s *drReplicationSecondary) nextReconcileRetryDelay(class drReconcileFailur
 	base := time.Second
 	switch class {
 	case drReconcileFailureBudgetExceeded:
-		base = 3 * time.Second
+		// Force faster checkpoint rollover attempts under pressure.
+		base = time.Second
+	case drReconcileFailureStalled:
+		base = 1500 * time.Millisecond
 	case drReconcileFailureCheckpointConflict:
 		base = 2 * time.Second
 	case drReconcileFailureAuthRevoked:
 		base = 5 * time.Second
+	}
+
+	if class == drReconcileFailureBudgetExceeded {
+		if attempt > 4 {
+			attempt = 4
+		}
+		backoff := base * time.Duration(attempt)
+		if backoff > 5*time.Second {
+			backoff = 5 * time.Second
+		}
+		jitter := time.Duration(randIntn(int(backoff / 4)))
+		return backoff + jitter
 	}
 
 	if attempt > 6 {
@@ -95,13 +129,60 @@ func (s *drReplicationSecondary) nextReconcileRetryDelay(class drReconcileFailur
 	return backoff + jitter
 }
 
+func (s *drReplicationSecondary) shouldRetryReconcile(class drReconcileFailureClass) bool {
+	classKey := string(class)
+	s.sessionMu.RLock()
+	attempt := s.lastReconcileFailureByType[classKey]
+	s.sessionMu.RUnlock()
+	if attempt == 0 {
+		return true
+	}
+	return attempt <= s.reconcileRetryCap(class)
+}
+
+func (s *drReplicationSecondary) reconcileRetryCap(class drReconcileFailureClass) uint64 {
+	switch class {
+	case drReconcileFailureBudgetExceeded:
+		return drReconcileRetryCapBudgetExceeded
+	case drReconcileFailureStalled:
+		return drReconcileRetryCapStalled
+	case drReconcileFailureDecodeExhausted:
+		return drReconcileRetryCapDecodeExhausted
+	case drReconcileFailureCheckpointConflict:
+		return drReconcileRetryCapCheckpointConflict
+	case drReconcileFailureApplyFailed:
+		return drReconcileRetryCapApplyFailed
+	case drReconcileFailureAuthRevoked:
+		return drReconcileRetryCapAuthRevoked
+	default:
+		return drReconcileRetryCapUnknown
+	}
+}
+
+func (s *drReplicationSecondary) retryCapCooldown(class drReconcileFailureClass) time.Duration {
+	switch class {
+	case drReconcileFailureCheckpointConflict:
+		return 15 * time.Second
+	case drReconcileFailureStalled:
+		return 15 * time.Second
+	case drReconcileFailureBudgetExceeded:
+		return 20 * time.Second
+	default:
+		return 10 * time.Second
+	}
+}
+
 func classifyReconcileFailure(err error) drReconcileFailureClass {
 	if err == nil {
 		return drReconcileFailureUnknown
 	}
 	msg := strings.ToLower(err.Error())
 	switch {
+	case strings.Contains(msg, "reconcile failure [stalled]"), strings.Contains(msg, "stalled without task progress"):
+		return drReconcileFailureStalled
 	case strings.Contains(msg, "budget_exceeded"):
+		return drReconcileFailureBudgetExceeded
+	case strings.Contains(msg, "stream pressure"), strings.Contains(msg, "primary overloaded"):
 		return drReconcileFailureBudgetExceeded
 	case strings.Contains(msg, "decode_exhausted"):
 		return drReconcileFailureDecodeExhausted
@@ -139,7 +220,8 @@ func (s *drReplicationSecondary) validateDeleteSafety(checkpointID string, check
 	s.sessionMu.RLock()
 	pausedAt := s.streamPausedAt
 	s.sessionMu.RUnlock()
-	if s.State() != DRSecondaryReconciling {
+	state := s.State()
+	if state != DRSecondaryReconciling && state != DRSecondaryResnapshotting {
 		return fmt.Errorf("delete safety violation: secondary is not reconciling")
 	}
 	if s.lastAppliedIndex.Load() != pausedAt {

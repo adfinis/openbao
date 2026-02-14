@@ -23,6 +23,13 @@ import (
 	"github.com/openbao/openbao/sdk/v2/logical"
 )
 
+const (
+	drRegistrationDialTimeout           = 5 * time.Second
+	drRegistrationTLSHandshakeTimeout   = 5 * time.Second
+	drRegistrationResponseHeaderTimeout = 10 * time.Second
+	drRegistrationRequestTimeout        = 15 * time.Second
+)
+
 // GenerateActivationToken creates a token that a secondary uses to
 // establish the DR relationship. Each token includes a single-use
 // bootstrap token for the secondary's cert registration step.
@@ -325,8 +332,16 @@ func (m *drRelationshipManager) registerWithPrimary(ctx context.Context, token *
 
 	client := &http.Client{
 		Transport: &http.Transport{
-			TLSClientConfig: tlsConfig,
+			DialContext: (&net.Dialer{
+				Timeout: drRegistrationDialTimeout,
+			}).DialContext,
+			TLSClientConfig:       tlsConfig,
+			TLSHandshakeTimeout:   drRegistrationTLSHandshakeTimeout,
+			ResponseHeaderTimeout: drRegistrationResponseHeaderTimeout,
+			ExpectContinueTimeout: 1 * time.Second,
+			IdleConnTimeout:       30 * time.Second,
 		},
+		Timeout: drRegistrationRequestTimeout,
 	}
 
 	url := fmt.Sprintf("%s/v1/sys/replication/dr/primary/register-secondary", apiAddr)

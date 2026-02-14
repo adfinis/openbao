@@ -119,6 +119,47 @@ type RangeIndex struct {
 	Ranges []RangeDescriptor
 }
 
+// RangeMapIndex provides sorted-KID iteration over a checkpoint-local
+// KID->VID map for efficient repeated span operations.
+type RangeMapIndex struct {
+	sortedKids [][32]byte
+	kidToVID   map[[32]byte][32]byte
+	entries    map[[32]byte]*physical.Entry
+}
+
+// NewRangeMapIndex builds a sorted index for range-bounded operations.
+func NewRangeMapIndex(kidToVID map[[32]byte][32]byte, entries map[[32]byte]*physical.Entry) *RangeMapIndex {
+	keys := make([][32]byte, 0, len(kidToVID))
+	for kid := range kidToVID {
+		keys = append(keys, kid)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		return bytes.Compare(keys[i][:], keys[j][:]) < 0
+	})
+	return &RangeMapIndex{
+		sortedKids: keys,
+		kidToVID:   kidToVID,
+		entries:    entries,
+	}
+}
+
+// RangeKeys returns sorted keys inside the inclusive span.
+func (i *RangeMapIndex) RangeKeys(span RangeSpan) [][32]byte {
+	if i == nil || len(i.sortedKids) == 0 {
+		return nil
+	}
+	start := sort.Search(len(i.sortedKids), func(idx int) bool {
+		return bytes.Compare(i.sortedKids[idx][:], span.StartKID[:]) >= 0
+	})
+	end := sort.Search(len(i.sortedKids), func(idx int) bool {
+		return bytes.Compare(i.sortedKids[idx][:], span.EndKID[:]) > 0
+	})
+	if start >= end || start >= len(i.sortedKids) {
+		return nil
+	}
+	return i.sortedKids[start:end]
+}
+
 // BuildRangeManifest computes deterministic top-level ranges from a scanned
 // reconciliation set.
 func BuildRangeManifest(rs *ReconciliationSet, cfg RangePlanConfig) ([]RangeDescriptor, error) {
@@ -201,16 +242,24 @@ func BuildRangeDigest(rs *ReconciliationSet, span RangeSpan, maxIBLTCells uint32
 
 // BuildRangeDigestFromMap computes a range digest from KID/VID and optional entries.
 func BuildRangeDigestFromMap(kidToVID map[[32]byte][32]byte, entries map[[32]byte]*physical.Entry, span RangeSpan, maxIBLTCells uint32) RangeDescriptor {
-	keys := make([][32]byte, 0, len(kidToVID))
-	for kid := range kidToVID {
-		if span.Contains(kid) {
-			keys = append(keys, kid)
+	index := NewRangeMapIndex(kidToVID, entries)
+	return BuildRangeDigestFromIndex(index, span, maxIBLTCells)
+}
+
+// BuildRangeDigestFromIndex computes a range digest using a pre-sorted index.
+func BuildRangeDigestFromIndex(index *RangeMapIndex, span RangeSpan, maxIBLTCells uint32) RangeDescriptor {
+	if index == nil {
+		var empty RangeDescriptor
+		empty.Span = span
+		if maxIBLTCells < sketch.DefaultHashCount {
+			empty.SuggestedIBLTCells = sketch.DefaultHashCount
+		} else {
+			empty.SuggestedIBLTCells = maxIBLTCells
 		}
+		return empty
 	}
-	sort.Slice(keys, func(i, j int) bool {
-		return bytes.Compare(keys[i][:], keys[j][:]) < 0
-	})
-	return buildRangeDescriptor(keys, kidToVID, entries, maxIBLTCells, span.SplitDepth)
+	keys := index.RangeKeys(span)
+	return buildRangeDescriptor(keys, index.kidToVID, index.entries, maxIBLTCells, span.SplitDepth)
 }
 
 // ComputeRangeDigestFromItems computes a range digest from compact
@@ -230,14 +279,26 @@ func BuildRangeIBLT(rs *ReconciliationSet, span RangeSpan, numCells uint32) *ske
 
 // BuildRangeIBLTFromMap builds an IBLT for a specific KID range.
 func BuildRangeIBLTFromMap(kidToVID map[[32]byte][32]byte, span RangeSpan, numCells uint32) *sketch.IBLT {
+	index := NewRangeMapIndex(kidToVID, nil)
+	return BuildRangeIBLTFromIndex(index, span, numCells)
+}
+
+// BuildRangeIBLTFromIndex builds an IBLT for a specific KID range using a
+// pre-sorted range index.
+func BuildRangeIBLTFromIndex(index *RangeMapIndex, span RangeSpan, numCells uint32) *sketch.IBLT {
 	if numCells < sketch.DefaultHashCount {
 		numCells = sketch.DefaultHashCount
 	}
 	iblt := sketch.NewIBLT(numCells, sketch.DefaultHashCount)
-	for kid, vid := range kidToVID {
-		if span.Contains(kid) {
-			iblt.Insert(kid, vid)
+	if index == nil {
+		return iblt
+	}
+	for _, kid := range index.RangeKeys(span) {
+		vid, ok := index.kidToVID[kid]
+		if !ok {
+			continue
 		}
+		iblt.Insert(kid, vid)
 	}
 	return iblt
 }

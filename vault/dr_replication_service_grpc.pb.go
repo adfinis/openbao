@@ -22,14 +22,14 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	DRReplication_StreamChanges_FullMethodName           = "/vault.DRReplication/StreamChanges"
-	DRReplication_RequestCheckpoint_FullMethodName       = "/vault.DRReplication/RequestCheckpoint"
-	DRReplication_ExchangeStrataEstimator_FullMethodName = "/vault.DRReplication/ExchangeStrataEstimator"
-	DRReplication_ExchangeIBLT_FullMethodName            = "/vault.DRReplication/ExchangeIBLT"
-	DRReplication_ExchangePrefixDigests_FullMethodName   = "/vault.DRReplication/ExchangePrefixDigests"
-	DRReplication_FetchEntries_FullMethodName            = "/vault.DRReplication/FetchEntries"
-	DRReplication_Heartbeat_FullMethodName               = "/vault.DRReplication/Heartbeat"
-	DRReplication_SyncKeyring_FullMethodName             = "/vault.DRReplication/SyncKeyring"
+	DRReplication_StreamChanges_FullMethodName         = "/vault.DRReplication/StreamChanges"
+	DRReplication_RequestCheckpoint_FullMethodName     = "/vault.DRReplication/RequestCheckpoint"
+	DRReplication_ExchangeIBLT_FullMethodName          = "/vault.DRReplication/ExchangeIBLT"
+	DRReplication_ExchangeRangeDigests_FullMethodName  = "/vault.DRReplication/ExchangeRangeDigests"
+	DRReplication_ExchangePrefixDigests_FullMethodName = "/vault.DRReplication/ExchangePrefixDigests"
+	DRReplication_FetchEntries_FullMethodName          = "/vault.DRReplication/FetchEntries"
+	DRReplication_Heartbeat_FullMethodName             = "/vault.DRReplication/Heartbeat"
+	DRReplication_SyncKeyring_FullMethodName           = "/vault.DRReplication/SyncKeyring"
 )
 
 // DRReplicationClient is the client API for DRReplication service.
@@ -53,12 +53,13 @@ type DRReplicationClient interface {
 	// RequestCheckpoint asks the primary to create a consistent
 	// checkpoint at its current commit index for reconciliation.
 	RequestCheckpoint(ctx context.Context, in *CheckpointRequest, opts ...grpc.CallOption) (*CheckpointResponse, error)
-	// ExchangeStrataEstimator exchanges strata estimator sketches to
-	// estimate the number of differences between primary and secondary.
-	ExchangeStrataEstimator(ctx context.Context, in *StrataMessage, opts ...grpc.CallOption) (*StrataMessage, error)
 	// ExchangeIBLT exchanges IBLT sketches to decode the actual
 	// differing elements.
 	ExchangeIBLT(ctx context.Context, in *IBLTMessage, opts ...grpc.CallOption) (*IBLTMessage, error)
+	// ExchangeRangeDigests returns range digests for explicit spans from
+	// an immutable checkpoint artifact. Used by secondaries to avoid blind
+	// split fanout after decode failures.
+	ExchangeRangeDigests(ctx context.Context, in *RangeDigestRequest, opts ...grpc.CallOption) (*RangeDigestResponse, error)
 	// ExchangePrefixDigests exchanges prefix digest buckets for
 	// adaptive drill-down when IBLT decode fails.
 	ExchangePrefixDigests(ctx context.Context, in *PrefixDigestRequest, opts ...grpc.CallOption) (*PrefixDigestResponse, error)
@@ -111,20 +112,20 @@ func (c *dRReplicationClient) RequestCheckpoint(ctx context.Context, in *Checkpo
 	return out, nil
 }
 
-func (c *dRReplicationClient) ExchangeStrataEstimator(ctx context.Context, in *StrataMessage, opts ...grpc.CallOption) (*StrataMessage, error) {
+func (c *dRReplicationClient) ExchangeIBLT(ctx context.Context, in *IBLTMessage, opts ...grpc.CallOption) (*IBLTMessage, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(StrataMessage)
-	err := c.cc.Invoke(ctx, DRReplication_ExchangeStrataEstimator_FullMethodName, in, out, cOpts...)
+	out := new(IBLTMessage)
+	err := c.cc.Invoke(ctx, DRReplication_ExchangeIBLT_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *dRReplicationClient) ExchangeIBLT(ctx context.Context, in *IBLTMessage, opts ...grpc.CallOption) (*IBLTMessage, error) {
+func (c *dRReplicationClient) ExchangeRangeDigests(ctx context.Context, in *RangeDigestRequest, opts ...grpc.CallOption) (*RangeDigestResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(IBLTMessage)
-	err := c.cc.Invoke(ctx, DRReplication_ExchangeIBLT_FullMethodName, in, out, cOpts...)
+	out := new(RangeDigestResponse)
+	err := c.cc.Invoke(ctx, DRReplication_ExchangeRangeDigests_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -201,12 +202,13 @@ type DRReplicationServer interface {
 	// RequestCheckpoint asks the primary to create a consistent
 	// checkpoint at its current commit index for reconciliation.
 	RequestCheckpoint(context.Context, *CheckpointRequest) (*CheckpointResponse, error)
-	// ExchangeStrataEstimator exchanges strata estimator sketches to
-	// estimate the number of differences between primary and secondary.
-	ExchangeStrataEstimator(context.Context, *StrataMessage) (*StrataMessage, error)
 	// ExchangeIBLT exchanges IBLT sketches to decode the actual
 	// differing elements.
 	ExchangeIBLT(context.Context, *IBLTMessage) (*IBLTMessage, error)
+	// ExchangeRangeDigests returns range digests for explicit spans from
+	// an immutable checkpoint artifact. Used by secondaries to avoid blind
+	// split fanout after decode failures.
+	ExchangeRangeDigests(context.Context, *RangeDigestRequest) (*RangeDigestResponse, error)
 	// ExchangePrefixDigests exchanges prefix digest buckets for
 	// adaptive drill-down when IBLT decode fails.
 	ExchangePrefixDigests(context.Context, *PrefixDigestRequest) (*PrefixDigestResponse, error)
@@ -236,11 +238,11 @@ func (UnimplementedDRReplicationServer) StreamChanges(*StreamChangesRequest, grp
 func (UnimplementedDRReplicationServer) RequestCheckpoint(context.Context, *CheckpointRequest) (*CheckpointResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RequestCheckpoint not implemented")
 }
-func (UnimplementedDRReplicationServer) ExchangeStrataEstimator(context.Context, *StrataMessage) (*StrataMessage, error) {
-	return nil, status.Error(codes.Unimplemented, "method ExchangeStrataEstimator not implemented")
-}
 func (UnimplementedDRReplicationServer) ExchangeIBLT(context.Context, *IBLTMessage) (*IBLTMessage, error) {
 	return nil, status.Error(codes.Unimplemented, "method ExchangeIBLT not implemented")
+}
+func (UnimplementedDRReplicationServer) ExchangeRangeDigests(context.Context, *RangeDigestRequest) (*RangeDigestResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ExchangeRangeDigests not implemented")
 }
 func (UnimplementedDRReplicationServer) ExchangePrefixDigests(context.Context, *PrefixDigestRequest) (*PrefixDigestResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ExchangePrefixDigests not implemented")
@@ -304,24 +306,6 @@ func _DRReplication_RequestCheckpoint_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
-func _DRReplication_ExchangeStrataEstimator_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(StrataMessage)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(DRReplicationServer).ExchangeStrataEstimator(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: DRReplication_ExchangeStrataEstimator_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(DRReplicationServer).ExchangeStrataEstimator(ctx, req.(*StrataMessage))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 func _DRReplication_ExchangeIBLT_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(IBLTMessage)
 	if err := dec(in); err != nil {
@@ -336,6 +320,24 @@ func _DRReplication_ExchangeIBLT_Handler(srv interface{}, ctx context.Context, d
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(DRReplicationServer).ExchangeIBLT(ctx, req.(*IBLTMessage))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _DRReplication_ExchangeRangeDigests_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RangeDigestRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DRReplicationServer).ExchangeRangeDigests(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: DRReplication_ExchangeRangeDigests_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DRReplicationServer).ExchangeRangeDigests(ctx, req.(*RangeDigestRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -417,12 +419,12 @@ var DRReplication_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _DRReplication_RequestCheckpoint_Handler,
 		},
 		{
-			MethodName: "ExchangeStrataEstimator",
-			Handler:    _DRReplication_ExchangeStrataEstimator_Handler,
-		},
-		{
 			MethodName: "ExchangeIBLT",
 			Handler:    _DRReplication_ExchangeIBLT_Handler,
+		},
+		{
+			MethodName: "ExchangeRangeDigests",
+			Handler:    _DRReplication_ExchangeRangeDigests_Handler,
 		},
 		{
 			MethodName: "ExchangePrefixDigests",

@@ -117,6 +117,11 @@ type ScanConfig struct {
 	// point-in-time snapshot of scanned entries keyed by KID.
 	BuildEntryMap bool
 
+	// RequireTransactionalSnapshot enforces that scans run against a
+	// read-only transaction view. If no transactional view is available,
+	// Scan returns an error.
+	RequireTransactionalSnapshot bool
+
 	// ExcludePaths is an optional set of storage paths to skip during
 	// reconciliation scans. Paths in this set cannot be read through
 	// the barrier (e.g. core/keyring, encrypted with root key) or
@@ -134,11 +139,12 @@ type ScanConfig struct {
 // DefaultScanConfig returns a ScanConfig with sensible defaults.
 func DefaultScanConfig(replSalt []byte) ScanConfig {
 	return ScanConfig{
-		ReplSalt:     replSalt,
-		PrefixLen:    8,
-		StrataLevels: sketch.DefaultStrataLevels,
-		StrataCells:  sketch.DefaultStrataCells,
-		BuildKIDMap:  false,
+		ReplSalt:                      replSalt,
+		PrefixLen:                     8,
+		StrataLevels:                  sketch.DefaultStrataLevels,
+		StrataCells:                   sketch.DefaultStrataCells,
+		BuildKIDMap:                   false,
+		RequireTransactionalSnapshot:  false,
 	}
 }
 
@@ -184,19 +190,26 @@ func (s *Scanner) Scan(ctx context.Context, storage logical.Storage, checkpoint 
 		rs.Entries = make(map[[32]byte]*physical.Entry)
 	}
 
+	scanStorage, rollback, err := s.beginScanSnapshot(ctx, storage)
+	if err != nil {
+		return nil, fmt.Errorf("reconciler: failed to begin scan snapshot: %w", err)
+	}
+	if rollback != nil {
+		defer rollback()
+	}
+
 	var mu sync.Mutex
-	err := logical.ScanView(ctx, storage, func(path string) {
+	err = logical.ScanViewPaginated(ctx, scanStorage, s.logger, logical.DefaultScanViewPageLimit, func(_ int, _ int, path string) (bool, error) {
 		// Skip excluded paths (e.g. core/keyring which is encrypted
 		// with the root key and cannot be read through the barrier).
 		if s.shouldExclude(path) {
-			return
+			return true, nil
 		}
 
 		// Get the entry to compute VID from value hash.
-		entry, err := storage.Get(ctx, path)
+		entry, err := scanStorage.Get(ctx, path)
 		if err != nil {
-			s.logger.Warn("failed to get entry during scan", "path", path, "error", err)
-			return
+			return false, fmt.Errorf("failed to read entry during scan for %q: %w", path, err)
 		}
 
 		kid := s.computeKID(path)
@@ -229,6 +242,7 @@ func (s *Scanner) Scan(ctx context.Context, storage logical.Storage, checkpoint 
 		}
 		rs.KeyCount++
 		mu.Unlock()
+		return true, nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("reconciler: scan failed: %w", err)
@@ -244,16 +258,23 @@ func (s *Scanner) Scan(ctx context.Context, storage logical.Storage, checkpoint 
 func (s *Scanner) BuildIBLTFromScan(ctx context.Context, storage logical.Storage, numCells uint32) (*sketch.IBLT, error) {
 	iblt := sketch.NewIBLT(numCells, sketch.DefaultHashCount)
 
-	err := logical.ScanView(ctx, storage, func(path string) {
+	scanStorage, rollback, err := s.beginScanSnapshot(ctx, storage)
+	if err != nil {
+		return nil, fmt.Errorf("reconciler: failed to begin IBLT snapshot: %w", err)
+	}
+	if rollback != nil {
+		defer rollback()
+	}
+
+	err = logical.ScanViewPaginated(ctx, scanStorage, s.logger, logical.DefaultScanViewPageLimit, func(_ int, _ int, path string) (bool, error) {
 		// Skip excluded paths.
 		if s.shouldExclude(path) {
-			return
+			return true, nil
 		}
 
-		entry, err := storage.Get(ctx, path)
+		entry, err := scanStorage.Get(ctx, path)
 		if err != nil {
-			s.logger.Warn("failed to get entry for IBLT build", "path", path, "error", err)
-			return
+			return false, fmt.Errorf("failed to get entry for IBLT build for %q: %w", path, err)
 		}
 
 		kid := s.computeKID(path)
@@ -265,11 +286,30 @@ func (s *Scanner) BuildIBLTFromScan(ctx context.Context, storage logical.Storage
 		}
 
 		iblt.Insert(kid, vid)
+		return true, nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("reconciler: IBLT build failed: %w", err)
 	}
 	return iblt, nil
+}
+
+func (s *Scanner) beginScanSnapshot(ctx context.Context, storage logical.Storage) (logical.Storage, func(), error) {
+	if txView, ok := storage.(logical.Transactional); ok {
+		txn, err := txView.BeginReadOnlyTx(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		return txn, func() {
+			_ = txn.Rollback(ctx)
+		}, nil
+	}
+
+	if s.config.RequireTransactionalSnapshot {
+		return nil, nil, fmt.Errorf("transactional snapshot required but storage does not support read-only transactions")
+	}
+
+	return storage, nil, nil
 }
 
 func (s *Scanner) shouldExclude(path string) bool {

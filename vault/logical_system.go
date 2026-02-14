@@ -93,6 +93,8 @@ func NewSystemBackend(core *Core, logger log.Logger) *SystemBackend {
 				"replication/dr/secondary/enable",
 				"replication/dr/secondary/disable",
 				"replication/dr/secondary/promote",
+				"replication/dr/secondary/resnapshot",
+				"replication/dr/tuning",
 			},
 
 			Unauthenticated: []string{

@@ -334,6 +334,104 @@ func (b *SystemBackend) drReplicationPaths() []*framework.Path {
 			HelpSynopsis:    "Promote DR secondary",
 			HelpDescription: "Promotes this DR secondary to a standalone primary. This is the disaster recovery failover operation.",
 		},
+
+		// --- Secondary resnapshot trigger ---
+		{
+			Pattern: "replication/dr/secondary/resnapshot$",
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: "replication-dr-secondary",
+				OperationVerb:   "resnapshot",
+			},
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback:                  b.handleDRSecondaryResnapshot,
+					Summary:                   "Trigger a hard-cutover DR resnapshot on the secondary.",
+					ForwardPerformanceStandby: true,
+				},
+			},
+			HelpSynopsis:    "Trigger DR secondary resnapshot",
+			HelpDescription: "Requests a protocol-scoped full-copy resnapshot from the primary checkpoint.",
+		},
+
+		// --- DR tuning ---
+		{
+			Pattern: "replication/dr/tuning$",
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: "replication-dr",
+				OperationVerb:   "tuning",
+			},
+			Fields: map[string]*framework.FieldSchema{
+				"checkpoint_ttl_seconds": {
+					Type:        framework.TypeInt,
+					Description: "Checkpoint cache TTL in seconds.",
+				},
+				"checkpoint_global_budget_bytes": {
+					Type:        framework.TypeInt,
+					Description: "Global checkpoint cache budget in bytes.",
+				},
+				"checkpoint_per_relationship_budget_bytes": {
+					Type:        framework.TypeInt,
+					Description: "Per-relationship checkpoint cache budget in bytes.",
+				},
+				"stream_buffer_max_entries": {
+					Type:        framework.TypeInt,
+					Description: "Primary stream buffer max entries.",
+				},
+				"stream_buffer_max_bytes": {
+					Type:        framework.TypeInt,
+					Description: "Primary stream buffer max bytes.",
+				},
+				"reconcile_max_rpc_bytes": {
+					Type:        framework.TypeInt,
+					Description: "Secondary reconcile RPC byte budget.",
+				},
+				"reconcile_max_wall_time_seconds": {
+					Type:        framework.TypeInt,
+					Description: "Secondary reconcile wall-time budget in seconds.",
+				},
+				"reconcile_max_inflight_tasks": {
+					Type:        framework.TypeInt,
+					Description: "Secondary max in-flight range tasks.",
+				},
+				"fallback_enabled": {
+					Type:        framework.TypeBool,
+					Description: "Enable automatic resnapshot fallback under sustained lag pressure.",
+				},
+				"fallback_stall_seconds": {
+					Type:        framework.TypeInt,
+					Description: "Stall duration required before fallback can trigger.",
+				},
+				"fallback_failure_threshold": {
+					Type:        framework.TypeInt,
+					Description: "Failure count threshold in the fallback rolling window.",
+				},
+				"fallback_min_lag_entries": {
+					Type:        framework.TypeInt,
+					Description: "Minimum lag entries required before fallback can trigger.",
+				},
+				"fallback_cooldown_seconds": {
+					Type:        framework.TypeInt,
+					Description: "Cooldown between fallback runs in seconds.",
+				},
+				"fallback_max_per_hour": {
+					Type:        framework.TypeInt,
+					Description: "Maximum fallback runs per hour.",
+				},
+			},
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.ReadOperation: &framework.PathOperation{
+					Callback: b.handleDRTuningRead,
+					Summary:  "Read DR runtime tuning values.",
+				},
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback:                  b.handleDRTuningWrite,
+					Summary:                   "Update DR runtime tuning values.",
+					ForwardPerformanceStandby: true,
+				},
+			},
+			HelpSynopsis:    "Read/update DR tuning",
+			HelpDescription: "Reads and updates persisted DR runtime tuning values.",
+		},
 	}
 }
 
@@ -355,6 +453,7 @@ func (b *SystemBackend) handleDRStatus(ctx context.Context, req *logical.Request
 	if sec := mgr.Secondary(); sec != nil {
 		status := sec.Status()
 		data["secondary_state"] = status.State
+		data["primary_index"] = status.PrimaryIndex
 		data["last_applied_index"] = status.LastAppliedIndex
 		data["entries_applied"] = status.EntriesApplied
 		data["reconcile_count"] = status.ReconcileCount
@@ -370,17 +469,53 @@ func (b *SystemBackend) handleDRStatus(ctx context.Context, req *logical.Request
 		data["range_manifest_count"] = status.RangeManifestCount
 		data["range_split_count"] = status.RangeSplitCount
 		data["reconcile_rpc_bytes_used"] = status.ReconcileRPCBytesUsed
+		data["scan_failures_total"] = status.ScanFailuresTotal
+		data["checkpoint_conflicts_total"] = status.CheckpointConflictsTotal
+		data["reconcile_retries_total"] = status.ReconcileRetriesTotal
+		data["reconcile_queue_depth"] = status.ReconcileQueueDepth
+		data["reconcile_task_retries_total"] = status.ReconcileTaskRetriesTotal
+		data["reconcile_decode_failures_total"] = status.ReconcileDecodeFailuresTotal
+		data["reconcile_stalled_total"] = status.ReconcileStalledTotal
+		data["reconcile_stuck_seconds"] = status.ReconcileStuckSeconds
+		data["last_applied_age_seconds"] = status.LastAppliedAgeSeconds
+		data["reconcile_max_rpc_bytes"] = status.ReconcileMaxRPCBytes
+		data["reconcile_max_wall_time_seconds"] = status.ReconcileMaxWallTimeSeconds
+		data["reconcile_max_inflight_tasks"] = status.ReconcileMaxInflightTasks
+		data["stream_batch_max_entries"] = status.StreamBatchMaxEntries
+		data["stream_batch_max_bytes"] = status.StreamBatchMaxBytes
+		data["stream_batch_max_wait_milliseconds"] = status.StreamBatchMaxWaitMilliseconds
+		data["fallback_active"] = status.FallbackActive
+		data["fallback_count"] = status.FallbackCount
+		data["fallback_last_reason"] = status.FallbackLastReason
+		data["fallback_last_at"] = status.FallbackLastAt
+		data["reconcile_task_rate"] = status.ReconcileTaskRate
 	}
 
 	if primary := mgr.Primary(); primary != nil {
 		cacheBytes, cacheItems, cacheEvictions, cacheMetaBytes, cacheValueBytes, cacheAdmissionFailures := primary.checkpointCacheStats()
+		streamEntries, streamBytes := primary.streamBufferStats()
+		checkpointTTLSeconds, checkpointGlobalBudget, checkpointPerRelationshipBudget, streamBufferMaxEntries, streamBufferMaxBytes := primary.tuningSnapshot()
 		data["checkpoint_cache_bytes"] = cacheBytes
 		data["checkpoint_cache_items"] = cacheItems
 		data["checkpoint_cache_evictions"] = cacheEvictions
 		data["checkpoint_meta_bytes"] = cacheMetaBytes
 		data["checkpoint_value_bytes"] = cacheValueBytes
 		data["checkpoint_admission_failures"] = cacheAdmissionFailures
+		data["checkpoint_throttle_total"] = primary.checkpointThrottleCount()
+		data["checkpoint_throttle_bypass_total"] = primary.checkpointThrottleBypassCount()
 		data["revoked_streams_terminated"] = primary.revokedStreamsTerminatedCount()
+		data["stream_buffer_entries"] = streamEntries
+		data["stream_buffer_bytes"] = streamBytes
+		data["stream_lagging_subscribers_total"] = primary.laggingSubscribersCount()
+		data["stream_lagging_subscribers_active"] = primary.laggingSubscribersActiveCount()
+		data["stream_subscribers_active"] = primary.subscriberCount()
+		data["scan_failures_total"] = primary.scanFailuresCount()
+		data["checkpoint_ttl_seconds"] = checkpointTTLSeconds
+		data["checkpoint_global_budget_bytes"] = checkpointGlobalBudget
+		data["checkpoint_per_relationship_budget_bytes"] = checkpointPerRelationshipBudget
+		data["stream_buffer_max_entries"] = streamBufferMaxEntries
+		data["stream_buffer_max_bytes"] = streamBufferMaxBytes
+		data["stream_buffer_horizon_seconds"] = primary.streamBufferHorizonSeconds()
 	}
 
 	if config.Mode == DRModePrimary {
@@ -642,6 +777,102 @@ func (b *SystemBackend) handleDRPrimaryRelationshipRevoke(ctx context.Context, r
 	}
 
 	if err := mgr.RevokeRelationship(ctx, id); err != nil {
+		return logical.ErrorResponse(err.Error()), nil
+	}
+	return nil, nil
+}
+
+func (b *SystemBackend) handleDRSecondaryResnapshot(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	mgr := b.Core.drManager
+	if mgr == nil {
+		return logical.ErrorResponse("DR replication not initialized"), nil
+	}
+	if err := mgr.RequestSecondaryResnapshot("manual-api"); err != nil {
+		return logical.ErrorResponse(err.Error()), nil
+	}
+	return &logical.Response{
+		Data: map[string]interface{}{
+			"message": "DR secondary resnapshot requested",
+		},
+	}, nil
+}
+
+func (b *SystemBackend) handleDRTuningRead(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	mgr := b.Core.drManager
+	if mgr == nil {
+		return logical.ErrorResponse("DR replication not initialized"), nil
+	}
+	cfg := mgr.Config()
+	return &logical.Response{
+		Data: map[string]interface{}{
+			"checkpoint_ttl_seconds":                   cfg.CheckpointTTLSeconds,
+			"checkpoint_global_budget_bytes":           cfg.CheckpointGlobalBudgetBytes,
+			"checkpoint_per_relationship_budget_bytes": cfg.CheckpointPerRelBudgetBytes,
+			"stream_buffer_max_entries":                cfg.StreamBufferMaxEntries,
+			"stream_buffer_max_bytes":                  cfg.StreamBufferMaxBytes,
+			"reconcile_max_rpc_bytes":                  cfg.ReconcileMaxRPCBytes,
+			"reconcile_max_wall_time_seconds":          cfg.ReconcileMaxWallTimeSeconds,
+			"reconcile_max_inflight_tasks":             cfg.ReconcileMaxInflightTasks,
+			"fallback_enabled":                         cfg.FallbackEnabled,
+			"fallback_stall_seconds":                   cfg.FallbackStallSeconds,
+			"fallback_failure_threshold":               cfg.FallbackFailureThreshold,
+			"fallback_min_lag_entries":                 cfg.FallbackMinLagEntries,
+			"fallback_cooldown_seconds":                cfg.FallbackCooldownSeconds,
+			"fallback_max_per_hour":                    cfg.FallbackMaxPerHour,
+		},
+	}, nil
+}
+
+func (b *SystemBackend) handleDRTuningWrite(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	mgr := b.Core.drManager
+	if mgr == nil {
+		return logical.ErrorResponse("DR replication not initialized"), nil
+	}
+	if err := mgr.UpdateTuning(ctx, func(cfg *DRConfig) error {
+		if raw, ok := d.GetOk("checkpoint_ttl_seconds"); ok {
+			cfg.CheckpointTTLSeconds = int64(raw.(int))
+		}
+		if raw, ok := d.GetOk("checkpoint_global_budget_bytes"); ok {
+			cfg.CheckpointGlobalBudgetBytes = uint64(raw.(int))
+		}
+		if raw, ok := d.GetOk("checkpoint_per_relationship_budget_bytes"); ok {
+			cfg.CheckpointPerRelBudgetBytes = uint64(raw.(int))
+		}
+		if raw, ok := d.GetOk("stream_buffer_max_entries"); ok {
+			cfg.StreamBufferMaxEntries = raw.(int)
+		}
+		if raw, ok := d.GetOk("stream_buffer_max_bytes"); ok {
+			cfg.StreamBufferMaxBytes = uint64(raw.(int))
+		}
+		if raw, ok := d.GetOk("reconcile_max_rpc_bytes"); ok {
+			cfg.ReconcileMaxRPCBytes = uint64(raw.(int))
+		}
+		if raw, ok := d.GetOk("reconcile_max_wall_time_seconds"); ok {
+			cfg.ReconcileMaxWallTimeSeconds = int64(raw.(int))
+		}
+		if raw, ok := d.GetOk("reconcile_max_inflight_tasks"); ok {
+			cfg.ReconcileMaxInflightTasks = raw.(int)
+		}
+		if raw, ok := d.GetOk("fallback_enabled"); ok {
+			cfg.FallbackEnabled = raw.(bool)
+		}
+		if raw, ok := d.GetOk("fallback_stall_seconds"); ok {
+			cfg.FallbackStallSeconds = int64(raw.(int))
+		}
+		if raw, ok := d.GetOk("fallback_failure_threshold"); ok {
+			cfg.FallbackFailureThreshold = raw.(int)
+		}
+		if raw, ok := d.GetOk("fallback_min_lag_entries"); ok {
+			cfg.FallbackMinLagEntries = uint64(raw.(int))
+		}
+		if raw, ok := d.GetOk("fallback_cooldown_seconds"); ok {
+			cfg.FallbackCooldownSeconds = int64(raw.(int))
+		}
+		if raw, ok := d.GetOk("fallback_max_per_hour"); ok {
+			cfg.FallbackMaxPerHour = raw.(int)
+		}
+		return nil
+	}); err != nil {
 		return logical.ErrorResponse(err.Error()), nil
 	}
 	return nil, nil

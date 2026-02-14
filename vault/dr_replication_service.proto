@@ -26,13 +26,14 @@ service DRReplication {
     // checkpoint at its current commit index for reconciliation.
     rpc RequestCheckpoint(CheckpointRequest) returns (CheckpointResponse) {}
 
-    // ExchangeStrataEstimator exchanges strata estimator sketches to
-    // estimate the number of differences between primary and secondary.
-    rpc ExchangeStrataEstimator(StrataMessage) returns (StrataMessage) {}
-
     // ExchangeIBLT exchanges IBLT sketches to decode the actual
     // differing elements.
     rpc ExchangeIBLT(IBLTMessage) returns (IBLTMessage) {}
+
+    // ExchangeRangeDigests returns range digests for explicit spans from
+    // an immutable checkpoint artifact. Used by secondaries to avoid blind
+    // split fanout after decode failures.
+    rpc ExchangeRangeDigests(RangeDigestRequest) returns (RangeDigestResponse) {}
 
     // ExchangePrefixDigests exchanges prefix digest buckets for
     // adaptive drill-down when IBLT decode fails.
@@ -128,17 +129,16 @@ message RangeDigest {
     uint64 approx_value_bytes = 6;
 }
 
-// StrataMessage carries a serialized strata estimator.
-message StrataMessage {
+// RangeDigestRequest asks the primary for digest metadata of explicit spans.
+message RangeDigestRequest {
     string checkpoint_id = 1;
+    uint64 checkpoint_index = 2;
+    repeated RangeSpan spans = 3;
+}
 
-    // strata_data is the serialized StrataEstimator.
-    bytes strata_data = 2;
-
-    // checkpoint_index is the primary commit index associated with this
-    // checkpoint. All reconciliation phase requests must carry the same
-    // checkpoint tuple (id + index).
-    uint64 checkpoint_index = 3;
+// RangeDigestResponse returns one digest per requested span.
+message RangeDigestResponse {
+    repeated RangeDigest ranges = 1;
 }
 
 // IBLTMessage carries a serialized IBLT.
