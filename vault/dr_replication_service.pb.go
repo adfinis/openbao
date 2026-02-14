@@ -118,6 +118,141 @@ func (x *EntryChange) GetKid() []byte {
 	return nil
 }
 
+// StreamChangesUpstream is the client-to-server message envelope for the
+// bidirectional StreamChanges RPC. The first message must be an init
+// carrying the StreamChangesRequest. Subsequent messages carry WindowUpdate
+// credits to replenish the primary's per-subscriber send budget.
+type StreamChangesUpstream struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Msg:
+	//
+	//	*StreamChangesUpstream_Init
+	//	*StreamChangesUpstream_WindowUpdate
+	Msg           isStreamChangesUpstream_Msg `protobuf_oneof:"msg"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StreamChangesUpstream) Reset() {
+	*x = StreamChangesUpstream{}
+	mi := &file_vault_dr_replication_service_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StreamChangesUpstream) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StreamChangesUpstream) ProtoMessage() {}
+
+func (x *StreamChangesUpstream) ProtoReflect() protoreflect.Message {
+	mi := &file_vault_dr_replication_service_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StreamChangesUpstream.ProtoReflect.Descriptor instead.
+func (*StreamChangesUpstream) Descriptor() ([]byte, []int) {
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *StreamChangesUpstream) GetMsg() isStreamChangesUpstream_Msg {
+	if x != nil {
+		return x.Msg
+	}
+	return nil
+}
+
+func (x *StreamChangesUpstream) GetInit() *StreamChangesRequest {
+	if x != nil {
+		if x, ok := x.Msg.(*StreamChangesUpstream_Init); ok {
+			return x.Init
+		}
+	}
+	return nil
+}
+
+func (x *StreamChangesUpstream) GetWindowUpdate() *WindowUpdate {
+	if x != nil {
+		if x, ok := x.Msg.(*StreamChangesUpstream_WindowUpdate); ok {
+			return x.WindowUpdate
+		}
+	}
+	return nil
+}
+
+type isStreamChangesUpstream_Msg interface {
+	isStreamChangesUpstream_Msg()
+}
+
+type StreamChangesUpstream_Init struct {
+	Init *StreamChangesRequest `protobuf:"bytes,1,opt,name=init,proto3,oneof"`
+}
+
+type StreamChangesUpstream_WindowUpdate struct {
+	WindowUpdate *WindowUpdate `protobuf:"bytes,2,opt,name=window_update,json=windowUpdate,proto3,oneof"`
+}
+
+func (*StreamChangesUpstream_Init) isStreamChangesUpstream_Msg() {}
+
+func (*StreamChangesUpstream_WindowUpdate) isStreamChangesUpstream_Msg() {}
+
+// WindowUpdate carries credit replenishment from the secondary to the
+// primary. The secondary sends this after flushing a batch of entries,
+// allowing the primary to resume sending.
+type WindowUpdate struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// credits is the number of additional entries the secondary is ready
+	// to accept.
+	Credits       uint64 `protobuf:"varint,1,opt,name=credits,proto3" json:"credits,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WindowUpdate) Reset() {
+	*x = WindowUpdate{}
+	mi := &file_vault_dr_replication_service_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WindowUpdate) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WindowUpdate) ProtoMessage() {}
+
+func (x *WindowUpdate) ProtoReflect() protoreflect.Message {
+	mi := &file_vault_dr_replication_service_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WindowUpdate.ProtoReflect.Descriptor instead.
+func (*WindowUpdate) Descriptor() ([]byte, []int) {
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *WindowUpdate) GetCredits() uint64 {
+	if x != nil {
+		return x.Credits
+	}
+	return 0
+}
+
 // StreamChangesRequest initiates the change stream from primary.
 type StreamChangesRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -126,13 +261,17 @@ type StreamChangesRequest struct {
 	// last_applied_index is the secondary's last known primary index.
 	// Used as a hint for the primary to skip already-applied entries.
 	LastAppliedIndex uint64 `protobuf:"varint,2,opt,name=last_applied_index,json=lastAppliedIndex,proto3" json:"last_applied_index,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// initial_window is the number of entries the secondary is initially
+	// willing to accept before requiring WindowUpdate replenishment.
+	// If zero, the primary uses a default (drDefaultInitialWindow).
+	InitialWindow uint64 `protobuf:"varint,3,opt,name=initial_window,json=initialWindow,proto3" json:"initial_window,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *StreamChangesRequest) Reset() {
 	*x = StreamChangesRequest{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[1]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -144,7 +283,7 @@ func (x *StreamChangesRequest) String() string {
 func (*StreamChangesRequest) ProtoMessage() {}
 
 func (x *StreamChangesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[1]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -157,7 +296,7 @@ func (x *StreamChangesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamChangesRequest.ProtoReflect.Descriptor instead.
 func (*StreamChangesRequest) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{1}
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *StreamChangesRequest) GetRelationshipId() string {
@@ -174,6 +313,13 @@ func (x *StreamChangesRequest) GetLastAppliedIndex() uint64 {
 	return 0
 }
 
+func (x *StreamChangesRequest) GetInitialWindow() uint64 {
+	if x != nil {
+		return x.InitialWindow
+	}
+	return 0
+}
+
 // CheckpointRequest asks the primary to create a reconciliation checkpoint.
 type CheckpointRequest struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
@@ -184,7 +330,7 @@ type CheckpointRequest struct {
 
 func (x *CheckpointRequest) Reset() {
 	*x = CheckpointRequest{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[2]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -196,7 +342,7 @@ func (x *CheckpointRequest) String() string {
 func (*CheckpointRequest) ProtoMessage() {}
 
 func (x *CheckpointRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[2]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -209,7 +355,7 @@ func (x *CheckpointRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CheckpointRequest.ProtoReflect.Descriptor instead.
 func (*CheckpointRequest) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{2}
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *CheckpointRequest) GetRelationshipId() string {
@@ -226,9 +372,6 @@ type CheckpointResponse struct {
 	CheckpointId string `protobuf:"bytes,1,opt,name=checkpoint_id,json=checkpointId,proto3" json:"checkpoint_id,omitempty"`
 	// commit_index is the primary's Raft commit index at checkpoint time.
 	CommitIndex uint64 `protobuf:"varint,2,opt,name=commit_index,json=commitIndex,proto3" json:"commit_index,omitempty"`
-	// top_ranges is the primary-generated deterministic top-level range
-	// manifest for range-based reconciliation.
-	TopRanges []*RangeDigest `protobuf:"bytes,3,rep,name=top_ranges,json=topRanges,proto3" json:"top_ranges,omitempty"`
 	// range_plan_version identifies the deterministic range planner
 	// algorithm used to generate top_ranges.
 	RangePlanVersion uint32 `protobuf:"varint,4,opt,name=range_plan_version,json=rangePlanVersion,proto3" json:"range_plan_version,omitempty"`
@@ -238,7 +381,7 @@ type CheckpointResponse struct {
 
 func (x *CheckpointResponse) Reset() {
 	*x = CheckpointResponse{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[3]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -250,7 +393,7 @@ func (x *CheckpointResponse) String() string {
 func (*CheckpointResponse) ProtoMessage() {}
 
 func (x *CheckpointResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[3]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -263,7 +406,7 @@ func (x *CheckpointResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CheckpointResponse.ProtoReflect.Descriptor instead.
 func (*CheckpointResponse) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{3}
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *CheckpointResponse) GetCheckpointId() string {
@@ -278,13 +421,6 @@ func (x *CheckpointResponse) GetCommitIndex() uint64 {
 		return x.CommitIndex
 	}
 	return 0
-}
-
-func (x *CheckpointResponse) GetTopRanges() []*RangeDigest {
-	if x != nil {
-		return x.TopRanges
-	}
-	return nil
 }
 
 func (x *CheckpointResponse) GetRangePlanVersion() uint32 {
@@ -308,7 +444,7 @@ type RangeSpan struct {
 
 func (x *RangeSpan) Reset() {
 	*x = RangeSpan{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[4]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -320,7 +456,7 @@ func (x *RangeSpan) String() string {
 func (*RangeSpan) ProtoMessage() {}
 
 func (x *RangeSpan) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[4]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -333,7 +469,7 @@ func (x *RangeSpan) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RangeSpan.ProtoReflect.Descriptor instead.
 func (*RangeSpan) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{4}
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *RangeSpan) GetStartKid() []byte {
@@ -357,22 +493,265 @@ func (x *RangeSpan) GetSplitDepth() uint32 {
 	return 0
 }
 
-// RangeDigest summarizes a KID interval for mismatch detection and sizing hints.
+// DirtyBitmapMessage carries the dirty range bitmap.
+type DirtyBitmapMessage struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	RelationshipId  string                 `protobuf:"bytes,1,opt,name=relationship_id,json=relationshipId,proto3" json:"relationship_id,omitempty"`
+	CheckpointId    string                 `protobuf:"bytes,2,opt,name=checkpoint_id,json=checkpointId,proto3" json:"checkpoint_id,omitempty"`
+	CheckpointIndex uint64                 `protobuf:"varint,3,opt,name=checkpoint_index,json=checkpointIndex,proto3" json:"checkpoint_index,omitempty"`
+	StartIndex      uint64                 `protobuf:"varint,4,opt,name=start_index,json=startIndex,proto3" json:"start_index,omitempty"` // The Raft index since when changes are tracked
+	Bitmap          []byte                 `protobuf:"bytes,5,opt,name=bitmap,proto3" json:"bitmap,omitempty"`                            // The bitmap itself
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *DirtyBitmapMessage) Reset() {
+	*x = DirtyBitmapMessage{}
+	mi := &file_vault_dr_replication_service_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DirtyBitmapMessage) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DirtyBitmapMessage) ProtoMessage() {}
+
+func (x *DirtyBitmapMessage) ProtoReflect() protoreflect.Message {
+	mi := &file_vault_dr_replication_service_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DirtyBitmapMessage.ProtoReflect.Descriptor instead.
+func (*DirtyBitmapMessage) Descriptor() ([]byte, []int) {
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *DirtyBitmapMessage) GetRelationshipId() string {
+	if x != nil {
+		return x.RelationshipId
+	}
+	return ""
+}
+
+func (x *DirtyBitmapMessage) GetCheckpointId() string {
+	if x != nil {
+		return x.CheckpointId
+	}
+	return ""
+}
+
+func (x *DirtyBitmapMessage) GetCheckpointIndex() uint64 {
+	if x != nil {
+		return x.CheckpointIndex
+	}
+	return 0
+}
+
+func (x *DirtyBitmapMessage) GetStartIndex() uint64 {
+	if x != nil {
+		return x.StartIndex
+	}
+	return 0
+}
+
+func (x *DirtyBitmapMessage) GetBitmap() []byte {
+	if x != nil {
+		return x.Bitmap
+	}
+	return nil
+}
+
+// RangeChecksum represents a simple checksum for a range.
+type RangeChecksum struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	RangeId       uint64                 `protobuf:"varint,1,opt,name=range_id,json=rangeId,proto3" json:"range_id,omitempty"`
+	Checksum      uint64                 `protobuf:"varint,2,opt,name=checksum,proto3" json:"checksum,omitempty"` // Simple XOR or CRC64
+	Count         uint64                 `protobuf:"varint,3,opt,name=count,proto3" json:"count,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RangeChecksum) Reset() {
+	*x = RangeChecksum{}
+	mi := &file_vault_dr_replication_service_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RangeChecksum) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RangeChecksum) ProtoMessage() {}
+
+func (x *RangeChecksum) ProtoReflect() protoreflect.Message {
+	mi := &file_vault_dr_replication_service_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RangeChecksum.ProtoReflect.Descriptor instead.
+func (*RangeChecksum) Descriptor() ([]byte, []int) {
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *RangeChecksum) GetRangeId() uint64 {
+	if x != nil {
+		return x.RangeId
+	}
+	return 0
+}
+
+func (x *RangeChecksum) GetChecksum() uint64 {
+	if x != nil {
+		return x.Checksum
+	}
+	return 0
+}
+
+func (x *RangeChecksum) GetCount() uint64 {
+	if x != nil {
+		return x.Count
+	}
+	return 0
+}
+
+// RangeChecksumRequest requests checksums for specific ranges.
+type RangeChecksumRequest struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	CheckpointId    string                 `protobuf:"bytes,1,opt,name=checkpoint_id,json=checkpointId,proto3" json:"checkpoint_id,omitempty"`
+	CheckpointIndex uint64                 `protobuf:"varint,2,opt,name=checkpoint_index,json=checkpointIndex,proto3" json:"checkpoint_index,omitempty"`
+	RangeIds        []uint64               `protobuf:"varint,3,rep,packed,name=range_ids,json=rangeIds,proto3" json:"range_ids,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *RangeChecksumRequest) Reset() {
+	*x = RangeChecksumRequest{}
+	mi := &file_vault_dr_replication_service_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RangeChecksumRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RangeChecksumRequest) ProtoMessage() {}
+
+func (x *RangeChecksumRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_vault_dr_replication_service_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RangeChecksumRequest.ProtoReflect.Descriptor instead.
+func (*RangeChecksumRequest) Descriptor() ([]byte, []int) {
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *RangeChecksumRequest) GetCheckpointId() string {
+	if x != nil {
+		return x.CheckpointId
+	}
+	return ""
+}
+
+func (x *RangeChecksumRequest) GetCheckpointIndex() uint64 {
+	if x != nil {
+		return x.CheckpointIndex
+	}
+	return 0
+}
+
+func (x *RangeChecksumRequest) GetRangeIds() []uint64 {
+	if x != nil {
+		return x.RangeIds
+	}
+	return nil
+}
+
+// RangeChecksumResponse returns the requested range checksums.
+type RangeChecksumResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Checksums     []*RangeChecksum       `protobuf:"bytes,1,rep,name=checksums,proto3" json:"checksums,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RangeChecksumResponse) Reset() {
+	*x = RangeChecksumResponse{}
+	mi := &file_vault_dr_replication_service_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RangeChecksumResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RangeChecksumResponse) ProtoMessage() {}
+
+func (x *RangeChecksumResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_vault_dr_replication_service_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RangeChecksumResponse.ProtoReflect.Descriptor instead.
+func (*RangeChecksumResponse) Descriptor() ([]byte, []int) {
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *RangeChecksumResponse) GetChecksums() []*RangeChecksum {
+	if x != nil {
+		return x.Checksums
+	}
+	return nil
+}
+
+// RangeDigest is a fine-grained sub-range digest for drill-down.
 type RangeDigest struct {
-	state              protoimpl.MessageState `protogen:"open.v1"`
-	Span               *RangeSpan             `protobuf:"bytes,1,opt,name=span,proto3" json:"span,omitempty"`
-	Count              uint64                 `protobuf:"varint,2,opt,name=count,proto3" json:"count,omitempty"`
-	XorKeyHash         []byte                 `protobuf:"bytes,3,opt,name=xor_key_hash,json=xorKeyHash,proto3" json:"xor_key_hash,omitempty"`
-	XorValueHash       []byte                 `protobuf:"bytes,4,opt,name=xor_value_hash,json=xorValueHash,proto3" json:"xor_value_hash,omitempty"`
-	SuggestedIbltCells uint32                 `protobuf:"varint,5,opt,name=suggested_iblt_cells,json=suggestedIbltCells,proto3" json:"suggested_iblt_cells,omitempty"`
-	ApproxValueBytes   uint64                 `protobuf:"varint,6,opt,name=approx_value_bytes,json=approxValueBytes,proto3" json:"approx_value_bytes,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Span             *RangeSpan             `protobuf:"bytes,1,opt,name=span,proto3" json:"span,omitempty"`
+	Count            uint64                 `protobuf:"varint,2,opt,name=count,proto3" json:"count,omitempty"`
+	XorKeyHash       []byte                 `protobuf:"bytes,3,opt,name=xor_key_hash,json=xorKeyHash,proto3" json:"xor_key_hash,omitempty"`       // 32-byte XOR of SHA256(KID) values
+	XorValueHash     []byte                 `protobuf:"bytes,4,opt,name=xor_value_hash,json=xorValueHash,proto3" json:"xor_value_hash,omitempty"` // 32-byte XOR of SHA256(KID||VID) values
+	ApproxValueBytes uint64                 `protobuf:"varint,5,opt,name=approx_value_bytes,json=approxValueBytes,proto3" json:"approx_value_bytes,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *RangeDigest) Reset() {
 	*x = RangeDigest{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[5]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -384,7 +763,7 @@ func (x *RangeDigest) String() string {
 func (*RangeDigest) ProtoMessage() {}
 
 func (x *RangeDigest) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[5]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -397,7 +776,7 @@ func (x *RangeDigest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RangeDigest.ProtoReflect.Descriptor instead.
 func (*RangeDigest) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{5}
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *RangeDigest) GetSpan() *RangeSpan {
@@ -428,13 +807,6 @@ func (x *RangeDigest) GetXorValueHash() []byte {
 	return nil
 }
 
-func (x *RangeDigest) GetSuggestedIbltCells() uint32 {
-	if x != nil {
-		return x.SuggestedIbltCells
-	}
-	return 0
-}
-
 func (x *RangeDigest) GetApproxValueBytes() uint64 {
 	if x != nil {
 		return x.ApproxValueBytes
@@ -442,19 +814,20 @@ func (x *RangeDigest) GetApproxValueBytes() uint64 {
 	return 0
 }
 
-// RangeDigestRequest asks the primary for digest metadata of explicit spans.
+// RangeDigestRequest asks the primary for fine-grained sub-range digests.
 type RangeDigestRequest struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	CheckpointId    string                 `protobuf:"bytes,1,opt,name=checkpoint_id,json=checkpointId,proto3" json:"checkpoint_id,omitempty"`
 	CheckpointIndex uint64                 `protobuf:"varint,2,opt,name=checkpoint_index,json=checkpointIndex,proto3" json:"checkpoint_index,omitempty"`
-	Spans           []*RangeSpan           `protobuf:"bytes,3,rep,name=spans,proto3" json:"spans,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// parent_span is the mismatched range to drill into.
+	ParentSpan    *RangeSpan `protobuf:"bytes,3,opt,name=parent_span,json=parentSpan,proto3" json:"parent_span,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *RangeDigestRequest) Reset() {
 	*x = RangeDigestRequest{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[6]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -466,7 +839,7 @@ func (x *RangeDigestRequest) String() string {
 func (*RangeDigestRequest) ProtoMessage() {}
 
 func (x *RangeDigestRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[6]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -479,7 +852,7 @@ func (x *RangeDigestRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RangeDigestRequest.ProtoReflect.Descriptor instead.
 func (*RangeDigestRequest) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{6}
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *RangeDigestRequest) GetCheckpointId() string {
@@ -496,24 +869,24 @@ func (x *RangeDigestRequest) GetCheckpointIndex() uint64 {
 	return 0
 }
 
-func (x *RangeDigestRequest) GetSpans() []*RangeSpan {
+func (x *RangeDigestRequest) GetParentSpan() *RangeSpan {
 	if x != nil {
-		return x.Spans
+		return x.ParentSpan
 	}
 	return nil
 }
 
-// RangeDigestResponse returns one digest per requested span.
+// RangeDigestResponse returns the sub-range digests for a drilled-down range.
 type RangeDigestResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Ranges        []*RangeDigest         `protobuf:"bytes,1,rep,name=ranges,proto3" json:"ranges,omitempty"`
+	Digests       []*RangeDigest         `protobuf:"bytes,1,rep,name=digests,proto3" json:"digests,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *RangeDigestResponse) Reset() {
 	*x = RangeDigestResponse{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[7]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -525,7 +898,7 @@ func (x *RangeDigestResponse) String() string {
 func (*RangeDigestResponse) ProtoMessage() {}
 
 func (x *RangeDigestResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[7]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -538,299 +911,12 @@ func (x *RangeDigestResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RangeDigestResponse.ProtoReflect.Descriptor instead.
 func (*RangeDigestResponse) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{7}
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{13}
 }
 
-func (x *RangeDigestResponse) GetRanges() []*RangeDigest {
+func (x *RangeDigestResponse) GetDigests() []*RangeDigest {
 	if x != nil {
-		return x.Ranges
-	}
-	return nil
-}
-
-// IBLTMessage carries a serialized IBLT.
-type IBLTMessage struct {
-	state        protoimpl.MessageState `protogen:"open.v1"`
-	CheckpointId string                 `protobuf:"bytes,1,opt,name=checkpoint_id,json=checkpointId,proto3" json:"checkpoint_id,omitempty"`
-	// num_cells is the IBLT size (for informational purposes).
-	NumCells uint32 `protobuf:"varint,2,opt,name=num_cells,json=numCells,proto3" json:"num_cells,omitempty"`
-	// iblt_data is the serialized IBLT.
-	IbltData []byte `protobuf:"bytes,3,opt,name=iblt_data,json=ibltData,proto3" json:"iblt_data,omitempty"`
-	// span optionally scopes IBLT exchange to a specific KID interval.
-	// When unset, global behavior is used.
-	Span *RangeSpan `protobuf:"bytes,4,opt,name=span,proto3" json:"span,omitempty"`
-	// checkpoint_index fences this request to a specific checkpoint tuple.
-	CheckpointIndex uint64 `protobuf:"varint,5,opt,name=checkpoint_index,json=checkpointIndex,proto3" json:"checkpoint_index,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
-}
-
-func (x *IBLTMessage) Reset() {
-	*x = IBLTMessage{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[8]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *IBLTMessage) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*IBLTMessage) ProtoMessage() {}
-
-func (x *IBLTMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[8]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use IBLTMessage.ProtoReflect.Descriptor instead.
-func (*IBLTMessage) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{8}
-}
-
-func (x *IBLTMessage) GetCheckpointId() string {
-	if x != nil {
-		return x.CheckpointId
-	}
-	return ""
-}
-
-func (x *IBLTMessage) GetNumCells() uint32 {
-	if x != nil {
-		return x.NumCells
-	}
-	return 0
-}
-
-func (x *IBLTMessage) GetIbltData() []byte {
-	if x != nil {
-		return x.IbltData
-	}
-	return nil
-}
-
-func (x *IBLTMessage) GetSpan() *RangeSpan {
-	if x != nil {
-		return x.Span
-	}
-	return nil
-}
-
-func (x *IBLTMessage) GetCheckpointIndex() uint64 {
-	if x != nil {
-		return x.CheckpointIndex
-	}
-	return 0
-}
-
-// PrefixDigestRequest requests prefix digests at a given depth.
-type PrefixDigestRequest struct {
-	state        protoimpl.MessageState `protogen:"open.v1"`
-	CheckpointId string                 `protobuf:"bytes,1,opt,name=checkpoint_id,json=checkpointId,proto3" json:"checkpoint_id,omitempty"`
-	// prefix_length is the number of prefix bits (e.g. 8, 12, 16).
-	PrefixLength uint32 `protobuf:"varint,2,opt,name=prefix_length,json=prefixLength,proto3" json:"prefix_length,omitempty"`
-	// bucket_indices restricts the response to specific buckets.
-	// Empty means all buckets at this prefix length.
-	BucketIndices []uint32 `protobuf:"varint,3,rep,packed,name=bucket_indices,json=bucketIndices,proto3" json:"bucket_indices,omitempty"`
-	// span optionally scopes digest generation to a specific KID interval.
-	// When unset, global behavior is used.
-	Span *RangeSpan `protobuf:"bytes,4,opt,name=span,proto3" json:"span,omitempty"`
-	// checkpoint_index fences this request to a specific checkpoint tuple.
-	CheckpointIndex uint64 `protobuf:"varint,5,opt,name=checkpoint_index,json=checkpointIndex,proto3" json:"checkpoint_index,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
-}
-
-func (x *PrefixDigestRequest) Reset() {
-	*x = PrefixDigestRequest{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[9]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *PrefixDigestRequest) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*PrefixDigestRequest) ProtoMessage() {}
-
-func (x *PrefixDigestRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[9]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use PrefixDigestRequest.ProtoReflect.Descriptor instead.
-func (*PrefixDigestRequest) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{9}
-}
-
-func (x *PrefixDigestRequest) GetCheckpointId() string {
-	if x != nil {
-		return x.CheckpointId
-	}
-	return ""
-}
-
-func (x *PrefixDigestRequest) GetPrefixLength() uint32 {
-	if x != nil {
-		return x.PrefixLength
-	}
-	return 0
-}
-
-func (x *PrefixDigestRequest) GetBucketIndices() []uint32 {
-	if x != nil {
-		return x.BucketIndices
-	}
-	return nil
-}
-
-func (x *PrefixDigestRequest) GetSpan() *RangeSpan {
-	if x != nil {
-		return x.Span
-	}
-	return nil
-}
-
-func (x *PrefixDigestRequest) GetCheckpointIndex() uint64 {
-	if x != nil {
-		return x.CheckpointIndex
-	}
-	return 0
-}
-
-// PrefixDigestResponse returns prefix digest buckets.
-type PrefixDigestResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	PrefixLength  uint32                 `protobuf:"varint,1,opt,name=prefix_length,json=prefixLength,proto3" json:"prefix_length,omitempty"`
-	Buckets       []*BucketDigestProto   `protobuf:"bytes,2,rep,name=buckets,proto3" json:"buckets,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *PrefixDigestResponse) Reset() {
-	*x = PrefixDigestResponse{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[10]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *PrefixDigestResponse) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*PrefixDigestResponse) ProtoMessage() {}
-
-func (x *PrefixDigestResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[10]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use PrefixDigestResponse.ProtoReflect.Descriptor instead.
-func (*PrefixDigestResponse) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{10}
-}
-
-func (x *PrefixDigestResponse) GetPrefixLength() uint32 {
-	if x != nil {
-		return x.PrefixLength
-	}
-	return 0
-}
-
-func (x *PrefixDigestResponse) GetBuckets() []*BucketDigestProto {
-	if x != nil {
-		return x.Buckets
-	}
-	return nil
-}
-
-// BucketDigestProto is the wire representation of a single prefix bucket.
-type BucketDigestProto struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Index         uint32                 `protobuf:"varint,1,opt,name=index,proto3" json:"index,omitempty"`
-	Count         uint64                 `protobuf:"varint,2,opt,name=count,proto3" json:"count,omitempty"`
-	XorKeyHash    []byte                 `protobuf:"bytes,3,opt,name=xor_key_hash,json=xorKeyHash,proto3" json:"xor_key_hash,omitempty"`
-	XorValueHash  []byte                 `protobuf:"bytes,4,opt,name=xor_value_hash,json=xorValueHash,proto3" json:"xor_value_hash,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *BucketDigestProto) Reset() {
-	*x = BucketDigestProto{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[11]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *BucketDigestProto) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*BucketDigestProto) ProtoMessage() {}
-
-func (x *BucketDigestProto) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[11]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use BucketDigestProto.ProtoReflect.Descriptor instead.
-func (*BucketDigestProto) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{11}
-}
-
-func (x *BucketDigestProto) GetIndex() uint32 {
-	if x != nil {
-		return x.Index
-	}
-	return 0
-}
-
-func (x *BucketDigestProto) GetCount() uint64 {
-	if x != nil {
-		return x.Count
-	}
-	return 0
-}
-
-func (x *BucketDigestProto) GetXorKeyHash() []byte {
-	if x != nil {
-		return x.XorKeyHash
-	}
-	return nil
-}
-
-func (x *BucketDigestProto) GetXorValueHash() []byte {
-	if x != nil {
-		return x.XorValueHash
+		return x.Digests
 	}
 	return nil
 }
@@ -849,7 +935,7 @@ type FetchItem struct {
 
 func (x *FetchItem) Reset() {
 	*x = FetchItem{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[12]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -861,7 +947,7 @@ func (x *FetchItem) String() string {
 func (*FetchItem) ProtoMessage() {}
 
 func (x *FetchItem) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[12]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -874,7 +960,7 @@ func (x *FetchItem) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FetchItem.ProtoReflect.Descriptor instead.
 func (*FetchItem) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{12}
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *FetchItem) GetKid() []byte {
@@ -920,7 +1006,7 @@ type FetchEntriesRequest struct {
 
 func (x *FetchEntriesRequest) Reset() {
 	*x = FetchEntriesRequest{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[13]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -932,7 +1018,7 @@ func (x *FetchEntriesRequest) String() string {
 func (*FetchEntriesRequest) ProtoMessage() {}
 
 func (x *FetchEntriesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[13]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -945,7 +1031,7 @@ func (x *FetchEntriesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FetchEntriesRequest.ProtoReflect.Descriptor instead.
 func (*FetchEntriesRequest) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{13}
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *FetchEntriesRequest) GetCheckpointId() string {
@@ -1021,7 +1107,7 @@ type EntryBatch struct {
 
 func (x *EntryBatch) Reset() {
 	*x = EntryBatch{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[14]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1033,7 +1119,7 @@ func (x *EntryBatch) String() string {
 func (*EntryBatch) ProtoMessage() {}
 
 func (x *EntryBatch) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[14]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1046,7 +1132,7 @@ func (x *EntryBatch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EntryBatch.ProtoReflect.Descriptor instead.
 func (*EntryBatch) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{14}
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *EntryBatch) GetEntries() []*EntryChange {
@@ -1090,7 +1176,7 @@ type DRHeartbeatRequest struct {
 
 func (x *DRHeartbeatRequest) Reset() {
 	*x = DRHeartbeatRequest{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[15]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1102,7 +1188,7 @@ func (x *DRHeartbeatRequest) String() string {
 func (*DRHeartbeatRequest) ProtoMessage() {}
 
 func (x *DRHeartbeatRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[15]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1115,7 +1201,7 @@ func (x *DRHeartbeatRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DRHeartbeatRequest.ProtoReflect.Descriptor instead.
 func (*DRHeartbeatRequest) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{15}
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *DRHeartbeatRequest) GetRelationshipId() string {
@@ -1158,7 +1244,7 @@ type DRHeartbeatResponse struct {
 
 func (x *DRHeartbeatResponse) Reset() {
 	*x = DRHeartbeatResponse{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[16]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1170,7 +1256,7 @@ func (x *DRHeartbeatResponse) String() string {
 func (*DRHeartbeatResponse) ProtoMessage() {}
 
 func (x *DRHeartbeatResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[16]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1183,7 +1269,7 @@ func (x *DRHeartbeatResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DRHeartbeatResponse.ProtoReflect.Descriptor instead.
 func (*DRHeartbeatResponse) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{16}
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *DRHeartbeatResponse) GetPrimaryIndex() uint64 {
@@ -1220,7 +1306,7 @@ type SyncKeyringRequest struct {
 
 func (x *SyncKeyringRequest) Reset() {
 	*x = SyncKeyringRequest{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[17]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1232,7 +1318,7 @@ func (x *SyncKeyringRequest) String() string {
 func (*SyncKeyringRequest) ProtoMessage() {}
 
 func (x *SyncKeyringRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[17]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1245,7 +1331,7 @@ func (x *SyncKeyringRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncKeyringRequest.ProtoReflect.Descriptor instead.
 func (*SyncKeyringRequest) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{17}
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *SyncKeyringRequest) GetRelationshipId() string {
@@ -1293,7 +1379,7 @@ type SyncKeyringResponse struct {
 
 func (x *SyncKeyringResponse) Reset() {
 	*x = SyncKeyringResponse{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[18]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1305,7 +1391,7 @@ func (x *SyncKeyringResponse) String() string {
 func (*SyncKeyringResponse) ProtoMessage() {}
 
 func (x *SyncKeyringResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[18]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1318,7 +1404,7 @@ func (x *SyncKeyringResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncKeyringResponse.ProtoReflect.Descriptor instead.
 func (*SyncKeyringResponse) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{18}
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *SyncKeyringResponse) GetKeyringEntry() []byte {
@@ -1375,58 +1461,59 @@ const file_vault_dr_replication_service_proto_rawDesc = "" +
 	"\tseal_wrap\x18\x04 \x01(\bR\bsealWrap\x12\x1d\n" +
 	"\n" +
 	"raft_index\x18\x05 \x01(\x04R\traftIndex\x12\x10\n" +
-	"\x03kid\x18\x06 \x01(\fR\x03kid\"m\n" +
+	"\x03kid\x18\x06 \x01(\fR\x03kid\"\x8d\x01\n" +
+	"\x15StreamChangesUpstream\x121\n" +
+	"\x04init\x18\x01 \x01(\v2\x1b.vault.StreamChangesRequestH\x00R\x04init\x12:\n" +
+	"\rwindow_update\x18\x02 \x01(\v2\x13.vault.WindowUpdateH\x00R\fwindowUpdateB\x05\n" +
+	"\x03msg\"(\n" +
+	"\fWindowUpdate\x12\x18\n" +
+	"\acredits\x18\x01 \x01(\x04R\acredits\"\x94\x01\n" +
 	"\x14StreamChangesRequest\x12'\n" +
 	"\x0frelationship_id\x18\x01 \x01(\tR\x0erelationshipId\x12,\n" +
-	"\x12last_applied_index\x18\x02 \x01(\x04R\x10lastAppliedIndex\"<\n" +
+	"\x12last_applied_index\x18\x02 \x01(\x04R\x10lastAppliedIndex\x12%\n" +
+	"\x0einitial_window\x18\x03 \x01(\x04R\rinitialWindow\"<\n" +
 	"\x11CheckpointRequest\x12'\n" +
-	"\x0frelationship_id\x18\x01 \x01(\tR\x0erelationshipId\"\xbd\x01\n" +
+	"\x0frelationship_id\x18\x01 \x01(\tR\x0erelationshipId\"\x8a\x01\n" +
 	"\x12CheckpointResponse\x12#\n" +
 	"\rcheckpoint_id\x18\x01 \x01(\tR\fcheckpointId\x12!\n" +
-	"\fcommit_index\x18\x02 \x01(\x04R\vcommitIndex\x121\n" +
-	"\n" +
-	"top_ranges\x18\x03 \x03(\v2\x12.vault.RangeDigestR\ttopRanges\x12,\n" +
+	"\fcommit_index\x18\x02 \x01(\x04R\vcommitIndex\x12,\n" +
 	"\x12range_plan_version\x18\x04 \x01(\rR\x10rangePlanVersion\"b\n" +
 	"\tRangeSpan\x12\x1b\n" +
 	"\tstart_kid\x18\x01 \x01(\fR\bstartKid\x12\x17\n" +
 	"\aend_kid\x18\x02 \x01(\fR\x06endKid\x12\x1f\n" +
 	"\vsplit_depth\x18\x03 \x01(\rR\n" +
-	"splitDepth\"\xf1\x01\n" +
+	"splitDepth\"\xc6\x01\n" +
+	"\x12DirtyBitmapMessage\x12'\n" +
+	"\x0frelationship_id\x18\x01 \x01(\tR\x0erelationshipId\x12#\n" +
+	"\rcheckpoint_id\x18\x02 \x01(\tR\fcheckpointId\x12)\n" +
+	"\x10checkpoint_index\x18\x03 \x01(\x04R\x0fcheckpointIndex\x12\x1f\n" +
+	"\vstart_index\x18\x04 \x01(\x04R\n" +
+	"startIndex\x12\x16\n" +
+	"\x06bitmap\x18\x05 \x01(\fR\x06bitmap\"\\\n" +
+	"\rRangeChecksum\x12\x19\n" +
+	"\brange_id\x18\x01 \x01(\x04R\arangeId\x12\x1a\n" +
+	"\bchecksum\x18\x02 \x01(\x04R\bchecksum\x12\x14\n" +
+	"\x05count\x18\x03 \x01(\x04R\x05count\"\x83\x01\n" +
+	"\x14RangeChecksumRequest\x12#\n" +
+	"\rcheckpoint_id\x18\x01 \x01(\tR\fcheckpointId\x12)\n" +
+	"\x10checkpoint_index\x18\x02 \x01(\x04R\x0fcheckpointIndex\x12\x1b\n" +
+	"\trange_ids\x18\x03 \x03(\x04R\brangeIds\"K\n" +
+	"\x15RangeChecksumResponse\x122\n" +
+	"\tchecksums\x18\x01 \x03(\v2\x14.vault.RangeChecksumR\tchecksums\"\xbf\x01\n" +
 	"\vRangeDigest\x12$\n" +
 	"\x04span\x18\x01 \x01(\v2\x10.vault.RangeSpanR\x04span\x12\x14\n" +
 	"\x05count\x18\x02 \x01(\x04R\x05count\x12 \n" +
 	"\fxor_key_hash\x18\x03 \x01(\fR\n" +
 	"xorKeyHash\x12$\n" +
-	"\x0exor_value_hash\x18\x04 \x01(\fR\fxorValueHash\x120\n" +
-	"\x14suggested_iblt_cells\x18\x05 \x01(\rR\x12suggestedIbltCells\x12,\n" +
-	"\x12approx_value_bytes\x18\x06 \x01(\x04R\x10approxValueBytes\"\x8c\x01\n" +
+	"\x0exor_value_hash\x18\x04 \x01(\fR\fxorValueHash\x12,\n" +
+	"\x12approx_value_bytes\x18\x05 \x01(\x04R\x10approxValueBytes\"\x97\x01\n" +
 	"\x12RangeDigestRequest\x12#\n" +
 	"\rcheckpoint_id\x18\x01 \x01(\tR\fcheckpointId\x12)\n" +
-	"\x10checkpoint_index\x18\x02 \x01(\x04R\x0fcheckpointIndex\x12&\n" +
-	"\x05spans\x18\x03 \x03(\v2\x10.vault.RangeSpanR\x05spans\"A\n" +
-	"\x13RangeDigestResponse\x12*\n" +
-	"\x06ranges\x18\x01 \x03(\v2\x12.vault.RangeDigestR\x06ranges\"\xbd\x01\n" +
-	"\vIBLTMessage\x12#\n" +
-	"\rcheckpoint_id\x18\x01 \x01(\tR\fcheckpointId\x12\x1b\n" +
-	"\tnum_cells\x18\x02 \x01(\rR\bnumCells\x12\x1b\n" +
-	"\tiblt_data\x18\x03 \x01(\fR\bibltData\x12$\n" +
-	"\x04span\x18\x04 \x01(\v2\x10.vault.RangeSpanR\x04span\x12)\n" +
-	"\x10checkpoint_index\x18\x05 \x01(\x04R\x0fcheckpointIndex\"\xd7\x01\n" +
-	"\x13PrefixDigestRequest\x12#\n" +
-	"\rcheckpoint_id\x18\x01 \x01(\tR\fcheckpointId\x12#\n" +
-	"\rprefix_length\x18\x02 \x01(\rR\fprefixLength\x12%\n" +
-	"\x0ebucket_indices\x18\x03 \x03(\rR\rbucketIndices\x12$\n" +
-	"\x04span\x18\x04 \x01(\v2\x10.vault.RangeSpanR\x04span\x12)\n" +
-	"\x10checkpoint_index\x18\x05 \x01(\x04R\x0fcheckpointIndex\"o\n" +
-	"\x14PrefixDigestResponse\x12#\n" +
-	"\rprefix_length\x18\x01 \x01(\rR\fprefixLength\x122\n" +
-	"\abuckets\x18\x02 \x03(\v2\x18.vault.BucketDigestProtoR\abuckets\"\x87\x01\n" +
-	"\x11BucketDigestProto\x12\x14\n" +
-	"\x05index\x18\x01 \x01(\rR\x05index\x12\x14\n" +
-	"\x05count\x18\x02 \x01(\x04R\x05count\x12 \n" +
-	"\fxor_key_hash\x18\x03 \x01(\fR\n" +
-	"xorKeyHash\x12$\n" +
-	"\x0exor_value_hash\x18\x04 \x01(\fR\fxorValueHash\"@\n" +
+	"\x10checkpoint_index\x18\x02 \x01(\x04R\x0fcheckpointIndex\x121\n" +
+	"\vparent_span\x18\x03 \x01(\v2\x10.vault.RangeSpanR\n" +
+	"parentSpan\"C\n" +
+	"\x13RangeDigestResponse\x12,\n" +
+	"\adigests\x18\x01 \x03(\v2\x12.vault.RangeDigestR\adigests\"@\n" +
 	"\tFetchItem\x12\x10\n" +
 	"\x03kid\x18\x01 \x01(\fR\x03kid\x12!\n" +
 	"\fexpected_vid\x18\x02 \x01(\fR\vexpectedVid\"\xcd\x02\n" +
@@ -1466,13 +1553,13 @@ const file_vault_dr_replication_service_proto_rawDesc = "" +
 	"\x17server_ephemeral_pubkey\x18\x04 \x01(\fR\x15serverEphemeralPubkey\x12\x1d\n" +
 	"\n" +
 	"wrap_nonce\x18\x05 \x01(\fR\twrapNonce\x12(\n" +
-	"\x10wrap_aad_version\x18\x06 \x01(\rR\x0ewrapAadVersion2\xd1\x04\n" +
-	"\rDRReplication\x12D\n" +
-	"\rStreamChanges\x12\x1b.vault.StreamChangesRequest\x1a\x12.vault.EntryChange\"\x000\x01\x12J\n" +
-	"\x11RequestCheckpoint\x12\x18.vault.CheckpointRequest\x1a\x19.vault.CheckpointResponse\"\x00\x128\n" +
-	"\fExchangeIBLT\x12\x12.vault.IBLTMessage\x1a\x12.vault.IBLTMessage\"\x00\x12O\n" +
-	"\x14ExchangeRangeDigests\x12\x19.vault.RangeDigestRequest\x1a\x1a.vault.RangeDigestResponse\"\x00\x12R\n" +
-	"\x15ExchangePrefixDigests\x12\x1a.vault.PrefixDigestRequest\x1a\x1b.vault.PrefixDigestResponse\"\x00\x12A\n" +
+	"\x10wrap_aad_version\x18\x06 \x01(\rR\x0ewrapAadVersion2\xeb\x04\n" +
+	"\rDRReplication\x12F\n" +
+	"\rStreamChanges\x12\x1c.vault.StreamChangesUpstream\x1a\x11.vault.EntryBatch\"\x00(\x010\x01\x12J\n" +
+	"\x11RequestCheckpoint\x12\x18.vault.CheckpointRequest\x1a\x19.vault.CheckpointResponse\"\x00\x12M\n" +
+	"\x13ExchangeDirtyBitmap\x12\x19.vault.DirtyBitmapMessage\x1a\x19.vault.DirtyBitmapMessage\"\x00\x12U\n" +
+	"\x16ExchangeRangeChecksums\x12\x1b.vault.RangeChecksumRequest\x1a\x1c.vault.RangeChecksumResponse\"\x00\x12O\n" +
+	"\x14ExchangeRangeDigests\x12\x19.vault.RangeDigestRequest\x1a\x1a.vault.RangeDigestResponse\"\x00\x12A\n" +
 	"\fFetchEntries\x12\x1a.vault.FetchEntriesRequest\x1a\x11.vault.EntryBatch\"\x000\x01\x12D\n" +
 	"\tHeartbeat\x12\x19.vault.DRHeartbeatRequest\x1a\x1a.vault.DRHeartbeatResponse\"\x00\x12F\n" +
 	"\vSyncKeyring\x12\x19.vault.SyncKeyringRequest\x1a\x1a.vault.SyncKeyringResponse\"\x00B\"Z github.com/openbao/openbao/vaultb\x06proto3"
@@ -1489,60 +1576,61 @@ func file_vault_dr_replication_service_proto_rawDescGZIP() []byte {
 	return file_vault_dr_replication_service_proto_rawDescData
 }
 
-var file_vault_dr_replication_service_proto_msgTypes = make([]protoimpl.MessageInfo, 19)
+var file_vault_dr_replication_service_proto_msgTypes = make([]protoimpl.MessageInfo, 21)
 var file_vault_dr_replication_service_proto_goTypes = []any{
-	(*EntryChange)(nil),          // 0: vault.EntryChange
-	(*StreamChangesRequest)(nil), // 1: vault.StreamChangesRequest
-	(*CheckpointRequest)(nil),    // 2: vault.CheckpointRequest
-	(*CheckpointResponse)(nil),   // 3: vault.CheckpointResponse
-	(*RangeSpan)(nil),            // 4: vault.RangeSpan
-	(*RangeDigest)(nil),          // 5: vault.RangeDigest
-	(*RangeDigestRequest)(nil),   // 6: vault.RangeDigestRequest
-	(*RangeDigestResponse)(nil),  // 7: vault.RangeDigestResponse
-	(*IBLTMessage)(nil),          // 8: vault.IBLTMessage
-	(*PrefixDigestRequest)(nil),  // 9: vault.PrefixDigestRequest
-	(*PrefixDigestResponse)(nil), // 10: vault.PrefixDigestResponse
-	(*BucketDigestProto)(nil),    // 11: vault.BucketDigestProto
-	(*FetchItem)(nil),            // 12: vault.FetchItem
-	(*FetchEntriesRequest)(nil),  // 13: vault.FetchEntriesRequest
-	(*EntryBatch)(nil),           // 14: vault.EntryBatch
-	(*DRHeartbeatRequest)(nil),   // 15: vault.DRHeartbeatRequest
-	(*DRHeartbeatResponse)(nil),  // 16: vault.DRHeartbeatResponse
-	(*SyncKeyringRequest)(nil),   // 17: vault.SyncKeyringRequest
-	(*SyncKeyringResponse)(nil),  // 18: vault.SyncKeyringResponse
+	(*EntryChange)(nil),           // 0: vault.EntryChange
+	(*StreamChangesUpstream)(nil), // 1: vault.StreamChangesUpstream
+	(*WindowUpdate)(nil),          // 2: vault.WindowUpdate
+	(*StreamChangesRequest)(nil),  // 3: vault.StreamChangesRequest
+	(*CheckpointRequest)(nil),     // 4: vault.CheckpointRequest
+	(*CheckpointResponse)(nil),    // 5: vault.CheckpointResponse
+	(*RangeSpan)(nil),             // 6: vault.RangeSpan
+	(*DirtyBitmapMessage)(nil),    // 7: vault.DirtyBitmapMessage
+	(*RangeChecksum)(nil),         // 8: vault.RangeChecksum
+	(*RangeChecksumRequest)(nil),  // 9: vault.RangeChecksumRequest
+	(*RangeChecksumResponse)(nil), // 10: vault.RangeChecksumResponse
+	(*RangeDigest)(nil),           // 11: vault.RangeDigest
+	(*RangeDigestRequest)(nil),    // 12: vault.RangeDigestRequest
+	(*RangeDigestResponse)(nil),   // 13: vault.RangeDigestResponse
+	(*FetchItem)(nil),             // 14: vault.FetchItem
+	(*FetchEntriesRequest)(nil),   // 15: vault.FetchEntriesRequest
+	(*EntryBatch)(nil),            // 16: vault.EntryBatch
+	(*DRHeartbeatRequest)(nil),    // 17: vault.DRHeartbeatRequest
+	(*DRHeartbeatResponse)(nil),   // 18: vault.DRHeartbeatResponse
+	(*SyncKeyringRequest)(nil),    // 19: vault.SyncKeyringRequest
+	(*SyncKeyringResponse)(nil),   // 20: vault.SyncKeyringResponse
 }
 var file_vault_dr_replication_service_proto_depIdxs = []int32{
-	5,  // 0: vault.CheckpointResponse.top_ranges:type_name -> vault.RangeDigest
-	4,  // 1: vault.RangeDigest.span:type_name -> vault.RangeSpan
-	4,  // 2: vault.RangeDigestRequest.spans:type_name -> vault.RangeSpan
-	5,  // 3: vault.RangeDigestResponse.ranges:type_name -> vault.RangeDigest
-	4,  // 4: vault.IBLTMessage.span:type_name -> vault.RangeSpan
-	4,  // 5: vault.PrefixDigestRequest.span:type_name -> vault.RangeSpan
-	11, // 6: vault.PrefixDigestResponse.buckets:type_name -> vault.BucketDigestProto
-	4,  // 7: vault.FetchEntriesRequest.ranges:type_name -> vault.RangeSpan
-	12, // 8: vault.FetchEntriesRequest.items:type_name -> vault.FetchItem
-	0,  // 9: vault.EntryBatch.entries:type_name -> vault.EntryChange
-	1,  // 10: vault.DRReplication.StreamChanges:input_type -> vault.StreamChangesRequest
-	2,  // 11: vault.DRReplication.RequestCheckpoint:input_type -> vault.CheckpointRequest
-	8,  // 12: vault.DRReplication.ExchangeIBLT:input_type -> vault.IBLTMessage
-	6,  // 13: vault.DRReplication.ExchangeRangeDigests:input_type -> vault.RangeDigestRequest
-	9,  // 14: vault.DRReplication.ExchangePrefixDigests:input_type -> vault.PrefixDigestRequest
-	13, // 15: vault.DRReplication.FetchEntries:input_type -> vault.FetchEntriesRequest
-	15, // 16: vault.DRReplication.Heartbeat:input_type -> vault.DRHeartbeatRequest
-	17, // 17: vault.DRReplication.SyncKeyring:input_type -> vault.SyncKeyringRequest
-	0,  // 18: vault.DRReplication.StreamChanges:output_type -> vault.EntryChange
-	3,  // 19: vault.DRReplication.RequestCheckpoint:output_type -> vault.CheckpointResponse
-	8,  // 20: vault.DRReplication.ExchangeIBLT:output_type -> vault.IBLTMessage
-	7,  // 21: vault.DRReplication.ExchangeRangeDigests:output_type -> vault.RangeDigestResponse
-	10, // 22: vault.DRReplication.ExchangePrefixDigests:output_type -> vault.PrefixDigestResponse
-	14, // 23: vault.DRReplication.FetchEntries:output_type -> vault.EntryBatch
-	16, // 24: vault.DRReplication.Heartbeat:output_type -> vault.DRHeartbeatResponse
-	18, // 25: vault.DRReplication.SyncKeyring:output_type -> vault.SyncKeyringResponse
-	18, // [18:26] is the sub-list for method output_type
-	10, // [10:18] is the sub-list for method input_type
-	10, // [10:10] is the sub-list for extension type_name
-	10, // [10:10] is the sub-list for extension extendee
-	0,  // [0:10] is the sub-list for field type_name
+	3,  // 0: vault.StreamChangesUpstream.init:type_name -> vault.StreamChangesRequest
+	2,  // 1: vault.StreamChangesUpstream.window_update:type_name -> vault.WindowUpdate
+	8,  // 2: vault.RangeChecksumResponse.checksums:type_name -> vault.RangeChecksum
+	6,  // 3: vault.RangeDigest.span:type_name -> vault.RangeSpan
+	6,  // 4: vault.RangeDigestRequest.parent_span:type_name -> vault.RangeSpan
+	11, // 5: vault.RangeDigestResponse.digests:type_name -> vault.RangeDigest
+	6,  // 6: vault.FetchEntriesRequest.ranges:type_name -> vault.RangeSpan
+	14, // 7: vault.FetchEntriesRequest.items:type_name -> vault.FetchItem
+	0,  // 8: vault.EntryBatch.entries:type_name -> vault.EntryChange
+	1,  // 9: vault.DRReplication.StreamChanges:input_type -> vault.StreamChangesUpstream
+	4,  // 10: vault.DRReplication.RequestCheckpoint:input_type -> vault.CheckpointRequest
+	7,  // 11: vault.DRReplication.ExchangeDirtyBitmap:input_type -> vault.DirtyBitmapMessage
+	9,  // 12: vault.DRReplication.ExchangeRangeChecksums:input_type -> vault.RangeChecksumRequest
+	12, // 13: vault.DRReplication.ExchangeRangeDigests:input_type -> vault.RangeDigestRequest
+	15, // 14: vault.DRReplication.FetchEntries:input_type -> vault.FetchEntriesRequest
+	17, // 15: vault.DRReplication.Heartbeat:input_type -> vault.DRHeartbeatRequest
+	19, // 16: vault.DRReplication.SyncKeyring:input_type -> vault.SyncKeyringRequest
+	16, // 17: vault.DRReplication.StreamChanges:output_type -> vault.EntryBatch
+	5,  // 18: vault.DRReplication.RequestCheckpoint:output_type -> vault.CheckpointResponse
+	7,  // 19: vault.DRReplication.ExchangeDirtyBitmap:output_type -> vault.DirtyBitmapMessage
+	10, // 20: vault.DRReplication.ExchangeRangeChecksums:output_type -> vault.RangeChecksumResponse
+	13, // 21: vault.DRReplication.ExchangeRangeDigests:output_type -> vault.RangeDigestResponse
+	16, // 22: vault.DRReplication.FetchEntries:output_type -> vault.EntryBatch
+	18, // 23: vault.DRReplication.Heartbeat:output_type -> vault.DRHeartbeatResponse
+	20, // 24: vault.DRReplication.SyncKeyring:output_type -> vault.SyncKeyringResponse
+	17, // [17:25] is the sub-list for method output_type
+	9,  // [9:17] is the sub-list for method input_type
+	9,  // [9:9] is the sub-list for extension type_name
+	9,  // [9:9] is the sub-list for extension extendee
+	0,  // [0:9] is the sub-list for field type_name
 }
 
 func init() { file_vault_dr_replication_service_proto_init() }
@@ -1550,13 +1638,17 @@ func file_vault_dr_replication_service_proto_init() {
 	if File_vault_dr_replication_service_proto != nil {
 		return
 	}
+	file_vault_dr_replication_service_proto_msgTypes[1].OneofWrappers = []any{
+		(*StreamChangesUpstream_Init)(nil),
+		(*StreamChangesUpstream_WindowUpdate)(nil),
+	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_vault_dr_replication_service_proto_rawDesc), len(file_vault_dr_replication_service_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   19,
+			NumMessages:   21,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

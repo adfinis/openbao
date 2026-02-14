@@ -14,30 +14,33 @@ package vault;
 // StreamChanges (entry-level change stream, not WAL shipping).
 //
 // Recovery mode: When the stream is interrupted or the secondary
-// detects divergence, IBLT/prefix digest reconciliation identifies
-// and repairs differences with bandwidth proportional to the number
-// of differences (d), not the total keyspace (n).
+// detects divergence, ordered hash-stream reconciliation with dirty
+// bitmap optimization identifies and repairs differences with
+// bandwidth proportional to the number of dirty ranges, not the
+// total keyspace.
 service DRReplication {
     // StreamChanges is the normal-mode replication stream. The primary
-    // pushes storage mutations to the secondary in real time.
-    rpc StreamChanges(StreamChangesRequest) returns (stream EntryChange) {}
+    // pushes storage mutations to the secondary in real time as
+    // EntryBatch messages (batched for throughput). The secondary sends
+    // an init message followed by periodic WindowUpdate messages for
+    // credit-based flow control.
+    rpc StreamChanges(stream StreamChangesUpstream) returns (stream EntryBatch) {}
 
     // RequestCheckpoint asks the primary to create a consistent
     // checkpoint at its current commit index for reconciliation.
     rpc RequestCheckpoint(CheckpointRequest) returns (CheckpointResponse) {}
 
-    // ExchangeIBLT exchanges IBLT sketches to decode the actual
-    // differing elements.
-    rpc ExchangeIBLT(IBLTMessage) returns (IBLTMessage) {}
+    // ExchangeDirtyBitmap exchanges the dirty bitmap for efficient
+    // range filtering.
+    rpc ExchangeDirtyBitmap(DirtyBitmapMessage) returns (DirtyBitmapMessage) {}
 
-    // ExchangeRangeDigests returns range digests for explicit spans from
-    // an immutable checkpoint artifact. Used by secondaries to avoid blind
-    // split fanout after decode failures.
+    // ExchangeRangeChecksums returns checksums for the requested ranges.
+    rpc ExchangeRangeChecksums(RangeChecksumRequest) returns (RangeChecksumResponse) {}
+
+    // ExchangeRangeDigests performs fine-grained drill-down on a
+    // mismatched range. The primary splits the requested range and
+    // returns sub-range digests so the secondary can narrow the diff.
     rpc ExchangeRangeDigests(RangeDigestRequest) returns (RangeDigestResponse) {}
-
-    // ExchangePrefixDigests exchanges prefix digest buckets for
-    // adaptive drill-down when IBLT decode fails.
-    rpc ExchangePrefixDigests(PrefixDigestRequest) returns (PrefixDigestResponse) {}
 
     // FetchEntries retrieves the actual storage entries for a set of
     // divergent keys identified during reconciliation.
@@ -77,6 +80,26 @@ message EntryChange {
     bytes kid = 6;
 }
 
+// StreamChangesUpstream is the client-to-server message envelope for the
+// bidirectional StreamChanges RPC. The first message must be an init
+// carrying the StreamChangesRequest. Subsequent messages carry WindowUpdate
+// credits to replenish the primary's per-subscriber send budget.
+message StreamChangesUpstream {
+    oneof msg {
+        StreamChangesRequest init = 1;
+        WindowUpdate window_update = 2;
+    }
+}
+
+// WindowUpdate carries credit replenishment from the secondary to the
+// primary. The secondary sends this after flushing a batch of entries,
+// allowing the primary to resume sending.
+message WindowUpdate {
+    // credits is the number of additional entries the secondary is ready
+    // to accept.
+    uint64 credits = 1;
+}
+
 // StreamChangesRequest initiates the change stream from primary.
 message StreamChangesRequest {
     // relationship_id identifies the DR relationship.
@@ -85,6 +108,11 @@ message StreamChangesRequest {
     // last_applied_index is the secondary's last known primary index.
     // Used as a hint for the primary to skip already-applied entries.
     uint64 last_applied_index = 2;
+
+    // initial_window is the number of entries the secondary is initially
+    // willing to accept before requiring WindowUpdate replenishment.
+    // If zero, the primary uses a default (drDefaultInitialWindow).
+    uint64 initial_window = 3;
 }
 
 // CheckpointRequest asks the primary to create a reconciliation checkpoint.
@@ -99,10 +127,6 @@ message CheckpointResponse {
 
     // commit_index is the primary's Raft commit index at checkpoint time.
     uint64 commit_index = 2;
-
-    // top_ranges is the primary-generated deterministic top-level range
-    // manifest for range-based reconciliation.
-    repeated RangeDigest top_ranges = 3;
 
     // range_plan_version identifies the deterministic range planner
     // algorithm used to generate top_ranges.
@@ -119,77 +143,56 @@ message RangeSpan {
     uint32 split_depth = 3;
 }
 
-// RangeDigest summarizes a KID interval for mismatch detection and sizing hints.
+
+
+// DirtyBitmapMessage carries the dirty range bitmap.
+message DirtyBitmapMessage {
+    string relationship_id = 1;
+    string checkpoint_id = 2;
+    uint64 checkpoint_index = 3;
+    uint64 start_index = 4; // The Raft index since when changes are tracked
+    bytes bitmap = 5;       // The bitmap itself
+}
+
+// RangeChecksum represents a simple checksum for a range.
+message RangeChecksum {
+    uint64 range_id = 1;
+    uint64 checksum = 2; // Simple XOR or CRC64
+    uint64 count = 3;
+}
+
+// RangeChecksumRequest requests checksums for specific ranges.
+message RangeChecksumRequest {
+    string checkpoint_id = 1;
+    uint64 checkpoint_index = 2;
+    repeated uint64 range_ids = 3;
+}
+
+// RangeChecksumResponse returns the requested range checksums.
+message RangeChecksumResponse {
+    repeated RangeChecksum checksums = 1;
+}
+
+// RangeDigest is a fine-grained sub-range digest for drill-down.
 message RangeDigest {
     RangeSpan span = 1;
     uint64 count = 2;
-    bytes xor_key_hash = 3;
-    bytes xor_value_hash = 4;
-    uint32 suggested_iblt_cells = 5;
-    uint64 approx_value_bytes = 6;
+    bytes xor_key_hash = 3;   // 32-byte XOR of SHA256(KID) values
+    bytes xor_value_hash = 4; // 32-byte XOR of SHA256(KID||VID) values
+    uint64 approx_value_bytes = 5;
 }
 
-// RangeDigestRequest asks the primary for digest metadata of explicit spans.
+// RangeDigestRequest asks the primary for fine-grained sub-range digests.
 message RangeDigestRequest {
     string checkpoint_id = 1;
     uint64 checkpoint_index = 2;
-    repeated RangeSpan spans = 3;
+    // parent_span is the mismatched range to drill into.
+    RangeSpan parent_span = 3;
 }
 
-// RangeDigestResponse returns one digest per requested span.
+// RangeDigestResponse returns the sub-range digests for a drilled-down range.
 message RangeDigestResponse {
-    repeated RangeDigest ranges = 1;
-}
-
-// IBLTMessage carries a serialized IBLT.
-message IBLTMessage {
-    string checkpoint_id = 1;
-
-    // num_cells is the IBLT size (for informational purposes).
-    uint32 num_cells = 2;
-
-    // iblt_data is the serialized IBLT.
-    bytes iblt_data = 3;
-
-    // span optionally scopes IBLT exchange to a specific KID interval.
-    // When unset, global behavior is used.
-    RangeSpan span = 4;
-
-    // checkpoint_index fences this request to a specific checkpoint tuple.
-    uint64 checkpoint_index = 5;
-}
-
-// PrefixDigestRequest requests prefix digests at a given depth.
-message PrefixDigestRequest {
-    string checkpoint_id = 1;
-
-    // prefix_length is the number of prefix bits (e.g. 8, 12, 16).
-    uint32 prefix_length = 2;
-
-    // bucket_indices restricts the response to specific buckets.
-    // Empty means all buckets at this prefix length.
-    repeated uint32 bucket_indices = 3;
-
-    // span optionally scopes digest generation to a specific KID interval.
-    // When unset, global behavior is used.
-    RangeSpan span = 4;
-
-    // checkpoint_index fences this request to a specific checkpoint tuple.
-    uint64 checkpoint_index = 5;
-}
-
-// PrefixDigestResponse returns prefix digest buckets.
-message PrefixDigestResponse {
-    uint32 prefix_length = 1;
-    repeated BucketDigestProto buckets = 2;
-}
-
-// BucketDigestProto is the wire representation of a single prefix bucket.
-message BucketDigestProto {
-    uint32 index = 1;
-    uint64 count = 2;
-    bytes xor_key_hash = 3;
-    bytes xor_value_hash = 4;
+    repeated RangeDigest digests = 1;
 }
 
 // FetchEntriesRequest asks the primary for specific entries by KID.

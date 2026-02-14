@@ -22,14 +22,14 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	DRReplication_StreamChanges_FullMethodName         = "/vault.DRReplication/StreamChanges"
-	DRReplication_RequestCheckpoint_FullMethodName     = "/vault.DRReplication/RequestCheckpoint"
-	DRReplication_ExchangeIBLT_FullMethodName          = "/vault.DRReplication/ExchangeIBLT"
-	DRReplication_ExchangeRangeDigests_FullMethodName  = "/vault.DRReplication/ExchangeRangeDigests"
-	DRReplication_ExchangePrefixDigests_FullMethodName = "/vault.DRReplication/ExchangePrefixDigests"
-	DRReplication_FetchEntries_FullMethodName          = "/vault.DRReplication/FetchEntries"
-	DRReplication_Heartbeat_FullMethodName             = "/vault.DRReplication/Heartbeat"
-	DRReplication_SyncKeyring_FullMethodName           = "/vault.DRReplication/SyncKeyring"
+	DRReplication_StreamChanges_FullMethodName          = "/vault.DRReplication/StreamChanges"
+	DRReplication_RequestCheckpoint_FullMethodName      = "/vault.DRReplication/RequestCheckpoint"
+	DRReplication_ExchangeDirtyBitmap_FullMethodName    = "/vault.DRReplication/ExchangeDirtyBitmap"
+	DRReplication_ExchangeRangeChecksums_FullMethodName = "/vault.DRReplication/ExchangeRangeChecksums"
+	DRReplication_ExchangeRangeDigests_FullMethodName   = "/vault.DRReplication/ExchangeRangeDigests"
+	DRReplication_FetchEntries_FullMethodName           = "/vault.DRReplication/FetchEntries"
+	DRReplication_Heartbeat_FullMethodName              = "/vault.DRReplication/Heartbeat"
+	DRReplication_SyncKeyring_FullMethodName            = "/vault.DRReplication/SyncKeyring"
 )
 
 // DRReplicationClient is the client API for DRReplication service.
@@ -43,26 +43,29 @@ const (
 // StreamChanges (entry-level change stream, not WAL shipping).
 //
 // Recovery mode: When the stream is interrupted or the secondary
-// detects divergence, IBLT/prefix digest reconciliation identifies
-// and repairs differences with bandwidth proportional to the number
-// of differences (d), not the total keyspace (n).
+// detects divergence, ordered hash-stream reconciliation with dirty
+// bitmap optimization identifies and repairs differences with
+// bandwidth proportional to the number of dirty ranges, not the
+// total keyspace.
 type DRReplicationClient interface {
 	// StreamChanges is the normal-mode replication stream. The primary
-	// pushes storage mutations to the secondary in real time.
-	StreamChanges(ctx context.Context, in *StreamChangesRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[EntryChange], error)
+	// pushes storage mutations to the secondary in real time as
+	// EntryBatch messages (batched for throughput). The secondary sends
+	// an init message followed by periodic WindowUpdate messages for
+	// credit-based flow control.
+	StreamChanges(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[StreamChangesUpstream, EntryBatch], error)
 	// RequestCheckpoint asks the primary to create a consistent
 	// checkpoint at its current commit index for reconciliation.
 	RequestCheckpoint(ctx context.Context, in *CheckpointRequest, opts ...grpc.CallOption) (*CheckpointResponse, error)
-	// ExchangeIBLT exchanges IBLT sketches to decode the actual
-	// differing elements.
-	ExchangeIBLT(ctx context.Context, in *IBLTMessage, opts ...grpc.CallOption) (*IBLTMessage, error)
-	// ExchangeRangeDigests returns range digests for explicit spans from
-	// an immutable checkpoint artifact. Used by secondaries to avoid blind
-	// split fanout after decode failures.
+	// ExchangeDirtyBitmap exchanges the dirty bitmap for efficient
+	// range filtering.
+	ExchangeDirtyBitmap(ctx context.Context, in *DirtyBitmapMessage, opts ...grpc.CallOption) (*DirtyBitmapMessage, error)
+	// ExchangeRangeChecksums returns checksums for the requested ranges.
+	ExchangeRangeChecksums(ctx context.Context, in *RangeChecksumRequest, opts ...grpc.CallOption) (*RangeChecksumResponse, error)
+	// ExchangeRangeDigests performs fine-grained drill-down on a
+	// mismatched range. The primary splits the requested range and
+	// returns sub-range digests so the secondary can narrow the diff.
 	ExchangeRangeDigests(ctx context.Context, in *RangeDigestRequest, opts ...grpc.CallOption) (*RangeDigestResponse, error)
-	// ExchangePrefixDigests exchanges prefix digest buckets for
-	// adaptive drill-down when IBLT decode fails.
-	ExchangePrefixDigests(ctx context.Context, in *PrefixDigestRequest, opts ...grpc.CallOption) (*PrefixDigestResponse, error)
 	// FetchEntries retrieves the actual storage entries for a set of
 	// divergent keys identified during reconciliation.
 	FetchEntries(ctx context.Context, in *FetchEntriesRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[EntryBatch], error)
@@ -83,24 +86,18 @@ func NewDRReplicationClient(cc grpc.ClientConnInterface) DRReplicationClient {
 	return &dRReplicationClient{cc}
 }
 
-func (c *dRReplicationClient) StreamChanges(ctx context.Context, in *StreamChangesRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[EntryChange], error) {
+func (c *dRReplicationClient) StreamChanges(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[StreamChangesUpstream, EntryBatch], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &DRReplication_ServiceDesc.Streams[0], DRReplication_StreamChanges_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
-	x := &grpc.GenericClientStream[StreamChangesRequest, EntryChange]{ClientStream: stream}
-	if err := x.ClientStream.SendMsg(in); err != nil {
-		return nil, err
-	}
-	if err := x.ClientStream.CloseSend(); err != nil {
-		return nil, err
-	}
+	x := &grpc.GenericClientStream[StreamChangesUpstream, EntryBatch]{ClientStream: stream}
 	return x, nil
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type DRReplication_StreamChangesClient = grpc.ServerStreamingClient[EntryChange]
+type DRReplication_StreamChangesClient = grpc.BidiStreamingClient[StreamChangesUpstream, EntryBatch]
 
 func (c *dRReplicationClient) RequestCheckpoint(ctx context.Context, in *CheckpointRequest, opts ...grpc.CallOption) (*CheckpointResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
@@ -112,10 +109,20 @@ func (c *dRReplicationClient) RequestCheckpoint(ctx context.Context, in *Checkpo
 	return out, nil
 }
 
-func (c *dRReplicationClient) ExchangeIBLT(ctx context.Context, in *IBLTMessage, opts ...grpc.CallOption) (*IBLTMessage, error) {
+func (c *dRReplicationClient) ExchangeDirtyBitmap(ctx context.Context, in *DirtyBitmapMessage, opts ...grpc.CallOption) (*DirtyBitmapMessage, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(IBLTMessage)
-	err := c.cc.Invoke(ctx, DRReplication_ExchangeIBLT_FullMethodName, in, out, cOpts...)
+	out := new(DirtyBitmapMessage)
+	err := c.cc.Invoke(ctx, DRReplication_ExchangeDirtyBitmap_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *dRReplicationClient) ExchangeRangeChecksums(ctx context.Context, in *RangeChecksumRequest, opts ...grpc.CallOption) (*RangeChecksumResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RangeChecksumResponse)
+	err := c.cc.Invoke(ctx, DRReplication_ExchangeRangeChecksums_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -126,16 +133,6 @@ func (c *dRReplicationClient) ExchangeRangeDigests(ctx context.Context, in *Rang
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(RangeDigestResponse)
 	err := c.cc.Invoke(ctx, DRReplication_ExchangeRangeDigests_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *dRReplicationClient) ExchangePrefixDigests(ctx context.Context, in *PrefixDigestRequest, opts ...grpc.CallOption) (*PrefixDigestResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(PrefixDigestResponse)
-	err := c.cc.Invoke(ctx, DRReplication_ExchangePrefixDigests_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -192,26 +189,29 @@ func (c *dRReplicationClient) SyncKeyring(ctx context.Context, in *SyncKeyringRe
 // StreamChanges (entry-level change stream, not WAL shipping).
 //
 // Recovery mode: When the stream is interrupted or the secondary
-// detects divergence, IBLT/prefix digest reconciliation identifies
-// and repairs differences with bandwidth proportional to the number
-// of differences (d), not the total keyspace (n).
+// detects divergence, ordered hash-stream reconciliation with dirty
+// bitmap optimization identifies and repairs differences with
+// bandwidth proportional to the number of dirty ranges, not the
+// total keyspace.
 type DRReplicationServer interface {
 	// StreamChanges is the normal-mode replication stream. The primary
-	// pushes storage mutations to the secondary in real time.
-	StreamChanges(*StreamChangesRequest, grpc.ServerStreamingServer[EntryChange]) error
+	// pushes storage mutations to the secondary in real time as
+	// EntryBatch messages (batched for throughput). The secondary sends
+	// an init message followed by periodic WindowUpdate messages for
+	// credit-based flow control.
+	StreamChanges(grpc.BidiStreamingServer[StreamChangesUpstream, EntryBatch]) error
 	// RequestCheckpoint asks the primary to create a consistent
 	// checkpoint at its current commit index for reconciliation.
 	RequestCheckpoint(context.Context, *CheckpointRequest) (*CheckpointResponse, error)
-	// ExchangeIBLT exchanges IBLT sketches to decode the actual
-	// differing elements.
-	ExchangeIBLT(context.Context, *IBLTMessage) (*IBLTMessage, error)
-	// ExchangeRangeDigests returns range digests for explicit spans from
-	// an immutable checkpoint artifact. Used by secondaries to avoid blind
-	// split fanout after decode failures.
+	// ExchangeDirtyBitmap exchanges the dirty bitmap for efficient
+	// range filtering.
+	ExchangeDirtyBitmap(context.Context, *DirtyBitmapMessage) (*DirtyBitmapMessage, error)
+	// ExchangeRangeChecksums returns checksums for the requested ranges.
+	ExchangeRangeChecksums(context.Context, *RangeChecksumRequest) (*RangeChecksumResponse, error)
+	// ExchangeRangeDigests performs fine-grained drill-down on a
+	// mismatched range. The primary splits the requested range and
+	// returns sub-range digests so the secondary can narrow the diff.
 	ExchangeRangeDigests(context.Context, *RangeDigestRequest) (*RangeDigestResponse, error)
-	// ExchangePrefixDigests exchanges prefix digest buckets for
-	// adaptive drill-down when IBLT decode fails.
-	ExchangePrefixDigests(context.Context, *PrefixDigestRequest) (*PrefixDigestResponse, error)
 	// FetchEntries retrieves the actual storage entries for a set of
 	// divergent keys identified during reconciliation.
 	FetchEntries(*FetchEntriesRequest, grpc.ServerStreamingServer[EntryBatch]) error
@@ -232,20 +232,20 @@ type DRReplicationServer interface {
 // pointer dereference when methods are called.
 type UnimplementedDRReplicationServer struct{}
 
-func (UnimplementedDRReplicationServer) StreamChanges(*StreamChangesRequest, grpc.ServerStreamingServer[EntryChange]) error {
+func (UnimplementedDRReplicationServer) StreamChanges(grpc.BidiStreamingServer[StreamChangesUpstream, EntryBatch]) error {
 	return status.Error(codes.Unimplemented, "method StreamChanges not implemented")
 }
 func (UnimplementedDRReplicationServer) RequestCheckpoint(context.Context, *CheckpointRequest) (*CheckpointResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RequestCheckpoint not implemented")
 }
-func (UnimplementedDRReplicationServer) ExchangeIBLT(context.Context, *IBLTMessage) (*IBLTMessage, error) {
-	return nil, status.Error(codes.Unimplemented, "method ExchangeIBLT not implemented")
+func (UnimplementedDRReplicationServer) ExchangeDirtyBitmap(context.Context, *DirtyBitmapMessage) (*DirtyBitmapMessage, error) {
+	return nil, status.Error(codes.Unimplemented, "method ExchangeDirtyBitmap not implemented")
+}
+func (UnimplementedDRReplicationServer) ExchangeRangeChecksums(context.Context, *RangeChecksumRequest) (*RangeChecksumResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ExchangeRangeChecksums not implemented")
 }
 func (UnimplementedDRReplicationServer) ExchangeRangeDigests(context.Context, *RangeDigestRequest) (*RangeDigestResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ExchangeRangeDigests not implemented")
-}
-func (UnimplementedDRReplicationServer) ExchangePrefixDigests(context.Context, *PrefixDigestRequest) (*PrefixDigestResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method ExchangePrefixDigests not implemented")
 }
 func (UnimplementedDRReplicationServer) FetchEntries(*FetchEntriesRequest, grpc.ServerStreamingServer[EntryBatch]) error {
 	return status.Error(codes.Unimplemented, "method FetchEntries not implemented")
@@ -278,15 +278,11 @@ func RegisterDRReplicationServer(s grpc.ServiceRegistrar, srv DRReplicationServe
 }
 
 func _DRReplication_StreamChanges_Handler(srv interface{}, stream grpc.ServerStream) error {
-	m := new(StreamChangesRequest)
-	if err := stream.RecvMsg(m); err != nil {
-		return err
-	}
-	return srv.(DRReplicationServer).StreamChanges(m, &grpc.GenericServerStream[StreamChangesRequest, EntryChange]{ServerStream: stream})
+	return srv.(DRReplicationServer).StreamChanges(&grpc.GenericServerStream[StreamChangesUpstream, EntryBatch]{ServerStream: stream})
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type DRReplication_StreamChangesServer = grpc.ServerStreamingServer[EntryChange]
+type DRReplication_StreamChangesServer = grpc.BidiStreamingServer[StreamChangesUpstream, EntryBatch]
 
 func _DRReplication_RequestCheckpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(CheckpointRequest)
@@ -306,20 +302,38 @@ func _DRReplication_RequestCheckpoint_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
-func _DRReplication_ExchangeIBLT_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(IBLTMessage)
+func _DRReplication_ExchangeDirtyBitmap_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DirtyBitmapMessage)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(DRReplicationServer).ExchangeIBLT(ctx, in)
+		return srv.(DRReplicationServer).ExchangeDirtyBitmap(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: DRReplication_ExchangeIBLT_FullMethodName,
+		FullMethod: DRReplication_ExchangeDirtyBitmap_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(DRReplicationServer).ExchangeIBLT(ctx, req.(*IBLTMessage))
+		return srv.(DRReplicationServer).ExchangeDirtyBitmap(ctx, req.(*DirtyBitmapMessage))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _DRReplication_ExchangeRangeChecksums_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RangeChecksumRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DRReplicationServer).ExchangeRangeChecksums(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: DRReplication_ExchangeRangeChecksums_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DRReplicationServer).ExchangeRangeChecksums(ctx, req.(*RangeChecksumRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -338,24 +352,6 @@ func _DRReplication_ExchangeRangeDigests_Handler(srv interface{}, ctx context.Co
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(DRReplicationServer).ExchangeRangeDigests(ctx, req.(*RangeDigestRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _DRReplication_ExchangePrefixDigests_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(PrefixDigestRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(DRReplicationServer).ExchangePrefixDigests(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: DRReplication_ExchangePrefixDigests_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(DRReplicationServer).ExchangePrefixDigests(ctx, req.(*PrefixDigestRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -419,16 +415,16 @@ var DRReplication_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _DRReplication_RequestCheckpoint_Handler,
 		},
 		{
-			MethodName: "ExchangeIBLT",
-			Handler:    _DRReplication_ExchangeIBLT_Handler,
+			MethodName: "ExchangeDirtyBitmap",
+			Handler:    _DRReplication_ExchangeDirtyBitmap_Handler,
+		},
+		{
+			MethodName: "ExchangeRangeChecksums",
+			Handler:    _DRReplication_ExchangeRangeChecksums_Handler,
 		},
 		{
 			MethodName: "ExchangeRangeDigests",
 			Handler:    _DRReplication_ExchangeRangeDigests_Handler,
-		},
-		{
-			MethodName: "ExchangePrefixDigests",
-			Handler:    _DRReplication_ExchangePrefixDigests_Handler,
 		},
 		{
 			MethodName: "Heartbeat",
@@ -444,6 +440,7 @@ var DRReplication_ServiceDesc = grpc.ServiceDesc{
 			StreamName:    "StreamChanges",
 			Handler:       _DRReplication_StreamChanges_Handler,
 			ServerStreams: true,
+			ClientStreams: true,
 		},
 		{
 			StreamName:    "FetchEntries",
