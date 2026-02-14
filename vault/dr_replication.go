@@ -550,6 +550,10 @@ func (s *drReplicationPrimary) StreamChanges(stream grpc.BidiStreamingServer[Str
 	bufferSnapshot := append([]physical.ChangeStreamEntry(nil), s.changeBuffer...)
 	s.bufMu.RUnlock()
 
+	// catchupSent tracks how many entries are sent during catch-up replay
+	// so the credit counter can be adjusted before entering the live loop.
+	var catchupSent int64
+
 	// sendBatch is a helper that sends an accumulated batch as a single
 	// EntryBatch message. It is used by both catch-up replay and live
 	// streaming to reduce per-message gRPC overhead.
@@ -557,6 +561,16 @@ func (s *drReplicationPrimary) StreamChanges(stream grpc.BidiStreamingServer[Str
 		if len(batch) == 0 {
 			return nil
 		}
+		return stream.Send(&EntryBatch{Entries: batch})
+	}
+
+	// sendCatchupBatch sends a batch and tracks the entry count for
+	// credit adjustment after catch-up completes.
+	sendCatchupBatch := func(batch []*EntryChange) error {
+		if len(batch) == 0 {
+			return nil
+		}
+		catchupSent += int64(len(batch))
 		return stream.Send(&EntryBatch{Entries: batch})
 	}
 
@@ -572,7 +586,7 @@ func (s *drReplicationPrimary) StreamChanges(stream grpc.BidiStreamingServer[Str
 				if err := s.streamJournal.replayRange(bufferStart, oldestIdx, func(e physical.ChangeStreamEntry) error {
 					journalBatch = append(journalBatch, entryChangeFromPhysical(e))
 					if len(journalBatch) >= drStreamSendBatchMaxEntries {
-						if err := sendBatch(journalBatch); err != nil {
+						if err := sendCatchupBatch(journalBatch); err != nil {
 							return err
 						}
 						journalBatch = journalBatch[:0]
@@ -591,7 +605,7 @@ func (s *drReplicationPrimary) StreamChanges(stream grpc.BidiStreamingServer[Str
 					return status.Errorf(codes.Internal, "journal catch-up failed: %v", err)
 				}
 				// Flush remaining journal entries.
-				if err := sendBatch(journalBatch); err != nil {
+				if err := sendCatchupBatch(journalBatch); err != nil {
 					return err
 				}
 				s.journalReplaySuccess.Add(1)
@@ -612,15 +626,28 @@ func (s *drReplicationPrimary) StreamChanges(stream grpc.BidiStreamingServer[Str
 		if e.RaftIndex >= bufferStart {
 			bufCatchupBatch = append(bufCatchupBatch, entryChangeFromPhysical(e))
 			if len(bufCatchupBatch) >= drStreamSendBatchMaxEntries {
-				if err := sendBatch(bufCatchupBatch); err != nil {
+				if err := sendCatchupBatch(bufCatchupBatch); err != nil {
 					return err
 				}
 				bufCatchupBatch = bufCatchupBatch[:0]
 			}
 		}
 	}
-	if err := sendBatch(bufCatchupBatch); err != nil {
+	if err := sendCatchupBatch(bufCatchupBatch); err != nil {
 		return err
+	}
+
+	// Debit the credit counter for entries sent during catch-up so the
+	// live loop has an accurate view of how many entries the secondary
+	// can still accept. Without this adjustment the counter is inflated:
+	// the secondary will send WindowUpdate credits for the catch-up
+	// entries it processes, but the primary never decremented for them.
+	if catchupSent > 0 {
+		sub.credits.Add(-catchupSent)
+		s.logger.Debug("adjusted credits after catch-up replay",
+			"subscriber", sub.id,
+			"catchup_sent", catchupSent,
+			"credits_remaining", sub.credits.Load())
 	}
 
 	// --- Live stream with credit-gated batched sends ---

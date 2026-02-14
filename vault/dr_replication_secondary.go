@@ -1948,16 +1948,23 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 	ticker := time.NewTicker(maxWait)
 	defer ticker.Stop()
 
-	// replenishCredits sends the flushed entry count to the credit-sender
-	// goroutine. Non-blocking: if the channel is full the sender will
-	// pick it up on the next iteration.
+	// pendingCredits accumulates credit counts that could not be sent
+	// to the credit-sender goroutine because creditReplenishCh was full.
+	// On each flush the total (new + pending) is sent, ensuring credits
+	// are never silently dropped.
+	var pendingCredits uint64
+
 	replenishCredits := func(n int) {
 		if n <= 0 {
 			return
 		}
+		pendingCredits += uint64(n)
 		select {
-		case creditReplenishCh <- uint64(n):
+		case creditReplenishCh <- pendingCredits:
+			pendingCredits = 0
 		default:
+			// Channel full -- credits are accumulated in pendingCredits
+			// and will be sent with the next successful send.
 		}
 	}
 
