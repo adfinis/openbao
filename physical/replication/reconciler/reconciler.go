@@ -134,17 +134,35 @@ type ScanConfig struct {
 
 	// Logger for scan progress.
 	Logger log.Logger
+
+	// ValueDomain controls how VIDs are derived.
+	//
+	// Plaintext mode hashes only entry bytes and matches legacy behavior.
+	// Ciphertext mode hashes entry bytes plus seal-wrap flag and is used
+	// for below-barrier DR reconciliation.
+	ValueDomain ValueDomain
 }
+
+// ValueDomain controls VID derivation semantics.
+type ValueDomain string
+
+const (
+	// ValueDomainPlaintext hashes only entry bytes.
+	ValueDomainPlaintext ValueDomain = "plaintext"
+	// ValueDomainCiphertext hashes entry bytes plus seal-wrap flag.
+	ValueDomainCiphertext ValueDomain = "ciphertext"
+)
 
 // DefaultScanConfig returns a ScanConfig with sensible defaults.
 func DefaultScanConfig(replSalt []byte) ScanConfig {
 	return ScanConfig{
-		ReplSalt:                      replSalt,
-		PrefixLen:                     8,
-		StrataLevels:                  sketch.DefaultStrataLevels,
-		StrataCells:                   sketch.DefaultStrataCells,
-		BuildKIDMap:                   false,
-		RequireTransactionalSnapshot:  false,
+		ReplSalt:                     replSalt,
+		PrefixLen:                    8,
+		StrataLevels:                 sketch.DefaultStrataLevels,
+		StrataCells:                  sketch.DefaultStrataCells,
+		BuildKIDMap:                  false,
+		RequireTransactionalSnapshot: false,
+		ValueDomain:                  ValueDomainPlaintext,
 	}
 }
 
@@ -218,7 +236,7 @@ func (s *Scanner) Scan(ctx context.Context, storage logical.Storage, checkpoint 
 			// Tombstone / deleted entry.
 			vid = s.computeTombstoneVID(path)
 		} else {
-			vid = s.computeVID(entry.Value)
+			vid = s.computeVIDWithSealWrap(entry.Value, entry.SealWrap)
 		}
 
 		mu.Lock()
@@ -282,7 +300,7 @@ func (s *Scanner) BuildIBLTFromScan(ctx context.Context, storage logical.Storage
 		if entry == nil {
 			vid = s.computeTombstoneVID(path)
 		} else {
-			vid = s.computeVID(entry.Value)
+			vid = s.computeVIDWithSealWrap(entry.Value, entry.SealWrap)
 		}
 
 		iblt.Insert(kid, vid)
@@ -292,6 +310,85 @@ func (s *Scanner) BuildIBLTFromScan(ctx context.Context, storage logical.Storage
 		return nil, fmt.Errorf("reconciler: IBLT build failed: %w", err)
 	}
 	return iblt, nil
+}
+
+// ScanPhysical iterates the full keyspace using a physical backend snapshot.
+// This is used by DR below-barrier reconciliation.
+func (s *Scanner) ScanPhysical(ctx context.Context, backend physical.Backend, checkpoint Checkpoint) (*ReconciliationSet, error) {
+	s.logger.Info("starting physical reconciliation scan", "checkpoint_id", checkpoint.ID, "commit_index", checkpoint.CommitIndex)
+
+	rs := &ReconciliationSet{
+		Checkpoint:   checkpoint,
+		Strata:       sketch.NewStrataEstimator(s.config.StrataLevels, s.config.StrataCells, sketch.DefaultHashCount),
+		PrefixDigest: sketch.NewPrefixDigest(s.config.PrefixLen),
+		KIDToVID:     make(map[[32]byte][32]byte),
+	}
+	if s.config.IBLTCells > 0 {
+		rs.IBLT = sketch.NewIBLT(s.config.IBLTCells, sketch.DefaultHashCount)
+	}
+	if s.config.BuildKIDMap {
+		rs.KIDToKey = make(map[[32]byte]string)
+	}
+	if s.config.BuildEntryMap {
+		rs.Entries = make(map[[32]byte]*physical.Entry)
+	}
+
+	scanBackend, rollback, err := s.beginScanSnapshotPhysical(ctx, backend)
+	if err != nil {
+		return nil, fmt.Errorf("reconciler: failed to begin physical scan snapshot: %w", err)
+	}
+	if rollback != nil {
+		defer rollback()
+	}
+
+	var mu sync.Mutex
+	err = logical.ScanViewPaginated(ctx, scanBackend, s.logger, logical.DefaultScanViewPageLimit, func(_ int, _ int, path string) (bool, error) {
+		if s.shouldExclude(path) {
+			return true, nil
+		}
+
+		entry, err := scanBackend.Get(ctx, path)
+		if err != nil {
+			return false, fmt.Errorf("failed to read physical entry during scan for %q: %w", path, err)
+		}
+
+		kid := s.computeKID(path)
+		var vid [32]byte
+		if entry == nil {
+			vid = s.computeTombstoneVID(path)
+		} else {
+			vid = s.computeVIDWithSealWrap(entry.Value, entry.SealWrap)
+		}
+
+		mu.Lock()
+		rs.Strata.Insert(kid, vid)
+		rs.PrefixDigest.Insert(kid, vid)
+		rs.KIDToVID[kid] = vid
+		if rs.IBLT != nil {
+			rs.IBLT.Insert(kid, vid)
+		}
+		if rs.KIDToKey != nil {
+			rs.KIDToKey[kid] = path
+		}
+		if rs.Entries != nil && entry != nil {
+			valueCopy := make([]byte, len(entry.Value))
+			copy(valueCopy, entry.Value)
+			rs.Entries[kid] = &physical.Entry{
+				Key:      path,
+				Value:    valueCopy,
+				SealWrap: entry.SealWrap,
+			}
+		}
+		rs.KeyCount++
+		mu.Unlock()
+		return true, nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("reconciler: physical scan failed: %w", err)
+	}
+
+	s.logger.Info("physical reconciliation scan complete", "keys", rs.KeyCount, "checkpoint_id", checkpoint.ID)
+	return rs, nil
 }
 
 func (s *Scanner) beginScanSnapshot(ctx context.Context, storage logical.Storage) (logical.Storage, func(), error) {
@@ -310,6 +407,24 @@ func (s *Scanner) beginScanSnapshot(ctx context.Context, storage logical.Storage
 	}
 
 	return storage, nil, nil
+}
+
+func (s *Scanner) beginScanSnapshotPhysical(ctx context.Context, backend physical.Backend) (physical.Backend, func(), error) {
+	if txView, ok := backend.(physical.Transactional); ok {
+		txn, err := txView.BeginReadOnlyTx(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		return txn, func() {
+			_ = txn.Rollback(ctx)
+		}, nil
+	}
+
+	if s.config.RequireTransactionalSnapshot {
+		return nil, nil, fmt.Errorf("transactional snapshot required but physical backend does not support read-only transactions")
+	}
+
+	return backend, nil, nil
 }
 
 func (s *Scanner) shouldExclude(path string) bool {
@@ -331,7 +446,12 @@ func (s *Scanner) ComputeKID(key string) [32]byte {
 // ComputeVID computes the VID for an entry value. Exported for use
 // in change stream processing.
 func (s *Scanner) ComputeVID(value []byte) [32]byte {
-	return s.computeVID(value)
+	return s.computeVIDWithSealWrap(value, false)
+}
+
+// ComputeVIDWithSealWrap computes the VID for entry bytes and SealWrap flag.
+func (s *Scanner) ComputeVIDWithSealWrap(value []byte, sealWrap bool) [32]byte {
+	return s.computeVIDWithSealWrap(value, sealWrap)
 }
 
 // ComputeItemFromEntry computes the (KID, VID) pair for a storage entry.
@@ -340,7 +460,7 @@ func (s *Scanner) ComputeItemFromEntry(entry *physical.Entry) (kid, vid [32]byte
 	if entry.Value == nil {
 		vid = s.computeTombstoneVID(entry.Key)
 	} else {
-		vid = s.computeVID(entry.Value)
+		vid = s.computeVIDWithSealWrap(entry.Value, entry.SealWrap)
 	}
 	return
 }
@@ -356,9 +476,23 @@ func (s *Scanner) computeKID(key string) [32]byte {
 	return kid
 }
 
-// computeVID derives VID = SHA-256(value).
-func (s *Scanner) computeVID(value []byte) [32]byte {
-	return sha256.Sum256(value)
+// computeVIDWithSealWrap derives VID from value and (optionally) SealWrap.
+func (s *Scanner) computeVIDWithSealWrap(value []byte, sealWrap bool) [32]byte {
+	switch s.config.ValueDomain {
+	case ValueDomainCiphertext:
+		h := sha256.New()
+		h.Write(value)
+		if sealWrap {
+			h.Write([]byte{1})
+		} else {
+			h.Write([]byte{0})
+		}
+		var vid [32]byte
+		copy(vid[:], h.Sum(nil))
+		return vid
+	default:
+		return sha256.Sum256(value)
+	}
 }
 
 // computeTombstoneVID derives VID for a deleted key.

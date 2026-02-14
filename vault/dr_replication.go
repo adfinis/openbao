@@ -37,6 +37,7 @@ const (
 	drCheckpointThrottleBufferPct          = 85
 	drCheckpointLaggingActiveWindow        = 10 * time.Second
 	drCheckpointForceBuildInterval         = 15 * time.Second
+	drCheckpointIndexFullScanInterval      = 10 * time.Minute
 )
 
 // drReplicationPrimary implements the DRReplicationServer gRPC interface
@@ -103,6 +104,15 @@ type drReplicationPrimary struct {
 	writeRateWindowStart   time.Time
 	writeRateWindowEntries uint64
 	writeRateEPS           float64
+
+	indexMu            sync.RWMutex
+	indexInitialized   bool
+	indexLastFullScan  time.Time
+	indexKIDToVID      map[[32]byte][32]byte
+	indexKIDToKey      map[[32]byte]string
+	indexResyncSkipped atomic.Uint64
+
+	streamJournal *drStreamJournal
 }
 
 type drCheckpointBuildResult struct {
@@ -148,6 +158,7 @@ func NewDRReplicationPrimary(core *Core, replSalt []byte, logger log.Logger) *dr
 	// Use metadata-first checkpoints to avoid retaining full values in cache.
 	config.BuildEntryMap = false
 	config.RequireTransactionalSnapshot = true
+	config.ValueDomain = reconciler.ValueDomainCiphertext
 	config.Logger = logger.Named("reconciler")
 	config.ExcludePaths = map[string]bool{
 		"core/keyring":                 true,
@@ -161,7 +172,7 @@ func NewDRReplicationPrimary(core *Core, replSalt []byte, logger log.Logger) *dr
 	// secondary so set comparisons are stable.
 	config.ExcludePathFunc = isDRReconcileExcludedPath
 
-	return &drReplicationPrimary{
+	primary := &drReplicationPrimary{
 		logger:                                  logger.Named("dr-replication"),
 		scanner:                                 reconciler.NewScanner(config),
 		core:                                    core,
@@ -179,7 +190,14 @@ func NewDRReplicationPrimary(core *Core, replSalt []byte, logger log.Logger) *dr
 		checkpointBuildInFlight:                 make(map[string]*drCheckpointBuildResult),
 		latestCheckpointByRelationship:          make(map[string]string),
 		checkpointLastForcedBuildByRelationship: make(map[string]time.Time),
+		indexKIDToVID:                           make(map[[32]byte][32]byte),
+		indexKIDToKey:                           make(map[[32]byte]string),
+		streamJournal:                           newDRStreamJournal(logger, ""),
 	}
+	if err := primary.streamJournal.configure(true, drDefaultStreamJournalMaxBytes, drDefaultStreamJournalSegmentBytes, drDefaultStreamJournalRetention); err != nil {
+		primary.logger.Warn("failed to initialize DR stream journal", "error", err)
+	}
+	return primary
 }
 
 // OnChange is called by the FSM change stream hook when storage
@@ -196,6 +214,15 @@ func (s *drReplicationPrimary) OnChange(entries []physical.ChangeStreamEntry) {
 	}
 	if len(replicableEntries) == 0 {
 		return
+	}
+
+	// Keep metadata index in sync with committed changes.
+	s.updateIndexFromChanges(replicableEntries)
+
+	if s.streamJournal != nil {
+		if err := s.streamJournal.append(replicableEntries); err != nil {
+			s.logger.Warn("failed to append stream journal entries", "error", err)
+		}
 	}
 
 	// Append to ring buffer.
@@ -315,34 +342,51 @@ func (s *drReplicationPrimary) StreamChanges(req *StreamChangesRequest, stream g
 		"relationship", req.RelationshipId,
 		"last_applied_index", req.LastAppliedIndex)
 
-	// Check if the buffer can satisfy catch-up, and send buffered changes.
+	// Check if buffer/journal can satisfy catch-up, and send catch-up changes.
 	//
 	// Resume is inclusive on last_applied_index because EntryChange is emitted
 	// per storage operation while the cursor is a Raft index. A reconnect may
 	// occur after applying one operation at index N but before applying the
 	// remaining operations at the same index.
+	resumeFrom := req.LastAppliedIndex
 	s.bufMu.RLock()
-	if len(s.changeBuffer) > 0 {
-		oldestIdx := s.changeBuffer[0].RaftIndex
-		resumeFrom := req.LastAppliedIndex
-		if resumeFrom < oldestIdx {
-			s.bufMu.RUnlock()
-			s.logger.Warn("buffer cannot satisfy catch-up, secondary needs reconciliation",
-				"requested_from", resumeFrom,
-				"oldest_buffered", oldestIdx)
-			return status.Errorf(codes.FailedPrecondition, "buffer too old: secondary missing from %d (inclusive), oldest buffered %d; reconciliation required",
-				resumeFrom, oldestIdx)
+	bufferSnapshot := append([]physical.ChangeStreamEntry(nil), s.changeBuffer...)
+	s.bufMu.RUnlock()
+
+	bufferStart := resumeFrom
+	if len(bufferSnapshot) > 0 {
+		oldestIdx := bufferSnapshot[0].RaftIndex
+		if bufferStart < oldestIdx {
+			if s.streamJournal != nil {
+				if err := s.streamJournal.replayRange(bufferStart, oldestIdx, func(e physical.ChangeStreamEntry) error {
+					return stream.Send(entryChangeFromPhysical(e))
+				}); err != nil {
+					if errors.Is(err, errDRStreamJournalRangeTooOld) {
+						s.logger.Warn("journal cannot satisfy catch-up, secondary needs reconciliation",
+							"requested_from", bufferStart,
+							"oldest_buffered", oldestIdx)
+						return status.Errorf(codes.FailedPrecondition, "journal too old: secondary missing from %d (inclusive), oldest buffered %d; reconciliation required",
+							bufferStart, oldestIdx)
+					}
+					return status.Errorf(codes.Internal, "journal catch-up failed: %v", err)
+				}
+			} else {
+				s.logger.Warn("buffer cannot satisfy catch-up, secondary needs reconciliation",
+					"requested_from", bufferStart,
+					"oldest_buffered", oldestIdx)
+				return status.Errorf(codes.FailedPrecondition, "buffer too old: secondary missing from %d (inclusive), oldest buffered %d; reconciliation required",
+					bufferStart, oldestIdx)
+			}
+			bufferStart = oldestIdx
 		}
 	}
-	for _, e := range s.changeBuffer {
-		if e.RaftIndex >= req.LastAppliedIndex {
+	for _, e := range bufferSnapshot {
+		if e.RaftIndex >= bufferStart {
 			if err := stream.Send(entryChangeFromPhysical(e)); err != nil {
-				s.bufMu.RUnlock()
 				return err
 			}
 		}
 	}
-	s.bufMu.RUnlock()
 
 	// Stream live changes.
 	authTicker := time.NewTicker(5 * time.Second)
@@ -858,11 +902,9 @@ func (s *drReplicationPrimary) buildAndCacheCheckpoint(ctx context.Context, rela
 		CommitIndex: commitIndex,
 	}
 
-	rs, err := s.scanner.Scan(ctx, s.core.barrier, checkpoint)
+	rs, err := s.buildCheckpointSet(ctx, checkpoint)
 	if err != nil {
-		s.scanFailures.Add(1)
-		metrics.IncrCounter([]string{"replication", "dr", "checkpoint", "scan_failures"}, 1)
-		return nil, status.Errorf(codes.Internal, "failed to build checkpoint snapshot: %v", err)
+		return nil, err
 	}
 	topRanges, err := reconciler.BuildRangeManifest(rs, s.rangePlanConfig)
 	if err != nil {
@@ -901,6 +943,65 @@ func (s *drReplicationPrimary) buildAndCacheCheckpoint(ctx context.Context, rela
 	}, nil
 }
 
+func (s *drReplicationPrimary) buildCheckpointSet(ctx context.Context, checkpoint reconciler.Checkpoint) (*reconciler.ReconciliationSet, error) {
+	if rs, ok := s.snapshotIndexCheckpointSet(); ok {
+		return rs, nil
+	}
+
+	rs, err := s.scanner.ScanPhysical(ctx, s.core.physical, checkpoint)
+	if err != nil {
+		s.scanFailures.Add(1)
+		metrics.IncrCounter([]string{"replication", "dr", "checkpoint", "scan_failures"}, 1)
+		return nil, status.Errorf(codes.Internal, "failed to build checkpoint snapshot: %v", err)
+	}
+	s.resetIndexFromSet(rs)
+	return rs, nil
+}
+
+func (s *drReplicationPrimary) snapshotIndexCheckpointSet() (*reconciler.ReconciliationSet, bool) {
+	s.indexMu.RLock()
+	defer s.indexMu.RUnlock()
+	if !s.indexInitialized {
+		return nil, false
+	}
+	if !s.indexLastFullScan.IsZero() && time.Since(s.indexLastFullScan) > drCheckpointIndexFullScanInterval {
+		return nil, false
+	}
+	kidToVID := make(map[[32]byte][32]byte, len(s.indexKIDToVID))
+	for kid, vid := range s.indexKIDToVID {
+		kidToVID[kid] = vid
+	}
+	kidToKey := make(map[[32]byte]string, len(s.indexKIDToKey))
+	for kid, key := range s.indexKIDToKey {
+		kidToKey[kid] = key
+	}
+	rs := &reconciler.ReconciliationSet{
+		KIDToVID:     kidToVID,
+		KIDToKey:     kidToKey,
+		KeyCount:     len(kidToVID),
+		PrefixDigest: reconciler.BuildRangePrefixDigestFromMap(kidToVID, fullRangeSpan(), 8),
+	}
+	return rs, true
+}
+
+func (s *drReplicationPrimary) resetIndexFromSet(rs *reconciler.ReconciliationSet) {
+	if rs == nil {
+		return
+	}
+	s.indexMu.Lock()
+	defer s.indexMu.Unlock()
+	s.indexKIDToVID = make(map[[32]byte][32]byte, len(rs.KIDToVID))
+	for kid, vid := range rs.KIDToVID {
+		s.indexKIDToVID[kid] = vid
+	}
+	s.indexKIDToKey = make(map[[32]byte]string, len(rs.KIDToKey))
+	for kid, key := range rs.KIDToKey {
+		s.indexKIDToKey[kid] = key
+	}
+	s.indexInitialized = true
+	s.indexLastFullScan = time.Now().UTC()
+}
+
 func (s *drReplicationPrimary) applyRuntimeTuning(cfg *DRConfig) {
 	if cfg == nil {
 		return
@@ -937,6 +1038,19 @@ func (s *drReplicationPrimary) applyRuntimeTuning(cfg *DRConfig) {
 		}
 	}
 	s.bufMu.Unlock()
+
+	if s.streamJournal != nil {
+		applyJournal := cfg.StreamJournalEnabled ||
+			cfg.StreamJournalMaxBytes > 0 ||
+			cfg.StreamJournalSegmentBytes > 0 ||
+			cfg.StreamJournalRetentionSecs > 0
+		if applyJournal {
+			retention := time.Duration(cfg.StreamJournalRetentionSecs) * time.Second
+			if err := s.streamJournal.configure(cfg.StreamJournalEnabled, cfg.StreamJournalMaxBytes, cfg.StreamJournalSegmentBytes, retention); err != nil {
+				s.logger.Warn("failed to apply stream journal tuning", "error", err)
+			}
+		}
+	}
 }
 
 func entryChangeBytes(e physical.ChangeStreamEntry) uint64 {
@@ -950,6 +1064,22 @@ func entryChangeFromPhysical(e physical.ChangeStreamEntry) *EntryChange {
 		Value:     e.Value,
 		SealWrap:  e.SealWrap,
 		RaftIndex: e.RaftIndex,
+	}
+}
+
+func (s *drReplicationPrimary) updateIndexFromChanges(entries []physical.ChangeStreamEntry) {
+	s.indexMu.Lock()
+	defer s.indexMu.Unlock()
+	for _, e := range entries {
+		kid := s.scanner.ComputeKID(e.Key)
+		switch e.OpType {
+		case physical.PutOperation:
+			s.indexKIDToVID[kid] = s.scanner.ComputeVIDWithSealWrap(e.Value, e.SealWrap)
+			s.indexKIDToKey[kid] = e.Key
+		case physical.DeleteOperation:
+			delete(s.indexKIDToVID, kid)
+			delete(s.indexKIDToKey, kid)
+		}
 	}
 }
 
@@ -1407,6 +1537,20 @@ func (s *drReplicationPrimary) tuningSnapshot() (checkpointTTLSeconds int64, che
 	return
 }
 
+func (s *drReplicationPrimary) writeRate() float64 {
+	s.writeRateMu.Lock()
+	defer s.writeRateMu.Unlock()
+	return s.writeRateEPS
+}
+
+func (s *drReplicationPrimary) streamJournalSnapshot() (bytes uint64, segments int, oldestIndex uint64) {
+	if s.streamJournal == nil {
+		return 0, 0, 0
+	}
+	bytes, segments, oldestIndex, _ = s.streamJournal.stats()
+	return
+}
+
 func (s *drReplicationPrimary) RevokeRelationship(relationshipID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1523,16 +1667,16 @@ func (s *drReplicationPrimary) readCheckpointEntryChange(ctx context.Context, cp
 		return nil, status.Error(codes.FailedPrecondition, "checkpoint conflict: missing KID->key mapping")
 	}
 
-	entry, err := s.core.barrier.Get(ctx, key)
+	entry, err := s.core.physical.Get(ctx, key)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read barrier entry %q: %w", key, err)
+		return nil, fmt.Errorf("failed to read physical entry %q: %w", key, err)
 	}
 
 	var currentVID [32]byte
 	if entry == nil {
 		_, currentVID = s.scanner.ComputeItemFromEntry(&physical.Entry{Key: key})
 	} else {
-		currentVID = s.scanner.ComputeVID(entry.Value)
+		currentVID = s.scanner.ComputeVIDWithSealWrap(entry.Value, entry.SealWrap)
 	}
 
 	if currentVID != cpVID {

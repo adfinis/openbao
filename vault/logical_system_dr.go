@@ -405,6 +405,42 @@ func (b *SystemBackend) drReplicationPaths() []*framework.Path {
 					Type:        framework.TypeInt,
 					Description: "Secondary stream apply batch max wait in milliseconds.",
 				},
+				"stream_journal_enabled": {
+					Type:        framework.TypeBool,
+					Description: "Enable persistent primary stream journal replay.",
+				},
+				"stream_journal_max_bytes": {
+					Type:        framework.TypeInt,
+					Description: "Primary stream journal max retained bytes.",
+				},
+				"stream_journal_segment_bytes": {
+					Type:        framework.TypeInt,
+					Description: "Primary stream journal segment size in bytes.",
+				},
+				"stream_journal_retention_seconds": {
+					Type:        framework.TypeInt,
+					Description: "Primary stream journal retention window in seconds.",
+				},
+				"reconcile_apply_workers": {
+					Type:        framework.TypeInt,
+					Description: "Secondary reconcile apply worker count.",
+				},
+				"reconcile_put_batch_max_entries": {
+					Type:        framework.TypeInt,
+					Description: "Secondary reconcile put batching max entries.",
+				},
+				"reconcile_put_batch_max_bytes": {
+					Type:        framework.TypeInt,
+					Description: "Secondary reconcile put batching max bytes.",
+				},
+				"convergence_min_rate_ratio": {
+					Type:        framework.TypeFloat,
+					Description: "Minimum secondary_apply_rate_eps / primary_write_rate_eps before convergence fallback.",
+				},
+				"convergence_stall_seconds": {
+					Type:        framework.TypeInt,
+					Description: "Lag-growth duration before convergence fallback can trigger.",
+				},
 				"fallback_enabled": {
 					Type:        framework.TypeBool,
 					Description: "Enable automatic resnapshot fallback under sustained lag pressure.",
@@ -501,6 +537,13 @@ func (b *SystemBackend) handleDRStatus(ctx context.Context, req *logical.Request
 		data["fallback_last_reason"] = status.FallbackLastReason
 		data["fallback_last_at"] = status.FallbackLastAt
 		data["reconcile_task_rate"] = status.ReconcileTaskRate
+		data["secondary_apply_rate_eps"] = status.SecondaryApplyRateEPS
+		data["lag_entries"] = status.LagEntries
+		data["lag_slope_eps"] = status.LagSlopeEPS
+		data["predicted_catchup_seconds"] = status.PredictedCatchupSeconds
+		data["reconcile_put_workers_active"] = status.ReconcilePutWorkersActive
+		data["reconcile_delete_phase_seconds"] = status.ReconcileDeletePhaseSeconds
+		data["primary_write_rate_eps"] = status.PrimaryWriteRateEPS
 	}
 
 	if primary := mgr.Primary(); primary != nil {
@@ -528,6 +571,11 @@ func (b *SystemBackend) handleDRStatus(ctx context.Context, req *logical.Request
 		data["stream_buffer_max_entries"] = streamBufferMaxEntries
 		data["stream_buffer_max_bytes"] = streamBufferMaxBytes
 		data["stream_buffer_horizon_seconds"] = primary.streamBufferHorizonSeconds()
+		data["primary_write_rate_eps"] = primary.writeRate()
+		journalBytes, journalSegments, journalOldest := primary.streamJournalSnapshot()
+		data["stream_journal_bytes"] = journalBytes
+		data["stream_journal_segments"] = journalSegments
+		data["stream_journal_oldest_index"] = journalOldest
 	}
 
 	if config.Mode == DRModePrimary {
@@ -828,6 +876,15 @@ func (b *SystemBackend) handleDRTuningRead(ctx context.Context, req *logical.Req
 			"stream_batch_max_entries":                 cfg.StreamBatchMaxEntries,
 			"stream_batch_max_bytes":                   cfg.StreamBatchMaxBytes,
 			"stream_batch_max_wait_milliseconds":       cfg.StreamBatchMaxWaitMillis,
+			"stream_journal_enabled":                   cfg.StreamJournalEnabled,
+			"stream_journal_max_bytes":                 cfg.StreamJournalMaxBytes,
+			"stream_journal_segment_bytes":             cfg.StreamJournalSegmentBytes,
+			"stream_journal_retention_seconds":         cfg.StreamJournalRetentionSecs,
+			"reconcile_apply_workers":                  cfg.ReconcileApplyWorkers,
+			"reconcile_put_batch_max_entries":          cfg.ReconcilePutBatchMaxEntries,
+			"reconcile_put_batch_max_bytes":            cfg.ReconcilePutBatchMaxBytes,
+			"convergence_min_rate_ratio":               cfg.ConvergenceMinRateRatio,
+			"convergence_stall_seconds":                cfg.ConvergenceStallSeconds,
 			"fallback_enabled":                         cfg.FallbackEnabled,
 			"fallback_stall_seconds":                   cfg.FallbackStallSeconds,
 			"fallback_failure_threshold":               cfg.FallbackFailureThreshold,
@@ -876,6 +933,33 @@ func (b *SystemBackend) handleDRTuningWrite(ctx context.Context, req *logical.Re
 		}
 		if raw, ok := d.GetOk("stream_batch_max_wait_milliseconds"); ok {
 			cfg.StreamBatchMaxWaitMillis = int64(raw.(int))
+		}
+		if raw, ok := d.GetOk("stream_journal_enabled"); ok {
+			cfg.StreamJournalEnabled = raw.(bool)
+		}
+		if raw, ok := d.GetOk("stream_journal_max_bytes"); ok {
+			cfg.StreamJournalMaxBytes = uint64(raw.(int))
+		}
+		if raw, ok := d.GetOk("stream_journal_segment_bytes"); ok {
+			cfg.StreamJournalSegmentBytes = uint64(raw.(int))
+		}
+		if raw, ok := d.GetOk("stream_journal_retention_seconds"); ok {
+			cfg.StreamJournalRetentionSecs = int64(raw.(int))
+		}
+		if raw, ok := d.GetOk("reconcile_apply_workers"); ok {
+			cfg.ReconcileApplyWorkers = raw.(int)
+		}
+		if raw, ok := d.GetOk("reconcile_put_batch_max_entries"); ok {
+			cfg.ReconcilePutBatchMaxEntries = raw.(int)
+		}
+		if raw, ok := d.GetOk("reconcile_put_batch_max_bytes"); ok {
+			cfg.ReconcilePutBatchMaxBytes = raw.(int)
+		}
+		if raw, ok := d.GetOk("convergence_min_rate_ratio"); ok {
+			cfg.ConvergenceMinRateRatio = raw.(float64)
+		}
+		if raw, ok := d.GetOk("convergence_stall_seconds"); ok {
+			cfg.ConvergenceStallSeconds = int64(raw.(int))
 		}
 		if raw, ok := d.GetOk("fallback_enabled"); ok {
 			cfg.FallbackEnabled = raw.(bool)

@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"math"
 	"sort"
@@ -133,6 +134,11 @@ const (
 	drDefaultStreamBatchMaxEntries     = 256
 	drDefaultStreamBatchMaxBytes       = 1 << 20 // 1 MiB
 	drDefaultStreamBatchMaxWait        = 10 * time.Millisecond
+	drDefaultReconcileApplyWorkers     = 16
+	drDefaultReconcilePutBatchEntries  = 512
+	drDefaultReconcilePutBatchBytes    = 2 << 20 // 2 MiB
+	drDefaultConvergenceMinRateRatio   = 0.8
+	drDefaultConvergenceStall          = 180 * time.Second
 
 	drDefaultFallbackEnabled          = true
 	drDefaultFallbackStall            = 180 * time.Second
@@ -243,6 +249,8 @@ type drReplicationSecondary struct {
 	reconcileRetries        atomic.Uint64
 	reconcileTaskRetries    atomic.Uint64
 	reconcileDecodeFailures atomic.Uint64
+	reconcilePutWorkers     atomic.Int64
+	reconcileDeletePhaseMS  atomic.Uint64
 
 	// Runtime tunables.
 	reconcileMaxRPCBytes      uint64
@@ -253,6 +261,22 @@ type drReplicationSecondary struct {
 	streamBatchMaxEntries     int
 	streamBatchMaxBytes       int
 	streamBatchMaxWait        time.Duration
+	reconcileApplyWorkers     int
+	reconcilePutBatchEntries  int
+	reconcilePutBatchBytes    int
+
+	rateMu                  sync.Mutex
+	rateLastSampleAt        time.Time
+	rateLastPrimaryIndex    uint64
+	rateLastAppliedIndex    uint64
+	rateLastLag             int64
+	primaryWriteRateEPS     float64
+	secondaryApplyRateEPS   float64
+	lagSlopeEPS             float64
+	predictedCatchupSeconds float64
+	lagGrowthStartAt        time.Time
+	convergenceMinRateRatio float64
+	convergenceStall        time.Duration
 
 	primaryIndex atomic.Uint64
 
@@ -287,6 +311,7 @@ func newDRReplicationSecondary(core *Core, replSalt []byte, relationshipID strin
 	config := reconciler.DefaultScanConfig(replSalt)
 	config.BuildKIDMap = true // Secondary needs reverse KID->key mapping for deletes
 	config.RequireTransactionalSnapshot = true
+	config.ValueDomain = reconciler.ValueDomainCiphertext
 	config.Logger = logger.Named("reconciler")
 
 	// Keep exact exclusions for hot-path lookup and include predicate-based
@@ -317,6 +342,11 @@ func newDRReplicationSecondary(core *Core, replSalt []byte, relationshipID strin
 		streamBatchMaxEntries:      drDefaultStreamBatchMaxEntries,
 		streamBatchMaxBytes:        drDefaultStreamBatchMaxBytes,
 		streamBatchMaxWait:         drDefaultStreamBatchMaxWait,
+		reconcileApplyWorkers:      drDefaultReconcileApplyWorkers,
+		reconcilePutBatchEntries:   drDefaultReconcilePutBatchEntries,
+		reconcilePutBatchBytes:     drDefaultReconcilePutBatchBytes,
+		convergenceMinRateRatio:    drDefaultConvergenceMinRateRatio,
+		convergenceStall:           drDefaultConvergenceStall,
 		fallbackEnabled:            drDefaultFallbackEnabled,
 		fallbackStall:              drDefaultFallbackStall,
 		fallbackFailureThreshold:   drDefaultFallbackFailureThreshold,
@@ -798,6 +828,7 @@ func (s *drReplicationSecondary) Status() DRSecondaryStatus {
 	s.sessionMu.RUnlock()
 	fallbackLastAt := time.Unix(s.fallbackLastAt.Load(), 0)
 	taskRate := float64(s.reconcileTaskRateMillis.Load()) / 1000.0
+	primaryRate, secondaryRate, lagSlope, predictedCatchup, lagEntries := s.rateSnapshot()
 	return DRSecondaryStatus{
 		State:                          s.State().String(),
 		RelationshipID:                 s.relationshipID,
@@ -837,6 +868,13 @@ func (s *drReplicationSecondary) Status() DRSecondaryStatus {
 		FallbackLastReason:             s.getFallbackLastReason(),
 		FallbackLastAt:                 fallbackLastAt,
 		ReconcileTaskRate:              taskRate,
+		PrimaryWriteRateEPS:            primaryRate,
+		SecondaryApplyRateEPS:          secondaryRate,
+		LagEntries:                     lagEntries,
+		LagSlopeEPS:                    lagSlope,
+		PredictedCatchupSeconds:        predictedCatchup,
+		ReconcilePutWorkersActive:      s.reconcilePutWorkers.Load(),
+		ReconcileDeletePhaseSeconds:    float64(s.reconcileDeletePhaseMS.Load()) / 1000.0,
 	}
 }
 
@@ -880,6 +918,13 @@ type DRSecondaryStatus struct {
 	FallbackLastReason             string
 	FallbackLastAt                 time.Time
 	ReconcileTaskRate              float64
+	PrimaryWriteRateEPS            float64
+	SecondaryApplyRateEPS          float64
+	LagEntries                     uint64
+	LagSlopeEPS                    float64
+	PredictedCatchupSeconds        float64
+	ReconcilePutWorkersActive      int64
+	ReconcileDeletePhaseSeconds    float64
 }
 
 func (s *drReplicationSecondary) applyRuntimeTuning(cfg *DRConfig) {
@@ -908,6 +953,21 @@ func (s *drReplicationSecondary) applyRuntimeTuning(cfg *DRConfig) {
 	}
 	if cfg.StreamBatchMaxWaitMillis > 0 {
 		s.streamBatchMaxWait = time.Duration(cfg.StreamBatchMaxWaitMillis) * time.Millisecond
+	}
+	if cfg.ReconcileApplyWorkers > 0 {
+		s.reconcileApplyWorkers = cfg.ReconcileApplyWorkers
+	}
+	if cfg.ReconcilePutBatchMaxEntries > 0 {
+		s.reconcilePutBatchEntries = cfg.ReconcilePutBatchMaxEntries
+	}
+	if cfg.ReconcilePutBatchMaxBytes > 0 {
+		s.reconcilePutBatchBytes = cfg.ReconcilePutBatchMaxBytes
+	}
+	if cfg.ConvergenceMinRateRatio > 0 {
+		s.convergenceMinRateRatio = cfg.ConvergenceMinRateRatio
+	}
+	if cfg.ConvergenceStallSeconds > 0 {
+		s.convergenceStall = time.Duration(cfg.ConvergenceStallSeconds) * time.Second
 	}
 	if cfg.ReconcileMaxWallTimeSeconds > 0 {
 		// Stall abort should remain below wall-time to force controlled rollover.
@@ -973,7 +1033,117 @@ func (s *drReplicationSecondary) runHeartbeatLoop(ctx context.Context) {
 			continue
 		}
 		s.primaryIndex.Store(resp.PrimaryIndex)
+		s.updateConvergenceTelemetry(resp.PrimaryIndex, s.lastAppliedIndex.Load(), time.Now().UTC())
 	}
+}
+
+func (s *drReplicationSecondary) updateConvergenceTelemetry(primaryIndex uint64, appliedIndex uint64, now time.Time) {
+	s.rateMu.Lock()
+	defer s.rateMu.Unlock()
+
+	if s.rateLastSampleAt.IsZero() {
+		s.rateLastSampleAt = now
+		s.rateLastPrimaryIndex = primaryIndex
+		s.rateLastAppliedIndex = appliedIndex
+		s.rateLastLag = int64(primaryIndex) - int64(appliedIndex)
+		return
+	}
+
+	dt := now.Sub(s.rateLastSampleAt).Seconds()
+	if dt <= 0 {
+		return
+	}
+
+	dp := int64(primaryIndex) - int64(s.rateLastPrimaryIndex)
+	if dp < 0 {
+		dp = 0
+	}
+	da := int64(appliedIndex) - int64(s.rateLastAppliedIndex)
+	if da < 0 {
+		da = 0
+	}
+
+	primaryRate := float64(dp) / dt
+	secondaryRate := float64(da) / dt
+	lag := int64(primaryIndex) - int64(appliedIndex)
+	lagSlope := float64(lag-s.rateLastLag) / dt
+
+	if s.primaryWriteRateEPS == 0 {
+		s.primaryWriteRateEPS = primaryRate
+	} else {
+		s.primaryWriteRateEPS = (s.primaryWriteRateEPS * 0.7) + (primaryRate * 0.3)
+	}
+	if s.secondaryApplyRateEPS == 0 {
+		s.secondaryApplyRateEPS = secondaryRate
+	} else {
+		s.secondaryApplyRateEPS = (s.secondaryApplyRateEPS * 0.7) + (secondaryRate * 0.3)
+	}
+	if s.lagSlopeEPS == 0 {
+		s.lagSlopeEPS = lagSlope
+	} else {
+		s.lagSlopeEPS = (s.lagSlopeEPS * 0.7) + (lagSlope * 0.3)
+	}
+
+	if lag > 0 && s.secondaryApplyRateEPS > s.primaryWriteRateEPS {
+		s.predictedCatchupSeconds = float64(lag) / (s.secondaryApplyRateEPS - s.primaryWriteRateEPS)
+	} else {
+		s.predictedCatchupSeconds = -1
+	}
+
+	if s.lagSlopeEPS > 0 {
+		if s.lagGrowthStartAt.IsZero() {
+			s.lagGrowthStartAt = now
+		}
+	} else {
+		s.lagGrowthStartAt = time.Time{}
+	}
+
+	s.rateLastSampleAt = now
+	s.rateLastPrimaryIndex = primaryIndex
+	s.rateLastAppliedIndex = appliedIndex
+	s.rateLastLag = lag
+}
+
+func (s *drReplicationSecondary) rateSnapshot() (primaryRate float64, secondaryRate float64, lagSlope float64, predictedCatchup float64, lagEntries uint64) {
+	s.rateMu.Lock()
+	defer s.rateMu.Unlock()
+	primaryRate = s.primaryWriteRateEPS
+	secondaryRate = s.secondaryApplyRateEPS
+	lagSlope = s.lagSlopeEPS
+	predictedCatchup = s.predictedCatchupSeconds
+	primary := s.primaryIndex.Load()
+	applied := s.lastAppliedIndex.Load()
+	if primary > applied {
+		lagEntries = primary - applied
+	}
+	return
+}
+
+func (s *drReplicationSecondary) convergenceFallbackEligible(now time.Time) bool {
+	s.rateMu.Lock()
+	defer s.rateMu.Unlock()
+
+	lag := uint64(0)
+	primary := s.primaryIndex.Load()
+	applied := s.lastAppliedIndex.Load()
+	if primary > applied {
+		lag = primary - applied
+	}
+	minLag := s.fallbackMinLagEntries
+	if minLag == 0 {
+		minLag = uint64(2 * drStreamBufferMaxEntries)
+	}
+	if lag < minLag {
+		return false
+	}
+	if s.lagGrowthStartAt.IsZero() || now.Sub(s.lagGrowthStartAt) < s.convergenceStall {
+		return false
+	}
+	if s.primaryWriteRateEPS <= 0 {
+		return false
+	}
+	ratio := s.secondaryApplyRateEPS / s.primaryWriteRateEPS
+	return ratio < s.convergenceMinRateRatio
 }
 
 func (s *drReplicationSecondary) recordFallbackFailure(class drReconcileFailureClass) {
@@ -1003,6 +1173,9 @@ func (s *drReplicationSecondary) recordFallbackFailure(class drReconcileFailureC
 func (s *drReplicationSecondary) shouldTriggerFallback(class drReconcileFailureClass) bool {
 	if !s.fallbackEnabled {
 		return false
+	}
+	if class == drReconcileFailureStalled && s.convergenceFallbackEligible(time.Now().UTC()) {
+		return true
 	}
 	switch class {
 	case drReconcileFailureBudgetExceeded, drReconcileFailureStalled, drReconcileFailureDecodeExhausted:
@@ -1137,6 +1310,10 @@ func (s *drReplicationSecondary) performResnapshot(ctx context.Context, reason s
 
 	remoteKeys := make(map[string]struct{}, 1024)
 	applied := 0
+	applyPipeline := newDRPutApplyPipeline(ctx, s, nil)
+	defer func() {
+		_ = applyPipeline.closeAndWait()
+	}()
 	for {
 		batch, recvErr := stream.Recv()
 		if recvErr == io.EOF {
@@ -1156,8 +1333,8 @@ func (s *drReplicationSecondary) performResnapshot(ctx context.Context, reason s
 			for _, e := range batch.GetEntries() {
 				entries = append(entries, cloneEntryChange(e))
 			}
-			if err := s.applyFetchedEntriesDeterministic(ctx, nil, entries); err != nil {
-				return fmt.Errorf("resnapshot apply failed: %w", err)
+			if err := applyPipeline.submit(entries); err != nil {
+				return fmt.Errorf("resnapshot apply queue failed: %w", err)
 			}
 			applied += len(entries)
 			for _, e := range entries {
@@ -1167,12 +1344,15 @@ func (s *drReplicationSecondary) performResnapshot(ctx context.Context, reason s
 			}
 		}
 	}
+	if err := applyPipeline.closeAndWait(); err != nil {
+		return fmt.Errorf("resnapshot apply failed: %w", err)
+	}
 
 	localCheckpoint := reconciler.Checkpoint{
 		ID:          checkpoint.CheckpointId,
 		CommitIndex: checkpoint.CommitIndex,
 	}
-	localSet, err := s.scanner.Scan(ctx, s.core.barrier, localCheckpoint)
+	localSet, err := s.scanner.ScanPhysical(ctx, s.core.physical, localCheckpoint)
 	if err != nil {
 		s.scanFailures.Add(1)
 		return fmt.Errorf("failed to scan local state after resnapshot fetch: %w", err)
@@ -1654,9 +1834,9 @@ func (s *drReplicationSecondary) applyStreamChange(ctx context.Context, change *
 }
 
 // applyFetchedChange applies a single entry change received via
-// FetchEntries (reconciliation). These values were read through the
-// primary's barrier (decrypted), so they must be written through the
-// secondary's barrier to re-encrypt them.
+// FetchEntries (reconciliation). Reconciliation runs below the barrier,
+// so fetched values are ciphertext bytes and must be written directly to
+// physical storage.
 //
 // kidToKey is an optional map for resolving KID-based deletes (where the
 // primary sends a delete with only the KID, not the key). Pass nil if
@@ -1678,12 +1858,12 @@ func (s *drReplicationSecondary) applyFetchedChangeWithKIDMap(ctx context.Contex
 
 	switch physical.Operation(change.OpType) {
 	case physical.PutOperation:
-		entry := &logical.StorageEntry{
+		entry := &physical.Entry{
 			Key:      change.Key,
 			Value:    change.Value,
 			SealWrap: change.SealWrap,
 		}
-		if err := s.core.barrier.Put(ctx, entry); err != nil {
+		if err := s.core.physical.Put(ctx, entry); err != nil {
 			return err
 		}
 
@@ -1712,7 +1892,7 @@ func (s *drReplicationSecondary) applyFetchedChangeWithKIDMap(ctx context.Contex
 
 	case physical.DeleteOperation:
 		if change.Key != "" {
-			return s.core.barrier.Delete(ctx, change.Key)
+			return s.core.physical.Delete(ctx, change.Key)
 		}
 		// If Key is empty but KID is present, resolve via local KID map.
 		if len(change.Kid) == 32 && kidToKey != nil {
@@ -1722,7 +1902,7 @@ func (s *drReplicationSecondary) applyFetchedChangeWithKIDMap(ctx context.Contex
 				if isDRNeverReplicatePath(key) {
 					return nil
 				}
-				return s.core.barrier.Delete(ctx, key)
+				return s.core.physical.Delete(ctx, key)
 			}
 			s.logger.Warn("delete with KID but key not found in local map",
 				"kid_prefix", fmt.Sprintf("%x", change.Kid[:8]))
@@ -1874,6 +2054,169 @@ func (b *drRangeBudget) addRPC(n uint64) error {
 	return b.check()
 }
 
+type drPutApplyPipeline struct {
+	secondary *drReplicationSecondary
+	ctx       context.Context
+	cancel    context.CancelFunc
+	kidToKey  map[[32]byte]string
+
+	shards []chan *EntryChange
+	wg     sync.WaitGroup
+
+	mu     sync.Mutex
+	err    error
+	closed bool
+}
+
+func newDRPutApplyPipeline(ctx context.Context, secondary *drReplicationSecondary, kidToKey map[[32]byte]string) *drPutApplyPipeline {
+	workers := secondary.reconcileApplyWorkers
+	if workers <= 0 {
+		workers = 1
+	}
+	queueDepth := workers * 512
+	if queueDepth < 1024 {
+		queueDepth = 1024
+	}
+	workerCtx, cancel := context.WithCancel(ctx)
+	p := &drPutApplyPipeline{
+		secondary: secondary,
+		ctx:       workerCtx,
+		cancel:    cancel,
+		kidToKey:  kidToKey,
+		shards:    make([]chan *EntryChange, workers),
+	}
+	for i := 0; i < workers; i++ {
+		ch := make(chan *EntryChange, queueDepth/workers+1)
+		p.shards[i] = ch
+		p.wg.Add(1)
+		go p.runWorker(ch)
+	}
+	return p
+}
+
+func (p *drPutApplyPipeline) runWorker(ch <-chan *EntryChange) {
+	defer p.wg.Done()
+	p.secondary.reconcilePutWorkers.Add(1)
+	defer p.secondary.reconcilePutWorkers.Add(-1)
+
+	maxEntries := p.secondary.reconcilePutBatchEntries
+	if maxEntries <= 0 {
+		maxEntries = drDefaultReconcilePutBatchEntries
+	}
+	maxBytes := p.secondary.reconcilePutBatchBytes
+	if maxBytes <= 0 {
+		maxBytes = drDefaultReconcilePutBatchBytes
+	}
+
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	batch := make([]*EntryChange, 0, maxEntries)
+	batchBytes := 0
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		for _, change := range batch {
+			if err := p.secondary.applyFetchedChange(p.ctx, change, p.kidToKey); err != nil {
+				p.setErr(fmt.Errorf("reconcile apply worker failed: %w", err))
+				return
+			}
+		}
+		batch = batch[:0]
+		batchBytes = 0
+	}
+
+	for {
+		select {
+		case <-p.ctx.Done():
+			return
+		case <-ticker.C:
+			flush()
+		case change, ok := <-ch:
+			if !ok {
+				flush()
+				return
+			}
+			batch = append(batch, change)
+			batchBytes += len(change.Key) + len(change.Value) + 48
+			if len(batch) >= maxEntries || batchBytes >= maxBytes {
+				flush()
+			}
+		}
+	}
+}
+
+func (p *drPutApplyPipeline) submit(entries []*EntryChange) error {
+	if len(entries) == 0 {
+		return p.Err()
+	}
+	for _, entry := range entries {
+		if entry == nil {
+			continue
+		}
+		shard := hashEntryShard(entry, len(p.shards))
+		select {
+		case <-p.ctx.Done():
+			return p.Err()
+		case p.shards[shard] <- entry:
+		}
+	}
+	return p.Err()
+}
+
+func (p *drPutApplyPipeline) closeAndWait() error {
+	p.mu.Lock()
+	if p.closed {
+		err := p.err
+		p.mu.Unlock()
+		return err
+	}
+	p.closed = true
+	chans := make([]chan *EntryChange, len(p.shards))
+	copy(chans, p.shards)
+	p.mu.Unlock()
+
+	for _, ch := range chans {
+		close(ch)
+	}
+	p.wg.Wait()
+	p.cancel()
+	return p.Err()
+}
+
+func (p *drPutApplyPipeline) setErr(err error) {
+	if err == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.err != nil {
+		return
+	}
+	p.err = err
+	p.cancel()
+}
+
+func (p *drPutApplyPipeline) Err() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.err
+}
+
+func hashEntryShard(change *EntryChange, shards int) int {
+	if shards <= 1 {
+		return 0
+	}
+	h := fnv.New32a()
+	if change.Key != "" {
+		_, _ = h.Write([]byte(change.Key))
+	} else if len(change.Kid) > 0 {
+		_, _ = h.Write(change.Kid)
+	}
+	return int(h.Sum32() % uint32(shards))
+}
+
 func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, checkpoint *CheckpointResponse, localSet *reconciler.ReconciliationSet, startTime time.Time) error {
 	ownedSession := false
 	if err := s.assertActiveCheckpoint(checkpoint.CheckpointId, checkpoint.CommitIndex); err != nil {
@@ -2001,6 +2344,12 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 	}
 	updateWorkloadMetrics()
 	var ibltCellsUsed uint64
+	s.reconcileDeletePhaseMS.Store(0)
+	applyPipeline := newDRPutApplyPipeline(ctx, s, localSet.KIDToKey)
+	defer func() {
+		_ = applyPipeline.closeAndWait()
+	}()
+	pendingDeletes := make(map[string]struct{})
 	for queue.Len() > 0 || inflight > 0 {
 		if stalled, since := s.isReconcileStalled(time.Now().UTC()); stalled {
 			workerCancel()
@@ -2008,6 +2357,13 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 			s.reconcileStalled.Add(1)
 			metrics.IncrCounter([]string{"replication", "dr", "reconcile", "stalled_total"}, 1)
 			return fmt.Errorf("reconcile failure [stalled]: stalled without task progress for %s", since.Round(time.Second))
+		}
+		if s.convergenceFallbackEligible(time.Now().UTC()) {
+			workerCancel()
+			s.reconcileRangesFailed.Add(1)
+			s.reconcileStalled.Add(1)
+			metrics.IncrCounter([]string{"replication", "dr", "reconcile", "stalled_total"}, 1)
+			return fmt.Errorf("reconcile failure [stalled]: convergence controller detected sustained lag growth")
 		}
 		for inflight < maxWorkers && queue.Len() > 0 {
 			if err := budget.check(); err != nil {
@@ -2126,22 +2482,36 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 		}
 
 		if len(res.fetchedEntries) > 0 {
-			if err := s.applyFetchedEntriesDeterministic(ctx, localSet.KIDToKey, res.fetchedEntries); err != nil {
+			if err := applyPipeline.submit(res.fetchedEntries); err != nil {
 				workerCancel()
 				s.reconcileRangesFailed.Add(1)
-				return wrapReconcileFailure(drReconcileFailureApplyFailed, "apply fetched entries", err)
+				return wrapReconcileFailure(drReconcileFailureApplyFailed, "queue fetched entries for apply", err)
 			}
 		}
 		if len(res.removedKeys) > 0 {
-			if err := s.applyRemovedKeys(ctx, checkpoint.CheckpointId, checkpoint.CommitIndex, res.removedKeys); err != nil {
-				workerCancel()
-				s.reconcileRangesFailed.Add(1)
-				return wrapReconcileFailure(drReconcileFailureApplyFailed, "apply removed keys", err)
+			for _, key := range res.removedKeys {
+				pendingDeletes[key] = struct{}{}
 			}
 		}
 		updateWorkloadMetrics()
 	}
 	workerCancel()
+	if err := applyPipeline.closeAndWait(); err != nil {
+		s.reconcileRangesFailed.Add(1)
+		return wrapReconcileFailure(drReconcileFailureApplyFailed, "apply pipeline", err)
+	}
+	if len(pendingDeletes) > 0 {
+		deletePhaseStart := time.Now()
+		keys := make([]string, 0, len(pendingDeletes))
+		for key := range pendingDeletes {
+			keys = append(keys, key)
+		}
+		if err := s.applyRemovedKeys(ctx, checkpoint.CheckpointId, checkpoint.CommitIndex, keys); err != nil {
+			s.reconcileRangesFailed.Add(1)
+			return wrapReconcileFailure(drReconcileFailureApplyFailed, "apply removed keys", err)
+		}
+		s.reconcileDeletePhaseMS.Store(uint64(time.Since(deletePhaseStart) / time.Millisecond))
+	}
 	s.reconcileRangesInflight.Store(0)
 	s.reconcileQueueDepth.Store(0)
 	if budget.rpcBytes >= s.reconcileMaxRPCBytes {
@@ -2530,7 +2900,7 @@ func (s *drReplicationSecondary) applyRemovedKeys(ctx context.Context, checkpoin
 		if isDRNeverReplicatePath(key) {
 			continue
 		}
-		if err := s.core.barrier.Delete(ctx, key); err != nil {
+		if err := s.core.physical.Delete(ctx, key); err != nil {
 			failures++
 			if len(examples) < cap(examples) {
 				examples = append(examples, key)
@@ -2677,7 +3047,7 @@ func (s *drReplicationSecondary) runRangePrefixRefinement(ctx context.Context, c
 		if primaryKeys[key] || isDRNeverReplicatePath(key) {
 			continue
 		}
-		if err := s.core.barrier.Delete(ctx, key); err != nil {
+		if err := s.core.physical.Delete(ctx, key); err != nil {
 			deleteFailures++
 			if len(deleteExamples) < cap(deleteExamples) {
 				deleteExamples = append(deleteExamples, key)
@@ -2774,7 +3144,7 @@ func (s *drReplicationSecondary) applyRemovedEntries(ctx context.Context, checkp
 				if isDRNeverReplicatePath(key) {
 					continue
 				}
-				if err := s.core.barrier.Delete(ctx, key); err != nil {
+				if err := s.core.physical.Delete(ctx, key); err != nil {
 					deleteFailures++
 					if len(deleteExamples) < cap(deleteExamples) {
 						deleteExamples = append(deleteExamples, key)

@@ -70,23 +70,32 @@ type DRConfig struct {
 	PrimaryCACert []byte `json:"primary_ca_cert,omitempty"`
 
 	// Optional DR runtime tuning knobs. Zero values mean "use defaults".
-	CheckpointTTLSeconds        int64  `json:"checkpoint_ttl_seconds,omitempty"`
-	CheckpointGlobalBudgetBytes uint64 `json:"checkpoint_global_budget_bytes,omitempty"`
-	CheckpointPerRelBudgetBytes uint64 `json:"checkpoint_per_relationship_budget_bytes,omitempty"`
-	StreamBufferMaxEntries      int    `json:"stream_buffer_max_entries,omitempty"`
-	StreamBufferMaxBytes        uint64 `json:"stream_buffer_max_bytes,omitempty"`
-	ReconcileMaxRPCBytes        uint64 `json:"reconcile_max_rpc_bytes,omitempty"`
-	ReconcileMaxWallTimeSeconds int64  `json:"reconcile_max_wall_time_seconds,omitempty"`
-	ReconcileMaxInflightTasks   int    `json:"reconcile_max_inflight_tasks,omitempty"`
-	StreamBatchMaxEntries       int    `json:"stream_batch_max_entries,omitempty"`
-	StreamBatchMaxBytes         int    `json:"stream_batch_max_bytes,omitempty"`
-	StreamBatchMaxWaitMillis    int64  `json:"stream_batch_max_wait_milliseconds,omitempty"`
-	FallbackEnabled             bool   `json:"fallback_enabled,omitempty"`
-	FallbackStallSeconds        int64  `json:"fallback_stall_seconds,omitempty"`
-	FallbackFailureThreshold    int    `json:"fallback_failure_threshold,omitempty"`
-	FallbackMinLagEntries       uint64 `json:"fallback_min_lag_entries,omitempty"`
-	FallbackCooldownSeconds     int64  `json:"fallback_cooldown_seconds,omitempty"`
-	FallbackMaxPerHour          int    `json:"fallback_max_per_hour,omitempty"`
+	CheckpointTTLSeconds        int64   `json:"checkpoint_ttl_seconds,omitempty"`
+	CheckpointGlobalBudgetBytes uint64  `json:"checkpoint_global_budget_bytes,omitempty"`
+	CheckpointPerRelBudgetBytes uint64  `json:"checkpoint_per_relationship_budget_bytes,omitempty"`
+	StreamBufferMaxEntries      int     `json:"stream_buffer_max_entries,omitempty"`
+	StreamBufferMaxBytes        uint64  `json:"stream_buffer_max_bytes,omitempty"`
+	ReconcileMaxRPCBytes        uint64  `json:"reconcile_max_rpc_bytes,omitempty"`
+	ReconcileMaxWallTimeSeconds int64   `json:"reconcile_max_wall_time_seconds,omitempty"`
+	ReconcileMaxInflightTasks   int     `json:"reconcile_max_inflight_tasks,omitempty"`
+	StreamBatchMaxEntries       int     `json:"stream_batch_max_entries,omitempty"`
+	StreamBatchMaxBytes         int     `json:"stream_batch_max_bytes,omitempty"`
+	StreamBatchMaxWaitMillis    int64   `json:"stream_batch_max_wait_milliseconds,omitempty"`
+	StreamJournalEnabled        bool    `json:"stream_journal_enabled,omitempty"`
+	StreamJournalMaxBytes       uint64  `json:"stream_journal_max_bytes,omitempty"`
+	StreamJournalSegmentBytes   uint64  `json:"stream_journal_segment_bytes,omitempty"`
+	StreamJournalRetentionSecs  int64   `json:"stream_journal_retention_seconds,omitempty"`
+	ReconcileApplyWorkers       int     `json:"reconcile_apply_workers,omitempty"`
+	ReconcilePutBatchMaxEntries int     `json:"reconcile_put_batch_max_entries,omitempty"`
+	ReconcilePutBatchMaxBytes   int     `json:"reconcile_put_batch_max_bytes,omitempty"`
+	ConvergenceMinRateRatio     float64 `json:"convergence_min_rate_ratio,omitempty"`
+	ConvergenceStallSeconds     int64   `json:"convergence_stall_seconds,omitempty"`
+	FallbackEnabled             bool    `json:"fallback_enabled,omitempty"`
+	FallbackStallSeconds        int64   `json:"fallback_stall_seconds,omitempty"`
+	FallbackFailureThreshold    int     `json:"fallback_failure_threshold,omitempty"`
+	FallbackMinLagEntries       uint64  `json:"fallback_min_lag_entries,omitempty"`
+	FallbackCooldownSeconds     int64   `json:"fallback_cooldown_seconds,omitempty"`
+	FallbackMaxPerHour          int     `json:"fallback_max_per_hour,omitempty"`
 }
 
 // DRActivationToken contains the information a secondary needs to
@@ -231,6 +240,36 @@ func applyDRConfigDefaults(cfg *DRConfig) {
 	}
 	if cfg.Mode != DRModeDisabled && !cfg.FallbackEnabled {
 		cfg.FallbackEnabled = drDefaultFallbackEnabled
+	}
+	if cfg.StreamJournalMaxBytes == 0 {
+		cfg.StreamJournalMaxBytes = drDefaultStreamJournalMaxBytes
+	}
+	if cfg.StreamJournalSegmentBytes == 0 {
+		cfg.StreamJournalSegmentBytes = drDefaultStreamJournalSegmentBytes
+	}
+	if cfg.StreamJournalRetentionSecs == 0 {
+		cfg.StreamJournalRetentionSecs = int64(drDefaultStreamJournalRetention / time.Second)
+	}
+	if cfg.Mode != DRModeDisabled &&
+		!cfg.StreamJournalEnabled &&
+		cfg.StreamJournalMaxBytes == drDefaultStreamJournalMaxBytes &&
+		cfg.StreamJournalSegmentBytes == drDefaultStreamJournalSegmentBytes {
+		cfg.StreamJournalEnabled = true
+	}
+	if cfg.ReconcileApplyWorkers <= 0 {
+		cfg.ReconcileApplyWorkers = drDefaultReconcileApplyWorkers
+	}
+	if cfg.ReconcilePutBatchMaxEntries <= 0 {
+		cfg.ReconcilePutBatchMaxEntries = drDefaultReconcilePutBatchEntries
+	}
+	if cfg.ReconcilePutBatchMaxBytes <= 0 {
+		cfg.ReconcilePutBatchMaxBytes = drDefaultReconcilePutBatchBytes
+	}
+	if cfg.ConvergenceMinRateRatio <= 0 {
+		cfg.ConvergenceMinRateRatio = drDefaultConvergenceMinRateRatio
+	}
+	if cfg.ConvergenceStallSeconds <= 0 {
+		cfg.ConvergenceStallSeconds = int64(drDefaultConvergenceStall / time.Second)
 	}
 }
 
