@@ -24,6 +24,23 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+func newDRReconcilerScanConfigForTests(replSalt []byte) reconciler.ScanConfig {
+	cfg := reconciler.DefaultScanConfig(replSalt)
+	cfg.RequireTransactionalSnapshot = true
+	cfg.Logger = log.NewNullLogger()
+
+	excludePaths := make(map[string]bool, len(drNeverReplicateExactPaths)+len(drReconcileExcludeExactPaths))
+	for p := range drNeverReplicateExactPaths {
+		excludePaths[p] = true
+	}
+	for p := range drReconcileExcludeExactPaths {
+		excludePaths[p] = true
+	}
+	cfg.ExcludePaths = excludePaths
+	cfg.ExcludePathFunc = isDRReconcileExcludedPath
+	return cfg
+}
+
 // --- Unit Tests for DR Relationship Manager ---
 
 func TestDRRelationshipManager_EnableDisablePrimary(t *testing.T) {
@@ -71,6 +88,59 @@ func TestDRRelationshipManager_EnableDisablePrimary(t *testing.T) {
 	}
 	if mgr.Primary() != nil {
 		t.Fatal("expected primary to be nil after disable")
+	}
+}
+
+func TestDRRelationshipManager_EnablePrimary_SaveConfigFailureRollsBackState(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	mgr := newDRRelationshipManager(core, core.logger)
+
+	failedCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := mgr.EnablePrimary(failedCtx); err == nil {
+		t.Fatal("expected enable primary to fail when config save fails")
+	}
+	if mgr.Mode() != DRModeDisabled {
+		t.Fatalf("expected mode to remain disabled after failed enable, got %s", mgr.Mode())
+	}
+	if mgr.Primary() != nil {
+		t.Fatal("expected primary to remain nil after failed enable")
+	}
+
+	if err := mgr.EnablePrimary(context.Background()); err != nil {
+		t.Fatalf("expected enable primary retry to succeed, got: %v", err)
+	}
+}
+
+func TestDRRelationshipManager_EnableSecondary_SaveConfigFailureRollsBackState(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	mgr := newDRRelationshipManager(core, core.logger)
+
+	token := &DRActivationToken{
+		ClusterID:      "cluster-1",
+		RelationshipID: "rel-1",
+		ReplSalt:       make([]byte, drReplSaltLen),
+	}
+
+	failedCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := mgr.EnableSecondary(failedCtx, token); err == nil {
+		t.Fatal("expected enable secondary to fail when config save fails")
+	}
+	if mgr.Mode() != DRModeDisabled {
+		t.Fatalf("expected mode to remain disabled after failed secondary enable, got %s", mgr.Mode())
+	}
+	if mgr.Secondary() != nil {
+		t.Fatal("expected secondary to remain nil after failed enable")
+	}
+
+	if err := mgr.EnableSecondary(context.Background(), token); err != nil {
+		t.Fatalf("expected enable secondary retry to succeed, got: %v", err)
+	}
+	if err := mgr.DisableSecondary(context.Background()); err != nil {
+		t.Fatalf("failed to disable secondary after retry: %v", err)
 	}
 }
 
@@ -388,6 +458,7 @@ func TestDRSecondaryState_String(t *testing.T) {
 		{DRSecondaryInitialSync, "initial-sync"},
 		{DRSecondaryStreaming, "streaming"},
 		{DRSecondaryReconciling, "reconciling"},
+		{DRSecondaryResnapshotting, "resnapshotting"},
 		{DRSecondaryPromoting, "promoting"},
 		{DRSecondaryStandalone, "standalone"},
 		{DRSecondaryState(99), "unknown"},
@@ -424,6 +495,74 @@ func TestDRSecondaryStatus(t *testing.T) {
 	}
 	if status.ReconcileCount != 2 {
 		t.Fatalf("expected 2, got %d", status.ReconcileCount)
+	}
+}
+
+func TestDRSecondary_RequestResnapshotFlag(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+	sec := newDRReplicationSecondary(core, replSalt, "rel-resnap", core.logger)
+
+	sec.RequestResnapshot("manual-test")
+	ok, reason := sec.consumeResnapshotRequest()
+	if !ok {
+		t.Fatal("expected pending resnapshot request")
+	}
+	if reason != "manual-test" {
+		t.Fatalf("expected manual-test reason, got %q", reason)
+	}
+}
+
+func TestDRRelationshipManager_UpdateTuningAppliesSecondaryRuntime(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	token := &DRActivationToken{
+		ClusterID:      "cluster-1",
+		RelationshipID: "rel-1",
+		ReplSalt:       make([]byte, drReplSaltLen),
+		PrimaryAddr:    "127.0.0.1:8201",
+	}
+	rand.Read(token.ReplSalt)
+
+	if err := mgr.EnableSecondary(ctx, token); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = mgr.DisableSecondary(context.Background())
+	})
+
+	if err := mgr.UpdateTuning(ctx, func(cfg *DRConfig) error {
+		cfg.ReconcileMaxInflightTasks = 7
+		cfg.ReconcileMaxWallTimeSeconds = 120
+		cfg.FallbackEnabled = false
+		cfg.FallbackStallSeconds = 90
+		cfg.FallbackFailureThreshold = 4
+		cfg.FallbackCooldownSeconds = 180
+		cfg.FallbackMaxPerHour = 1
+		cfg.FallbackMinLagEntries = 1234
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := mgr.Config()
+	if cfg.ReconcileMaxInflightTasks != 7 {
+		t.Fatalf("expected reconcile max inflight=7, got %d", cfg.ReconcileMaxInflightTasks)
+	}
+	if cfg.FallbackFailureThreshold != 4 {
+		t.Fatalf("expected fallback failure threshold=4, got %d", cfg.FallbackFailureThreshold)
+	}
+	if mgr.secondary.reconcileMaxInflightTasks != 7 {
+		t.Fatalf("expected runtime inflight=7, got %d", mgr.secondary.reconcileMaxInflightTasks)
+	}
+	if mgr.secondary.fallbackEnabled {
+		t.Fatal("expected runtime fallback to be disabled")
+	}
+	if mgr.secondary.fallbackMinLagEntries != 1234 {
+		t.Fatalf("expected runtime fallback min lag entries=1234, got %d", mgr.secondary.fallbackMinLagEntries)
 	}
 }
 
@@ -588,9 +727,8 @@ func TestDRReconciliation_BuildSet(t *testing.T) {
 	replSalt := make([]byte, 32)
 	rand.Read(replSalt)
 
-	config := reconciler.DefaultScanConfig(replSalt)
+	config := newDRReconcilerScanConfigForTests(replSalt)
 	config.BuildKIDMap = true
-	config.Logger = core.logger
 
 	scanner := reconciler.NewScanner(config)
 	checkpoint := reconciler.Checkpoint{ID: "test-cp-1", CommitIndex: 100}
@@ -669,9 +807,8 @@ func TestDRReconciliation_TwoSideDiff(t *testing.T) {
 	}
 
 	// Build reconciliation sets.
-	config := reconciler.DefaultScanConfig(replSalt)
+	config := newDRReconcilerScanConfigForTests(replSalt)
 	config.BuildKIDMap = true
-	config.Logger = log.NewNullLogger()
 
 	scanner := reconciler.NewScanner(config)
 	checkpoint := reconciler.Checkpoint{ID: "test-diff", CommitIndex: 100}
@@ -764,8 +901,7 @@ func TestDRReconciliation_PrefixDigestCompare(t *testing.T) {
 		secondaryCore.barrier.Put(ctx, &logical.StorageEntry{Key: key, Value: value})
 	}
 
-	config := reconciler.DefaultScanConfig(replSalt)
-	config.Logger = log.NewNullLogger()
+	config := newDRReconcilerScanConfigForTests(replSalt)
 
 	scanner := reconciler.NewScanner(config)
 	checkpoint := reconciler.Checkpoint{ID: "pd-test", CommitIndex: 100}
@@ -809,6 +945,7 @@ func TestDRPrimary_ChangeStreamFanout(t *testing.T) {
 		{OpType: physical.PutOperation, Key: "test/key1", Value: []byte("value1"), RaftIndex: 1},
 		{OpType: physical.PutOperation, Key: "test/key2", Value: []byte("value2"), RaftIndex: 2},
 		{OpType: physical.DeleteOperation, Key: "test/key1", RaftIndex: 3},
+		{OpType: physical.PutOperation, Key: "core/dr-replication/config", Value: []byte("local"), RaftIndex: 4},
 	}
 
 	primary.OnChange(changes)
@@ -819,7 +956,7 @@ func TestDRPrimary_ChangeStreamFanout(t *testing.T) {
 	primary.mu.Unlock()
 
 	if bufLen != 3 {
-		t.Fatalf("expected 3 changes in buffer, got %d", bufLen)
+		t.Fatalf("expected 3 replicable changes in buffer, got %d", bufLen)
 	}
 }
 
@@ -891,7 +1028,9 @@ func TestDRPrimary_CheckpointCacheBudgetEnforced(t *testing.T) {
 		checkpoint:     reconciler.Checkpoint{ID: "cp-over", CommitIndex: 1},
 		relationshipID: "rel-1",
 		createdAt:      time.Now().UTC(),
-		strataData:     make([]byte, 256),
+		kidToKey: map[[32]byte]string{
+			{1}: strings.Repeat("a", 256),
+		},
 	})
 	if err == nil {
 		t.Fatal("expected checkpoint cache admission to fail when over budget")
@@ -913,7 +1052,6 @@ func TestDRPrimary_CheckpointCachePerRelationshipEviction(t *testing.T) {
 			checkpoint:     reconciler.Checkpoint{ID: fmt.Sprintf("cp-%d", i), CommitIndex: uint64(i)},
 			relationshipID: "rel-1",
 			createdAt:      base.Add(time.Duration(i) * time.Second),
-			strataData:     []byte{1, 2, 3},
 		})
 		if err != nil {
 			t.Fatalf("unexpected cache checkpoint error for cp-%d: %v", i, err)
@@ -953,6 +1091,68 @@ func TestDRPrimary_ValidateCheckpointTuple(t *testing.T) {
 	}
 	if err := validateCheckpointTuple("cp-1", 99, cp); err == nil {
 		t.Fatal("expected mismatched checkpoint_index to fail")
+	}
+}
+
+func TestDRPrimary_ExchangeRangeDigests_CheckpointTupleMismatch(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+
+	var start [32]byte
+	var end [32]byte
+	for i := range end {
+		end[i] = 0xff
+	}
+	cp := &drCheckpointCacheEntry{
+		checkpoint: reconciler.Checkpoint{
+			ID:          "cp-1",
+			CommitIndex: 10,
+		},
+		relationshipID: "rel-1",
+		kidToVID: map[[32]byte][32]byte{
+			start: {},
+		},
+		createdAt: time.Now().UTC(),
+	}
+	primary.checkpointMu.Lock()
+	primary.checkpoints[cp.checkpoint.ID] = cp
+	primary.checkpointMu.Unlock()
+
+	_, err := primary.ExchangeRangeDigests(context.Background(), &RangeDigestRequest{
+		CheckpointId:    "cp-1",
+		CheckpointIndex: 11, // mismatch
+		Spans: []*RangeSpan{
+			{
+				StartKid: start[:],
+				EndKid:   end[:],
+			},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected checkpoint tuple mismatch to fail")
+	}
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition, got %v", status.Code(err))
+	}
+}
+
+func TestDRPrimary_StreamBufferHorizonSeconds(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+
+	primary.bufMu.Lock()
+	primary.changeBuffer = make([]physical.ChangeStreamEntry, 500)
+	primary.bufMu.Unlock()
+	primary.writeRateMu.Lock()
+	primary.writeRateEPS = 100.0
+	primary.writeRateMu.Unlock()
+
+	if got := primary.streamBufferHorizonSeconds(); got < 4 || got > 6 {
+		t.Fatalf("expected horizon around 5s, got %d", got)
 	}
 }
 
@@ -1006,6 +1206,82 @@ func TestDRPrimary_ReadCheckpointEntryChange_ExpectedVIDMismatch(t *testing.T) {
 	}
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("expected FailedPrecondition, got %v", status.Code(err))
+	}
+}
+
+func TestDRPrimary_ShouldThrottleCheckpointBuild_UsesActiveLagSignal(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+
+	primary.bufMaxSize = 100
+	primary.bufMaxBytes = 1024
+	primary.changeBuffer = make([]physical.ChangeStreamEntry, primary.bufMaxSize)
+	primary.bufBytes = primary.bufMaxBytes
+
+	primary.mu.Lock()
+	primary.subscribers["sub-a"] = &changeStreamSubscriber{
+		id:             "sub-a",
+		relationshipID: "rel-a",
+		ch:             make(chan physical.ChangeStreamEntry, 1),
+		cancel:         func() {},
+	}
+	primary.mu.Unlock()
+
+	// Simulate historical lag pressure only.
+	primary.streamLaggingSubscribers.Store(99)
+	primary.streamLaggingSubscribersActive.Store(0)
+	primary.streamLaggingLastEventUnix.Store(time.Now().Add(-1 * time.Hour).Unix())
+
+	throttle, reason := primary.shouldThrottleCheckpointBuild()
+	if throttle {
+		t.Fatalf("expected no throttle with stale lag signal, got reason: %s", reason)
+	}
+
+	// Simulate live lag pressure.
+	primary.streamLaggingSubscribersActive.Store(1)
+	primary.streamLaggingLastEventUnix.Store(time.Now().Unix())
+
+	throttle, reason = primary.shouldThrottleCheckpointBuild()
+	if !throttle {
+		t.Fatalf("expected throttle with active lag signal, got reason: %s", reason)
+	}
+}
+
+func TestDRPrimary_LaggingSubscribersActiveCount_ExpiresWindow(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+
+	primary.streamLaggingSubscribersActive.Store(3)
+	primary.streamLaggingLastEventUnix.Store(time.Now().Add(-2 * drCheckpointLaggingActiveWindow).Unix())
+
+	if got := primary.laggingSubscribersActiveCount(); got != 0 {
+		t.Fatalf("expected active lag count to expire to 0, got %d", got)
+	}
+}
+
+func TestDRPrimary_AllowForcedCheckpointBuild_Cooldown(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+
+	if !primary.allowForcedCheckpointBuild("rel-a") {
+		t.Fatal("expected first forced checkpoint admission to pass")
+	}
+	if primary.allowForcedCheckpointBuild("rel-a") {
+		t.Fatal("expected second forced checkpoint admission within cooldown to fail")
+	}
+
+	primary.checkpointMu.Lock()
+	primary.checkpointLastForcedBuildByRelationship["rel-a"] = time.Now().UTC().Add(-2 * drCheckpointForceBuildInterval)
+	primary.checkpointMu.Unlock()
+
+	if !primary.allowForcedCheckpointBuild("rel-a") {
+		t.Fatal("expected forced checkpoint admission to pass after cooldown")
 	}
 }
 

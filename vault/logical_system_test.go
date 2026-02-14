@@ -70,6 +70,16 @@ func TestSystemBackend_RootPaths(t *testing.T) {
 		"leases/lookup/*",
 		"leases",
 		"internal/inspect/*",
+		"replication/dr/primary/enable",
+		"replication/dr/primary/disable",
+		"replication/dr/primary/secondary-token",
+		"replication/dr/primary/relationships",
+		"replication/dr/primary/relationships/*",
+		"replication/dr/secondary/enable",
+		"replication/dr/secondary/disable",
+		"replication/dr/secondary/promote",
+		"replication/dr/secondary/resnapshot",
+		"replication/dr/tuning",
 	}
 
 	b := testSystemBackend(t)

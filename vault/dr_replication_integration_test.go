@@ -204,9 +204,8 @@ func TestDRIntegration_DisconnectAndReconcile(t *testing.T) {
 	}
 
 	// Phase 4: Run reconciliation.
-	config := reconciler.DefaultScanConfig(replSalt)
+	config := newDRReconcilerScanConfigForTests(replSalt)
 	config.BuildKIDMap = true
-	config.Logger = log.NewNullLogger()
 	scanner := reconciler.NewScanner(config)
 
 	checkpoint := reconciler.Checkpoint{ID: "reconcile-test", CommitIndex: 100}
@@ -453,9 +452,8 @@ func TestDRIntegration_LargeKeyspaceReconciliation(t *testing.T) {
 	}
 
 	// Build reconciliation sets.
-	config := reconciler.DefaultScanConfig(replSalt)
+	config := newDRReconcilerScanConfigForTests(replSalt)
 	config.BuildKIDMap = true
-	config.Logger = log.NewNullLogger()
 	scanner := reconciler.NewScanner(config)
 
 	checkpoint := reconciler.Checkpoint{ID: "large-test", CommitIndex: 100}
@@ -1572,6 +1570,13 @@ func TestDRIntegration_PathExclusions(t *testing.T) {
 		"core/local-mounts",
 		"core/local-auth",
 		"core/local-audit",
+		"core/lock",
+		"core/initialize-lock",
+		"core/recovery-config",
+		"core/recovery-key",
+		"core/cluster/local/info",
+		"core/dr-replication/config",
+		"core/dr-replication/relationships/abc123",
 		"core/local-mounts/6e0aa9a6-6259-7189-2294-f3ab9028ca20",
 		"namespaces/00000000-0000-0000-0000-000000000000/core/local-mounts/6e0aa9a6-6259-7189-2294-f3ab9028ca20",
 	}
@@ -1698,8 +1703,7 @@ func TestDRIntegration_ScannerExcludesPaths(t *testing.T) {
 	}
 
 	// Create scanner WITH exclusions.
-	config := reconciler.DefaultScanConfig(replSalt)
-	config.Logger = log.NewNullLogger()
+	config := newDRReconcilerScanConfigForTests(replSalt)
 	config.ExcludePaths = map[string]bool{
 		"core/keyring":                 true,
 		"core/hsm/barrier-unseal-keys": true,
@@ -1720,19 +1724,17 @@ func TestDRIntegration_ScannerExcludesPaths(t *testing.T) {
 	}
 	t.Logf("scanned %d keys with exclusions applied", set.KeyCount)
 
-	// Create scanner WITHOUT exclusions (should still work but may log warnings).
+	// Create scanner WITHOUT exclusions. In strict fail-closed mode this
+	// must fail when unreadable internal paths (e.g. core/keyring) are seen.
 	configNoExclude := reconciler.DefaultScanConfig(replSalt)
+	configNoExclude.RequireTransactionalSnapshot = true
 	configNoExclude.Logger = log.NewNullLogger()
 	scannerNoExclude := reconciler.NewScanner(configNoExclude)
 
-	setNoExclude, err := scannerNoExclude.Scan(ctx, core.barrier, checkpoint)
-	if err != nil {
-		t.Fatal(err)
+	_, err = scannerNoExclude.Scan(ctx, core.barrier, checkpoint)
+	if err == nil {
+		t.Fatal("expected strict scan to fail without exclusions")
 	}
-
-	// The set without exclusions should have equal or more keys
-	// (core/keyring would fail barrier.Get but still be counted via ScanView).
-	t.Logf("scanned %d keys without exclusions", setNoExclude.KeyCount)
 }
 
 // --- Test: Root key rotation propagation ---
@@ -1834,6 +1836,7 @@ func TestDRIntegration_RootKeyRotationHandling(t *testing.T) {
 type drRangeTestClient struct {
 	streamChangesFn        func(context.Context, *StreamChangesRequest, ...grpc.CallOption) (grpc.ServerStreamingClient[EntryChange], error)
 	exchangeIBLTFn         func(context.Context, *IBLTMessage, ...grpc.CallOption) (*IBLTMessage, error)
+	exchangeRangeDigestsFn func(context.Context, *RangeDigestRequest, ...grpc.CallOption) (*RangeDigestResponse, error)
 	exchangePrefixFn       func(context.Context, *PrefixDigestRequest, ...grpc.CallOption) (*PrefixDigestResponse, error)
 	fetchEntriesFn         func(context.Context, *FetchEntriesRequest, ...grpc.CallOption) (grpc.ServerStreamingClient[EntryBatch], error)
 	exchangeIBLTCallCount  int
@@ -1851,10 +1854,6 @@ func (c *drRangeTestClient) RequestCheckpoint(context.Context, *CheckpointReques
 	return nil, errors.New("not implemented")
 }
 
-func (c *drRangeTestClient) ExchangeStrataEstimator(context.Context, *StrataMessage, ...grpc.CallOption) (*StrataMessage, error) {
-	return nil, errors.New("not implemented")
-}
-
 func (c *drRangeTestClient) ExchangeIBLT(ctx context.Context, in *IBLTMessage, opts ...grpc.CallOption) (*IBLTMessage, error) {
 	c.exchangeIBLTCallCount++
 	if in.GetSpan() != nil && in.GetSpan().GetSplitDepth() > 0 {
@@ -1864,6 +1863,13 @@ func (c *drRangeTestClient) ExchangeIBLT(ctx context.Context, in *IBLTMessage, o
 		return nil, errors.New("not implemented")
 	}
 	return c.exchangeIBLTFn(ctx, in, opts...)
+}
+
+func (c *drRangeTestClient) ExchangeRangeDigests(ctx context.Context, in *RangeDigestRequest, opts ...grpc.CallOption) (*RangeDigestResponse, error) {
+	if c.exchangeRangeDigestsFn == nil {
+		return nil, errors.New("not implemented")
+	}
+	return c.exchangeRangeDigestsFn(ctx, in, opts...)
 }
 
 func (c *drRangeTestClient) ExchangePrefixDigests(ctx context.Context, in *PrefixDigestRequest, opts ...grpc.CallOption) (*PrefixDigestResponse, error) {
@@ -1940,6 +1946,29 @@ func (s *staticEntryChangeStream) Recv() (*EntryChange, error) {
 	return ch, nil
 }
 
+type captureEntryChangeServerStream struct {
+	ctx  context.Context
+	sent []*EntryChange
+}
+
+func (s *captureEntryChangeServerStream) SetHeader(metadata.MD) error { return nil }
+func (s *captureEntryChangeServerStream) SendHeader(metadata.MD) error {
+	return nil
+}
+func (s *captureEntryChangeServerStream) SetTrailer(metadata.MD) {}
+func (s *captureEntryChangeServerStream) Context() context.Context {
+	if s.ctx != nil {
+		return s.ctx
+	}
+	return context.Background()
+}
+func (s *captureEntryChangeServerStream) SendMsg(any) error { return nil }
+func (s *captureEntryChangeServerStream) RecvMsg(any) error { return io.EOF }
+func (s *captureEntryChangeServerStream) Send(ch *EntryChange) error {
+	s.sent = append(s.sent, ch)
+	return nil
+}
+
 func fullRangeProtoSpan() *RangeSpan {
 	return &RangeSpan{
 		StartKid: make([]byte, 32),
@@ -1972,10 +2001,9 @@ func TestDRIntegration_RangeManifestDeterminism(t *testing.T) {
 	rand.Read(replSalt)
 	writeTestEntries(t, core, "range-manifest", 300)
 
-	cfg := reconciler.DefaultScanConfig(replSalt)
+	cfg := newDRReconcilerScanConfigForTests(replSalt)
 	cfg.BuildKIDMap = true
 	cfg.BuildEntryMap = true
-	cfg.Logger = log.NewNullLogger()
 	scanner := reconciler.NewScanner(cfg)
 
 	cp := reconciler.Checkpoint{ID: "manifest-cp", CommitIndex: 42}
@@ -2088,6 +2116,19 @@ func TestDRIntegration_RangeIBLTDecodeAdaptiveSplit(t *testing.T) {
 				IbltData:        empty.Marshal(),
 			}, nil
 		},
+		exchangeRangeDigestsFn: func(_ context.Context, req *RangeDigestRequest, _ ...grpc.CallOption) (*RangeDigestResponse, error) {
+			out := make([]*RangeDigest, 0, len(req.GetSpans()))
+			for i, span := range req.GetSpans() {
+				out = append(out, &RangeDigest{
+					Span:               span,
+					Count:              1,
+					XorKeyHash:         bytes.Repeat([]byte{byte(i + 1)}, 32),
+					XorValueHash:       bytes.Repeat([]byte{byte(i + 2)}, 32),
+					SuggestedIbltCells: 8,
+				})
+			}
+			return &RangeDigestResponse{Ranges: out}, nil
+		},
 		fetchEntriesFn: func(context.Context, *FetchEntriesRequest, ...grpc.CallOption) (grpc.ServerStreamingClient[EntryBatch], error) {
 			return &staticEntryBatchStream{}, nil
 		},
@@ -2109,6 +2150,69 @@ func TestDRIntegration_RangeIBLTDecodeAdaptiveSplit(t *testing.T) {
 	}
 	if !client.seenSplitDepthPositive {
 		t.Fatal("expected adaptive split to request at least one child span")
+	}
+}
+
+func TestDRIntegration_RangeIBLTDecodeAdaptiveSplitFromNonZeroDepth(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+	sec := newDRReplicationSecondary(core, replSalt, "rel-range-split-depth", core.logger)
+
+	client := &drRangeTestClient{
+		exchangeIBLTFn: func(_ context.Context, req *IBLTMessage, _ ...grpc.CallOption) (*IBLTMessage, error) {
+			if req.GetSpan() != nil && req.GetSpan().GetSplitDepth() == 8 {
+				undecodable := sketch.NewIBLT(req.GetNumCells(), sketch.DefaultHashCount)
+				for i := 0; i < 512; i++ {
+					kid := testSHA256([]byte(fmt.Sprintf("split-depth-kid-%d", i)))
+					vid := testSHA256([]byte(fmt.Sprintf("split-depth-vid-%d", i)))
+					undecodable.Insert(kid, vid)
+				}
+				return &IBLTMessage{
+					CheckpointId:    req.GetCheckpointId(),
+					CheckpointIndex: req.GetCheckpointIndex(),
+					IbltData:        undecodable.Marshal(),
+				}, nil
+			}
+			empty := sketch.NewIBLT(req.GetNumCells(), sketch.DefaultHashCount)
+			return &IBLTMessage{
+				CheckpointId:    req.GetCheckpointId(),
+				CheckpointIndex: req.GetCheckpointIndex(),
+				IbltData:        empty.Marshal(),
+			}, nil
+		},
+		exchangeRangeDigestsFn: func(_ context.Context, req *RangeDigestRequest, _ ...grpc.CallOption) (*RangeDigestResponse, error) {
+			out := make([]*RangeDigest, 0, len(req.GetSpans()))
+			for i, span := range req.GetSpans() {
+				out = append(out, &RangeDigest{
+					Span:               span,
+					Count:              1,
+					XorKeyHash:         bytes.Repeat([]byte{byte(i + 3)}, 32),
+					XorValueHash:       bytes.Repeat([]byte{byte(i + 4)}, 32),
+					SuggestedIbltCells: 8,
+				})
+			}
+			return &RangeDigestResponse{Ranges: out}, nil
+		},
+		fetchEntriesFn: func(context.Context, *FetchEntriesRequest, ...grpc.CallOption) (grpc.ServerStreamingClient[EntryBatch], error) {
+			return &staticEntryBatchStream{}, nil
+		},
+	}
+	sec.client = client
+
+	localSet := &reconciler.ReconciliationSet{
+		KIDToVID: make(map[[32]byte][32]byte),
+		KIDToKey: make(map[[32]byte]string),
+		Entries:  make(map[[32]byte]*physical.Entry),
+	}
+	checkpoint := newTestRangeCheckpoint("cp-range-split-depth", 101, 64)
+	checkpoint.TopRanges[0].Span.SplitDepth = 8
+
+	if err := sec.runRangeReconciliation(context.Background(), checkpoint, localSet, time.Now()); err != nil {
+		t.Fatalf("expected adaptive split reconciliation to succeed from non-zero depth, got %v", err)
+	}
+	if client.exchangeIBLTCallCount < 2 {
+		t.Fatalf("expected adaptive split to trigger multiple ExchangeIBLT calls, got %d", client.exchangeIBLTCallCount)
 	}
 }
 
@@ -2338,6 +2442,70 @@ func TestDRIntegration_StreamAppliesSameRaftIndexBatchEntries(t *testing.T) {
 	}
 	if got := sec.lastAppliedIndex.Load(); got != 11 {
 		t.Fatalf("expected lastAppliedIndex=11, got %d", got)
+	}
+}
+
+func TestDRIntegration_PrimaryStreamReplayIncludesLastAppliedIndex(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	setupTestClusterCert(t, core)
+
+	mgr := core.drManager
+	if mgr == nil {
+		t.Fatal("expected DR relationship manager to be initialized")
+	}
+	if err := mgr.EnablePrimary(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	token, err := mgr.GenerateActivationToken(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const fingerprint = "test-secondary-fingerprint"
+	rel, err := mgr.loadRelationship(context.Background(), token.RelationshipID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel.State = DRRelationshipStateRegistered
+	rel.SecondaryCertFingerprint = fingerprint
+	if err := mgr.saveRelationship(context.Background(), rel); err != nil {
+		t.Fatal(err)
+	}
+
+	primary := mgr.Primary()
+	if primary == nil {
+		t.Fatal("expected primary replication server to be initialized")
+	}
+
+	primary.bufMu.Lock()
+	primary.changeBuffer = []physical.ChangeStreamEntry{
+		{OpType: physical.PutOperation, Key: "stream/replay/a", Value: []byte("a"), RaftIndex: 10},
+		{OpType: physical.PutOperation, Key: "stream/replay/b", Value: []byte("b"), RaftIndex: 10},
+		{OpType: physical.PutOperation, Key: "stream/replay/c", Value: []byte("c"), RaftIndex: 11},
+	}
+	primary.bufMu.Unlock()
+
+	streamCtx, cancel := context.WithCancel(context.WithValue(context.Background(), drPeerFingerprintContextKey{}, fingerprint))
+	cancel()
+	stream := &captureEntryChangeServerStream{ctx: streamCtx}
+
+	err = primary.StreamChanges(&StreamChangesRequest{
+		RelationshipId:   token.RelationshipID,
+		LastAppliedIndex: 10,
+	}, stream)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context canceled from stream loop, got: %v", err)
+	}
+
+	if len(stream.sent) != 3 {
+		t.Fatalf("expected 3 replayed entries, got %d", len(stream.sent))
+	}
+	if stream.sent[0].RaftIndex != 10 || stream.sent[1].RaftIndex != 10 {
+		t.Fatalf("expected entries at last_applied_index to be replayed, got indexes: %d, %d", stream.sent[0].RaftIndex, stream.sent[1].RaftIndex)
+	}
+	if stream.sent[2].RaftIndex != 11 {
+		t.Fatalf("expected replay to include later index, got %d", stream.sent[2].RaftIndex)
 	}
 }
 

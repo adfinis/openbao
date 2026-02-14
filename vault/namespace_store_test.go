@@ -840,6 +840,13 @@ func TestNamespaces_ResolveNamespaceFromRequest(t *testing.T) {
 	}
 }
 
+func TestNamespaces_ResolveNamespaceFromRequest_NilStore(t *testing.T) {
+	var nsStore *NamespaceStore
+	ns, trimmedPath := nsStore.ResolveNamespaceFromRequest("ns1", "secret/foo")
+	require.Nil(t, ns)
+	require.Equal(t, "", trimmedPath)
+}
+
 func TestNamespaceStorage(t *testing.T) {
 	c, keys, root := TestCoreUnsealed(t)
 	s := c.namespaceStore

@@ -23,6 +23,24 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestRequestHandling_NamespaceStoreNotInitialized(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+
+	core.stateLock.Lock()
+	core.namespaceStore = nil
+	core.stateLock.Unlock()
+
+	req := &logical.Request{
+		Path:      "sys/health",
+		Operation: logical.ReadOperation,
+	}
+
+	resp, err := core.HandleRequest(context.Background(), req)
+	require.Nil(t, resp)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "namespace not found")
+}
+
 func TestRequestHandling_Wrapping(t *testing.T) {
 	core, _, root := TestCoreUnsealed(t)
 
