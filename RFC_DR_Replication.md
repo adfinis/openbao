@@ -10,9 +10,11 @@ The current architecture uses:
 - Two (or more) independent Raft clusters (primary and one or more secondaries)
 - Entry-level change streaming for normal operation
 - Disk-backed stream journal replay to extend reconnect horizon beyond in-memory ring depth
+- Immutable disk-backed checkpoint artifact store for checkpoint-fenced fetches
 - Hybrid range-first reconciliation for recovery
 - Ciphertext-domain reconciliation/apply below the barrier
 - Convergence controller with lag-slope/rate-ratio fallback triggering
+- Primary ingress write backpressure with DR-aware bounded admission
 - Strict relationship authorization (cert fingerprint + relationship state)
 - Wrapped root-key bootstrap (no plaintext root-key transfer)
 - Strict mTLS transport model (no insecure fallback)
@@ -206,7 +208,7 @@ DR intentionally excludes cluster-local/internal paths from both stream fanout a
 ### Phase A: Checkpoint + Range Manifest
 1. Secondary requests checkpoint from primary.
 2. Primary scans checkpoint state and computes deterministic fixed hash-interval top ranges (`top_ranges`) from KID space.
-3. Primary caches checkpoint artifacts under strict budgets.
+3. Primary materializes an immutable disk artifact for the checkpoint (metadata + content-addressed value blobs), then caches checkpoint metadata under strict budgets.
 
 ### Phase B: Local Compare by Range
 1. Secondary performs local scan for the checkpoint.
@@ -288,6 +290,7 @@ flowchart TD
 5. Catch-up replay is inclusive on `last_applied_index` so reconnect can recover same-index multi-operation Raft entries.
 6. Reconciliation scanning is transactional-snapshot aware and fail-closed on `ListPage/Get` errors.
 7. Reconcile session fencing (`checkpoint_id` + `checkpoint_index`) is enforced across all range/fetch/prefix phases.
+8. Reconcile/resnapshot fetches are served from immutable checkpoint artifacts only; live primary storage drift is not consulted for checkpoint-fenced reads.
 
 ## Resource Controls and Fail-Closed Behavior
 
@@ -304,6 +307,16 @@ Eviction order:
 3. Oldest global
 
 If admission still fails, `RequestCheckpoint` fails with precondition error.
+
+### Checkpoint Artifact Store (Primary)
+- Enabled by default.
+- Immutable per-checkpoint records persisted on disk (`checkpoint_id`, `checkpoint_index`, KID/VID/key/sealwrap/tombstone/value_ref).
+- Value blobs are content-addressed and reused per artifact.
+- Independent budgets and TTL:
+  - Global budget: 8 GiB (default)
+  - Per-relationship budget: 2 GiB (default)
+  - TTL: 30 minutes (default)
+- Fetches fail closed with explicit reasons when artifacts are missing/expired.
 
 ### Checkpoint Build Throttling (Primary)
 - Primary may temporarily deny `RequestCheckpoint` under high stream pressure (`budget_exceeded: primary stream pressure (...)`).
@@ -327,9 +340,15 @@ If admission still fails, `RequestCheckpoint` fails with precondition error.
 Budget breach is explicit failure (`budget_exceeded`), not silent degradation.
 
 ### Reconcile Retry Control
-- Failure classes are tracked (`budget_exceeded`, `decode_exhausted`, `checkpoint_conflict`, `apply_failed`, `auth_revoked`, `unknown`).
+- Failure classes are tracked (`budget_exceeded`, `decode_exhausted`, `checkpoint_tuple_mismatch`, `checkpoint_artifact_missing`, `checkpoint_provenance_mismatch`, `apply_failed`, `auth_revoked`, `unknown`).
 - Per-class retry caps are enforced with cooldowns to avoid infinite hot-loop retries under sustained contention.
-- `checkpoint_conflict` class uses an explicit cooldown path before next attempt.
+- Checkpoint tuple/artifact/provenance classes use explicit cooldown paths before next attempt.
+
+### DR-Aware Backpressure (Primary)
+- A pressure controller computes `healthy|degraded|critical` from primary write rate, minimum secondary apply rate, lag, and stream horizon.
+- External mutating requests (`create|update|delete|patch`) are admitted with a bounded per-second cap in degraded/critical states.
+- Exempt paths: `sys/replication/dr/*`, `sys/health`, `sys/seal-status`.
+- Overflow is rejected with HTTP 429 and explicit status telemetry.
 
 ### Fallback Policy (Secondary)
 - Automatic fallback is enabled by default.
@@ -425,8 +444,19 @@ On failed validation:
 - `stream_journal_bytes`
 - `stream_journal_segments`
 - `stream_journal_oldest_index`
+- `journal_replay_attempts_total`
+- `journal_replay_success_total`
+- `journal_range_too_old_total`
 - `reconcile_put_workers_active`
 - `reconcile_delete_phase_seconds`
+- `checkpoint_artifact_bytes`
+- `checkpoint_artifact_items`
+- `checkpoint_artifact_evictions`
+- `checkpoint_artifact_build_seconds`
+- `checkpoint_conflicts_storage_drift_total`
+- `dr_backpressure_state`
+- `dr_backpressure_rejections_total`
+- `dr_backpressure_effective_qps_cap`
 
 ### Metrics
 Representative metrics emitted include:
@@ -477,7 +507,7 @@ Alternatives rejected:
 1. Range partitioning is a performance partitioning mechanism, not a security or tenancy boundary.
 2. Additive protocol evolution is used; no protocol version bump was required for current range fields.
 3. Change-stream replay intentionally includes entries at `last_applied_index` to safely recover reconnects that split same-index operation batches.
-4. Checkpoint cache is metadata-first; entry values are fetched on demand during `FetchEntries`, and cache metrics expose metadata/value byte split.
+4. Checkpoint cache is metadata-first; checkpoint-fenced `FetchEntries` values are served from immutable checkpoint artifacts (not live storage), and artifact/cache metrics expose memory/disk pressure separately.
 5. No legacy compatibility reconciliation path is retained; `top_ranges` are required.
 
 ## Implementation Mapping
@@ -488,6 +518,7 @@ Alternatives rejected:
 | DR primary server and subscriber model | `vault/dr_replication.go` (`drReplicationPrimary`, `OnChange`, `StreamChanges`) | `vault/dr_replication_secondary.go` (`drReplicationSecondary`, `runStream`) |
 | Stream journal append/replay/retention | `vault/dr_replication.go` (`OnChange`, `StreamChanges`) | `vault/dr_stream_journal.go` |
 | Checkpoint creation and cache admission | `vault/dr_replication.go` (`RequestCheckpoint`, `cacheCheckpoint`, checkpoint eviction helpers) | `vault/dr_replication_secondary.go` (`runReconciliation`) |
+| Immutable checkpoint artifact materialization and lookup | `vault/dr_checkpoint_artifact_store.go` | `vault/dr_replication.go` (`buildAndCacheCheckpoint`, `readCheckpointEntryChange`) |
 | Range manifest generation | `vault/dr_replication.go` (`RequestCheckpoint`) | `physical/replication/reconciler/range.go` (`BuildRangeManifest`) |
 | Range-scoped IBLT exchange | `vault/dr_replication.go` (`ExchangeIBLT`) | `vault/dr_replication_secondary.go` (`runRangeReconciliation`, `processRangeTask`) |
 | Range-scoped prefix refinement | `vault/dr_replication.go` (`ExchangePrefixDigests`) | `vault/dr_replication_secondary.go` (`runRangePrefixRefinement`) |
@@ -523,8 +554,10 @@ Alternatives rejected:
 | System DR routes and handlers | `vault/logical_system_dr.go` |
 | Auth/unauth path registration | `vault/logical_system.go` |
 | Status handler fields | `vault/logical_system_dr.go` (`handleDRStatus`) |
+| DR tuning/status wiring for artifact + backpressure knobs | `vault/logical_system_dr.go` (`handleDRTuningRead`, `handleDRTuningWrite`) |
 | Core manager wiring/load on unseal | `vault/core.go` (`NewCore`, `postUnseal`) |
 | Secondary write enforcement exceptions | `vault/request_handling.go` + `vault/dr_replication_state.go` (`isDRSecondaryAllowedPath`) |
+| Primary write ingress backpressure gate | `vault/request_handling.go` (`switchedLockHandleRequest`) + `vault/dr_replication.go` (`allowWriteRequest`) |
 | Failover/promotion path | `vault/dr_failover.go` and `vault/dr_replication_state.go` (`PromoteSecondary`) |
 
 ### Storage/Hook Plumbing
@@ -562,6 +595,8 @@ Alternatives rejected:
 | Checkpoint cache budget and eviction | `vault/dr_replication_test.go` checkpoint cache tests |
 | Revoke stream termination isolation | `TestDRRelationshipManager_PrimaryRevokeTerminatesOnlyMatchingStreams` (`vault/dr_replication_test.go`) |
 | Bootstrap expiry/lockout/source-IP/throttle | `TestDRRelationshipManager_BootstrapTokenExpires`, `TestDRRelationshipManager_BootstrapTokenAttemptLockout`, `TestDRRelationshipManager_BootstrapTokenSourceIPBinding`, `TestDRRelationshipManager_HeartbeatLastSeenWriteThrottle` (`vault/dr_replication_test.go`) |
+| Artifact fetch correctness vs live drift | `TestDRPrimary_ReadCheckpointEntryChange_UsesArtifactNotLiveStorage`, `TestDRPrimary_ReadCheckpointEntryChange_ExpectedVIDMismatch` (`vault/dr_replication_test.go`) |
+| Artifact store budget/eviction behavior | `TestDRCheckpointArtifactStore_EvictsByGlobalBudget`, `TestDRCheckpointArtifactStore_RejectsOversizedArtifact` (`vault/dr_replication_test.go`) |
 
 ## Demo (CLI)
 

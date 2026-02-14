@@ -35,6 +35,8 @@ This matrix defines manual and automated validation for DR replication in this r
 | A8 | Sketch package | `go test ./physical/replication/sketch -count=1` | Pass |
 | A9 | Reconciler package | `go test ./physical/replication/reconciler -count=1` | Pass |
 | A10 | Raft stream hooks | `go test ./physical/raft -run 'Test.*ChangeStream|Test.*HookChangeStream|Test.*ApplyBatch' -count=1` | Pass |
+| A11 | Artifact fetch + budget semantics | `go test ./vault -run 'TestDRPrimary_ReadCheckpointEntryChange_(ExpectedVIDMismatch|UsesArtifactNotLiveStorage)|TestDRCheckpointArtifactStore_(EvictsByGlobalBudget|RejectsOversizedArtifact)' -count=1` | Pass |
+| A12 | Reconcile failure taxonomy | `go test ./vault -run 'TestClassifyReconcileFailure_(Stalled|CheckpointClasses)' -count=1` | Pass |
 
 Recommended compile pre-step:
 
@@ -140,7 +142,11 @@ docker logs --since=10m bao-primary-1 | rg 'dr-replication|checkpoint|change str
 - `stream_buffer_entries` is retained ring-history depth, not ACK backlog.
 - `stream_lagging_subscribers_total` is cumulative; use `stream_lagging_subscribers_active` for current pressure.
 - `stream_journal_*` shows replay horizon health; if `stream_journal_oldest_index` is ahead of a secondary start index, reconcile is expected.
+- `journal_replay_attempts_total`, `journal_replay_success_total`, `journal_range_too_old_total` explain reconnect behavior before reconcile.
+- `checkpoint_conflicts_storage_drift_total` should remain `0` after artifact-only fetch cutover.
 - `secondary_apply_rate_eps`, `primary_write_rate_eps`, and `lag_slope_eps` are the primary convergence signals under sustained load.
+- `dr_backpressure_state` and `dr_backpressure_effective_qps_cap` indicate when ingress throttling is active.
+- Sustained `dr_backpressure_rejections_total` growth means the cluster is protecting convergence with bounded write admission (expected under overload tests).
 - If both secondaries enter long `reconciling` with flat `last_applied_index`, reduce write pressure or increase secondary reconcile/stream batch tuning.
 - Strict TLS and relationship authz are fail-closed; stale bootstrap/tokens/certs correctly break reconnect.
 
@@ -160,6 +166,7 @@ Use scripts in `/Users/roelc/projects/secretz/openbao/scripts`.
 | S6 | Cancellation safety | Start any stress run, press `Ctrl-C`, verify no stray workers | Process hygiene | No lingering `dr_stress*`/`bao kv put` worker processes |
 | S7 | Mixed realism profile | `dr_stress_mixed_workload.sh run --duration-seconds 1800 --concurrency 24 --put-percent 55 --get-primary-percent 25 --get-secondary1-percent 10 --get-secondary2-percent 10 --hot-key-percent 80 --payload-small-bytes 512 --payload-large-bytes 8192 --large-payload-percent 15` | More production-like traffic mix | Stable ops rate, bounded errors, no prolonged flat secondary indexes |
 | S8 | Convergence-controller trigger | S3 with reduced reconcile throughput tuning (for test) | Verify automatic fallback behavior | `fallback_count` increments, secondaries return to `streaming`, `last_applied_index` resumes growth |
+| S9 | Backpressure enforcement | S3 with high write concurrency and low secondary apply tuning | Verify bounded ingress on overload | `dr_backpressure_state` reaches `degraded/critical`, `dr_backpressure_rejections_total` increases, secondaries avoid permanent flatline |
 
 ### Stress Run Examples
 
@@ -213,7 +220,7 @@ Quick convergence signal check:
 
 ```bash
 BAO_ADDR="$DR_SECONDARY1_ADDR" BAO_TOKEN="$DR_SECONDARY1_TOKEN" BAO_CACERT="$DR_CA_CERT" bao read -format=json sys/replication/dr/status | \
-  jq '.data | {secondary_state, last_applied_index, primary_index, secondary_apply_rate_eps, primary_write_rate_eps, lag_entries, lag_slope_eps, fallback_count, fallback_last_reason}'
+  jq '.data | {secondary_state, last_applied_index, primary_index, secondary_apply_rate_eps, primary_write_rate_eps, lag_entries, lag_slope_eps, fallback_count, fallback_last_reason, checkpoint_conflicts_storage_drift_total, dr_backpressure_state, dr_backpressure_rejections_total}'
 ```
 
 Mixed workload example:
