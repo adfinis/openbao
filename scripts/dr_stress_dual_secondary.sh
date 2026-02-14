@@ -20,6 +20,9 @@ Run options:
   --primary-cacert PATH         Optional primary BAO_CACERT
   --secondary1-cacert PATH      Optional secondary #1 BAO_CACERT
   --secondary2-cacert PATH      Optional secondary #2 BAO_CACERT
+  --primary-tls-server-name N   Optional primary BAO_TLS_SERVER_NAME
+  --secondary1-tls-server-name N Optional secondary #1 BAO_TLS_SERVER_NAME
+  --secondary2-tls-server-name N Optional secondary #2 BAO_TLS_SERVER_NAME
   --primary-skip-verify         Set BAO_SKIP_VERIFY=true for primary
   --secondary1-skip-verify      Set BAO_SKIP_VERIFY=true for secondary #1
   --secondary2-skip-verify      Set BAO_SKIP_VERIFY=true for secondary #2
@@ -35,6 +38,9 @@ Run options:
   --poll-interval SECONDS       Poll interval for sentinel checks (default: 1)
   --max-wait-seconds SECONDS    Sentinel wait timeout (default: 300)
   --monitor-interval SECONDS    Status timeline interval (default: 2)
+  --progress-interval SECONDS   Console progress interval (default: 5)
+  --bao-client-timeout DURATION Per-request BAO client timeout (default: 20s)
+  --write-retries N             Retries per write before marking failed (default: 2)
   --output-dir DIR              Results root (default: ./dr-stress-results)
   --ensure-kv                   Create KV mount on primary if missing
 
@@ -74,28 +80,47 @@ PY
   echo "$(( $(date +%s) * 1000 ))"
 }
 
+format_seconds() {
+  local total="$1"
+  if [[ "$total" -lt 0 ]]; then
+    echo "n/a"
+    return
+  fi
+  local h=$((total / 3600))
+  local m=$(((total % 3600) / 60))
+  local s=$((total % 60))
+  if [[ "$h" -gt 0 ]]; then
+    printf "%02d:%02d:%02d" "$h" "$m" "$s"
+    return
+  fi
+  printf "%02d:%02d" "$m" "$s"
+}
+
 bao_role() {
   local role="$1"
   shift
-  local addr token cacert skip
+  local addr token cacert skip tls_server_name
   case "$role" in
     primary)
       addr="$PRIMARY_ADDR"
       token="$PRIMARY_TOKEN"
       cacert="$PRIMARY_CACERT"
       skip="$PRIMARY_SKIP_VERIFY"
+      tls_server_name="$PRIMARY_TLS_SERVER_NAME"
       ;;
     secondary1)
       addr="$SECONDARY1_ADDR"
       token="$SECONDARY1_TOKEN"
       cacert="$SECONDARY1_CACERT"
       skip="$SECONDARY1_SKIP_VERIFY"
+      tls_server_name="$SECONDARY1_TLS_SERVER_NAME"
       ;;
     secondary2)
       addr="$SECONDARY2_ADDR"
       token="$SECONDARY2_TOKEN"
       cacert="$SECONDARY2_CACERT"
       skip="$SECONDARY2_SKIP_VERIFY"
+      tls_server_name="$SECONDARY2_TLS_SERVER_NAME"
       ;;
     *)
       die "unknown role: $role"
@@ -108,8 +133,14 @@ bao_role() {
   if [[ -n "$cacert" ]]; then
     env_args+=(BAO_CACERT="$cacert")
   fi
+  if [[ -n "$tls_server_name" ]]; then
+    env_args+=(BAO_TLS_SERVER_NAME="$tls_server_name")
+  fi
   if [[ "$skip" == "true" ]]; then
     env_args+=(BAO_SKIP_VERIFY=true)
+  fi
+  if [[ -n "$BAO_CLIENT_TIMEOUT_DURATION" ]]; then
+    env_args+=(BAO_CLIENT_TIMEOUT="$BAO_CLIENT_TIMEOUT_DURATION")
   fi
   env "${env_args[@]}" bao "$@"
 }
@@ -136,13 +167,43 @@ calc_delta() {
   echo $((after - before))
 }
 
+sum_worker_progress() {
+  local progress_dir="$1"
+  local suffix="$2"
+  if ! compgen -G "$progress_dir/worker-*.$suffix" >/dev/null; then
+    echo 0
+    return
+  fi
+  awk '{s += $1} END {print s + 0}' "$progress_dir"/worker-*."$suffix"
+}
+
+latest_timeline_snapshot() {
+  local timeline_file="$1"
+  if [[ -s "$timeline_file" ]]; then
+    tail -n1 "$timeline_file"
+  else
+    echo '{}'
+  fi
+}
+
 write_key() {
   local idx="$1"
   local base_path="$2"
-  bao_role primary kv put "$base_path/k${idx}" \
-    payload="$PAYLOAD" \
-    run_id="$RUN_ID" \
-    seq="$idx" >/dev/null
+  local attempt=0
+  local max_attempts=$((WRITE_RETRIES + 1))
+  while [[ "$attempt" -lt "$max_attempts" ]]; do
+    if bao_role primary kv put "$base_path/k${idx}" \
+      payload="$PAYLOAD" \
+      run_id="$RUN_ID" \
+      seq="$idx" >/dev/null 2>&1; then
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    if [[ "$attempt" -lt "$max_attempts" ]]; then
+      sleep "0.$((attempt + 1))"
+    fi
+  done
+  return 1
 }
 
 normalize_sample_keys() {
@@ -175,6 +236,67 @@ monitor_status_loop() {
   done
 }
 
+progress_loop() {
+  local progress_dir="$1"
+  local write_failures_file="$2"
+  local timeline_file="$3"
+  local stop_file="$4"
+  local total="$5"
+  local start_ms="$6"
+
+  while [[ ! -f "$stop_file" ]]; do
+    local now_ms elapsed_s processed started inflight failures succeeded pct rate eta_s remaining
+    now_ms="$(now_epoch_ms)"
+    elapsed_s=$(( (now_ms - start_ms) / 1000 ))
+    processed="$(sum_worker_progress "$progress_dir" done)"
+    started="$(sum_worker_progress "$progress_dir" started)"
+    if [[ "$started" -gt "$total" ]]; then
+      started="$total"
+    fi
+    if [[ "$processed" -gt "$total" ]]; then
+      processed="$total"
+    fi
+    inflight=$((started - processed))
+    if [[ "$inflight" -lt 0 ]]; then
+      inflight=0
+    fi
+    failures="$(wc -l <"$write_failures_file" | awk '{print $1}')"
+    succeeded=$((processed - failures))
+    if [[ "$succeeded" -lt 0 ]]; then
+      succeeded=0
+    fi
+    pct="$(awk -v p="$processed" -v t="$total" 'BEGIN { if (t <= 0) { printf "100.00"; } else { printf "%.2f", (p * 100.0) / t } }')"
+    rate="0.00"
+    if [[ "$elapsed_s" -gt 0 ]]; then
+      rate="$(awk -v p="$processed" -v e="$elapsed_s" 'BEGIN { printf "%.2f", p / e }')"
+    fi
+    remaining=$((total - processed))
+    eta_s=-1
+    if [[ "$remaining" -le 0 ]]; then
+      eta_s=0
+    elif [[ "$processed" -gt 0 && "$elapsed_s" -gt 0 ]]; then
+      eta_s="$(awk -v r="$remaining" -v e="$elapsed_s" -v p="$processed" 'BEGIN { printf "%.0f", (r * e) / p }')"
+    fi
+
+    local snapshot s1_state s2_state s1_idx s2_idx p_lag p_buf p_buf_max s1_reason s2_reason
+    snapshot="$(latest_timeline_snapshot "$timeline_file")"
+    s1_state="$(jq -r '.secondary1.secondary_state // "n/a"' <<<"$snapshot")"
+    s2_state="$(jq -r '.secondary2.secondary_state // "n/a"' <<<"$snapshot")"
+    s1_idx="$(jq -r '.secondary1.last_applied_index // 0' <<<"$snapshot")"
+    s2_idx="$(jq -r '.secondary2.last_applied_index // 0' <<<"$snapshot")"
+    s1_reason="$(jq -r '.secondary1.reconcile_fail_reason_last // "n/a"' <<<"$snapshot")"
+    s2_reason="$(jq -r '.secondary2.reconcile_fail_reason_last // "n/a"' <<<"$snapshot")"
+    p_lag="$(jq -r '.primary.stream_lagging_subscribers_total // 0' <<<"$snapshot")"
+    p_buf="$(jq -r '.primary.stream_buffer_entries // 0' <<<"$snapshot")"
+    p_buf_max="$(jq -r '.primary.stream_buffer_max_entries // 0' <<<"$snapshot")"
+
+    printf "[progress] writes_done=%s/%s (%s%%) started=%s inflight=%s ok=%s fail=%s rate=%s/s elapsed=%s eta=%s s1=%s(idx=%s,reason=%s) s2=%s(idx=%s,reason=%s) primary_buf=%s/%s lagging=%s\n" \
+      "$processed" "$total" "$pct" "$started" "$inflight" "$succeeded" "$failures" "$rate" "$(format_seconds "$elapsed_s")" "$(format_seconds "$eta_s")" \
+      "$s1_state" "$s1_idx" "$s1_reason" "$s2_state" "$s2_idx" "$s2_reason" "$p_buf" "$p_buf_max" "$p_lag"
+    sleep "$PROGRESS_INTERVAL"
+  done
+}
+
 run_mode() {
   require_bin bao
   require_bin jq
@@ -191,10 +313,13 @@ run_mode() {
   safe_int "write-count" "$WRITE_COUNT"
   safe_int "concurrency" "$CONCURRENCY"
   safe_int "payload-bytes" "$PAYLOAD_BYTES"
+  safe_int "write-retries" "$WRITE_RETRIES"
   safe_int "poll-interval" "$POLL_INTERVAL"
   safe_int "max-wait-seconds" "$MAX_WAIT_SECONDS"
   safe_int "monitor-interval" "$MONITOR_INTERVAL"
+  safe_int "progress-interval" "$PROGRESS_INTERVAL"
   [[ "$CONCURRENCY" -gt 0 ]] || die "concurrency must be > 0"
+  [[ "$PROGRESS_INTERVAL" -gt 0 ]] || die "progress-interval must be > 0"
 
   mkdir -p "$OUTPUT_DIR"
   local run_dir="$OUTPUT_DIR/$RUN_ID"
@@ -202,7 +327,18 @@ run_mode() {
   local result_file="$run_dir/result.json"
   local timeline_file="$run_dir/status_timeline.ndjson"
   local stop_file="$run_dir/.monitor_stop"
+  local progress_stop_file="$run_dir/.progress_stop"
+  local write_failures_file="$run_dir/write_failures.txt"
+  local progress_dir="$run_dir/progress"
   local data_path="${KV_MOUNT}/${KEY_PREFIX}/${RUN_ID}"
+  mkdir -p "$progress_dir"
+
+  echo "Starting DR dual-secondary stress run"
+  echo "  run_id=$RUN_ID"
+  echo "  output_dir=$run_dir"
+  echo "  write_count=$WRITE_COUNT concurrency=$CONCURRENCY payload_bytes=$PAYLOAD_BYTES retries=$WRITE_RETRIES"
+  echo "  monitor_interval=${MONITOR_INTERVAL}s progress_interval=${PROGRESS_INTERVAL}s max_wait_seconds=$MAX_WAIT_SECONDS"
+  echo "  secondary1=$SECONDARY1_NAME secondary2=$SECONDARY2_NAME"
 
   if [[ "$ENSURE_KV" == "true" ]]; then
     if ! bao_role primary secrets list -format=json | jq -e --arg p "${KV_MOUNT}/" 'has($p)' >/dev/null; then
@@ -219,36 +355,122 @@ run_mode() {
   before_s2="$(json_status_for_role secondary2)"
 
   : >"$timeline_file"
+  : >"$write_failures_file"
+  rm -f "$progress_dir"/worker-*.done "$progress_dir"/worker-*.started
   rm -f "$stop_file"
+  rm -f "$progress_stop_file"
   monitor_status_loop "$timeline_file" "$stop_file" &
   local monitor_pid=$!
+  local progress_pid=0
+  local worker_pids=()
 
   local finished=0
+  local cleanup_started=0
+  local interrupted=0
   cleanup_run() {
+    if [[ "$cleanup_started" -eq 1 ]]; then
+      return
+    fi
+    cleanup_started=1
     if [[ "$finished" -eq 0 ]]; then
       touch "$stop_file" 2>/dev/null || true
+      touch "$progress_stop_file" 2>/dev/null || true
+
+      local pid
+      for pid in "${worker_pids[@]}"; do
+        kill -TERM "$pid" 2>/dev/null || true
+        if command -v pkill >/dev/null 2>&1; then
+          pkill -TERM -P "$pid" 2>/dev/null || true
+        fi
+      done
+
+      if [[ "$progress_pid" -gt 0 ]]; then
+        kill -TERM "$progress_pid" 2>/dev/null || true
+      fi
+      if [[ "$monitor_pid" -gt 0 ]]; then
+        kill -TERM "$monitor_pid" 2>/dev/null || true
+      fi
+
+      if jobs -pr >/dev/null 2>&1; then
+        jobs -pr | xargs -r kill -TERM 2>/dev/null || true
+      fi
+      sleep 0.2
+      if jobs -pr >/dev/null 2>&1; then
+        jobs -pr | xargs -r kill -KILL 2>/dev/null || true
+      fi
+
       wait "$monitor_pid" 2>/dev/null || true
+      if [[ "$progress_pid" -gt 0 ]]; then
+        wait "$progress_pid" 2>/dev/null || true
+      fi
     fi
   }
+  on_interrupt() {
+    interrupted=1
+    echo
+    echo "Received interrupt; stopping stress run and terminating workers..."
+    exit 130
+  }
+  trap on_interrupt INT TERM HUP QUIT PIPE
   trap cleanup_run EXIT
 
   local start_ms write_done_ms sentinel_written_ms done_ms
   start_ms="$(now_epoch_ms)"
+  progress_loop "$progress_dir" "$write_failures_file" "$timeline_file" "$progress_stop_file" "$WRITE_COUNT" "$start_ms" &
+  progress_pid=$!
 
   local worker
   for worker in $(seq 0 $((CONCURRENCY - 1))); do
     (
+      local worker_id="$worker"
+      local done_file="$progress_dir/worker-${worker_id}.done"
+      local started_file="$progress_dir/worker-${worker_id}.started"
+      local done_local=0
+      local started_local=0
+      echo 0 >"$done_file"
+      echo 0 >"$started_file"
       local idx=$((worker + 1))
       while [[ "$idx" -le "$WRITE_COUNT" ]]; do
-        write_key "$idx" "$data_path"
+        started_local=$((started_local + 1))
+        echo "$started_local" >"$started_file"
+        if ! write_key "$idx" "$data_path"; then
+          echo "$idx" >>"$write_failures_file"
+        fi
+        done_local=$((done_local + 1))
+        if [[ $((done_local % 25)) -eq 0 ]]; then
+          echo "$done_local" >"$done_file"
+        fi
         idx=$((idx + CONCURRENCY))
       done
+      echo "$done_local" >"$done_file"
     ) &
+    worker_pids+=("$!")
   done
-  wait
+  wait || true
+  if [[ "$interrupted" -eq 1 ]]; then
+    return
+  fi
 
   write_done_ms="$(now_epoch_ms)"
-  bao_role primary kv put "$data_path/sentinel" done=true count="$WRITE_COUNT" >/dev/null
+  touch "$progress_stop_file"
+  wait "$progress_pid" || true
+  progress_pid=0
+  echo "[phase] writes completed in $(format_seconds $(( (write_done_ms - start_ms) / 1000 )))"
+  local write_failures_count=0
+  write_failures_count="$(wc -l <"$write_failures_file" | awk '{print $1}')"
+  local sentinel_write_ok="false"
+  local sentinel_attempt=0
+  local sentinel_max_attempts=$((WRITE_RETRIES + 1))
+  while [[ "$sentinel_attempt" -lt "$sentinel_max_attempts" ]]; do
+    if bao_role primary kv put "$data_path/sentinel" done=true count="$WRITE_COUNT" write_failures="$write_failures_count" >/dev/null 2>&1; then
+      sentinel_write_ok="true"
+      break
+    fi
+    sentinel_attempt=$((sentinel_attempt + 1))
+    if [[ "$sentinel_attempt" -lt "$sentinel_max_attempts" ]]; then
+      sleep "0.$((sentinel_attempt + 1))"
+    fi
+  done
   sentinel_written_ms="$(now_epoch_ms)"
 
   local deadline_ms now_ms
@@ -256,29 +478,48 @@ run_mode() {
 
   local s1_seen=false s2_seen=false
   local s1_seen_ms=-1 s2_seen_ms=-1
-  while true; do
-    if [[ "$s1_seen" == "false" ]]; then
-      if bao_role secondary1 kv get -format=json "$data_path/sentinel" >/dev/null 2>&1; then
-        s1_seen=true
-        s1_seen_ms="$(now_epoch_ms)"
+  local wait_started_ms="$sentinel_written_ms"
+  local wait_last_log_ms=0
+  if [[ "$sentinel_write_ok" == "true" ]]; then
+    echo "[phase] waiting for sentinel replication on both secondaries"
+    while true; do
+      if [[ "$s1_seen" == "false" ]]; then
+        if bao_role secondary1 kv get -format=json "$data_path/sentinel" >/dev/null 2>&1; then
+          s1_seen=true
+          s1_seen_ms="$(now_epoch_ms)"
+        fi
       fi
-    fi
-    if [[ "$s2_seen" == "false" ]]; then
-      if bao_role secondary2 kv get -format=json "$data_path/sentinel" >/dev/null 2>&1; then
-        s2_seen=true
-        s2_seen_ms="$(now_epoch_ms)"
+      if [[ "$s2_seen" == "false" ]]; then
+        if bao_role secondary2 kv get -format=json "$data_path/sentinel" >/dev/null 2>&1; then
+          s2_seen=true
+          s2_seen_ms="$(now_epoch_ms)"
+        fi
       fi
-    fi
 
-    if [[ "$s1_seen" == "true" && "$s2_seen" == "true" ]]; then
-      break
-    fi
-    now_ms="$(now_epoch_ms)"
-    if [[ "$now_ms" -ge "$deadline_ms" ]]; then
-      break
-    fi
-    sleep "$POLL_INTERVAL"
-  done
+      if [[ "$s1_seen" == "true" && "$s2_seen" == "true" ]]; then
+        break
+      fi
+      now_ms="$(now_epoch_ms)"
+      if [[ "$wait_last_log_ms" -eq 0 || $((now_ms - wait_last_log_ms)) -ge $((PROGRESS_INTERVAL * 1000)) ]]; then
+        local s1_status s2_status s1_state s2_state s1_idx s2_idx
+        s1_status="$(json_status_for_role secondary1)"
+        s2_status="$(json_status_for_role secondary2)"
+        s1_state="$(jq -r '.secondary_state // "n/a"' <<<"$s1_status")"
+        s2_state="$(jq -r '.secondary_state // "n/a"' <<<"$s2_status")"
+        s1_idx="$(jq -r '.last_applied_index // 0' <<<"$s1_status")"
+        s2_idx="$(jq -r '.last_applied_index // 0' <<<"$s2_status")"
+        printf "[wait] elapsed=%s remaining=%s s1_seen=%s s2_seen=%s s1=%s(idx=%s) s2=%s(idx=%s)\n" \
+          "$(format_seconds $(( (now_ms - wait_started_ms) / 1000 )))" \
+          "$(format_seconds $(( (deadline_ms - now_ms) / 1000 )))" \
+          "$s1_seen" "$s2_seen" "$s1_state" "$s1_idx" "$s2_state" "$s2_idx"
+        wait_last_log_ms="$now_ms"
+      fi
+      if [[ "$now_ms" -ge "$deadline_ms" ]]; then
+        break
+      fi
+      sleep "$POLL_INTERVAL"
+    done
+  fi
   done_ms="$(now_epoch_ms)"
 
   local s1_lag_seconds=-1 s2_lag_seconds=-1
@@ -323,11 +564,19 @@ run_mode() {
   fi
 
   local s1_result="ok" s2_result="ok"
-  [[ "$s1_seen" == "true" ]] || s1_result="timeout_waiting_for_sentinel"
-  [[ "$s2_seen" == "true" ]] || s2_result="timeout_waiting_for_sentinel"
+  if [[ "$sentinel_write_ok" != "true" ]]; then
+    s1_result="sentinel_write_failed"
+    s2_result="sentinel_write_failed"
+  else
+    [[ "$s1_seen" == "true" ]] || s1_result="timeout_waiting_for_sentinel"
+    [[ "$s2_seen" == "true" ]] || s2_result="timeout_waiting_for_sentinel"
+  fi
   local overall_result="ok"
   if [[ "$s1_result" != "ok" || "$s2_result" != "ok" ]]; then
     overall_result="partial_or_timeout"
+  fi
+  if [[ "$write_failures_count" -gt 0 ]]; then
+    overall_result="partial_write_failures"
   fi
 
   local lag_delta_json="null"
@@ -367,6 +616,10 @@ run_mode() {
     --argjson write_count "$WRITE_COUNT" \
     --argjson concurrency "$CONCURRENCY" \
     --argjson payload_bytes "$PAYLOAD_BYTES" \
+    --arg bao_client_timeout "$BAO_CLIENT_TIMEOUT_DURATION" \
+    --argjson write_retries "$WRITE_RETRIES" \
+    --argjson write_failures "$write_failures_count" \
+    --arg sentinel_write_ok "$sentinel_write_ok" \
     --argjson write_duration_ms "$write_duration_ms" \
     --arg write_tps "$write_tps" \
     --argjson end_to_end_ms "$end_to_end_ms" \
@@ -410,8 +663,12 @@ run_mode() {
       parameters: {
         write_count: $write_count,
         concurrency: $concurrency,
-        payload_bytes: $payload_bytes
+        payload_bytes: $payload_bytes,
+        bao_client_timeout: $bao_client_timeout,
+        write_retries: $write_retries
       },
+      write_failures: $write_failures,
+      sentinel_write_ok: ($sentinel_write_ok == "true"),
       data_path: $data_path,
       workload: {
         write_duration_ms: $write_duration_ms,
@@ -486,6 +743,7 @@ run_mode() {
     echo
     echo "lag_delta_seconds_secondary2_minus_secondary1=$lag_delta_json"
   fi
+  echo "write_failures=$write_failures_count sentinel_write_ok=$sentinel_write_ok"
 }
 
 resolve_results() {
@@ -579,17 +837,20 @@ fi
 PRIMARY_ADDR="${PRIMARY_ADDR:-}"
 PRIMARY_TOKEN="${PRIMARY_TOKEN:-}"
 PRIMARY_CACERT="${PRIMARY_CACERT:-}"
+PRIMARY_TLS_SERVER_NAME="${PRIMARY_TLS_SERVER_NAME:-}"
 PRIMARY_SKIP_VERIFY="false"
 
 SECONDARY1_ADDR="${SECONDARY1_ADDR:-}"
 SECONDARY1_TOKEN="${SECONDARY1_TOKEN:-}"
 SECONDARY1_CACERT="${SECONDARY1_CACERT:-}"
+SECONDARY1_TLS_SERVER_NAME="${SECONDARY1_TLS_SERVER_NAME:-}"
 SECONDARY1_SKIP_VERIFY="false"
 SECONDARY1_NAME="secondary1"
 
 SECONDARY2_ADDR="${SECONDARY2_ADDR:-}"
 SECONDARY2_TOKEN="${SECONDARY2_TOKEN:-}"
 SECONDARY2_CACERT="${SECONDARY2_CACERT:-}"
+SECONDARY2_TLS_SERVER_NAME="${SECONDARY2_TLS_SERVER_NAME:-}"
 SECONDARY2_SKIP_VERIFY="false"
 SECONDARY2_NAME="secondary2"
 
@@ -603,6 +864,9 @@ SAMPLE_KEYS_CSV=""
 POLL_INTERVAL=1
 MAX_WAIT_SECONDS=300
 MONITOR_INTERVAL=2
+PROGRESS_INTERVAL=5
+BAO_CLIENT_TIMEOUT_DURATION="20s"
+WRITE_RETRIES=2
 OUTPUT_DIR="$(pwd)/dr-stress-results"
 ENSURE_KV="false"
 
@@ -619,6 +883,9 @@ case "$MODE" in
         --primary-cacert) PRIMARY_CACERT="$2"; shift 2 ;;
         --secondary1-cacert) SECONDARY1_CACERT="$2"; shift 2 ;;
         --secondary2-cacert) SECONDARY2_CACERT="$2"; shift 2 ;;
+        --primary-tls-server-name) PRIMARY_TLS_SERVER_NAME="$2"; shift 2 ;;
+        --secondary1-tls-server-name) SECONDARY1_TLS_SERVER_NAME="$2"; shift 2 ;;
+        --secondary2-tls-server-name) SECONDARY2_TLS_SERVER_NAME="$2"; shift 2 ;;
         --primary-skip-verify) PRIMARY_SKIP_VERIFY="true"; shift ;;
         --secondary1-skip-verify) SECONDARY1_SKIP_VERIFY="true"; shift ;;
         --secondary2-skip-verify) SECONDARY2_SKIP_VERIFY="true"; shift ;;
@@ -634,6 +901,9 @@ case "$MODE" in
         --poll-interval) POLL_INTERVAL="$2"; shift 2 ;;
         --max-wait-seconds) MAX_WAIT_SECONDS="$2"; shift 2 ;;
         --monitor-interval) MONITOR_INTERVAL="$2"; shift 2 ;;
+        --progress-interval) PROGRESS_INTERVAL="$2"; shift 2 ;;
+        --bao-client-timeout) BAO_CLIENT_TIMEOUT_DURATION="$2"; shift 2 ;;
+        --write-retries) WRITE_RETRIES="$2"; shift 2 ;;
         --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
         --ensure-kv) ENSURE_KV="true"; shift ;;
         -h|--help) usage; exit 0 ;;

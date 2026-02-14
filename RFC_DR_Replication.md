@@ -7,7 +7,7 @@ Draft, implementation-backed.
 This RFC defines OpenBao Disaster Recovery (DR) replication as a native, cross-cluster feature with security-first bootstrap and fail-closed reconciliation.
 
 The current architecture uses:
-- Two independent Raft clusters (primary and secondary)
+- Two (or more) independent Raft clusters (primary and one or more secondaries)
 - Entry-level change streaming for normal operation
 - Hybrid range-first reconciliation for recovery
 - Strict relationship authorization (cert fingerprint + relationship state)
@@ -33,8 +33,7 @@ OpenBao needed DR replication that is:
 
 ## Non-Goals
 1. Keyspace partitioning by tenant/namespace.
-2. Backward compatibility with legacy plaintext bootstrap behavior.
-3. Merkle-tree or WAL-shipping reconciliation.
+2. Merkle-tree or WAL-shipping reconciliation.
 
 ## Architecture Overview
 
@@ -81,7 +80,7 @@ graph LR
 
 ### Security Invariants
 1. No plaintext root key is transferred.
-2. No insecure transport fallback is allowed.
+2. DR transport fails closed if trusted cert context is unavailable (no plaintext/insecure DR link path).
 3. Every DR RPC is relationship-authorized.
 4. Revoked relationships are denied across all DR RPCs.
 
@@ -101,13 +100,29 @@ graph LR
 | Enable secondary | POST | `sys/replication/dr/secondary/enable` |
 | Disable secondary | POST | `sys/replication/dr/secondary/disable` |
 | Promote secondary | POST | `sys/replication/dr/secondary/promote` |
+| Trigger secondary resnapshot | POST | `sys/replication/dr/secondary/resnapshot` |
+| Read DR tuning | GET | `sys/replication/dr/tuning` |
+| Update DR tuning | POST | `sys/replication/dr/tuning` |
+
+Auth model notes:
+- `sys/replication/dr/status` is unauthenticated.
+- `sys/replication/dr/primary/register-secondary` is unauthenticated and bootstrap-token authenticated by payload.
+- Other DR system endpoints follow normal `sys/` root protections.
+- While in DR secondary mode, write requests are read-only blocked except:
+  - `sys/replication/dr/secondary/promote`
+  - `sys/replication/dr/secondary/disable`
+  - `sys/replication/dr/secondary/resnapshot`
+  - `sys/replication/dr/tuning`
+  - `sys/seal`
+  - `sys/step-down`
+  - namespace-prefixed variants of the same paths.
 
 ### gRPC Service
 `vault/dr_replication_service.proto` defines:
 - `StreamChanges`
 - `RequestCheckpoint`
-- `ExchangeStrataEstimator` (compatibility path)
 - `ExchangeIBLT`
+- `ExchangeRangeDigests`
 - `ExchangePrefixDigests`
 - `FetchEntries`
 - `Heartbeat`
@@ -118,9 +133,13 @@ Additive range-aware protocol elements:
 - `RangeDigest`
 - `CheckpointResponse.top_ranges`
 - `CheckpointResponse.range_plan_version`
+- `RangeDigestRequest` / `RangeDigestResponse`
 - `IBLTMessage.span`
+- `checkpoint_index` fencing fields on reconcile-phase requests (`IBLTMessage`, `PrefixDigestRequest`, `FetchEntriesRequest`, `RangeDigestRequest`)
 - `PrefixDigestRequest.span`
 - `FetchEntriesRequest.ranges`
+- `FetchEntriesRequest.items` (`FetchItem.kid`, `FetchItem.expected_vid`) for provenance-safe point fetches
+- `EntryChange.kid` for delete reconciliation when key text is unavailable
 
 ## Relationship and Bootstrap Model
 
@@ -172,11 +191,17 @@ Reconciliation operates over encrypted storage identity pairs:
 
 This keeps reconciliation below the barrier while preserving confidentiality of key names and values.
 
+### Replication Domain Exclusions
+DR intentionally excludes cluster-local/internal paths from both stream fanout and reconciliation so local node/cluster state does not pollute cross-cluster convergence.
+
+- Never-replicate (stream + reconcile): local seal/recovery/lock/raft/leader/cluster-local metadata and DR manager persistence paths (for example `core/hsm/barrier-unseal-keys`, `core/seal-config`, `core/recovery-config`, `core/recovery-key`, `core/lock`, `core/initialize-lock`, `core/cluster/local/*`, `core/leader/*`, `core/raft/*`, `core/dr-replication/*`).
+- Reconcile-only exclusion: `core/keyring` (handled by `SyncKeyring` bootstrap and stream updates rather than anti-entropy scan/fetch).
+
 ## Reconciliation Algorithm (Current)
 
 ### Phase A: Checkpoint + Range Manifest
 1. Secondary requests checkpoint from primary.
-2. Primary scans checkpoint state and computes deterministic top-level ranges (`top_ranges`) using balanced limits.
+2. Primary scans checkpoint state and computes deterministic fixed hash-interval top ranges (`top_ranges`) from KID space.
 3. Primary caches checkpoint artifacts under strict budgets.
 
 ### Phase B: Local Compare by Range
@@ -187,17 +212,20 @@ This keeps reconciliation below the barrier while preserving confidentiality of 
 
 ### Phase C: One-Shot Per-Range IBLT
 For each mismatched range:
-1. Secondary sizes IBLT from estimated diff.
-2. Secondary requests range-scoped `ExchangeIBLT(span=...)`.
+1. Secondary sizes IBLT from estimated diff and attempts adaptive sizes (`x1`, `x2`, `x4`, capped).
+2. Secondary requests range-scoped `ExchangeIBLT(span=...)` per attempt.
 3. If decode succeeds:
-   - fetch/add missing or changed items
-   - delete secondary-only items
+   - fetch missing or changed items
+   - stage deterministic delete set for secondary-only items
+4. Range tasks run in a bounded worker pool (`max_inflight_range_tasks`) for decode/fetch, while apply remains deterministic and session-fenced.
 
 ### Phase D: Adaptive Split on Decode Failure
 If decode fails:
 1. Split the range into two child spans.
-2. Retry per-child IBLT while split budgets permit.
-3. Continue until decoded or limits are reached.
+2. Query child digests using `ExchangeRangeDigests`.
+3. Enqueue only child spans whose local/remote digests mismatch.
+4. Retry per-child IBLT while split budgets permit.
+5. Continue until decoded or limits are reached.
 
 ### Phase E: In-Range Prefix Refinement
 If decode remains stubborn:
@@ -210,8 +238,21 @@ If decode remains stubborn:
 - no unresolved `failed_kids`
 - no apply failures
 - no unresolved range failures
+- no checkpoint/session fence violations
 
 Any unresolved failure is a reconciliation failure and retries later.
+
+## Automatic Resnapshot Fallback
+To handle sustained lag where reconcile throughput cannot catch up with incoming writes, the secondary supports a hard-cutover fallback:
+
+1. Trigger conditions (configurable):
+   - `lastAppliedIndex` stall duration exceeded
+   - lag (`primary_index - last_applied_index`) above threshold
+   - failure window threshold reached for `budget_exceeded|stalled|decode_exhausted`
+2. Secondary enters `resnapshotting` state.
+3. Secondary requests a fresh checkpoint and performs protocol-scoped full-copy fetch for full hash span.
+4. Secondary applies fetched entries, deletes local-only entries under checkpoint/session fencing, sets `lastAppliedIndex=checkpoint.commit_index`, and resumes streaming.
+5. Cooldown and per-hour limits bound fallback frequency.
 
 ```mermaid
 flowchart TD
@@ -234,26 +275,23 @@ flowchart TD
     N -- "No" --> M
 ```
 
-### Compatibility Path
-If `top_ranges` are absent (older peer behavior), the secondary uses legacy flow:
-- strata estimation
-- global IBLT
-- prefix digest fallback
-
 ## Ordering and Correctness
 1. Change stream delivery is ordered by Raft index.
 2. Gap detection fails closed on forward jumps.
-3. Duplicate/old entries (`<= lastAppliedIndex`) are ignored safely.
+3. Stale/old entries (`< lastAppliedIndex`) are ignored safely.
 4. Seal-wrap metadata is preserved in replication operations.
-5. Catch-up boundary handling uses `missing_from = last_applied_index + 1` semantics.
+5. Catch-up replay is inclusive on `last_applied_index` so reconnect can recover same-index multi-operation Raft entries.
+6. Reconciliation scanning is transactional-snapshot aware and fail-closed on `ListPage/Get` errors.
+7. Reconcile session fencing (`checkpoint_id` + `checkpoint_index`) is enforced across all range/fetch/prefix phases.
 
 ## Resource Controls and Fail-Closed Behavior
 
 ### Checkpoint Cache (Primary)
-- Global budget: 256 MiB
-- Per-relationship budget: 64 MiB
-- Max checkpoints per relationship: 2
-- TTL: 5 minutes
+- Global budget: 1 GiB
+- Per-relationship budget: 256 MiB
+- Max checkpoints per relationship: 8
+- Max checkpoints global: 16
+- TTL: 30 minutes
 
 Eviction order:
 1. Expired
@@ -262,16 +300,33 @@ Eviction order:
 
 If admission still fails, `RequestCheckpoint` fails with precondition error.
 
+### Checkpoint Build Throttling (Primary)
+- Primary may temporarily deny `RequestCheckpoint` under high stream pressure (`budget_exceeded: primary stream pressure (...)`).
+- Throttling is bounded and bypassed periodically to prevent permanent starvation.
+- Status exposes throttle counters and stream-pressure telemetry.
+
 ### Reconcile Budgets (Secondary)
 - Top ranges max: 256
 - Max total ranges after split: 1024
 - Max split depth: 6
 - Max IBLT cells per range: 32768
 - Max reconcile RPC bytes: 128 MiB
-- Max reconcile wall time: 5 minutes
-- Max inflight range tasks: 16 (scheduling target)
+- Max reconcile wall time: 30 minutes
+- Max inflight range tasks: 16 (bounded worker pool)
 
 Budget breach is explicit failure (`budget_exceeded`), not silent degradation.
+
+### Reconcile Retry Control
+- Failure classes are tracked (`budget_exceeded`, `decode_exhausted`, `checkpoint_conflict`, `apply_failed`, `auth_revoked`, `unknown`).
+- Per-class retry caps are enforced with cooldowns to avoid infinite hot-loop retries under sustained contention.
+- `checkpoint_conflict` class uses an explicit cooldown path before next attempt.
+
+### Fallback Policy (Secondary)
+- Automatic fallback is enabled by default.
+- Default stall threshold: 180s.
+- Default failure-window trigger: 3 failures in a 10-minute window (`budget_exceeded|stalled|decode_exhausted`).
+- Default minimum lag trigger: `2 * stream_buffer_max_entries` if not explicitly configured.
+- Cooldown and frequency limits: 10 minutes cooldown, max 2 fallback events per hour.
 
 ## Revocation and Authz Behavior
 1. Revoke marks relationship state as `revoked` and persists it.
@@ -291,6 +346,7 @@ On failed validation:
 - failed attempts are incremented and persisted
 - lockout is applied when threshold is reached
 - error context is recorded (`last_error`)
+- expired pending relationships are periodically garbage-collected from storage
 
 ## Heartbeat and Persistence Throttling
 - In-memory liveness updates are immediate.
@@ -302,15 +358,55 @@ On failed validation:
 ### Status Endpoint
 `GET sys/replication/dr/status` includes:
 - Mode and cluster metadata
-- Secondary counters/state (`last_applied_index`, `reconcile_count`, `connect_retries`, `connect_failures`)
+- Secondary counters/state (`primary_index`, `last_applied_index`, `reconcile_count`, `connect_retries`, `connect_failures`)
 - `reconcile_ranges_inflight`
 - `reconcile_ranges_failed`
 - `reconcile_budget_remaining_bytes`
+- `reconcile_active_checkpoint_id`
+- `reconcile_active_checkpoint_index`
+- `reconcile_fail_reason_last`
+- `range_manifest_count`
+- `range_split_count`
+- `reconcile_rpc_bytes_used`
+- `scan_failures_total`
+- `checkpoint_conflicts_total`
+- `reconcile_retries_total`
+- `reconcile_queue_depth`
+- `reconcile_task_retries_total`
+- `reconcile_decode_failures_total`
+- `reconcile_stalled_total`
+- `reconcile_stuck_seconds`
+- `last_applied_age_seconds`
+- `reconcile_max_rpc_bytes`
+- `reconcile_max_wall_time_seconds`
+- `reconcile_max_inflight_tasks`
+- `stream_batch_max_entries`
+- `stream_batch_max_bytes`
+- `stream_batch_max_wait_milliseconds`
 - `checkpoint_cache_bytes`
 - `checkpoint_cache_items`
 - `checkpoint_cache_evictions`
+- `checkpoint_meta_bytes`
+- `checkpoint_value_bytes`
+- `checkpoint_admission_failures`
+- `checkpoint_throttle_total`
+- `checkpoint_throttle_bypass_total`
+- `stream_buffer_entries`
+- `stream_buffer_bytes`
+- `stream_lagging_subscribers_total`
+- `stream_lagging_subscribers_active`
+- `stream_subscribers_active`
+- `stream_buffer_horizon_seconds`
+- `checkpoint_ttl_seconds`
+- `checkpoint_global_budget_bytes`
+- `checkpoint_per_relationship_budget_bytes`
 - `revoked_streams_terminated`
 - `relationship_count_by_state`
+- `fallback_active`
+- `fallback_count`
+- `fallback_last_reason`
+- `fallback_last_at`
+- `reconcile_task_rate`
 
 ### Metrics
 Representative metrics emitted include:
@@ -324,8 +420,9 @@ Representative metrics emitted include:
 ## Failover
 Secondary promotion path:
 1. Stop DR ingest.
-2. Transition from DR secondary semantics to standalone primary semantics.
-3. Resume serving client writes on promoted cluster.
+2. Transition from DR secondary semantics to standalone operation with DR mode set to `disabled`.
+3. Resume serving client writes on the promoted cluster.
+4. Operator may explicitly re-enable DR primary mode to accept new secondaries.
 
 ## Testing Expectations
 Core validation includes:
@@ -359,87 +456,89 @@ Alternatives rejected:
 ## Operational Notes
 1. Range partitioning is a performance partitioning mechanism, not a security or tenancy boundary.
 2. Additive protocol evolution is used; no protocol version bump was required for current range fields.
-3. Legacy reconcile path remains available when peers do not provide range manifest fields.
+3. Change-stream replay intentionally includes entries at `last_applied_index` to safely recover reconnects that split same-index operation batches.
+4. Checkpoint cache is metadata-first; entry values are fetched on demand during `FetchEntries`, and cache metrics expose metadata/value byte split.
 
 ## Implementation Mapping
 
 ### Core Replication and Reconciliation
 | RFC Area | Primary Implementation | Secondary/Supporting Implementation |
 |---|---|---|
-| DR primary server and subscriber model | `vault/dr_replication.go:42`, `vault/dr_replication.go:189` | `vault/dr_replication_secondary.go:253` |
-| Checkpoint creation and cache admission | `vault/dr_replication.go:268`, `vault/dr_replication.go:868` | `vault/dr_replication_secondary.go:951` |
-| Range manifest generation | `vault/dr_replication.go:293` | `physical/replication/reconciler/range.go:121` |
-| Range-scoped IBLT exchange | `vault/dr_replication.go:350` | `vault/dr_replication_secondary.go:1135` |
-| Range-scoped prefix refinement | `vault/dr_replication.go:393` | `vault/dr_replication_secondary.go:1294` |
-| Range/range+bucket fetch semantics | `vault/dr_replication.go:457` | `vault/dr_replication_secondary.go:1737` |
-| Legacy strata/global fallback path | `vault/dr_replication.go:330` | `vault/dr_replication_secondary.go:984` |
+| DR primary server and subscriber model | `vault/dr_replication.go` (`drReplicationPrimary`, `OnChange`, `StreamChanges`) | `vault/dr_replication_secondary.go` (`drReplicationSecondary`, `runStream`) |
+| Checkpoint creation and cache admission | `vault/dr_replication.go` (`RequestCheckpoint`, `cacheCheckpoint`, checkpoint eviction helpers) | `vault/dr_replication_secondary.go` (`runReconciliation`) |
+| Range manifest generation | `vault/dr_replication.go` (`RequestCheckpoint`) | `physical/replication/reconciler/range.go` (`BuildRangeManifest`) |
+| Range-scoped IBLT exchange | `vault/dr_replication.go` (`ExchangeIBLT`) | `vault/dr_replication_secondary.go` (`runRangeReconciliation`, `processRangeTask`) |
+| Range-scoped prefix refinement | `vault/dr_replication.go` (`ExchangePrefixDigests`) | `vault/dr_replication_secondary.go` (`runRangePrefixRefinement`) |
+| Range/range+bucket fetch semantics | `vault/dr_replication.go` (`FetchEntries`) | `vault/dr_replication_secondary.go` (`fetchEntriesForDiff`, `fetchAndApplyEntriesWithBudget`) |
 
 ### Protocol Surface
 | RFC Area | Proto Definition |
 |---|---|
-| DR service | `vault/dr_replication_service.proto:20` |
-| Stream entry and request | `vault/dr_replication_service.proto:56`, `vault/dr_replication_service.proto:80` |
-| Checkpoint + range manifest fields | `vault/dr_replication_service.proto:95`, `vault/dr_replication_service.proto:112`, `vault/dr_replication_service.proto:122` |
-| Range-scoped IBLT request | `vault/dr_replication_service.proto:140` |
-| Range-scoped prefix request | `vault/dr_replication_service.proto:155` |
-| Range-aware fetch request | `vault/dr_replication_service.proto:185` |
-| Heartbeat messages | `vault/dr_replication_service.proto:217`, `vault/dr_replication_service.proto:225` |
-| Wrapped bootstrap key exchange | `vault/dr_replication_service.proto:233`, `vault/dr_replication_service.proto:241` |
+| DR service + RPCs | `vault/dr_replication_service.proto` (`service DRReplication`) |
+| Stream entry + resume request | `vault/dr_replication_service.proto` (`EntryChange`, `StreamChangesRequest`) |
+| Checkpoint + range manifest fields | `vault/dr_replication_service.proto` (`CheckpointResponse`, `RangeDigest`, `RangeSpan`) |
+| Range digest RPC for split-informed enqueue | `vault/dr_replication_service.proto` (`RangeDigestRequest`, `RangeDigestResponse`) |
+| IBLT and prefix exchanges | `vault/dr_replication_service.proto` (`IBLTMessage`, `PrefixDigestRequest`, `PrefixDigestResponse`) |
+| Provenance-safe fetch and range/bucket fetch | `vault/dr_replication_service.proto` (`FetchEntriesRequest`, `FetchItem`, `EntryBatch`) |
+| Heartbeat and wrapped bootstrap exchange | `vault/dr_replication_service.proto` (`DRHeartbeat*`, `SyncKeyring*`) |
 
 ### Security and Relationship Lifecycle
 | RFC Area | Implementation |
 |---|---|
-| Activation token schema | `vault/dr_replication_state.go:75` |
-| Relationship schema/state model | `vault/dr_replication_state.go:109`, `vault/dr_replication_state.go:118` |
-| Token generation and expiry fields | `vault/dr_bootstrap_registration.go:29`, `vault/dr_bootstrap_registration.go:55` |
-| Bootstrap validation, lockout, source IP | `vault/dr_bootstrap_registration.go:182` |
-| Relationship authorization checks | `vault/dr_relationship_authz.go:50`, `vault/dr_replication.go:985` |
-| Revocation semantics | `vault/dr_relationship_authz.go:13`, `vault/dr_replication.go:962` |
-| Heartbeat last-seen throttling | `vault/dr_relationship_authz.go:110` |
-| Cluster cert trust and fingerprint propagation | `vault/dr_cluster.go:37`, `vault/dr_cluster.go:93`, `vault/dr_cluster.go:139`, `vault/dr_cluster.go:158` |
+| Activation token schema and manager config | `vault/dr_replication_state.go` (`DRActivationToken`, `DRConfig`) |
+| Relationship schema/state model | `vault/dr_replication_state.go` (`DRRelationship`, `DRRelationshipState`) |
+| Token generation and expiry fields | `vault/dr_bootstrap_registration.go` (`GenerateActivationToken`) |
+| Bootstrap validation, lockout, source IP | `vault/dr_bootstrap_registration.go` (`ValidateBootstrapAndStoreCertWithSourceIP`) |
+| Relationship authorization checks | `vault/dr_relationship_authz.go` (`ValidateRelationshipAccess`) and `vault/dr_replication.go` (`authorizeRelationship`) |
+| Revocation semantics | `vault/dr_relationship_authz.go` (`RevokeRelationship`) and `vault/dr_replication.go` (`RevokeRelationship`) |
+| Heartbeat last-seen throttling | `vault/dr_relationship_authz.go` (`MarkRelationshipSeen`) |
+| Cluster cert trust and fingerprint propagation | `vault/dr_cluster.go` and `vault/dr_replication.go` (`peerCertFingerprintFromContext`) |
 
 ### API and Operational Wiring
 | RFC Area | Implementation |
 |---|---|
-| System DR routes | `vault/logical_system_dr.go:23` |
-| Primary token endpoint route | `vault/logical_system_dr.go:109`, `vault/logical_system.go:89` |
-| Register-secondary and relationship routes | `vault/logical_system_dr.go:201`, `vault/logical_system_dr.go:245`, `vault/logical_system_dr.go:262`, `vault/logical_system_dr.go:286` |
-| Status handler fields | `vault/logical_system_dr.go:342` |
-| Core manager wiring/load | `vault/core.go:1176`, `vault/core.go:2521` |
-| Secondary write enforcement | `vault/request_handling.go:583` |
-| Failover/promotion path | `vault/dr_failover.go:42`, `vault/dr_replication_state.go:444` |
+| System DR routes and handlers | `vault/logical_system_dr.go` |
+| Auth/unauth path registration | `vault/logical_system.go` |
+| Status handler fields | `vault/logical_system_dr.go` (`handleDRStatus`) |
+| Core manager wiring/load on unseal | `vault/core.go` (`NewCore`, `postUnseal`) |
+| Secondary write enforcement exceptions | `vault/request_handling.go` + `vault/dr_replication_state.go` (`isDRSecondaryAllowedPath`) |
+| Failover/promotion path | `vault/dr_failover.go` and `vault/dr_replication_state.go` (`PromoteSecondary`) |
 
 ### Storage/Hook Plumbing
 | RFC Area | Implementation |
 |---|---|
-| Public change-stream interface | `sdk/physical/physical.go:74`, `sdk/physical/physical.go:98` |
-| Raft backend hook registration | `physical/raft/raft.go:217` |
-| Ordered FSM batch hook emission | `physical/raft/fsm.go:772`, `physical/raft/fsm.go:936`, `physical/raft/fsm.go:971` |
-| Seal-wrap propagation in transaction log ops | `physical/raft/transaction.go:709` |
+| Public change-stream interface | `sdk/physical/physical.go` (`ChangeStreamEntry`, `ChangeStreamBackend`) |
+| Raft backend hook registration | `physical/raft/raft.go` (`HookChangeStream`) |
+| Ordered FSM batch hook emission | `physical/raft/fsm.go` (`hookChangeStream`, `ApplyBatch`) |
+| Seal-wrap propagation in transaction log ops | `physical/raft/raft.go` (`Put`) and `physical/raft/transaction.go` (`Put`, `Commit`) |
+| Strict scanner semantics | `physical/replication/reconciler/reconciler.go` (`Scan`, `BuildIBLTFromScan`, `beginScanSnapshot`) |
 
 ### Budgets and Defaults
 | RFC Area | Implementation |
 |---|---|
-| Bootstrap policy defaults | `vault/dr_replication_state.go:33` |
-| Last-seen persistence throttle | `vault/dr_replication_state.go:39` |
-| Checkpoint cache budgets and TTL | `vault/dr_replication.go:30` |
-| Range reconcile limits | `vault/dr_replication_secondary.go:74` |
-| Deterministic range planner defaults | `physical/replication/reconciler/range.go:18`, `physical/replication/reconciler/range.go:40` |
+| Bootstrap policy defaults | `vault/dr_replication_state.go` (bootstrap constants block) |
+| Last-seen persistence throttle | `vault/dr_replication_state.go` (`drLastSeenPersistInterval`) |
+| Checkpoint cache budgets, cardinality, TTL | `vault/dr_replication.go` (constants + `NewDRReplicationPrimary`) |
+| Range reconcile limits | `vault/dr_replication_secondary.go` (range budget constants + checks) |
+| Reconcile retry caps/cooldowns | `vault/dr_reconcile_session.go` (`shouldRetryReconcile`, `reconcileRetryCap`, `retryCapCooldown`) |
+| Deterministic range planner defaults | `physical/replication/reconciler/range.go` (`DefaultRangePlanConfig`) |
 
 ### Test Coverage Map
 | RFC Area | Tests |
 |---|---|
-| Range manifest determinism | `vault/dr_replication_integration_test.go:1932` |
-| Per-range IBLT success | `vault/dr_replication_integration_test.go:1972` |
-| Adaptive split path | `vault/dr_replication_integration_test.go:2022` |
-| In-range prefix refinement | `vault/dr_replication_integration_test.go:2066` |
-| Budget-exceeded fail-closed behavior | `vault/dr_replication_integration_test.go:2123` |
-| No index advance on partial range failure | `vault/dr_replication_integration_test.go:2183` |
-| Multi-relationship isolation | `vault/dr_replication_integration_test.go:2265` |
-| Revoke-during-reconcile abort | `vault/dr_replication_integration_test.go:2316` |
-| Checkpoint cache budget and eviction | `vault/dr_replication_test.go:880`, `vault/dr_replication_test.go:899` |
-| Revoke stream termination isolation | `vault/dr_replication_test.go:824` |
-| Bootstrap expiry/lockout/source-IP/throttle | `vault/dr_replication_test.go:125`, `vault/dr_replication_test.go:165`, `vault/dr_replication_test.go:202`, `vault/dr_replication_test.go:230` |
+| Range manifest determinism | `TestDRIntegration_RangeManifestDeterminism` (`vault/dr_replication_integration_test.go`) |
+| Per-range IBLT success | `TestDRIntegration_RangeIBLTDecodeSuccess` (`vault/dr_replication_integration_test.go`) |
+| Adaptive split path | `TestDRIntegration_RangeIBLTDecodeAdaptiveSplit` (`vault/dr_replication_integration_test.go`) |
+| In-range prefix refinement | `TestDRIntegration_RangeRefinementPrefixFallback` (`vault/dr_replication_integration_test.go`) |
+| Budget-exceeded fail-closed behavior | `TestDRIntegration_ReconcileFailsOnBudgetExceeded` (`vault/dr_replication_integration_test.go`) |
+| No index advance on partial range failure | `TestDRIntegration_NoIndexAdvanceOnPartialRangeFailure` (`vault/dr_replication_integration_test.go`) |
+| Multi-relationship isolation | `TestDRIntegration_MultiRelationshipRangeIsolation` (`vault/dr_replication_integration_test.go`) |
+| Revoke-during-reconcile abort | `TestDRIntegration_RevokeDuringRangeReconcileAborts` (`vault/dr_replication_integration_test.go`) |
+| Stream same-index replay behavior | `TestDRIntegration_StreamAppliesSameRaftIndexBatchEntries`, `TestDRIntegration_PrimaryStreamReplayIncludesLastAppliedIndex` (`vault/dr_replication_integration_test.go`) |
+| Scanner fail-closed + transactional enforcement | `physical/replication/reconciler/reconciler_test.go` (`TestScannerFailsClosedOnGetError`, `TestScannerFailsClosedOnListPageError`, `TestScannerRequiresTransactionalSnapshotWhenConfigured`, `TestScannerUsesTransactionHandleForGet`) |
+| Checkpoint cache budget and eviction | `vault/dr_replication_test.go` checkpoint cache tests |
+| Revoke stream termination isolation | `TestDRRelationshipManager_PrimaryRevokeTerminatesOnlyMatchingStreams` (`vault/dr_replication_test.go`) |
+| Bootstrap expiry/lockout/source-IP/throttle | `TestDRRelationshipManager_BootstrapTokenExpires`, `TestDRRelationshipManager_BootstrapTokenAttemptLockout`, `TestDRRelationshipManager_BootstrapTokenSourceIPBinding`, `TestDRRelationshipManager_HeartbeatLastSeenWriteThrottle` (`vault/dr_replication_test.go`) |
 
 ## Demo (CLI)
 
