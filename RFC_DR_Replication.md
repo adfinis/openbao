@@ -12,10 +12,11 @@ The current architecture uses:
 
 - Two (or more) independent Raft clusters (primary and one or more secondaries)
 - Entry-level change streaming for normal operation with transactional batching
-- Disk-backed stream journal replay to extend reconnect horizon beyond in-memory ring depth
+- Disk-backed stream journal replay to extend reconnect horizon beyond in-memory ring depth, maintained on all primary-cluster nodes for leader-election resilience
 - Immutable disk-backed checkpoint artifact store for checkpoint-fenced fetches
 - Ordered hash-stream reconciliation for recovery (Dirty-range optimized)
 - Ciphertext-domain reconciliation/apply below the barrier
+- Journal-based checkpoint index warmup for fast recovery after leadership transitions
 - Convergence controller with lag-slope/rate-ratio fallback triggering
 - Primary ingress write backpressure with DR-aware bounded admission
 - Strict relationship authorization (cert fingerprint + relationship state)
@@ -84,7 +85,8 @@ graph TD
 
 1. Streaming mode:
    - Primary emits ordered `ChangeStreamEntry` mutations.
-   - Primary retains replay history in in-memory ring plus on-disk stream journal segments.
+   - Primary retains replay history in in-memory ring plus on-disk stream journal segments. The stream journal is maintained by a two-layer `drChangeStreamDispatcher` that runs on **all primary-cluster Raft nodes** (leaders and followers). This ensures journal continuity across leader elections: when a follower becomes the new leader, its journal already contains entries from the follower period, eliminating the need for expensive reconciliation fallback.
+   - Journal segments are stored in a persistent subdirectory of the Raft data path (not a temporary directory) so they survive node restarts.
    - Secondary applies mutations in transactional batches (where supported) to maximize throughput.
    - Secondary tracks `lastAppliedIndex` and updates it upon successful batch commit.
 
@@ -99,6 +101,48 @@ graph TD
 2. DR transport fails closed if trusted cert context is unavailable (no plaintext/insecure DR link path).
 3. Every DR RPC is relationship-authorized.
 4. Revoked relationships are denied across all DR RPCs.
+5. Cross-cluster TLS verification uses a dynamic trust pool with TOFU fallback (see "Cross-Cluster TLS Trust Model" below).
+
+### Cross-Cluster TLS Trust Model
+
+Each OpenBao cluster node generates its own self-signed cluster certificate with a unique CN (`fw-<fingerprint>`). During DR activation, the secondary receives the primary leader's certificate via the activation token. After a primary leadership change (stepdown), the new leader presents a different certificate that the secondary has never seen.
+
+The DR transport solves this with a **dynamic trust pool** maintained on the secondary:
+
+1. **Seeding:** The pool is initialized with the activation token certificate when `Connect()` is called.
+2. **Heartbeat propagation:** Every `DRHeartbeatResponse` carries the active leader's DER-encoded cluster certificate (`active_cluster_cert`). The secondary adds (or refreshes) it in the pool on each heartbeat tick.
+3. **Custom TLS verification:** The `cluster.Client` interface exposes a `VerifyPeerCertificate()` callback. For DR connections, this callback checks the server's certificate against the trust pool:
+   - **Known cert:** accepted immediately (fingerprint match in pool).
+   - **Unknown cert (TOFU):** accepted and added to the pool with a warning log. Security is maintained because the primary independently verifies the secondary via mTLS and gRPC relationship authorization -- a rogue server without the secondary's private key cannot complete the handshake.
+4. **TTL-based eviction:** Each pool entry has a `lastSeen` timestamp refreshed by heartbeats. Entries older than 10 minutes are pruned during heartbeat ticks, bounding pool size to ~1--3 certificates even in high-churn environments (e.g. Kubernetes pod recycling).
+
+```mermaid
+sequenceDiagram
+    participant Sec as Secondary
+    participant LB as HAProxy
+    participant LeaderA as PrimaryLeaderA
+    participant LeaderB as PrimaryLeaderB
+
+    Note over Sec,LeaderA: Normal operation
+    LeaderA->>Sec: Heartbeat(active_cluster_cert=A_cert)
+    Sec->>Sec: trustedPool.Add(A_cert)
+
+    Note over LeaderA,LeaderB: Stepdown occurs
+    LeaderA--xSec: Stream breaks
+
+    Note over Sec,LeaderB: Reconnection
+    Sec->>LB: Connect
+    LB->>LeaderB: Route to new leader
+    LeaderB->>Sec: TLS: presents B_cert
+    Sec->>Sec: VerifyPeerCert: B_cert not in pool
+    Sec->>Sec: TOFU accept + log warn
+    Sec->>LeaderB: gRPC Heartbeat succeeds
+    Sec->>Sec: trustedPool.Add(B_cert from heartbeat)
+
+    Note over Sec,LeaderB: Future reconnects to B are fully verified
+```
+
+Non-DR cluster-internal connections (`requestForwardingClusterClient`, `raftLayer`) return `nil` from `VerifyPeerCertificate()` and continue to use standard Go TLS verification.
 
 ## Protocol and API Surface
 
@@ -370,14 +414,32 @@ If admission still fails, `RequestCheckpoint` fails with precondition error.
 
 - In-memory ring remains the first replay source.
 - Disk-backed stream journal extends replay horizon and is consulted when catch-up start index is older than the oldest buffered entry.
+- Because the journal dispatcher runs on all primary-cluster nodes, a new leader inherits a populated journal from its follower period. This eliminates the need for reconciliation fallback after routine leader elections -- the new leader can serve catch-up from its own journal.
+- Journal segments are stored in a persistent subdirectory of the Raft data path (`{raft_data_dir}/dr-stream-journal/`), not a temporary directory.
 - Journal replay is relationship-authorized and index-ordered; if missing/expired, reconnect fails closed and secondary must reconcile.
+
+### Stream Buffer & Journal Defaults (Primary)
+
+- In-memory ring buffer: 50,000 entries / 256 MiB (`drStreamBufferMaxEntries`, `drStreamBufferMaxBytes`)
+- Journal max size: 4 GiB (`drDefaultStreamJournalMaxBytes`)
+- Journal segment size: 64 MiB (`drDefaultStreamJournalSegmentBytes`)
+- Journal retention: 2 hours (`drDefaultStreamJournalRetention`)
+- Journal flush interval: every 256 entries (`drDefaultStreamJournalFlushInterval`)
 
 ### Reconcile Budgets (Secondary)
 
 - Max top ranges: 1024
 - Max reconcile RPC bytes: 128 MiB
-- Max reconcile wall time: 30 minutes
+- Max reconcile wall time: 30 minutes (`drDefaultReconcileMaxWallTime`)
+- Reconcile context timeout: 10 minutes (`drDefaultReconcileTimeout`) -- the outer context timeout per reconciliation invocation
 - Max inflight range tasks: 16 (bounded worker pool)
+- Checkpoint RPC timeout: 5 minutes (`drDefaultCheckpointRPCTimeout`) -- longer than general RPCs because the primary must build a checkpoint artifact (full storage scan + KID/VID index)
+
+### Stream Resume & Redirect Defaults (Secondary)
+
+- Max stream resume attempts before reconciliation: 3 (`drMaxStreamResumeAttempts`)
+- Controller redirect failure max: 2 consecutive failures before reverting to config address
+- Apply yield duration: 1ms between batch commits (`drDefaultApplyYieldDuration`)
 
 ### Pipelined Stream Application & Flow Control
 
@@ -385,7 +447,7 @@ The stream pipeline decouples Raft FSM apply from replication I/O and uses credi
 
 #### Pipeline Stages
 
-1. **OnChange Fan-Out (Primary)**: The Raft FSM hook (`OnChange`) appends mutations to an in-memory ring buffer and pushes them into a bounded channel (`bufMaxSize` capacity) per subscriber. This operation is non-blocking: if a subscriber's channel is full, the subscriber's context is cancelled, forcing a reconnect. The fan-out never stalls the Raft apply path.
+1. **OnChange Fan-Out (Primary)**: The Raft FSM change stream hook is a two-layer dispatcher (`drChangeStreamDispatcher`). The base layer runs on **all** primary-cluster nodes: it filters non-replicable paths and appends entries to the on-disk stream journal. The primary layer (active only on the leader) handles ring buffer append, dirty bitmap update, index maintenance, and subscriber fan-out. Subscriber fan-out pushes entries into a bounded channel (`bufMaxSize` capacity) per subscriber. This operation is non-blocking: if a subscriber's channel is full, the subscriber's context is cancelled, forcing a reconnect. The fan-out never stalls the Raft apply path.
 
 2. **StreamChanges Send Loop (Primary)**: Each subscriber has a dedicated goroutine that reads entries from its channel and sends them to the Secondary via the bidirectional `StreamChanges` gRPC stream as `EntryBatch` messages. Entries are accumulated into batches (up to 64 entries or 1 MiB per batch) to reduce per-message gRPC framing overhead. Before each batch send, the loop consumes one credit per entry from the subscriber's credit counter. If no credits are available, it blocks (with a configurable timeout) until the Secondary replenishes them. Catch-up replay (from ring buffer and disk-backed journal) also batches entries for throughput.
 
@@ -415,11 +477,29 @@ This creates natural end-to-end backpressure: the Primary sends at most as fast 
 
 #### Reconnection & Catch-Up
 
-When a subscriber is cancelled (by credit timeout or channel overflow), the Secondary detects the stream error and re-enters `runStream`. The Primary's `StreamChanges` handler attempts catch-up from its in-memory ring buffer or disk-backed stream journal. If the gap is too old for both, it returns `FailedPrecondition` and the Secondary falls back to full reconciliation.
+When a subscriber is cancelled (by credit timeout or channel overflow), the Secondary detects the stream error and enters a **stream resume fast-path**: it re-enters `runStream` up to `drMaxStreamResumeAttempts` (default: 3) times before falling back to reconciliation. Each resume attempt reconnects to the Primary's `StreamChanges` handler, which attempts catch-up from its in-memory ring buffer or disk-backed stream journal. After a leader election, the new leader's journal typically covers the secondary's gap (since the journal was maintained during the follower period), enabling stream resume without reconciliation. If the primary explicitly signals that catch-up is impossible (`reconciliation required`, `buffer too old`, or `journal too old`), the secondary skips remaining resume attempts and enters reconciliation immediately. If the gap is too old for both ring buffer and journal, the primary returns `FailedPrecondition` and the Secondary falls back to full reconciliation.
 
-#### Heartbeat Pressure Signaling
+#### Standby Node Rejection
+
+All mutating DR RPCs (`RequestCheckpoint`, `SyncKeyring`, `StreamChanges`, `ExchangeRangeChecksums`, `ExchangeRangeDigests`, `FetchEntries`) perform a `requireActiveNode` check. If the request reaches a standby (non-leader) node, it is rejected with a `DRRedirectDetail` gRPC status containing the active leader's cluster address. The secondary extracts this redirect and returns it to the controller loop for immediate reconnection.
+
+#### Secondary Controller Redirect Handling
+
+The secondary controller loop (`startSecondaryControllerLocked`) maintains the current target address, initially set to the operator-configured address (typically a load balancer). When `Start()` returns an `errDRRedirect`, the controller switches to the redirect address and reconnects immediately without backoff. If the redirected address fails `redirectFailureMax` (default: 2) consecutive times (either during `Connect()` or `Start()`), the controller reverts to the original config address so the next attempt goes through the load balancer.
+
+#### gRPC Transport Compression
+
+DR gRPC streams use gzip compression (`grpc.UseCompressor("gzip")`) to reduce bandwidth between primary and secondary clusters. Both client (secondary) and server (primary) register the gzip compressor at import time.
+
+#### Apply Yield
+
+After each successful batch commit in the DR apply path (both streaming and reconciliation), the secondary inserts a short pause (`drDefaultApplyYieldDuration`, default: 1ms). This prevents the apply worker from monopolizing the secondary's Raft subsystem and starving heartbeat processing, which can otherwise cause the secondary cluster to lose quorum under sustained write load.
+
+#### Heartbeat Pressure Signaling and Cert Propagation
 
 Independently, the Secondary sends its `lastAppliedIndex` every 2s via the `Heartbeat` RPC. The Primary uses this for DR-aware ingress admission (write throttling) -- a coarser-grained mechanism that protects the entire system, complementing the per-subscriber credit flow control.
+
+The heartbeat response also carries the active leader's cluster TLS certificate (`active_cluster_cert`) and cluster address (`leader_cluster_addr`). The secondary uses these to maintain a dynamic trust pool for TLS verification after leadership changes and to enable redirect-based reconnection (see "Cross-Cluster TLS Trust Model").
 
 ## Performance & Limits
 
@@ -427,7 +507,11 @@ Independently, the Secondary sends its `lastAppliedIndex` every 2s via the `Hear
 | --- | --- | --- |
 | **Range Scanning** | Halts Primary FSM | **Dirty Bitmaps**: Only scan ranges modified since last check. |
 | **Stream Applier** | Serial application slow | **Batch Commit**: Group entries into 10-50ms commit batches. |
+| **Stream Buffer** | Memory pressure under write bursts | **Tuned Defaults**: 50,000 entries / 256 MiB ring buffer; disk-backed journal (4 GiB / 64 MiB segments / 2h retention) extends horizon. |
 | **Tombstones** | Infinite growth on high churn | **Epoch-Based GC**: Prune tombstones acknowledged by all peers. |
+| **Checkpoint Index Warmup** | Full O(N) scan on leader change | **Journal Replay**: Replay local stream journal to rebuild KID/VID index via sequential disk I/O instead of random-access storage scan. Full scan interval extended to 4 hours. |
+| **Apply Starvation** | Raft heartbeat starvation under load | **Apply Yield**: 1ms pause between batch commits to give secondary Raft heartbeat goroutines CPU time. |
+| **Bandwidth** | Cross-cluster WAN bandwidth | **gRPC gzip**: All DR streams use gzip compression. |
 
 ### Epoch-Based Tombstone GC
 
@@ -437,9 +521,10 @@ Independently, the Secondary sends its `lastAppliedIndex` every 2s via the `Hear
 
 ### Reconcile Retry Control
 
-- Failure classes are tracked (`budget_exceeded`, `decode_exhausted`, `checkpoint_tuple_mismatch`, `checkpoint_artifact_missing`, `checkpoint_provenance_mismatch`, `apply_failed`, `auth_revoked`, `unknown`).
+- Failure classes are tracked (`budget_exceeded`, `decode_exhausted`, `checkpoint_tuple_mismatch`, `checkpoint_artifact_missing`, `checkpoint_provenance_mismatch`, `apply_failed`, `auth_revoked`, `redirect`, `stalled`, `unknown`).
 - Per-class retry caps are enforced with cooldowns to avoid infinite hot-loop retries under sustained contention.
 - Checkpoint tuple/artifact/provenance classes use explicit cooldown paths before next attempt.
+- The `redirect` class is special: it bypasses retry logic entirely and immediately returns to the controller loop for reconnection to the actual leader node.
 
 ### DR-Aware Backpressure (Primary)
 
@@ -598,6 +683,11 @@ Core validation includes:
    - no index advance on partial failure
    - multi-relationship isolation
    - revoke during reconcile abort
+7. Leader-election journal continuity: verify new leader can serve stream catch-up from journal accumulated during follower period without reconciliation.
+8. Journal-based index warmup: verify index built from journal replay matches full-scan result.
+9. Dynamic TLS trust pool: known cert verification, TOFU acceptance and pool update, TTL-based eviction, heartbeat cert propagation.
+10. Standby node redirect: verify RPCs hitting a standby return a redirect with the active leader's address.
+11. Stream resume fast-path: verify transient disconnects attempt resume before falling back to reconciliation.
 
 ## Rationale and Alternatives
 
@@ -630,9 +720,10 @@ Alternatives rejected:
 
 | RFC Area | Primary Implementation | Secondary/Supporting Implementation |
 |---|---|---|
-| DR primary server, subscriber model, and batched streaming | `vault/dr_replication.go` (`drReplicationPrimary`, `OnChange`, `StreamChanges`, `sendBatch`, credit-gated batch drain) | `vault/dr_replication_secondary.go` (`drReplicationSecondary`, `runStream` batch receive + unpack, `runStreamApplyWorker`) |
+| DR primary server, subscriber model, and batched streaming | `vault/dr_replication.go` (`drReplicationPrimary`, `OnChange`, `onChangePrimaryPath`, `StreamChanges`, `sendBatch`, credit-gated batch drain) | `vault/dr_replication_secondary.go` (`drReplicationSecondary`, `runStream` batch receive + unpack, `runStreamApplyWorker`) |
 | Stream application (Transactional Batching) | N/A | `vault/dr_replication_secondary.go` (`applyStreamTxn`, `runStreamApplyWorker`) |
-| Stream journal append/replay/retention | `vault/dr_replication.go` (`OnChange`, `StreamChanges`) | `vault/dr_stream_journal.go` |
+| Shared journal dispatcher (all-node FSM hook) | `vault/dr_replication.go` (`drChangeStreamDispatcher`, `filterDRReplicableEntries`) | `vault/dr_replication_state.go` (`newDRRelationshipManager` dispatcher init + FSM hook registration) |
+| Stream journal append/replay/retention/warmup | `vault/dr_replication.go` (`OnChange`, `StreamChanges`, `WarmIndexFromJournal`, `WarmIndex`) | `vault/dr_stream_journal.go` (`append`, `replayRange`, `replayAll`) |
 | Checkpoint creation and cache admission | `vault/dr_replication.go` (`RequestCheckpoint`, `cacheCheckpoint`, checkpoint eviction helpers) | `vault/dr_replication_secondary.go` (`runReconciliation`) |
 | Immutable checkpoint artifact materialization and lookup | `vault/dr_checkpoint_artifact_store.go` | `vault/dr_replication.go` (`buildAndCacheCheckpoint`, `readCheckpointEntryChange`) |
 | Range manifest generation | `vault/dr_replication.go` (`RequestCheckpoint`) | `physical/replication/reconciler/range.go` (`BuildRangeChecksums`) |
@@ -641,6 +732,9 @@ Alternatives rejected:
 | Range/range+bucket fetch semantics | `vault/dr_replication.go` (`FetchEntries`) | `vault/dr_replication_secondary.go` (`fetchEntriesForDiff`, `fetchAndApplyEntriesWithBudget`, `applyFetchedTxn`) |
 | Convergence telemetry and fallback triggering | `vault/dr_replication_secondary.go` (`updateConvergenceTelemetry`, `convergenceFallbackEligible`, `shouldTriggerFallback`) | `vault/dr_replication_secondary.go` (`performFallback`, `performResnapshot`) |
 | Credit-based WindowUpdate flow control | `vault/dr_replication.go` (`StreamChanges` bidi handler, `waitForCredit`, credit-reader goroutine) | `vault/dr_replication_secondary.go` (`runStream` bidi init + credit-sender goroutine, `runStreamApplyWorker` credit replenishment) |
+| Secondary controller loop (connect/start/redirect) | N/A | `vault/dr_secondary_controller.go` (`startSecondaryControllerLocked`, redirect fallback, config address revert) |
+| Standby node rejection (active leader check) | `vault/dr_replication.go` (`requireActiveNode`, `DRRedirectDetail` gRPC status) | `vault/dr_replication_secondary.go` (`extractDRRedirect`) |
+| Stream resume fast-path | N/A | `vault/dr_replication_secondary.go` (`streamResumeAttempts`, `isReconciliationRequired`) |
 
 ### Protocol Surface
 
@@ -652,7 +746,7 @@ Alternatives rejected:
 | Range digest RPC (fine-grained drill-down) | `vault/dr_replication_service.proto` (`RangeDigestRequest`, `RangeDigestResponse`, `RangeDigest`) |
 | Dirty Bitmap exchange | `vault/dr_replication_service.proto` (`DirtyBitmapMessage`) |
 | Provenance-safe fetch and range/bucket fetch | `vault/dr_replication_service.proto` (`FetchEntriesRequest`, `FetchItem`, `EntryBatch`) |
-| Heartbeat and wrapped bootstrap exchange | `vault/dr_replication_service.proto` (`DRHeartbeat*`, `SyncKeyring*`) |
+| Heartbeat, cert propagation, and wrapped bootstrap exchange | `vault/dr_replication_service.proto` (`DRHeartbeat*` incl. `active_cluster_cert`, `leader_cluster_addr`, `DRRedirectDetail`, `SyncKeyring*`) |
 
 ### Security and Relationship Lifecycle
 
@@ -665,7 +759,9 @@ Alternatives rejected:
 | Relationship authorization checks | `vault/dr_relationship_authz.go` (`ValidateRelationshipAccess`) and `vault/dr_replication.go` (`authorizeRelationship`) |
 | Revocation semantics | `vault/dr_relationship_authz.go` (`RevokeRelationship`) and `vault/dr_replication.go` (`RevokeRelationship`) |
 | Heartbeat last-seen throttling | `vault/dr_relationship_authz.go` (`MarkRelationshipSeen`) |
-| Cluster cert trust and fingerprint propagation | `vault/dr_cluster.go` and `vault/dr_replication.go` (`peerCertFingerprintFromContext`) |
+| Cluster cert trust and fingerprint propagation | `vault/dr_cluster.go` (`drReplicationClusterClient`, `trustedPrimaryCert`, `VerifyPeerCertificate`, `addTrustedCert`, `pruneTrustedCerts`, `initTrustedPool`) and `vault/dr_replication.go` (`peerCertFingerprintFromContext`) |
+| Dynamic TLS trust pool (secondary) | `vault/dr_replication_secondary.go` (`trustedPrimaryCerts` pool, `Connect` pool init, `runHeartbeatLoop` cert add/prune) |
+| Cluster.Client TLS verification callback | `vault/cluster/cluster.go` (`VerifyPeerCertificate` interface method, `GetContextDialerFunc` callback wiring) |
 
 ### API and Operational Wiring
 
@@ -685,7 +781,7 @@ Alternatives rejected:
 | RFC Area | Implementation |
 |---|---|
 | Public change-stream interface | `sdk/physical/physical.go` (`ChangeStreamEntry`, `ChangeStreamBackend`) |
-| Raft backend hook registration | `physical/raft/raft.go` (`HookChangeStream`) |
+| Raft backend hook registration + journal dir | `physical/raft/raft.go` (`HookChangeStream`, `JournalDir`) |
 | Ordered FSM batch hook emission | `physical/raft/fsm.go` (`hookChangeStream`, `ApplyBatch`) |
 | Seal-wrap propagation in transaction log ops | `physical/raft/raft.go` (`Put`) and `physical/raft/transaction.go` (`Put`, `Commit`) |
 | Strict scanner semantics + ciphertext domain | `physical/replication/reconciler/reconciler.go` (`Scan`, `ScanPhysical`, `ComputeKID`, `ComputeVID`, `beginScanSnapshot`, `beginScanSnapshotPhysical`) |
@@ -697,7 +793,8 @@ Alternatives rejected:
 | Bootstrap policy defaults | `vault/dr_replication_state.go` (bootstrap constants block) |
 | Last-seen persistence throttle | `vault/dr_replication_state.go` (`drLastSeenPersistInterval`) |
 | Checkpoint cache budgets, cardinality, TTL | `vault/dr_replication.go` (constants + `NewDRReplicationPrimary`) |
-| Range reconcile limits | `vault/dr_replication_secondary.go` (range budget constants + checks) |
+| Range reconcile limits and timeouts | `vault/dr_replication_secondary.go` (range budget constants, `drDefaultReconcileTimeout`, `drDefaultCheckpointRPCTimeout`) |
+| Stream resume and apply yield defaults | `vault/dr_replication_secondary.go` (`drMaxStreamResumeAttempts`, `drDefaultApplyYieldDuration`) |
 | Reconcile retry caps/cooldowns | `vault/dr_reconcile_session.go` (`shouldRetryReconcile`, `reconcileRetryCap`, `retryCapCooldown`) |
 | Deterministic range planner defaults | `physical/replication/reconciler/range.go` (`DefaultRangePlanConfig`) |
 | Epoch-based GC intervals | `vault/dr_gc.go` (`DefaultGCInterval`, `MaxTombstoneAge`) |
@@ -726,6 +823,9 @@ Alternatives rejected:
 | Tombstone GC watermark computation | `TestDRTombstoneGC_ComputesWatermarkFromSecondaryPressure`, `TestDRTombstoneGC_DisconnectedPeersExcludedFromWatermark`, `TestDRTombstoneGC_NoActivePeersUsesLocalIndex` (`vault/dr_replication_test.go`) |
 | Credit-based WindowUpdate flow control | `TestStreamChanges_InitialWindowRespected`, `TestStreamChanges_CreditFlowControl`, `TestStreamChanges_CreditTimeout` (`vault/dr_replication_test.go`) |
 | EntryBatch stream batching | `TestStreamChanges_BatchSizeRespected` (`vault/dr_replication_test.go`) |
+| Dynamic TLS trust pool (known cert, TOFU, eviction) | `TestDRClusterClient_VerifyKnownCert`, `TestDRClusterClient_VerifyTOFU`, `TestDRClusterClient_VerifyEmptyCerts`, `TestDRTrustPool_TTLEviction`, `TestHeartbeatResponse_ActiveClusterCert`, `TestInitTrustedPool`, `TestDRCertFingerprint` (`vault/dr_replication_test.go`) |
+| Shared journal dispatcher (all-node journal, primary delegation, leader transition) | `TestDispatcher_JournalAlwaysWritten`, `TestDispatcher_DelegatesToPrimary`, `TestDispatcher_LeaderTransitionJournalContinuity`, `TestDispatcher_SetClearPrimary`, `TestFilterDRReplicableEntries` (`vault/dr_replication_test.go`) |
+| Journal-based index warmup | `TestWarmIndexFromJournal`, `TestWarmIndexFromJournal_EmptyJournal`, `TestWarmIndexFromJournal_NilJournal` (`vault/dr_replication_test.go`) |
 
 ## Demo (CLI)
 
