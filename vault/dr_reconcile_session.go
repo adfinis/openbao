@@ -22,6 +22,7 @@ const (
 	drReconcileFailureCheckpointProof    drReconcileFailureClass = "checkpoint_provenance_mismatch"
 	drReconcileFailureApplyFailed        drReconcileFailureClass = "apply_failed"
 	drReconcileFailureAuthRevoked        drReconcileFailureClass = "auth_revoked"
+	drReconcileFailureRedirect           drReconcileFailureClass = "redirect"
 	drReconcileFailureUnknown            drReconcileFailureClass = "unknown"
 )
 
@@ -134,6 +135,10 @@ func (s *drReplicationSecondary) nextReconcileRetryDelay(class drReconcileFailur
 }
 
 func (s *drReplicationSecondary) shouldRetryReconcile(class drReconcileFailureClass) bool {
+	// Never retry a redirect -- the controller must reconnect to the new leader.
+	if class == drReconcileFailureRedirect {
+		return false
+	}
 	classKey := string(class)
 	s.sessionMu.RLock()
 	attempt := s.lastReconcileFailureByType[classKey]
@@ -183,6 +188,12 @@ func (s *drReplicationSecondary) retryCapCooldown(class drReconcileFailureClass)
 func classifyReconcileFailure(err error) drReconcileFailureClass {
 	if err == nil {
 		return drReconcileFailureUnknown
+	}
+	// Check for DR redirect first -- this is a structured gRPC error, not
+	// a string match. If the reconciler hit a standby node, we must abort
+	// immediately and reconnect to the leader.
+	if _, ok := extractDRRedirect(err); ok {
+		return drReconcileFailureRedirect
 	}
 	msg := strings.ToLower(err.Error())
 	switch {

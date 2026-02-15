@@ -27,7 +27,8 @@ func (m *drRelationshipManager) startSecondaryControllerLocked() {
 	loopCtx, cancel := context.WithCancel(m.core.activeContext)
 	m.secondaryLoopCancel = cancel
 
-	primaryAddr := m.config.PrimaryAddr
+	configAddr := m.config.PrimaryAddr // original address from config (e.g. HAProxy)
+	primaryAddr := configAddr
 	secondary := m.secondary
 
 	go func() {
@@ -42,6 +43,8 @@ func (m *drRelationshipManager) startSecondaryControllerLocked() {
 
 		backoff := 500 * time.Millisecond
 		const maxBackoff = 30 * time.Second
+		redirectFailures := 0        // consecutive failures on a redirected address
+		const redirectFailureMax = 2 // after this many, revert to configAddr
 
 		for {
 			select {
@@ -68,6 +71,19 @@ func (m *drRelationshipManager) startSecondaryControllerLocked() {
 				if backoff > maxBackoff {
 					backoff = maxBackoff
 				}
+
+				// If we're using a redirected address and it keeps
+				// failing, revert to the original config address (LB).
+				if primaryAddr != configAddr {
+					redirectFailures++
+					if redirectFailures >= redirectFailureMax {
+						m.logger.Warn("redirect address unreachable, reverting to config address",
+							"redirect_addr", primaryAddr,
+							"config_addr", configAddr)
+						primaryAddr = configAddr
+						redirectFailures = 0
+					}
+				}
 				continue
 			}
 
@@ -83,12 +99,29 @@ func (m *drRelationshipManager) startSecondaryControllerLocked() {
 						"old_addr", primaryAddr,
 						"new_addr", redirect.LeaderAddr)
 					primaryAddr = redirect.LeaderAddr
+					redirectFailures = 0
 					// Reconnect immediately without backoff.
 					continue
 				}
 
 				m.logger.Warn("DR secondary replication loop exited; reconnecting",
 					"error", err)
+
+				// If we're using a redirected address and Start()
+				// failed (e.g. retry cap exhausted), the address may
+				// be unreachable. Fall back to the config address so
+				// the next Connect() goes through the LB/HAProxy.
+				if primaryAddr != configAddr {
+					redirectFailures++
+					if redirectFailures >= redirectFailureMax {
+						m.logger.Warn("redirect address not working, reverting to config address",
+							"redirect_addr", primaryAddr,
+							"config_addr", configAddr)
+						primaryAddr = configAddr
+						redirectFailures = 0
+					}
+				}
+
 				jitter := time.Duration(randIntn(int(backoff / 5)))
 				if !sleepCtx(loopCtx, backoff+jitter) {
 					return // context cancelled during backoff

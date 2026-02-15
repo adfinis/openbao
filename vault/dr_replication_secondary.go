@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -24,6 +25,7 @@ import (
 	metrics "github.com/hashicorp/go-metrics/compat"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	_ "google.golang.org/grpc/encoding/gzip" // Register gzip compressor for DR streams
 	"google.golang.org/grpc/status"
 
 	"github.com/openbao/openbao/helper/namespace"
@@ -127,6 +129,19 @@ func drPathMatches(path string, exact map[string]bool, prefixes []string) bool {
 	return false
 }
 
+// isReconciliationRequired returns true when a stream error indicates the
+// primary cannot satisfy catch-up from the buffer/journal and a full
+// reconciliation is needed.
+func isReconciliationRequired(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "reconciliation required") ||
+		strings.Contains(msg, "buffer too old") ||
+		strings.Contains(msg, "journal too old")
+}
+
 // DRSecondaryState represents the current state of the DR secondary.
 type DRSecondaryState int32
 
@@ -198,6 +213,25 @@ const (
 	drDefaultFallbackWindow           = 10 * time.Minute
 	drDefaultFallbackCooldown         = 10 * time.Minute
 	drDefaultFallbackMaxPerHour       = 2
+
+	drMaxStreamResumeAttempts = 3
+	drDefaultReconcileTimeout = 10 * time.Minute
+
+	// drDefaultCheckpointRPCTimeout is the timeout for the
+	// RequestCheckpoint RPC specifically. This is longer than the
+	// general drDefaultRPCDeadline because the primary must build a
+	// checkpoint artifact (full storage scan + KID/VID index), which
+	// scales with the number of keys and can take minutes for large
+	// datasets (100K+ entries).
+	drDefaultCheckpointRPCTimeout = 5 * time.Minute
+
+	// drDefaultApplyYieldDuration is a short pause inserted after each
+	// successful batch commit in the DR apply path (both streaming and
+	// reconciliation).  This prevents the apply worker from monopolising
+	// the secondary's Raft subsystem and starving heartbeat processing,
+	// which can otherwise cause the secondary cluster to lose quorum
+	// under sustained write load.
+	drDefaultApplyYieldDuration = 1 * time.Millisecond
 )
 
 func (s DRSecondaryState) String() string {
@@ -259,6 +293,18 @@ type drReplicationSecondary struct {
 
 	// primaryCACert is the primary's TLS CA certificate for mTLS.
 	primaryCACert []byte
+
+	// trustedPrimaryCerts holds primary cluster TLS certificates
+	// keyed by SHA-256 fingerprint. Seeded from the activation
+	// token cert and updated from heartbeat responses. Entries
+	// older than trustedCertTTL are pruned during heartbeat ticks.
+	trustedPrimaryCertsMu sync.RWMutex
+	trustedPrimaryCerts   map[string]*trustedPrimaryCert
+
+	// drClusterClient is the cluster client registered with the
+	// cluster listener. Kept so the heartbeat loop can call
+	// addTrustedCert / pruneTrustedCerts directly.
+	drClusterClient *drReplicationClusterClient
 
 	// lastKnownLeaderAddr caches the active leader's cluster address,
 	// updated on each heartbeat. Used for redirect-based reconnection
@@ -359,6 +405,16 @@ type drReplicationSecondary struct {
 	reconcileTasksHandled   atomic.Uint64
 	reconcileTaskRateMillis atomic.Uint64
 	reconcilePhase          atomic.Uint32
+
+	// streamResumeAttempts tracks consecutive resume attempts after
+	// a non-redirect stream disconnect.  Reset on successful streaming
+	// or after falling back to reconciliation.
+	streamResumeAttempts int
+
+	// applyYieldDuration is the pause inserted after each successful
+	// Raft commit in the apply path to give the secondary's Raft
+	// heartbeat goroutines time to run.
+	applyYieldDuration time.Duration
 }
 
 // newDRReplicationSecondary creates a new secondary replication manager.
@@ -444,10 +500,23 @@ func (s *drReplicationSecondary) Connect(ctx context.Context, primaryAddr string
 		return fmt.Errorf("dr-secondary: failed to parse primary CA cert: %w", err)
 	}
 
-	client := &drReplicationClusterClient{
-		core:          s.core,
-		primaryCACert: parsedCert,
+	// Lazily initialize the trust pool (persists across reconnects).
+	s.trustedPrimaryCertsMu.Lock()
+	if s.trustedPrimaryCerts == nil {
+		s.trustedPrimaryCerts = make(map[string]*trustedPrimaryCert)
 	}
+	initTrustedPool(s.trustedPrimaryCerts, parsedCert)
+	s.trustedPrimaryCertsMu.Unlock()
+
+	client := &drReplicationClusterClient{
+		core:           s.core,
+		primaryCACert:  parsedCert,
+		logger:         s.logger,
+		trustedCertsMu: &s.trustedPrimaryCertsMu,
+		trustedCerts:   s.trustedPrimaryCerts,
+	}
+	s.drClusterClient = client
+
 	// Ensure client registration is idempotent across reconnects.
 	cl.RemoveClient(consts.DRReplicationALPN)
 	cl.AddClient(consts.DRReplicationALPN, client)
@@ -456,6 +525,7 @@ func (s *drReplicationSecondary) Connect(ctx context.Context, primaryAddr string
 	opts = append(opts,
 		grpc.WithContextDialer(dialerFunc),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.UseCompressor("gzip")),
 	)
 	s.transportReady.Store(true)
 	s.logger.Info("using mTLS dialer for DR replication")
@@ -512,14 +582,25 @@ func (s *drReplicationSecondary) Start(ctx context.Context) error {
 			if err := s.runReconciliation(ctx); err != nil {
 				s.logger.Error("initial reconciliation failed", "error", err)
 				class := s.markReconcileFailure(err)
+
+				// Redirect during initial reconciliation -- return to
+				// controller to reconnect to the actual leader.
+				if class == drReconcileFailureRedirect {
+					if addr, ok := extractDRRedirect(err); ok {
+						s.logger.Info("initial reconciliation redirected to new leader", "addr", addr)
+						return &errDRRedirect{LeaderAddr: addr}
+					}
+					return fmt.Errorf("initial reconciliation hit standby, reconnecting: %w", err)
+				}
+
 				s.reconcileRetries.Add(1)
 				if !s.shouldRetryReconcile(class) {
-					cooldown := s.retryCapCooldown(class)
-					s.logger.Warn("reconciliation retry cap reached; entering cooldown",
-						"class", class,
-						"cooldown", cooldown)
-					time.Sleep(cooldown)
-					continue
+					// Retry cap exhausted -- return to the controller
+					// so it can re-establish the gRPC connection. This
+					// handles the case where the secondary is connected
+					// to a node that keeps failing (e.g. wrong node
+					// after a stepdown) and needs a fresh Connect().
+					return fmt.Errorf("initial reconciliation retry cap exhausted (class=%s): %w", class, err)
 				}
 				time.Sleep(s.nextReconcileRetryDelay(class))
 				continue
@@ -541,6 +622,7 @@ func (s *drReplicationSecondary) Start(ctx context.Context) error {
 				continue
 			}
 
+			s.streamResumeAttempts = 0
 			s.setState(DRSecondaryStreaming)
 
 		case DRSecondaryStreaming:
@@ -554,30 +636,45 @@ func (s *drReplicationSecondary) Start(ctx context.Context) error {
 				s.streamDisconnects.Add(1)
 				metrics.IncrCounter([]string{"replication", "dr", "secondary", "stream_disconnects"}, 1)
 
-				// Check if the error is a redirect to a new leader.
+				// Redirect: must reconnect via controller to reach the new leader.
 				if addr, ok := extractDRRedirect(err); ok {
-					s.logger.Info("redirected to new leader", "addr", addr)
+					s.logger.Info("stream returned redirect to new leader", "addr", addr)
+					s.streamResumeAttempts = 0
 					s.setState(DRSecondaryReconciling)
 					return &errDRRedirect{LeaderAddr: addr}
 				}
 
-				// Check if we have a cached leader address from heartbeats
-				// that differs from our current connection. This handles the
-				// case where the stream broke due to a stepdown but the error
-				// itself doesn't carry a redirect.
-				if addrPtr := s.lastKnownLeaderAddr.Load(); addrPtr != nil && *addrPtr != "" {
-					s.logger.Info("stream disconnected, reconnecting to last known leader", "addr", *addrPtr)
+				// If the primary explicitly says reconciliation is needed
+				// (buffer/journal too old to catch up), go directly to
+				// reconciling without wasting resume attempts.
+				if isReconciliationRequired(err) {
+					s.logger.Info("primary requires reconciliation", "error", err)
+					s.streamResumeAttempts = 0
 					s.setState(DRSecondaryReconciling)
-					return &errDRRedirect{LeaderAddr: *addrPtr}
+					continue
 				}
 
-				// No redirect info available. Return the error to the
-				// controller loop so it can re-establish the gRPC
-				// connection via Connect(). This handles the LB case
-				// where the controller just redials the same address.
-				s.setState(DRSecondaryReconciling)
-				return fmt.Errorf("stream disconnected, reconnecting: %w", err)
+				// Transient error: attempt stream resume.  The primary's
+				// StreamChanges handler has built-in catch-up replay from
+				// the buffer/journal keyed on lastAppliedIndex, so a
+				// simple reconnect often avoids a full reconciliation.
+				s.streamResumeAttempts++
+				if s.streamResumeAttempts > drMaxStreamResumeAttempts {
+					s.logger.Warn("stream resume attempts exhausted, falling back to reconciliation",
+						"attempts", s.streamResumeAttempts)
+					s.streamResumeAttempts = 0
+					s.setState(DRSecondaryReconciling)
+					continue
+				}
+
+				s.logger.Info("attempting stream resume",
+					"attempt", s.streamResumeAttempts,
+					"last_applied", s.lastAppliedIndex.Load())
+				time.Sleep(500 * time.Millisecond)
+				continue // Re-enter Streaming case -> runStream again
 			}
+			// Stream ended cleanly (EOF). Reset resume counter.
+			s.streamResumeAttempts = 0
 
 		case DRSecondaryReconciling:
 			if requested, reason := s.consumeResnapshotRequest(); requested {
@@ -588,6 +685,20 @@ func (s *drReplicationSecondary) Start(ctx context.Context) error {
 			if err := s.runReconciliation(ctx); err != nil {
 				s.logger.Error("reconciliation failed", "error", err)
 				class := s.markReconcileFailure(err)
+
+				// If the reconciler hit a standby (redirect), abort
+				// immediately and return to the controller so it can
+				// reconnect to the actual leader.
+				if class == drReconcileFailureRedirect {
+					if addr, ok := extractDRRedirect(err); ok {
+						s.logger.Info("reconciliation redirected to new leader", "addr", addr)
+						return &errDRRedirect{LeaderAddr: addr}
+					}
+					// Redirect classified but address not parseable;
+					// fall through to generic reconnect.
+					return fmt.Errorf("reconciliation hit standby, reconnecting: %w", err)
+				}
+
 				s.recordFallbackFailure(class)
 				if s.shouldTriggerFallback(class) {
 					s.logger.Warn("triggering automatic resnapshot fallback",
@@ -600,17 +711,17 @@ func (s *drReplicationSecondary) Start(ctx context.Context) error {
 				}
 				s.reconcileRetries.Add(1)
 				if !s.shouldRetryReconcile(class) {
-					cooldown := s.retryCapCooldown(class)
-					s.logger.Warn("reconciliation retry cap reached; entering cooldown",
-						"class", class,
-						"cooldown", cooldown)
-					time.Sleep(cooldown)
-					continue
+					// Retry cap exhausted -- return to the controller
+					// so it can re-establish the gRPC connection. This
+					// breaks the internal retry loop when the secondary
+					// is stuck talking to the wrong node.
+					return fmt.Errorf("reconciliation retry cap exhausted (class=%s): %w", class, err)
 				}
 				time.Sleep(s.nextReconcileRetryDelay(class))
 				continue
 			}
 			s.markReconcileSuccess()
+			s.streamResumeAttempts = 0
 			s.setState(DRSecondaryStreaming)
 
 		case DRSecondaryResnapshotting:
@@ -622,12 +733,23 @@ func (s *drReplicationSecondary) Start(ctx context.Context) error {
 			if err := s.performResnapshot(ctx, reason); err != nil {
 				s.logger.Error("resnapshot fallback failed", "error", err)
 				class := s.markReconcileFailure(err)
+
+				// Redirect during resnapshot -- return to controller.
+				if class == drReconcileFailureRedirect {
+					if addr, ok := extractDRRedirect(err); ok {
+						s.logger.Info("resnapshot redirected to new leader", "addr", addr)
+						return &errDRRedirect{LeaderAddr: addr}
+					}
+					return fmt.Errorf("resnapshot hit standby, reconnecting: %w", err)
+				}
+
 				s.reconcileRetries.Add(1)
 				time.Sleep(s.nextReconcileRetryDelay(class))
 				s.setState(DRSecondaryReconciling)
 				continue
 			}
 			s.markReconcileSuccess()
+			s.streamResumeAttempts = 0
 			s.setState(DRSecondaryStreaming)
 
 		case DRSecondaryPromoting, DRSecondaryStandalone:
@@ -1171,6 +1293,15 @@ func (s *drReplicationSecondary) runHeartbeatLoop(ctx context.Context) {
 		if addr := resp.GetLeaderClusterAddr(); addr != "" {
 			s.lastKnownLeaderAddr.Store(&addr)
 		}
+
+		// Add the active leader's cluster certificate to the
+		// dynamic trust pool and prune expired entries.
+		if cert := resp.GetActiveClusterCert(); len(cert) > 0 {
+			if cl := s.drClusterClient; cl != nil {
+				cl.addTrustedCert(cert)
+				cl.pruneTrustedCerts()
+			}
+		}
 	}
 }
 
@@ -1451,9 +1582,9 @@ func (s *drReplicationSecondary) performResnapshot(ctx context.Context, reason s
 	s.reconcileDeletePhaseMS.Store(0)
 	s.reconcileBudgetRemainingByte.Store(int64(s.reconcileMaxRPCBytes))
 
-	rpcCtx, cancel := s.rpcContext(ctx)
-	checkpoint, err := s.client.RequestCheckpoint(rpcCtx, &CheckpointRequest{RelationshipId: s.relationshipID})
-	cancel()
+	checkpointCtx, checkpointCancel := context.WithTimeout(ctx, drDefaultCheckpointRPCTimeout)
+	checkpoint, err := s.client.RequestCheckpoint(checkpointCtx, &CheckpointRequest{RelationshipId: s.relationshipID})
+	checkpointCancel()
 	if err != nil {
 		return fmt.Errorf("failed to request checkpoint for resnapshot: %w", err)
 	}
@@ -1886,9 +2017,17 @@ func (s *drReplicationSecondary) runStream(ctx context.Context) error {
 		return fmt.Errorf("failed to open change stream: %w", err)
 	}
 
-	applyQueueSize := s.streamBatchMaxEntries * 4
-	if applyQueueSize < 1024 {
-		applyQueueSize = 1024
+	applyQueueEntries := s.streamBatchMaxEntries * 4
+	if applyQueueEntries < 1024 {
+		applyQueueEntries = 1024
+	}
+	// Size the batch channel by the number of gRPC batches, not
+	// individual entries.  Each batch can carry up to 64 entries
+	// (drStreamSendBatchMaxEntries), so the channel depth is the
+	// total capacity divided by the expected batch size.
+	applyQueueBatches := applyQueueEntries / drStreamSendBatchMaxEntries
+	if applyQueueBatches < 64 {
+		applyQueueBatches = 64
 	}
 
 	// Send the init message with the initial credit window.
@@ -1897,14 +2036,14 @@ func (s *drReplicationSecondary) runStream(ctx context.Context) error {
 			Init: &StreamChangesRequest{
 				RelationshipId:   s.relationshipID,
 				LastAppliedIndex: s.lastAppliedIndex.Load(),
-				InitialWindow:    uint64(applyQueueSize),
+				InitialWindow:    uint64(applyQueueEntries),
 			},
 		},
 	}); err != nil {
 		return fmt.Errorf("failed to send stream init: %w", err)
 	}
 
-	applyCh := make(chan *EntryChange, applyQueueSize)
+	applyCh := make(chan []*EntryChange, applyQueueBatches)
 	creditReplenishCh := make(chan uint64, 64)
 	applyErrCh := make(chan error, 1)
 	go func() {
@@ -1971,8 +2110,13 @@ func (s *drReplicationSecondary) runStream(ctx context.Context) error {
 			return fmt.Errorf("change stream error: %w", err)
 		}
 
-		// Unpack the EntryBatch and process each entry individually.
-		for _, change := range batch.GetEntries() {
+		// Validate monotonic index ordering and filter stale entries,
+		// then deliver the entire batch slice in one channel send to
+		// reduce per-entry channel overhead and let the apply worker
+		// form optimal transaction batches.
+		entries := batch.GetEntries()
+		filtered := make([]*EntryChange, 0, len(entries))
+		for _, change := range entries {
 			// Monotonic index check: indices must never go backwards.
 			// Gaps (change.RaftIndex > expectedNext) are expected and
 			// normal because the primary filters out non-replicable
@@ -1989,20 +2133,45 @@ func (s *drReplicationSecondary) runStream(ctx context.Context) error {
 				s.logger.Warn("received out-of-order raft index on change stream",
 					"expected_at_least", expectedNext,
 					"received_index", change.RaftIndex)
-				// Skip stale/duplicate entries but keep the stream alive.
 				continue
 			}
 
 			if next := change.RaftIndex + 1; next > expectedNext {
 				expectedNext = next
 			}
+			filtered = append(filtered, change)
+		}
 
+		if len(filtered) > 0 {
+			// Block until the apply worker consumes the batch. This
+			// exerts natural backpressure on the primary via the credit
+			// system: while we're blocked here, no WindowUpdate is sent,
+			// so the primary stops sending new entries.  Only tear down
+			// the stream if we've been blocked longer than the stall
+			// timeout (indicating a genuine apply failure, not a
+			// transient slow-down).
+			stallTimeout := s.reconcileStallAbort
+			if stallTimeout <= 0 {
+				stallTimeout = drDefaultReconcileStallAbort
+			}
+			timer := time.NewTimer(stallTimeout)
 			select {
-			case applyCh <- change:
-			default:
+			case applyCh <- filtered:
+				timer.Stop()
+			case <-timer.C:
 				close(applyCh)
 				_ = <-applyErrCh
-				return fmt.Errorf("change stream apply queue full (capacity=%d); reconciliation required", cap(applyCh))
+				return fmt.Errorf("change stream apply stalled for %s; reconciliation required", stallTimeout)
+			case <-ctx.Done():
+				timer.Stop()
+				close(applyCh)
+				_ = <-applyErrCh
+				return ctx.Err()
+			case <-s.stopCh:
+				timer.Stop()
+				close(applyCh)
+				_ = <-applyErrCh
+				return nil
 			}
 		}
 	}
@@ -2013,7 +2182,7 @@ func (s *drReplicationSecondary) runStream(ctx context.Context) error {
 // After each successful flush it sends the number of flushed entries to
 // creditReplenishCh so the credit-sender goroutine can issue a WindowUpdate
 // to the primary.
-func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, applyCh <-chan *EntryChange, creditReplenishCh chan<- uint64) error {
+func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, applyCh <-chan []*EntryChange, creditReplenishCh chan<- uint64) error {
 	maxEntries := s.streamBatchMaxEntries
 	if maxEntries <= 0 {
 		maxEntries = drDefaultStreamBatchMaxEntries
@@ -2052,6 +2221,24 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 		}
 	}
 
+	// Probe transaction support once. If the backend doesn't support
+	// transactions we skip the attempt entirely on every flush.
+	txnBackend, txnSupported := s.core.physical.(physical.Transactional)
+	var txnLogOnce sync.Once
+
+	// yieldDuration is a short pause after each Raft commit that gives
+	// the secondary's Raft heartbeat goroutines time to run, preventing
+	// quorum loss under sustained apply pressure.
+	yieldDuration := s.applyYieldDuration
+	if yieldDuration <= 0 {
+		yieldDuration = drDefaultApplyYieldDuration
+	}
+
+	applyYield := func() {
+		runtime.Gosched()
+		time.Sleep(yieldDuration)
+	}
+
 	// Flush consumes the current batch. It optimistically tries a transaction,
 	// and falls back to sequential application on error.
 	flush := func() error {
@@ -2063,19 +2250,28 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 		applyStart := time.Now()
 
 		// Optimization: Try to apply as a transaction if supported
-		if txnBackend, ok := s.core.physical.(physical.Transactional); ok {
+		if txnSupported {
 			if err := s.applyStreamTxn(ctx, txnBackend, batch); err == nil {
 				// Transaction succeeded
+				txnLogOnce.Do(func() {
+					s.logger.Info("stream apply using transactional batching",
+						"batch_max_entries", maxEntries,
+						"batch_max_bytes", maxBytes)
+				})
+				metrics.IncrCounter([]string{"replication", "dr", "secondary", "stream_txn_success"}, 1)
 				metrics.MeasureSince([]string{"replication", "dr", "secondary", "apply_latency"}, applyStart)
 
 				// Clear batch
 				batch = batch[:0]
 				batchBytes = 0
 				replenishCredits(flushedCount)
+				applyYield()
 				return nil
 			} else {
 				// Transaction failed; log warning and fall back to sequential
-				s.logger.Warn("transactional batch apply failed, falling back to sequential", "error", err)
+				metrics.IncrCounter([]string{"replication", "dr", "secondary", "stream_txn_fallback"}, 1)
+				s.logger.Warn("transactional batch apply failed, falling back to sequential",
+					"error", err, "batch_size", flushedCount)
 			}
 		}
 
@@ -2098,6 +2294,7 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 		batch = batch[:0]
 		batchBytes = 0
 		replenishCredits(flushedCount)
+		applyYield()
 		return nil
 	}
 
@@ -2111,13 +2308,15 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 			if err := flush(); err != nil {
 				return err
 			}
-		case change, ok := <-applyCh:
+		case incoming, ok := <-applyCh:
 			if !ok {
 				return flush()
 			}
-			batch = append(batch, change)
-			// Rough estimate of memory size: key + value + overhead
-			batchBytes += len(change.Key) + len(change.Value) + 48
+			for _, change := range incoming {
+				batch = append(batch, change)
+				// Rough estimate of memory size: key + value + overhead
+				batchBytes += len(change.Key) + len(change.Value) + 48
+			}
 			if len(batch) >= maxEntries || batchBytes >= maxBytes {
 				if err := flush(); err != nil {
 					return err
@@ -2399,6 +2598,13 @@ func (s *drReplicationSecondary) applyFetchedChangeWithKIDMap(ctx context.Contex
 func (s *drReplicationSecondary) runReconciliation(ctx context.Context) error {
 	s.logger.Info("starting reconciliation")
 	startTime := time.Now()
+
+	// Bound the total time a single reconciliation attempt may run so
+	// that a slow scan, checkpoint build, or stalled FetchEntries RPC
+	// cannot hang the secondary indefinitely.
+	reconcileCtx, reconcileCancel := context.WithTimeout(ctx, drDefaultReconcileTimeout)
+	defer reconcileCancel()
+
 	s.setReconcilePhase(drReconcilePhaseRangeTasks)
 	s.reconcileRPCBytesUsed.Store(0)
 	s.rangeSplitCount.Store(0)
@@ -2411,11 +2617,14 @@ func (s *drReplicationSecondary) runReconciliation(ctx context.Context) error {
 	}()
 
 	// Step 1: Request a checkpoint from the primary.
-	rpcCtx, cancel := s.rpcContext(ctx)
-	checkpoint, err := s.client.RequestCheckpoint(rpcCtx, &CheckpointRequest{
+	// Use a dedicated longer timeout: the primary may need to build the
+	// checkpoint artifact from scratch (full storage scan + KID/VID
+	// index), which scales linearly with key count.
+	checkpointCtx, checkpointCancel := context.WithTimeout(reconcileCtx, drDefaultCheckpointRPCTimeout)
+	checkpoint, err := s.client.RequestCheckpoint(checkpointCtx, &CheckpointRequest{
 		RelationshipId: s.relationshipID,
 	})
-	cancel()
+	checkpointCancel()
 	if err != nil {
 		return fmt.Errorf("failed to request checkpoint: %w", err)
 	}
@@ -2430,14 +2639,14 @@ func (s *drReplicationSecondary) runReconciliation(ctx context.Context) error {
 		ID:          checkpoint.CheckpointId,
 		CommitIndex: checkpoint.CommitIndex,
 	}
-	localSet, err := s.scanner.Scan(ctx, s.core.barrier, localCheckpoint)
+	localSet, err := s.scanner.Scan(reconcileCtx, s.core.barrier, localCheckpoint)
 	if err != nil {
 		s.scanFailures.Add(1)
 		return fmt.Errorf("failed to scan local storage: %w", err)
 	}
 	s.logger.Info("local scan complete", "keys", localSet.KeyCount)
 
-	if err := s.runRangeReconciliation(ctx, checkpoint, localSet, startTime); err != nil {
+	if err := s.runRangeReconciliation(reconcileCtx, checkpoint, localSet, startTime); err != nil {
 		return err
 	}
 	return nil
@@ -2523,11 +2732,13 @@ func (b *drRangeBudget) addRPC(n uint64) error {
 }
 
 type drPutApplyPipeline struct {
-	secondary *drReplicationSecondary
-	ctx       context.Context
-	cancel    context.CancelFunc
-	kidToKey  map[[32]byte]string
-	onApply   func()
+	secondary  *drReplicationSecondary
+	ctx        context.Context
+	cancel     context.CancelFunc
+	kidToKey   map[[32]byte]string
+	onApply    func()
+	txnBackend physical.TransactionalBackend // nil if physical backend doesn't support transactions
+	submitted  atomic.Int64                  // total entries submitted (for diagnostics)
 
 	shards []chan *EntryChange
 	wg     sync.WaitGroup
@@ -2547,13 +2758,21 @@ func newDRPutApplyPipeline(ctx context.Context, secondary *drReplicationSecondar
 		queueDepth = 1024
 	}
 	workerCtx, cancel := context.WithCancel(ctx)
+
+	// Probe for TransactionalBackend support to enable batch commits.
+	var txnBackend physical.TransactionalBackend
+	if tb, ok := secondary.core.physical.(physical.TransactionalBackend); ok {
+		txnBackend = tb
+	}
+
 	p := &drPutApplyPipeline{
-		secondary: secondary,
-		ctx:       workerCtx,
-		cancel:    cancel,
-		kidToKey:  kidToKey,
-		onApply:   onApply,
-		shards:    make([]chan *EntryChange, workers),
+		secondary:  secondary,
+		ctx:        workerCtx,
+		cancel:     cancel,
+		kidToKey:   kidToKey,
+		onApply:    onApply,
+		txnBackend: txnBackend,
+		shards:     make([]chan *EntryChange, workers),
 	}
 	for i := 0; i < workers; i++ {
 		ch := make(chan *EntryChange, queueDepth/workers+1)
@@ -2581,6 +2800,13 @@ func (p *drPutApplyPipeline) runWorker(ch <-chan *EntryChange) {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 
+	// Yield duration to let the secondary's Raft heartbeat goroutines
+	// run between reconciliation batch commits.
+	yieldDuration := p.secondary.applyYieldDuration
+	if yieldDuration <= 0 {
+		yieldDuration = drDefaultApplyYieldDuration
+	}
+
 	batch := make([]*EntryChange, 0, maxEntries)
 	batchBytes := 0
 
@@ -2589,7 +2815,7 @@ func (p *drPutApplyPipeline) runWorker(ch <-chan *EntryChange) {
 			return
 		}
 
-		// Coalesce updates by key to reduce work
+		// Coalesce updates by key to reduce work.
 		coalesced := make([]*EntryChange, 0, len(batch))
 		putPosByKey := make(map[string]int, len(batch))
 		for _, change := range batch {
@@ -2606,11 +2832,24 @@ func (p *drPutApplyPipeline) runWorker(ch <-chan *EntryChange) {
 			coalesced = append(coalesced, change)
 		}
 
-		// Fallback: apply sequentially
-		for _, change := range coalesced {
-			if err := p.secondary.applyFetchedChange(p.ctx, change, p.kidToKey); err != nil {
+		if p.txnBackend != nil {
+			// Batch-apply using a single Raft transaction instead of
+			// individual consensus rounds per entry. This turns N Raft
+			// commits into 1, dramatically reducing apply time during
+			// reconciliation of large key sets.
+			if err := p.applyBatchTxn(coalesced); err != nil {
 				p.setErr(fmt.Errorf("reconcile apply worker failed: %w", err))
+				batch = batch[:0]
+				batchBytes = 0
 				return
+			}
+		} else {
+			// Fallback: apply sequentially when transactions unsupported.
+			for _, change := range coalesced {
+				if err := p.secondary.applyFetchedChange(p.ctx, change, p.kidToKey); err != nil {
+					p.setErr(fmt.Errorf("reconcile apply worker failed: %w", err))
+					return
+				}
 			}
 		}
 
@@ -2620,6 +2859,10 @@ func (p *drPutApplyPipeline) runWorker(ch <-chan *EntryChange) {
 		}
 		batch = batch[:0]
 		batchBytes = 0
+
+		// Yield to Raft heartbeat goroutines after each commit.
+		runtime.Gosched()
+		time.Sleep(yieldDuration)
 	}
 
 	for {
@@ -2642,12 +2885,96 @@ func (p *drPutApplyPipeline) runWorker(ch <-chan *EntryChange) {
 	}
 }
 
-// applyFetchedTxn attempts to apply a batch of fetched changes in a single transaction.
+// applyBatchTxn applies a batch of coalesced changes in a single Raft
+// transaction.  Entries that require special post-commit handling (the
+// barrier keyring and root key) are extracted and applied individually
+// after the transaction commits so that the reload + seal-persist logic
+// in applyFetchedChange fires correctly.
+func (p *drPutApplyPipeline) applyBatchTxn(entries []*EntryChange) error {
+	// Partition entries: "normal" go into the transaction, "keyring"
+	// entries need the special reload path in applyFetchedChange.
+	var keyringEntries []*EntryChange
+	normalEntries := make([]*EntryChange, 0, len(entries))
+
+	for _, change := range entries {
+		if change == nil {
+			continue
+		}
+		if change.Key != "" && isDRNeverReplicatePath(change.Key) {
+			continue
+		}
+		if change.Key == "core/keyring" || change.Key == "core/root-key" {
+			keyringEntries = append(keyringEntries, change)
+		} else {
+			normalEntries = append(normalEntries, change)
+		}
+	}
+
+	// Batch-commit normal entries in a single Raft round.
+	if len(normalEntries) > 0 {
+		tx, err := p.txnBackend.BeginTx(p.ctx)
+		if err != nil {
+			return fmt.Errorf("begin batch txn: %w", err)
+		}
+
+		for _, change := range normalEntries {
+			switch physical.Operation(change.OpType) {
+			case physical.PutOperation:
+				if err := tx.Put(p.ctx, &physical.Entry{
+					Key:      change.Key,
+					Value:    change.Value,
+					SealWrap: change.SealWrap,
+				}); err != nil {
+					_ = tx.Rollback(p.ctx)
+					return fmt.Errorf("batch txn put %q: %w", change.Key, err)
+				}
+
+			case physical.DeleteOperation:
+				key := change.Key
+				if key == "" && len(change.Kid) == 32 && p.kidToKey != nil {
+					var kid [32]byte
+					copy(kid[:], change.Kid)
+					if k, ok := p.kidToKey[kid]; ok {
+						if isDRNeverReplicatePath(k) {
+							continue
+						}
+						key = k
+					}
+				}
+				if key != "" {
+					if err := tx.Delete(p.ctx, key); err != nil {
+						_ = tx.Rollback(p.ctx)
+						return fmt.Errorf("batch txn delete %q: %w", key, err)
+					}
+				}
+
+			default:
+				_ = tx.Rollback(p.ctx)
+				return fmt.Errorf("unknown operation type in fetched change: op_type=%s key=%s", change.OpType, change.Key)
+			}
+		}
+
+		if err := tx.Commit(p.ctx); err != nil {
+			return fmt.Errorf("commit batch txn (%d entries): %w", len(normalEntries), err)
+		}
+	}
+
+	// Apply keyring / root-key entries individually so that the barrier
+	// reload and seal-persist side-effects run in the correct order.
+	for _, change := range keyringEntries {
+		if err := p.secondary.applyFetchedChange(p.ctx, change, p.kidToKey); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
 
 func (p *drPutApplyPipeline) submit(entries []*EntryChange) error {
 	if len(entries) == 0 {
 		return p.Err()
 	}
+	var count int64
 	for _, entry := range entries {
 		if entry == nil {
 			continue
@@ -2657,8 +2984,10 @@ func (p *drPutApplyPipeline) submit(entries []*EntryChange) error {
 		case <-p.ctx.Done():
 			return p.Err()
 		case p.shards[shard] <- entry:
+			count++
 		}
 	}
+	p.submitted.Add(count)
 	return p.Err()
 }
 
@@ -2684,12 +3013,14 @@ func (p *drPutApplyPipeline) closeAndWait() error {
 	}()
 	timeout := p.secondary.reconcileStallAbort
 	if timeout <= 0 {
-		timeout = 2 * time.Minute
+		timeout = 5 * time.Minute
 	}
+	submitted := p.submitted.Load()
 	select {
 	case <-done:
 	case <-time.After(timeout):
-		p.setErr(fmt.Errorf("apply phase exceeded %s", timeout.Round(time.Second)))
+		p.setErr(fmt.Errorf("apply phase exceeded %s (%d entries submitted, txn=%v)",
+			timeout.Round(time.Second), submitted, p.txnBackend != nil))
 		p.cancel()
 		return p.Err()
 	}
@@ -3169,12 +3500,53 @@ func (s *drReplicationSecondary) applyRemovedKeys(ctx context.Context, checkpoin
 		return fmt.Errorf("checkpoint conflict: %w", err)
 	}
 	sort.Strings(keys)
+
+	// Filter out non-replicable paths.
+	filtered := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if !isDRNeverReplicatePath(key) {
+			filtered = append(filtered, key)
+		}
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+
+	// Batch deletes using transactions when supported, mirroring the
+	// batch PUT path in applyBatchTxn.
+	if txnBackend, ok := s.core.physical.(physical.TransactionalBackend); ok {
+		batchSize := s.reconcilePutBatchEntries
+		if batchSize <= 0 {
+			batchSize = drDefaultReconcilePutBatchEntries
+		}
+		for i := 0; i < len(filtered); i += batchSize {
+			end := i + batchSize
+			if end > len(filtered) {
+				end = len(filtered)
+			}
+			batch := filtered[i:end]
+
+			tx, err := txnBackend.BeginTx(ctx)
+			if err != nil {
+				return fmt.Errorf("begin delete txn: %w", err)
+			}
+			for _, key := range batch {
+				if err := tx.Delete(ctx, key); err != nil {
+					_ = tx.Rollback(ctx)
+					return fmt.Errorf("batch txn delete %q: %w", key, err)
+				}
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return fmt.Errorf("commit delete txn (%d keys): %w", len(batch), err)
+			}
+		}
+		return nil
+	}
+
+	// Fallback: sequential deletes.
 	failures := 0
 	examples := make([]string, 0, 5)
-	for _, key := range keys {
-		if isDRNeverReplicatePath(key) {
-			continue
-		}
+	for _, key := range filtered {
 		if err := s.core.physical.Delete(ctx, key); err != nil {
 			failures++
 			if len(examples) < cap(examples) {
