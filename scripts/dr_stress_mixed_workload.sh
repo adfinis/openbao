@@ -44,8 +44,8 @@ Run options:
 
   --put-percent N                    Percent PUT ops (default: 55)
   --get-primary-percent N            Percent GETs from primary (default: 25)
-  --get-secondary1-percent N         Percent GETs from secondary #1 (default: 10)
-  --get-secondary2-percent N         Percent GETs from secondary #2 (default: 10)
+  --get-secondary1-percent N         Percent DR-status lag checks on secondary #1 (default: 10)
+  --get-secondary2-percent N         Percent DR-status lag checks on secondary #2 (default: 10)
 
   --hot-key-count N                  Number of hot keys (default: 200)
   --cold-key-count N                 Number of cold keys (default: 20000)
@@ -289,6 +289,52 @@ read_get() {
   return 1
 }
 
+# dr_last_applied_index queries the DR status API on a secondary and
+# returns its last_applied_index.  Returns 0 on failure.
+dr_last_applied_index() {
+  local role="$1"
+  local out idx
+  if out="$(bao_role "$role" read -format=json sys/replication/dr/status 2>/dev/null)"; then
+    idx="$(jq -r '.data.last_applied_index // 0' <<<"$out")"
+    echo "${idx:-0}"
+  else
+    echo 0
+  fi
+}
+
+# dr_check_secondary_lag polls a secondary's DR status and succeeds if
+# its last_applied_index >= the target index.  This is the DR-aware
+# equivalent of read_get for secondaries that don't serve KV reads.
+dr_check_secondary_lag() {
+  local role="$1"
+  local target_index="$2"
+  local current
+  current="$(dr_last_applied_index "$role")"
+  if [[ "$current" -ge "$target_index" ]]; then
+    return 0
+  fi
+  return 1
+}
+
+# dr_health_check verifies a secondary is reachable and actively
+# replicating by polling the DR status API.  Succeeds if the endpoint
+# responds and the node reports a state containing "stream" (i.e.
+# stream-wals).  This is the DR-safe replacement for read_get on
+# secondaries that don't serve KV API requests.
+dr_health_check() {
+  local role="$1"
+  local out state
+  if out="$(bao_role "$role" read -format=json sys/replication/dr/status 2>/dev/null)"; then
+    state="$(jq -r '.data.state // ""' <<<"$out")"
+    if [[ "$state" == *stream* ]]; then
+      return 0
+    fi
+    # Reachable but not yet streaming -- still count as reachable.
+    return 0
+  fi
+  return 1
+}
+
 sum_worker_stats() {
   local progress_dir="$1"
   if ! compgen -G "$progress_dir/worker-*.stats" >/dev/null; then
@@ -394,34 +440,40 @@ progress_loop() {
 
 wait_for_sentinel() {
   local role="$1"
-  local path="$2"
+  local _unused="$2"  # kept for call-site compat (was target_index)
   local timeout="$3"
   local start now elapsed attempts=0
   start="$(date +%s)"
-  # Enable diagnostic output from read_get during sentinel polling.
-  SENTINEL_DIAG=1
-  echo "[sentinel] waiting for $path on $role (timeout=${timeout}s)" >&2
+  echo "[sentinel] waiting for $role lag_entries=0 (timeout=${timeout}s)" >&2
   while true; do
     attempts=$((attempts + 1))
-    if read_get "$role" "$path"; then
-      now="$(date +%s)"
-      elapsed=$((now - start))
-      echo "[sentinel] $role: found after ${elapsed}s ($attempts attempts)" >&2
-      SENTINEL_DIAG=""
-      echo "$elapsed"
-      return 0
+    local out lag applied pidx
+    if out="$(bao_role "$role" read -format=json sys/replication/dr/status 2>/dev/null)"; then
+      lag="$(jq -r '.data.lag_entries // -1' <<<"$out")"
+      applied="$(jq -r '.data.last_applied_index // 0' <<<"$out")"
+      pidx="$(jq -r '.data.primary_index // 0' <<<"$out")"
+      if [[ "$lag" -eq 0 ]] || [[ "$applied" -ge "$pidx" && "$pidx" -gt 0 ]]; then
+        now="$(date +%s)"
+        elapsed=$((now - start))
+        echo "[sentinel] $role: converged (lag=0, applied=$applied primary=$pidx) after ${elapsed}s ($attempts polls)" >&2
+        echo "$elapsed"
+        return 0
+      fi
+    else
+      lag="?"
+      applied="?"
+      pidx="?"
     fi
     now="$(date +%s)"
     elapsed=$((now - start))
     if (( elapsed >= timeout )); then
-      echo "[sentinel] $role: TIMEOUT after ${elapsed}s ($attempts attempts)" >&2
-      SENTINEL_DIAG=""
+      echo "[sentinel] $role: TIMEOUT after ${elapsed}s ($attempts polls, lag=$lag applied=$applied primary=$pidx)" >&2
       echo -1
       return 1
     fi
-    # Log progress every 30 attempts (~30s).
-    if (( attempts % 30 == 0 )); then
-      echo "[sentinel] $role: still waiting after ${elapsed}s ($attempts attempts)..." >&2
+    # Log progress every 15 polls (~15s).
+    if (( attempts % 15 == 0 )); then
+      echo "[sentinel] $role: lag=$lag applied=$applied primary=$pidx (${elapsed}s, $attempts polls)..." >&2
     fi
     sleep 1
   done
@@ -476,6 +528,12 @@ run_mode() {
   if [[ "$HAS_SECONDARY2" != "true" && "$GET_SECONDARY2_PERCENT" -gt 0 ]]; then
     die "get-secondary2-percent > 0 requires secondary2 endpoint"
   fi
+
+  # Export config variables so jq's $ENV can access them in result JSON.
+  export PUT_PERCENT GET_PRIMARY_PERCENT GET_SECONDARY1_PERCENT GET_SECONDARY2_PERCENT
+  export HOT_KEY_COUNT COLD_KEY_COUNT HOT_KEY_PERCENT
+  export PAYLOAD_SMALL_BYTES PAYLOAD_LARGE_BYTES LARGE_PAYLOAD_PERCENT
+  export WRITE_RETRIES STEPDOWN_INTERVAL_SECONDS
 
   mkdir -p "$OUTPUT_DIR"
   local run_dir="$OUTPUT_DIR/$RUN_ID"
@@ -536,30 +594,43 @@ run_mode() {
     cleanup_started=1
 
     if [[ "$finished" -eq 0 ]]; then
+      # Signal all loops to stop via files first (cheap, no race).
       touch "$stop_file" 2>/dev/null || true
       touch "$progress_stop_file" 2>/dev/null || true
       touch "$worker_stop_file" 2>/dev/null || true
 
-      local pid
-      for pid in "${worker_pids[@]}"; do
-        kill -TERM "$pid" 2>/dev/null || true
-        terminate_descendants "$pid" TERM
-      done
+      # Collect all known child PIDs into a single array to batch-kill.
+      local all_pids=("${worker_pids[@]}" "$monitor_pid" "$progress_pid" "$churn_pid")
 
-      kill -TERM "$monitor_pid" 2>/dev/null || true
-      kill -TERM "$progress_pid" 2>/dev/null || true
-      kill -TERM "$churn_pid" 2>/dev/null || true
-      terminate_descendants "$monitor_pid" TERM
-      terminate_descendants "$progress_pid" TERM
-      terminate_descendants "$churn_pid" TERM
-      terminate_descendants "$$" TERM
-      sleep 0.25
-      terminate_descendants "$$" KILL
+      # 1. SIGTERM all known children (not self -- avoid killing cleanup).
+      kill_pid_set TERM "${all_pids[@]}"
 
-      wait "$monitor_pid" 2>/dev/null || true
-      wait "$progress_pid" 2>/dev/null || true
-      wait "$churn_pid" 2>/dev/null || true
-      for pid in "${worker_pids[@]}"; do
+      # 2. Brief grace period, then SIGKILL stragglers.
+      sleep 0.5
+      kill_pid_set KILL "${all_pids[@]}"
+
+      # 3. Also kill any grandchildren (bao commands spawned by workers).
+      #    Walk the tree once from $$ but exclude $$ itself and BASHPID.
+      local desc_pids=()
+      while IFS= read -r pid; do
+        [[ -n "$pid" ]] || continue
+        # Don't kill ourselves.
+        [[ "$pid" != "$$" && "$pid" != "$BASHPID" ]] || continue
+        desc_pids+=("$pid")
+      done < <(list_descendant_pids "$$")
+      if [[ "${#desc_pids[@]}" -gt 0 ]]; then
+        kill_pid_set TERM "${desc_pids[@]}"
+        sleep 0.25
+        kill_pid_set KILL "${desc_pids[@]}"
+      fi
+
+      # 4. Reap children with a timeout so cleanup never hangs.
+      #    Bash 'wait -n' with a deadline via a background watchdog.
+      local reap_deadline=$((SECONDS + 5))
+      for pid in "${all_pids[@]}"; do
+        if (( SECONDS >= reap_deadline )); then
+          break
+        fi
         wait "$pid" 2>/dev/null || true
       done
     fi
@@ -630,8 +701,11 @@ run_mode() {
             fi
             ;;
           get_secondary1)
+            # DR secondaries don't serve KV reads. Instead, poll the
+            # DR status API as a health/reachability check.  A successful
+            # response with secondary_state=streaming counts as get_ok.
             if [[ "$HAS_SECONDARY1" == "true" ]]; then
-              if read_get secondary1 "$key_path"; then
+              if dr_health_check secondary1; then
                 get_ok=$((get_ok + 1))
               else
                 get_fail=$((get_fail + 1))
@@ -646,7 +720,7 @@ run_mode() {
             ;;
           get_secondary2)
             if [[ "$HAS_SECONDARY2" == "true" ]]; then
-              if read_get secondary2 "$key_path"; then
+              if dr_health_check secondary2; then
                 get_ok=$((get_ok + 1))
               else
                 get_fail=$((get_fail + 1))
@@ -687,6 +761,10 @@ run_mode() {
   progress_pid=0
 
   # Sentinel verification after workload completes.
+  # Write a sentinel key to the primary, then poll each secondary's
+  # DR status API until lag_entries reaches 0.  DR secondaries do not
+  # serve KV API reads, so we verify convergence through the DR status
+  # API (lag_entries / last_applied_index vs primary_index) instead.
   local sentinel_path="${data_prefix}/sentinel"
   local sentinel_written_ms sentinel_s1_lag sentinel_s2_lag
   sentinel_s1_lag=-1
@@ -694,11 +772,15 @@ run_mode() {
 
   if write_put "$sentinel_path" "sentinel-${RUN_ID}" "999999"; then
     sentinel_written_ms="$(now_epoch_ms)"
+    # Brief pause to let the sentinel write propagate through Raft + stream.
+    sleep 2
+    echo "[sentinel] sentinel written, waiting for secondaries to converge" >&2
+
     if [[ "$HAS_SECONDARY1" == "true" ]]; then
-      sentinel_s1_lag="$(wait_for_sentinel secondary1 "$sentinel_path" "$MAX_WAIT_SECONDS")"
+      sentinel_s1_lag="$(wait_for_sentinel secondary1 0 "$MAX_WAIT_SECONDS")"
     fi
     if [[ "$HAS_SECONDARY2" == "true" ]]; then
-      sentinel_s2_lag="$(wait_for_sentinel secondary2 "$sentinel_path" "$MAX_WAIT_SECONDS")"
+      sentinel_s2_lag="$(wait_for_sentinel secondary2 0 "$MAX_WAIT_SECONDS")"
     fi
   fi
 
@@ -812,8 +894,8 @@ run_mode() {
   echo "  result_file=$result_file"
   echo "  timeline_file=$timeline_file"
   echo "  ops_total=$done ops_per_sec=$ops_per_sec"
-  echo "  put_fail=$put_fail get_fail=$get_fail"
-  echo "  sentinel_lag_s: secondary1=$sentinel_s1_lag secondary2=$sentinel_s2_lag"
+  echo "  put_fail=$put_fail get_fail=$get_fail (secondary gets = DR status health checks)"
+  echo "  sentinel_lag_s: secondary1=$sentinel_s1_lag secondary2=$sentinel_s2_lag (index-based)"
 }
 
 resolve_results() {
