@@ -160,6 +160,13 @@ type drReplicationPrimary struct {
 	indexKIDToKey      map[[32]byte]string
 	indexResyncSkipped atomic.Uint64
 	indexApplied       atomic.Uint64
+	// indexReplicable tracks the highest RaftIndex of any entry that
+	// passed the isDRNeverReplicatePath filter and was pushed to
+	// subscribers. Used by the Heartbeat RPC so the secondary can
+	// compute lag against the replicable watermark instead of the
+	// raw Raft applied index, avoiding phantom lag from non-replicated
+	// internal entries (core/raft/*, core/dr-replication/*, etc.).
+	indexReplicable atomic.Uint64
 
 	streamJournal *drStreamJournal
 
@@ -348,7 +355,36 @@ func (s *drReplicationPrimary) OnChange(entries []physical.ChangeStreamEntry) {
 		replicableEntries = append(replicableEntries, e)
 	}
 	if len(replicableEntries) == 0 {
+		// All entries in this batch were non-replicable. Inject an
+		// index-advance marker into each subscriber so the secondary
+		// can advance its lastAppliedIndex and avoid phantom lag.
+		// The marker uses an empty key which the secondary recognises
+		// as a noop (no storage write, just index advancement).
+		if len(entries) > 0 {
+			marker := physical.ChangeStreamEntry{
+				RaftIndex: entries[len(entries)-1].RaftIndex,
+				// Empty Key signals an index-advance marker.
+			}
+			s.mu.RLock()
+			for _, sub := range s.subscribers {
+				select {
+				case sub.ch <- marker:
+				default:
+					// Channel full; subscriber will catch up via
+					// normal reconnect/reconcile. Don't cancel here
+					// for a lightweight marker.
+				}
+			}
+			s.mu.RUnlock()
+		}
 		return
+	}
+
+	// Track the highest replicable Raft index for accurate lag
+	// reporting in the Heartbeat RPC.
+	lastReplicable := replicableEntries[len(replicableEntries)-1].RaftIndex
+	if lastReplicable > 0 {
+		s.indexReplicable.Store(lastReplicable)
 	}
 
 	// Mark dirty ranges.
@@ -1184,15 +1220,27 @@ func (s *drReplicationPrimary) Heartbeat(ctx context.Context, req *DRHeartbeatRe
 		mgr.MarkRelationshipSeen(req.RelationshipId)
 	}
 
-	var primaryIndex, primaryTerm uint64
+	var raftApplied, primaryTerm uint64
 	if rb, ok := s.core.underlyingPhysical.(*raft.RaftBackend); ok {
-		primaryIndex = rb.AppliedIndex()
+		raftApplied = rb.AppliedIndex()
 		primaryTerm = rb.Term()
 	}
-	s.recordSecondaryPressure(req.RelationshipId, primaryIndex, req.GetAppliedIndex(), time.Now().UTC())
+
+	// Use backpressure calculations against the raw Raft applied index
+	// so throttling reflects actual write load.
+	s.recordSecondaryPressure(req.RelationshipId, raftApplied, req.GetAppliedIndex(), time.Now().UTC())
+
+	// Return the replicable index as the primary_index so the
+	// secondary computes lag only against indices it can actually
+	// reach. Fall back to the raw applied index when no replicable
+	// entries have been observed yet (cold start).
+	reportedIndex := s.indexReplicable.Load()
+	if reportedIndex == 0 {
+		reportedIndex = raftApplied
+	}
 
 	return &DRHeartbeatResponse{
-		PrimaryIndex:     primaryIndex,
+		PrimaryIndex:     reportedIndex,
 		PrimaryTerm:      primaryTerm,
 		ReplicationState: uint32(s.core.ReplicationState()),
 	}, nil

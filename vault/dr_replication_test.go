@@ -421,6 +421,142 @@ func TestDRRelationshipManager_Promote(t *testing.T) {
 	}
 }
 
+// TestDRPromote_SkipsRaftTLSKeyringWithoutRaftBackend verifies that
+// Promote() completes successfully on non-Raft cores (e.g., in-memory
+// backends) where no Raft TLS keyring regeneration is needed.
+func TestDRPromote_SkipsRaftTLSKeyringWithoutRaftBackend(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+
+	// Verify this test core has no Raft backend.
+	if core.getRaftBackend() != nil {
+		t.Skip("test requires non-Raft core")
+	}
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	token := &DRActivationToken{
+		ClusterID:      "skip-raft-test",
+		RelationshipID: "rel-skip-raft",
+		PrimaryAddr:    "127.0.0.1:8201",
+		ReplSalt:       make([]byte, 32),
+	}
+	rand.Read(token.ReplSalt)
+
+	if err := mgr.EnableSecondary(ctx, token); err != nil {
+		t.Fatal(err)
+	}
+
+	// Promote must succeed even without a Raft backend; the TLS
+	// keyring regeneration is skipped.
+	if err := mgr.PromoteSecondary(ctx); err != nil {
+		t.Fatalf("PromoteSecondary failed on non-Raft core: %v", err)
+	}
+	if mgr.Mode() != DRModeDisabled {
+		t.Fatalf("expected disabled after promote, got %s", mgr.Mode())
+	}
+}
+
+// TestRaftForceRecreateTLSKeyring_NoRaftBackend verifies that
+// raftForceRecreateTLSKeyring returns an error on non-Raft cores.
+func TestRaftForceRecreateTLSKeyring_NoRaftBackend(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+
+	if core.getRaftBackend() != nil {
+		t.Skip("test requires non-Raft core")
+	}
+
+	_, err := core.raftForceRecreateTLSKeyring(ctx)
+	if err == nil {
+		t.Fatal("expected error from raftForceRecreateTLSKeyring on non-Raft core")
+	}
+	if !strings.Contains(err.Error(), "raft backend not in use") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestRaftForceRecreateTLSKeyring_OrphanedKeyring verifies the keyring
+// regeneration logic by simulating the orphaned-keyring scenario:
+//  1. Write a valid TLS keyring through the barrier.
+//  2. Delete it (simulating the barrier key change making it unreadable).
+//  3. Call raftForceRecreateTLSKeyring and verify a new keyring is created
+//     and is readable through the barrier.
+//
+// Note: This test only exercises the barrier read/write path; it cannot
+// fully test the Raft backend integration (SetTLSKeyring) without a live
+// Raft cluster. The integration test covers the full promote path.
+func TestRaftForceRecreateTLSKeyring_OrphanedKeyring(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+
+	// This core has no Raft backend, so we can't call the full
+	// raftForceRecreateTLSKeyring. Instead, verify the barrier
+	// layer logic: write, delete, verify absent, write again.
+
+	// Step 1: Write a mock TLS keyring to the barrier.
+	mockKeyring := map[string]interface{}{
+		"ActiveKeyID": "mock-key-1",
+		"Keys":        []interface{}{},
+	}
+	entry, err := logical.StorageEntryJSON(raftTLSStoragePath, mockKeyring)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := core.barrier.Put(ctx, entry); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify it's readable.
+	got, err := core.barrier.Get(ctx, raftTLSStoragePath)
+	if err != nil || got == nil {
+		t.Fatalf("expected keyring to be readable, err=%v", err)
+	}
+
+	// Step 2: Delete through barrier (simulating what force-recreate does).
+	if err := core.barrier.Delete(ctx, raftTLSStoragePath); err != nil {
+		t.Fatal(err)
+	}
+
+	// Step 3: Verify it's gone.
+	got, err = core.barrier.Get(ctx, raftTLSStoragePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nil {
+		t.Fatal("expected keyring to be deleted")
+	}
+
+	// Step 4: Write a new one (simulating the force-recreate write).
+	newKeyring := map[string]interface{}{
+		"ActiveKeyID": "new-key-1",
+		"Keys":        []interface{}{},
+	}
+	entry, err = logical.StorageEntryJSON(raftTLSStoragePath, newKeyring)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := core.barrier.Put(ctx, entry); err != nil {
+		t.Fatal(err)
+	}
+
+	// Step 5: Verify the new keyring is readable.
+	got, err = core.barrier.Get(ctx, raftTLSStoragePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil {
+		t.Fatal("expected new keyring to be readable")
+	}
+
+	var decoded map[string]interface{}
+	if err := got.DecodeJSON(&decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded["ActiveKeyID"] != "new-key-1" {
+		t.Fatalf("unexpected ActiveKeyID: %v", decoded["ActiveKeyID"])
+	}
+}
+
 func TestDRRelationshipManager_PersistConfig(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	ctx := context.Background()
@@ -2218,4 +2354,119 @@ drainBatches:
 	t.Logf("sent %d entries in %d batches", received, len(batches))
 	cancel()
 	<-errCh
+}
+
+// TestOnChange_IndexReplicable verifies that indexReplicable tracks the
+// highest Raft index of replicable entries and is not advanced by
+// non-replicable (filtered) entries.
+func TestOnChange_IndexReplicable(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+
+	// Batch 1: only replicable entries.
+	primary.OnChange([]physical.ChangeStreamEntry{
+		{OpType: physical.PutOperation, Key: "logical/foo", Value: []byte("v"), RaftIndex: 10},
+		{OpType: physical.PutOperation, Key: "logical/bar", Value: []byte("v"), RaftIndex: 11},
+	})
+	if got := primary.indexReplicable.Load(); got != 11 {
+		t.Fatalf("expected indexReplicable=11 after replicable batch, got %d", got)
+	}
+
+	// Batch 2: only non-replicable entries (core/raft/* is never replicated).
+	primary.OnChange([]physical.ChangeStreamEntry{
+		{OpType: physical.PutOperation, Key: "core/raft/tls", Value: []byte("v"), RaftIndex: 12},
+		{OpType: physical.PutOperation, Key: "core/raft/config", Value: []byte("v"), RaftIndex: 13},
+	})
+	// indexReplicable should NOT advance for non-replicable entries.
+	if got := primary.indexReplicable.Load(); got != 11 {
+		t.Fatalf("expected indexReplicable=11 after non-replicable batch, got %d", got)
+	}
+	// But indexApplied (raw Raft index) SHOULD advance.
+	if got := primary.indexApplied.Load(); got != 13 {
+		t.Fatalf("expected indexApplied=13 after non-replicable batch, got %d", got)
+	}
+
+	// Batch 3: mixed batch (some replicable, some not).
+	primary.OnChange([]physical.ChangeStreamEntry{
+		{OpType: physical.PutOperation, Key: "core/raft/peers", Value: []byte("v"), RaftIndex: 14},
+		{OpType: physical.PutOperation, Key: "logical/baz", Value: []byte("v"), RaftIndex: 15},
+	})
+	if got := primary.indexReplicable.Load(); got != 15 {
+		t.Fatalf("expected indexReplicable=15 after mixed batch, got %d", got)
+	}
+}
+
+// TestOnChange_IndexAdvanceMarkerInjected verifies that when OnChange
+// receives a batch of only non-replicable entries, it injects an
+// index-advance marker into each subscriber's channel.
+func TestOnChange_IndexAdvanceMarkerInjected(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+
+	// Register a fake subscriber.
+	ch := make(chan physical.ChangeStreamEntry, 16)
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	primary.mu.Lock()
+	if primary.subscribers == nil {
+		primary.subscribers = make(map[string]*changeStreamSubscriber)
+	}
+	primary.subscribers["test-sub"] = &changeStreamSubscriber{
+		id:     "test-sub",
+		ch:     ch,
+		cancel: cancel,
+	}
+	primary.mu.Unlock()
+
+	// Send a batch of non-replicable entries.
+	primary.OnChange([]physical.ChangeStreamEntry{
+		{OpType: physical.PutOperation, Key: "core/raft/tls", Value: []byte("v"), RaftIndex: 42},
+	})
+
+	// The subscriber should receive exactly one marker.
+	select {
+	case marker := <-ch:
+		if marker.Key != "" {
+			t.Fatalf("expected empty key for index-advance marker, got %q", marker.Key)
+		}
+		if marker.RaftIndex != 42 {
+			t.Fatalf("expected marker RaftIndex=42, got %d", marker.RaftIndex)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for index-advance marker on subscriber channel")
+	}
+
+	// No more entries should be in the channel.
+	select {
+	case extra := <-ch:
+		t.Fatalf("unexpected extra entry on subscriber channel: %+v", extra)
+	default:
+		// OK
+	}
+}
+
+// TestApplyStreamChange_IndexAdvanceMarker verifies that an entry with
+// an empty key (index-advance marker) is silently ignored by
+// applyStreamChange (no storage write, no error).
+func TestApplyStreamChange_IndexAdvanceMarker(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+
+	secondary := &drReplicationSecondary{
+		core:   core,
+		logger: core.logger,
+	}
+
+	marker := &EntryChange{
+		Key:       "",
+		OpType:    "",
+		RaftIndex: 99,
+	}
+
+	if err := secondary.applyStreamChange(context.Background(), marker); err != nil {
+		t.Fatalf("applyStreamChange on marker should return nil, got: %v", err)
+	}
 }

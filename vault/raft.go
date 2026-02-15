@@ -599,6 +599,66 @@ func (c *Core) raftCreateTLSKeyring(ctx context.Context) (*raft.TLSKeyring, erro
 	return keyring, nil
 }
 
+// raftForceRecreateTLSKeyring deletes any existing Raft TLS keyring
+// from both the barrier and physical layers and creates a fresh one.
+//
+// This is needed after DR secondary promotion: the old keyring was
+// encrypted with the secondary's original barrier key, but the barrier
+// now uses the primary's key (replicated via the change stream). The
+// old entry is unreadable so we must delete it and generate a new one.
+//
+// The new keyring is written through the barrier (encrypted with the
+// current key) and applied to the running Raft backend so the cluster
+// can immediately resume TLS-secured peer communication.
+func (c *Core) raftForceRecreateTLSKeyring(ctx context.Context) (*raft.TLSKeyring, error) {
+	raftBackend := c.getRaftBackend()
+	if raftBackend == nil {
+		return nil, errors.New("raft backend not in use")
+	}
+
+	// 1. Delete the old entry from the physical layer directly.
+	//    We bypass the barrier because the entry may be unreadable
+	//    (encrypted with the previous barrier key).
+	if err := c.physical.Delete(ctx, raftTLSStoragePath); err != nil {
+		c.logger.Warn("failed to delete old raft TLS keyring from physical storage", "error", err)
+		// Non-fatal: the barrier Put below will overwrite anyway.
+	}
+
+	// Also try deleting through the barrier in case the physical
+	// path is wrapped/transformed.
+	_ = c.barrier.Delete(ctx, raftTLSStoragePath)
+
+	// 2. Generate a fresh TLS key.
+	raftTLSKey, err := raft.GenerateTLSKey(c.secureRandomReader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate raft TLS key: %w", err)
+	}
+
+	keyring := &raft.TLSKeyring{
+		Keys:        []*raft.TLSKey{raftTLSKey},
+		ActiveKeyID: raftTLSKey.ID,
+	}
+
+	// 3. Write the new keyring through the barrier so it's encrypted
+	//    with the current (primary's) key.
+	entry, err := logical.StorageEntryJSON(raftTLSStoragePath, keyring)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal raft TLS keyring: %w", err)
+	}
+	if err := c.barrier.Put(ctx, entry); err != nil {
+		return nil, fmt.Errorf("failed to write raft TLS keyring: %w", err)
+	}
+
+	// 4. Apply the keyring to the running Raft backend so TLS works
+	//    immediately without requiring a restart.
+	if err := raftBackend.SetTLSKeyring(keyring); err != nil {
+		return nil, fmt.Errorf("failed to apply raft TLS keyring: %w", err)
+	}
+
+	c.logger.Info("raft TLS keyring regenerated successfully")
+	return keyring, nil
+}
+
 func (c *Core) stopPeriodicRaftTLSRotate() {
 	if c.raftTLSRotationStopCh != nil {
 		close(c.raftTLSRotationStopCh)

@@ -687,6 +687,26 @@ func (s *drReplicationSecondary) Promote() error {
 		return fmt.Errorf("failed to reload core state: %w", err)
 	}
 
+	// Regenerate the Raft TLS keyring (if using Raft storage).
+	//
+	// During DR replication the primary's barrier key (core/keyring,
+	// core/root-key) replaces the secondary's original key. However,
+	// the secondary's own core/raft/tls entry (in the
+	// drNeverReplicatePrefixes exclusion list) was written with the
+	// OLD barrier key and is now unreadable. Without a valid TLS
+	// keyring Raft nodes cannot establish peer connections, leader
+	// election fails, and the promoted cluster is permanently stuck.
+	//
+	// Force-recreate the keyring: delete the orphaned entry and
+	// generate a fresh one encrypted with the current (primary's)
+	// barrier key, then apply it to the running Raft backend.
+	if s.core.getRaftBackend() != nil {
+		if _, err := s.core.raftForceRecreateTLSKeyring(ctx); err != nil {
+			s.logger.Error("failed to regenerate raft TLS keyring during promotion", "error", err)
+			return fmt.Errorf("failed to regenerate raft TLS keyring: %w", err)
+		}
+	}
+
 	// Transition the core to primary mode.
 	s.setState(DRSecondaryStandalone)
 	s.logger.Info("DR secondary promoted to standalone primary")
@@ -2061,6 +2081,16 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 			continue
 		}
 
+		// Index-advance marker: empty key means the primary filtered
+		// all entries in a Raft batch. Track the index so
+		// lastAppliedIndex advances, but don't touch storage.
+		if change.Key == "" {
+			if change.RaftIndex > lastIndex {
+				lastIndex = change.RaftIndex
+			}
+			continue
+		}
+
 		if isDRNeverReplicatePath(change.Key) {
 			continue
 		}
@@ -2091,6 +2121,14 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 
 		affected++
 		lastIndex = change.RaftIndex
+	}
+
+	// If we only saw index-advance markers (no storage ops) we still
+	// need to advance lastAppliedIndex so lag reporting stays accurate.
+	if affected == 0 && lastIndex > 0 && lastIndex > current {
+		s.setLastAppliedIndex(lastIndex)
+		metrics.SetGauge([]string{"replication", "dr", "secondary", "last_applied_index"}, float32(lastIndex))
+		return nil
 	}
 
 	if affected == 0 {
@@ -2141,6 +2179,14 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 // must be written directly to the physical backend to avoid
 // double-encryption.
 func (s *drReplicationSecondary) applyStreamChange(ctx context.Context, change *EntryChange) error {
+	// Index-advance marker: the primary sends entries with an empty key
+	// when a Raft batch contained only non-replicable paths. There is
+	// nothing to apply to storage; the caller advances lastAppliedIndex
+	// using the marker's RaftIndex so lag reporting stays accurate.
+	if change.Key == "" {
+		return nil
+	}
+
 	// Skip cluster-local paths that should never be replicated.
 	if isDRNeverReplicatePath(change.Key) {
 		s.logger.Debug("skipping cluster-local path in stream", "key", change.Key)
