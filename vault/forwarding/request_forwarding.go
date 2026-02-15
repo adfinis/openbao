@@ -146,6 +146,10 @@ func (c *RequestForwardingClusterClient) CACert(ctx context.Context) *x509.Certi
 	return c.core.LocalClusterParsedCert()
 }
 
+func (c *RequestForwardingClusterClient) VerifyPeerCertificate() func([][]byte, [][]*x509.Certificate) error {
+	return nil
+}
+
 // ServerLookup satisfies the ClusterHandler interface and returns the server's
 // tls certs.
 func (rf *requestForwardingHandler) ServerLookup(ctx context.Context, clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {

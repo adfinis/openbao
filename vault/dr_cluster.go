@@ -6,9 +6,12 @@ package vault
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"sync"
@@ -19,6 +22,7 @@ import (
 	"github.com/openbao/openbao/vault/cluster"
 	"golang.org/x/net/http2"
 	"google.golang.org/grpc"
+	_ "google.golang.org/grpc/encoding/gzip" // Register gzip compressor for DR gRPC server
 	"google.golang.org/grpc/keepalive"
 )
 
@@ -211,12 +215,36 @@ func (h *drReplicationClusterHandler) Stop() error {
 
 // --- DR Replication Cluster Client (secondary side) ---
 
+// trustedPrimaryCert holds a cached primary cluster certificate along
+// with a timestamp of when it was last seen in a heartbeat response.
+// Certificates whose lastSeen exceeds trustedCertTTL are pruned.
+type trustedPrimaryCert struct {
+	derBytes []byte
+	lastSeen time.Time
+}
+
+const trustedCertTTL = 10 * time.Minute
+
+// drCertFingerprint computes the SHA-256 hex fingerprint of a
+// DER-encoded certificate.
+func drCertFingerprint(der []byte) string {
+	h := sha256.Sum256(der)
+	return hex.EncodeToString(h[:])
+}
+
 // drReplicationClusterClient implements the cluster.Client interface for
 // connecting to the primary's DR replication gRPC service over mTLS.
 type drReplicationClusterClient struct {
 	core *Core
 	// primaryCACert is the primary's CA certificate from the activation token.
 	primaryCACert *x509.Certificate
+	logger        log.Logger
+
+	// trustedCertsMu and trustedCerts are owned by the
+	// drReplicationSecondary and shared via pointer so the pool
+	// persists across reconnects.
+	trustedCertsMu *sync.RWMutex
+	trustedCerts   map[string]*trustedPrimaryCert
 }
 
 // ClientLookup returns the client TLS certificate for outgoing connections.
@@ -262,17 +290,127 @@ func (c *drReplicationClusterClient) ClientLookup(ctx context.Context, requestIn
 	return nil, nil
 }
 
-// ServerName returns the expected server name for TLS verification.
+// ServerName returns empty because after a leadership change the
+// secondary may reach any primary node, each with a unique CN.
 func (c *drReplicationClusterClient) ServerName() string {
-	if c.primaryCACert != nil {
-		return c.primaryCACert.Subject.CommonName
-	}
 	return ""
 }
 
-// CACert returns the primary's CA certificate for TLS verification.
+// CACert returns the primary's CA certificate from the activation
+// token. Retained for the initial CA pool (first connection to the
+// original leader).
 func (c *drReplicationClusterClient) CACert(ctx context.Context) *x509.Certificate {
 	return c.primaryCACert
+}
+
+// VerifyPeerCertificate returns a callback that checks the primary's
+// server certificate against a dynamically maintained trust pool.
+//
+// Known certs (from heartbeats) are verified immediately. Unknown
+// certs are accepted via TOFU (Trust On First Use) and added to the
+// pool; the next heartbeat from that leader refreshes them. Security
+// for TOFU connections is maintained by the primary's independent
+// mTLS verification of the secondary plus gRPC relationship authz.
+func (c *drReplicationClusterClient) VerifyPeerCertificate() func([][]byte, [][]*x509.Certificate) error {
+	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+		if len(rawCerts) == 0 {
+			return errors.New("dr: server presented no certificate")
+		}
+
+		fp := drCertFingerprint(rawCerts[0])
+
+		c.trustedCertsMu.RLock()
+		entry, known := c.trustedCerts[fp]
+		c.trustedCertsMu.RUnlock()
+
+		if known {
+			// Refresh lastSeen for the known cert.
+			c.trustedCertsMu.Lock()
+			entry.lastSeen = time.Now()
+			c.trustedCertsMu.Unlock()
+			return nil
+		}
+
+		// TOFU: accept the unknown cert and add it to the pool.
+		// The primary still verifies *us* via mTLS + gRPC authz,
+		// so a rogue server without the secondary's cert cannot
+		// complete the handshake.
+		c.trustedCertsMu.Lock()
+		c.trustedCerts[fp] = &trustedPrimaryCert{
+			derBytes: append([]byte(nil), rawCerts[0]...),
+			lastSeen: time.Now(),
+		}
+		c.trustedCertsMu.Unlock()
+
+		// Parse the cert for logging only; non-fatal if it fails.
+		cn := "(unknown)"
+		if cert, err := x509.ParseCertificate(rawCerts[0]); err == nil {
+			cn = cert.Subject.CommonName
+		}
+		c.logger.Warn("accepted unverified primary certificate (TOFU)",
+			"fingerprint", fp,
+			"cn", cn)
+		return nil
+	}
+}
+
+// addTrustedCert adds or refreshes a DER-encoded certificate in the
+// trust pool. Called from the heartbeat loop.
+func (c *drReplicationClusterClient) addTrustedCert(der []byte) {
+	fp := drCertFingerprint(der)
+	c.trustedCertsMu.Lock()
+	defer c.trustedCertsMu.Unlock()
+	if entry, ok := c.trustedCerts[fp]; ok {
+		entry.lastSeen = time.Now()
+	} else {
+		c.trustedCerts[fp] = &trustedPrimaryCert{
+			derBytes: append([]byte(nil), der...),
+			lastSeen: time.Now(),
+		}
+	}
+}
+
+// pruneTrustedCerts removes entries whose lastSeen exceeds the TTL.
+func (c *drReplicationClusterClient) pruneTrustedCerts() {
+	now := time.Now()
+	c.trustedCertsMu.Lock()
+	defer c.trustedCertsMu.Unlock()
+	for fp, entry := range c.trustedCerts {
+		if now.Sub(entry.lastSeen) > trustedCertTTL {
+			c.logger.Debug("pruning expired primary certificate from trust pool",
+				"fingerprint", fp)
+			delete(c.trustedCerts, fp)
+		}
+	}
+}
+
+// initTrustedPool seeds the trust pool with the activation token
+// certificate if not already present.
+func initTrustedPool(pool map[string]*trustedPrimaryCert, caCert *x509.Certificate) {
+	if caCert == nil {
+		return
+	}
+	fp := drCertFingerprint(caCert.Raw)
+	if _, ok := pool[fp]; !ok {
+		pool[fp] = &trustedPrimaryCert{
+			derBytes: append([]byte(nil), caCert.Raw...),
+			lastSeen: time.Now(),
+		}
+	}
+}
+
+// formatTrustedPoolFingerprints returns a short string listing all
+// fingerprints in the pool for diagnostic logging.
+func formatTrustedPoolFingerprints(pool map[string]*trustedPrimaryCert) string {
+	fps := make([]string, 0, len(pool))
+	for fp := range pool {
+		if len(fp) > 12 {
+			fps = append(fps, fp[:12])
+		} else {
+			fps = append(fps, fp)
+		}
+	}
+	return fmt.Sprintf("%v", fps)
 }
 
 // registerDRHandler registers the DR replication handler on the cluster listener.

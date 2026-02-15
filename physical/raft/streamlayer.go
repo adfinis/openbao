@@ -266,6 +266,10 @@ func (l *raftLayer) CACert(ctx context.Context) *x509.Certificate {
 	return key.parsedCert
 }
 
+func (l *raftLayer) VerifyPeerCertificate() func([][]byte, [][]*x509.Certificate) error {
+	return nil
+}
+
 func (l *raftLayer) ClientLookup(ctx context.Context, requestInfo *tls.CertificateRequestInfo) (*tls.Certificate, error) {
 	for _, subj := range requestInfo.AcceptableCAs {
 		for _, key := range l.keyring.Keys {

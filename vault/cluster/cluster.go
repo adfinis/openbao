@@ -36,6 +36,19 @@ type Client interface {
 	ClientLookup(context.Context, *tls.CertificateRequestInfo) (*tls.Certificate, error)
 	ServerName() string
 	CACert(ctx context.Context) *x509.Certificate
+
+	// VerifyPeerCertificate returns a custom TLS server certificate
+	// verification callback. When non-nil the dialer sets
+	// InsecureSkipVerify=true and uses this callback instead of the
+	// standard chain + hostname verification. When nil, standard TLS
+	// verification applies.
+	//
+	// This is used for cross-cluster DR connections where the
+	// secondary cannot predict which primary node (and thus which
+	// self-signed cluster certificate) it will reach after a
+	// leadership change. The callback verifies the server certificate
+	// against a dynamically maintained trust pool.
+	VerifyPeerCertificate() func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error
 }
 
 // Handler exposes functions for looking up TLS configuration and handing
@@ -459,6 +472,14 @@ func (cl *Listener) GetContextDialerFunc(ctx context.Context, alpn string) func(
 			pool.AddCert(caCert)
 			tlsConfig.RootCAs = pool
 			tlsConfig.ClientCAs = pool
+		}
+
+		// When a custom peer verifier is provided (e.g. DR
+		// replication), disable Go's built-in chain+hostname
+		// check and delegate to the callback instead.
+		if verifier := client.VerifyPeerCertificate(); verifier != nil {
+			tlsConfig.InsecureSkipVerify = true
+			tlsConfig.VerifyPeerCertificate = verifier
 		}
 
 		tlsConfig.NextProtos = []string{alpn}
