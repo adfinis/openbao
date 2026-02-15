@@ -25,7 +25,7 @@ const (
 	drDefaultStreamJournalMaxBytes      = 4 << 30  // 4 GiB
 	drDefaultStreamJournalSegmentBytes  = 64 << 20 // 64 MiB
 	drDefaultStreamJournalRetention     = 2 * time.Hour
-	drDefaultStreamJournalFlushInterval = 1024
+	drDefaultStreamJournalFlushInterval = 256
 )
 
 var errDRStreamJournalRangeTooOld = errors.New("stream journal range unavailable")
@@ -201,6 +201,29 @@ func (j *drStreamJournal) replayRange(startInclusive uint64, endExclusive uint64
 			break
 		}
 		if err := readJournalSegment(seg.Path, startInclusive, endExclusive, fn); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// replayAll replays every entry in the journal (all segments) in index
+// order. Unlike replayRange it does not require the caller to know the
+// exact start index. This is used for index warmup on leadership change.
+func (j *drStreamJournal) replayAll(fn func(physical.ChangeStreamEntry) error) error {
+	j.mu.RLock()
+	if !j.enabled || len(j.segments) == 0 {
+		j.mu.RUnlock()
+		return errDRStreamJournalRangeTooOld
+	}
+	segments := make([]drStreamJournalSegment, 0, len(j.segments))
+	for _, seg := range j.segments {
+		segments = append(segments, *seg)
+	}
+	j.mu.RUnlock()
+
+	for _, seg := range segments {
+		if err := readJournalSegment(seg.Path, 0, 0, fn); err != nil {
 			return err
 		}
 	}

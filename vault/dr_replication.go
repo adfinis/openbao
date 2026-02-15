@@ -34,12 +34,12 @@ const (
 	drCheckpointMaxPerRelationship         = 8
 	drCheckpointTTL                        = 30 * time.Minute
 	drRangeMaxIBLTCellsPerRange            = 32768
-	drStreamBufferMaxEntries               = 10000
-	drStreamBufferMaxBytes                 = 64 << 20 // 64 MiB
+	drStreamBufferMaxEntries               = 50000
+	drStreamBufferMaxBytes                 = 256 << 20 // 256 MiB
 	drCheckpointThrottleBufferPct          = 85
 	drCheckpointLaggingActiveWindow        = 10 * time.Second
 	drCheckpointForceBuildInterval         = 15 * time.Second
-	drCheckpointIndexFullScanInterval      = 10 * time.Minute
+	drCheckpointIndexFullScanInterval      = 4 * time.Hour
 
 	drDirtyBitmapSize            = 1024
 	drDirtyBitmapBytes           = drDirtyBitmapSize / 8
@@ -85,6 +85,74 @@ type drSecondaryPressureSample struct {
 	lastPrimary  uint64
 	applyRateEPS float64
 	lagEntries   uint64
+}
+
+// drChangeStreamDispatcher is a two-layer change stream hook that ensures
+// the stream journal is maintained on ALL primary-cluster Raft nodes (leader
+// and followers alike). The base layer filters non-replicable paths and
+// appends entries to the on-disk journal. When the node is the active
+// primary leader an optional second layer delegates to the primary's
+// processing logic (ring buffer, subscriber fan-out, dirty bitmap, index).
+//
+// This design guarantees that after a leader election the new leader already
+// has a populated journal covering its follower period, eliminating the need
+// for expensive reconciliation when secondaries reconnect.
+type drChangeStreamDispatcher struct {
+	mu      sync.RWMutex
+	journal *drStreamJournal
+	primary *drReplicationPrimary // nil when not the active primary leader
+	logger  log.Logger
+}
+
+// OnChange is the FSM change stream callback. It runs on every Raft node.
+func (d *drChangeStreamDispatcher) OnChange(entries []physical.ChangeStreamEntry) {
+	// 1. Filter non-replicable paths (always, on all nodes).
+	replicable := filterDRReplicableEntries(entries)
+
+	// 2. Append to journal (always, on all nodes).
+	if d.journal != nil && len(replicable) > 0 {
+		if err := d.journal.append(replicable); err != nil {
+			d.logger.Warn("journal append failed", "error", err)
+		}
+	}
+
+	// 3. Delegate to primary-specific processing (only when active leader).
+	d.mu.RLock()
+	primary := d.primary
+	d.mu.RUnlock()
+	if primary != nil {
+		primary.onChangePrimaryPath(entries, replicable)
+	}
+}
+
+// setPrimary attaches the primary processing layer. Must be called when
+// this node becomes the active primary leader.
+func (d *drChangeStreamDispatcher) setPrimary(p *drReplicationPrimary) {
+	d.mu.Lock()
+	d.primary = p
+	d.mu.Unlock()
+}
+
+// clearPrimary detaches the primary processing layer. Must be called when
+// this node steps down from primary leadership.
+func (d *drChangeStreamDispatcher) clearPrimary() {
+	d.mu.Lock()
+	d.primary = nil
+	d.mu.Unlock()
+}
+
+// filterDRReplicableEntries returns a subset of entries that excludes
+// cluster-local keys which are never replicated (e.g. core/raft/*,
+// core/dr-replication/*).
+func filterDRReplicableEntries(entries []physical.ChangeStreamEntry) []physical.ChangeStreamEntry {
+	replicable := make([]physical.ChangeStreamEntry, 0, len(entries))
+	for _, e := range entries {
+		if isDRNeverReplicatePath(e.Key) {
+			continue
+		}
+		replicable = append(replicable, e)
+	}
+	return replicable
 }
 
 // drReplicationPrimary implements the DRReplicationServer gRPC interface
@@ -241,8 +309,10 @@ type changeStreamSubscriber struct {
 }
 
 // NewDRReplicationPrimary creates a new DR replication gRPC server for
-// the primary side.
-func NewDRReplicationPrimary(core *Core, replSalt []byte, logger log.Logger) *drReplicationPrimary {
+// the primary side.  The journal parameter is the shared stream journal
+// maintained by the drChangeStreamDispatcher; if nil a local journal is
+// created (useful for tests).
+func NewDRReplicationPrimary(core *Core, replSalt []byte, logger log.Logger, journal *drStreamJournal) *drReplicationPrimary {
 	if logger == nil {
 		logger = log.NewNullLogger()
 	}
@@ -286,7 +356,7 @@ func NewDRReplicationPrimary(core *Core, replSalt []byte, logger log.Logger) *dr
 		checkpointLastForcedBuildByRelationship: make(map[string]time.Time),
 		indexKIDToVID:                           make(map[[32]byte][32]byte),
 		indexKIDToKey:                           make(map[[32]byte]string),
-		streamJournal:                           newDRStreamJournal(logger, ""),
+		streamJournal:                           journal,
 		checkpointArtifacts:                     newDRCheckpointArtifactStore(logger, ""),
 		secondaryPressure:                       make(map[string]*drSecondaryPressureSample),
 		backpressureEnabled:                     drBackpressureDefaultEnabled,
@@ -298,8 +368,12 @@ func NewDRReplicationPrimary(core *Core, replSalt []byte, logger log.Logger) *dr
 		dirtyMap:                                make([]byte, drDirtyBitmapBytes),
 		creditWaitTimeout:                       drCreditWaitTimeout,
 	}
-	if err := primary.streamJournal.configure(true, drDefaultStreamJournalMaxBytes, drDefaultStreamJournalSegmentBytes, drDefaultStreamJournalRetention); err != nil {
-		primary.logger.Warn("failed to initialize DR stream journal", "error", err)
+	// If no shared journal was provided (e.g. unit tests), create a local one.
+	if primary.streamJournal == nil {
+		primary.streamJournal = newDRStreamJournal(logger, "")
+		if err := primary.streamJournal.configure(true, drDefaultStreamJournalMaxBytes, drDefaultStreamJournalSegmentBytes, drDefaultStreamJournalRetention); err != nil {
+			primary.logger.Warn("failed to initialize DR stream journal", "error", err)
+		}
 	}
 	primary.checkpointArtifacts.configure(true, drCheckpointArtifactDefaultTTL, drCheckpointArtifactDefaultGlobalBudget, drCheckpointArtifactDefaultPerRelBudget, drCheckpointArtifactDefaultSegmentBytes)
 	primary.tombstoneGC = newDRTombstoneGC(primary, logger)
@@ -329,10 +403,28 @@ func (s *drReplicationPrimary) SeedAppliedIndex(idx uint64) {
 	}
 }
 
-// OnChange is called by the FSM change stream hook when storage
-// mutations are applied. It distributes changes to all subscribers
-// and appends to the ring buffer.
+// OnChange is a convenience wrapper that filters entries and delegates
+// to onChangePrimaryPath. It exists so tests and callers that don't use
+// the dispatcher can still call primary.OnChange(entries) directly.
 func (s *drReplicationPrimary) OnChange(entries []physical.ChangeStreamEntry) {
+	replicable := filterDRReplicableEntries(entries)
+
+	// When called directly (not via dispatcher), also append to journal.
+	if s.streamJournal != nil && len(replicable) > 0 {
+		if err := s.streamJournal.append(replicable); err != nil {
+			s.logger.Warn("failed to append stream journal entries", "error", err)
+		}
+	}
+
+	s.onChangePrimaryPath(entries, replicable)
+}
+
+// onChangePrimaryPath performs primary-specific processing: index
+// tracking, dirty bitmap updates, ring buffer append, write-rate
+// tracking, and subscriber fan-out. Journal append is NOT done here
+// because the drChangeStreamDispatcher has already written to the
+// journal before calling this method.
+func (s *drReplicationPrimary) onChangePrimaryPath(entries []physical.ChangeStreamEntry, replicableEntries []physical.ChangeStreamEntry) {
 	// Always advance the applied-index watermark from the raw (unfiltered)
 	// entries so the checkpoint fence sees every Raft index we have
 	// observed, including entries for non-replicated paths (e.g.
@@ -346,14 +438,6 @@ func (s *drReplicationPrimary) OnChange(entries []physical.ChangeStreamEntry) {
 		}
 	}
 
-	// Filter out cluster-local keys that are never replicated.
-	replicableEntries := make([]physical.ChangeStreamEntry, 0, len(entries))
-	for _, e := range entries {
-		if isDRNeverReplicatePath(e.Key) {
-			continue
-		}
-		replicableEntries = append(replicableEntries, e)
-	}
 	if len(replicableEntries) == 0 {
 		// All entries in this batch were non-replicable. Inject an
 		// index-advance marker into each subscriber so the secondary
@@ -405,12 +489,6 @@ func (s *drReplicationPrimary) OnChange(entries []physical.ChangeStreamEntry) {
 
 	// Keep metadata index in sync with committed changes.
 	s.updateIndexFromChanges(replicableEntries)
-
-	if s.streamJournal != nil {
-		if err := s.streamJournal.append(replicableEntries); err != nil {
-			s.logger.Warn("failed to append stream journal entries", "error", err)
-		}
-	}
 
 	// Append to ring buffer.
 	now := time.Now().UTC()
@@ -814,6 +892,9 @@ func (s *drReplicationPrimary) waitForCredit(ctx context.Context, sub *changeStr
 
 // RequestCheckpoint implements DRReplicationServer.RequestCheckpoint.
 func (s *drReplicationPrimary) RequestCheckpoint(ctx context.Context, req *CheckpointRequest) (*CheckpointResponse, error) {
+	if err := s.requireActiveNode(); err != nil {
+		return nil, err
+	}
 	if err := s.authorizeRelationship(ctx, req.RelationshipId, DRRelationshipStateRegistered, DRRelationshipStateActive); err != nil {
 		return nil, err
 	}
@@ -867,6 +948,9 @@ func (s *drReplicationPrimary) RequestCheckpoint(ctx context.Context, req *Check
 
 // ExchangeDirtyBitmap implements DRReplicationServer.ExchangeDirtyBitmap.
 func (s *drReplicationPrimary) ExchangeDirtyBitmap(ctx context.Context, req *DirtyBitmapMessage) (*DirtyBitmapMessage, error) {
+	if err := s.requireActiveNode(); err != nil {
+		return nil, err
+	}
 	s.dirtyMapMu.RLock()
 	defer s.dirtyMapMu.RUnlock()
 
@@ -1003,6 +1087,9 @@ func (s *drReplicationPrimary) maybePersistDirtyBitmap() {
 
 // ExchangeRangeChecksums implements DRReplicationServer.ExchangeRangeChecksums.
 func (s *drReplicationPrimary) ExchangeRangeChecksums(ctx context.Context, req *RangeChecksumRequest) (*RangeChecksumResponse, error) {
+	if err := s.requireActiveNode(); err != nil {
+		return nil, err
+	}
 	cp, err := s.getCheckpoint(req.CheckpointId)
 	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "checkpoint not found: %v", err)
@@ -1063,6 +1150,9 @@ func (s *drReplicationPrimary) ExchangeRangeChecksums(ctx context.Context, req *
 // It performs fine-grained drill-down on a mismatched range by splitting
 // it in half and returning sub-range digests for each child.
 func (s *drReplicationPrimary) ExchangeRangeDigests(ctx context.Context, req *RangeDigestRequest) (*RangeDigestResponse, error) {
+	if err := s.requireActiveNode(); err != nil {
+		return nil, err
+	}
 	cp, err := s.getCheckpoint(req.CheckpointId)
 	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "checkpoint not found: %v", err)
@@ -1130,6 +1220,28 @@ func rangeDescriptorToProto(desc reconciler.RangeDescriptor) *RangeDigest {
 // The secondary requests specific entries by KID and/or by bucket
 // indices; the primary looks them up and streams them back.
 func (s *drReplicationPrimary) FetchEntries(req *FetchEntriesRequest, stream grpc.ServerStreamingServer[EntryBatch]) error {
+	if err := s.requireActiveNode(); err != nil {
+		return err
+	}
+
+	// Derive a context from both the gRPC stream and the core's active
+	// context. The stream must terminate when either:
+	//   (a) the gRPC connection breaks (stream.Context() cancelled), or
+	//   (b) this node loses leadership (activeContext cancelled on stepdown).
+	// Without (b), a stepdown during a FetchEntries call leaves the
+	// handler iterating over checkpoint data while the secondary's
+	// stream.Recv() blocks indefinitely, stalling reconciliation.
+	ctx, cancel := context.WithCancel(stream.Context())
+	defer cancel()
+
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-s.core.activeContext.Done():
+			cancel()
+		}
+	}()
+
 	cp, err := s.getCheckpoint(req.CheckpointId)
 	if err != nil {
 		return status.Errorf(codes.NotFound, "checkpoint not found: %v", err)
@@ -1137,7 +1249,7 @@ func (s *drReplicationPrimary) FetchEntries(req *FetchEntriesRequest, stream grp
 	if err := validateCheckpointTuple(req.CheckpointId, req.GetCheckpointIndex(), cp); err != nil {
 		return status.Errorf(codes.FailedPrecondition, "invalid checkpoint tuple: %v", err)
 	}
-	if err := s.authorizeCheckpoint(stream.Context(), cp); err != nil {
+	if err := s.authorizeCheckpoint(ctx, cp); err != nil {
 		return err
 	}
 
@@ -1177,7 +1289,7 @@ func (s *drReplicationPrimary) FetchEntries(req *FetchEntriesRequest, stream grp
 	}
 
 	emitFromCheckpoint := func(kid [32]byte, expectedVID *[32]byte) error {
-		change, err := s.readCheckpointEntryChange(stream.Context(), cp, kid, expectedVID, req.IncludeDeletes)
+		change, err := s.readCheckpointEntryChange(ctx, cp, kid, expectedVID, req.IncludeDeletes)
 		if err != nil {
 			if status.Code(err) == codes.FailedPrecondition {
 				return err
@@ -1201,21 +1313,89 @@ func (s *drReplicationPrimary) FetchEntries(req *FetchEntriesRequest, stream grp
 		return nil
 	}
 
-	// Range-based fetching.
+	// Range-based fetching with parallel artifact reads.
 	if len(rangeSpans) > 0 {
+		// Collect matching KIDs first (cheap in-memory filter).
+		var matchingKIDs [][32]byte
 		for kid := range cp.kidToVID {
-			if !kidInAnyRange(kid, rangeSpans) {
-				continue
+			if kidInAnyRange(kid, rangeSpans) {
+				matchingKIDs = append(matchingKIDs, kid)
+				sent[kid] = true
 			}
-			sent[kid] = true
-			if err := emitFromCheckpoint(kid, nil); err != nil {
-				return err
+		}
+
+		if len(matchingKIDs) > 0 {
+			const fetchWorkers = 4
+
+			type fetchResult struct {
+				change *EntryChange
+				err    error
+			}
+
+			kidCh := make(chan [32]byte, fetchWorkers*2)
+			resultCh := make(chan fetchResult, fetchWorkers*2)
+
+			// Spawn parallel reader workers.
+			var wg sync.WaitGroup
+			for w := 0; w < fetchWorkers; w++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for kid := range kidCh {
+						change, err := s.readCheckpointEntryChange(ctx, cp, kid, nil, req.IncludeDeletes)
+						resultCh <- fetchResult{change: change, err: err}
+					}
+				}()
+			}
+
+			// Feed KIDs to workers in a separate goroutine.
+			go func() {
+				for _, kid := range matchingKIDs {
+					select {
+					case kidCh <- kid:
+					case <-ctx.Done():
+						break
+					}
+				}
+				close(kidCh)
+				wg.Wait()
+				close(resultCh)
+			}()
+
+			// Collect results and stream them.
+			for res := range resultCh {
+				if ctx.Err() != nil {
+					return status.Errorf(codes.Canceled, "fetch aborted: %v", ctx.Err())
+				}
+				if res.err != nil {
+					if status.Code(res.err) == codes.FailedPrecondition {
+						return res.err
+					}
+					// Non-fatal: record as failed KID in the batch.
+					continue
+				}
+				if res.change == nil {
+					continue
+				}
+				batch.Entries = append(batch.Entries, res.change)
+				if len(batch.Entries) >= 100 {
+					if err := stream.Send(&batch); err != nil {
+						return err
+					}
+					batch.Entries = batch.Entries[:0]
+					batch.FailedKids = batch.FailedKids[:0]
+					batch.CheckpointId = cp.checkpoint.ID
+					batch.CheckpointIndex = cp.checkpoint.CommitIndex
+				}
 			}
 		}
 	}
 
 	// Provenance-safe point fetches from items.
 	for kid, expectedVID := range expectedVIDByKID {
+		if ctx.Err() != nil {
+			return status.Errorf(codes.Canceled, "fetch aborted: %v", ctx.Err())
+		}
 		if sent[kid] {
 			continue
 		}
@@ -1228,6 +1408,9 @@ func (s *drReplicationPrimary) FetchEntries(req *FetchEntriesRequest, stream grp
 
 	// Look up each specifically requested KID.
 	for _, kidBytes := range req.Kids {
+		if ctx.Err() != nil {
+			return status.Errorf(codes.Canceled, "fetch aborted: %v", ctx.Err())
+		}
 		if len(kidBytes) != 32 {
 			continue
 		}
@@ -1291,11 +1474,20 @@ func (s *drReplicationPrimary) Heartbeat(ctx context.Context, req *DRHeartbeatRe
 		leaderClusterAddr = addr
 	}
 
+	// Include the active node's cluster TLS certificate so the
+	// secondary can build a dynamic trust pool for server certificate
+	// verification after leadership changes.
+	var activeClusterCert []byte
+	if certPtr := s.core.localClusterCert.Load(); certPtr != nil {
+		activeClusterCert = *certPtr
+	}
+
 	return &DRHeartbeatResponse{
 		PrimaryIndex:      reportedIndex,
 		PrimaryTerm:       primaryTerm,
 		ReplicationState:  uint32(s.core.ReplicationState()),
 		LeaderClusterAddr: leaderClusterAddr,
+		ActiveClusterCert: activeClusterCert,
 	}, nil
 }
 
@@ -1315,6 +1507,9 @@ func (s *drReplicationPrimary) OldestBufferedIndex() uint64 {
 // extracts the plaintext root key from the barrier, and sends
 // everything to the secondary for bootstrap.
 func (s *drReplicationPrimary) SyncKeyring(ctx context.Context, req *SyncKeyringRequest) (*SyncKeyringResponse, error) {
+	if err := s.requireActiveNode(); err != nil {
+		return nil, err
+	}
 	if err := s.authorizeRelationship(ctx, req.RelationshipId, DRRelationshipStateRegistered, DRRelationshipStateActive); err != nil {
 		return nil, err
 	}
@@ -1548,6 +1743,105 @@ func (s *drReplicationPrimary) resetIndexFromSet(rs *reconciler.ReconciliationSe
 	}
 	s.indexInitialized = true
 	s.indexLastFullScan = time.Now().UTC()
+}
+
+// WarmIndexFromJournal replays all available stream journal entries to
+// build the in-memory KID/VID index. This is dramatically faster than
+// a full storage scan because it only performs sequential reads on the
+// local journal segments. After a leader election the journal is already
+// populated (maintained by the drChangeStreamDispatcher on all nodes),
+// so the new leader can warm its index almost instantly.
+//
+// Returns the number of entries replayed, or an error if the journal is
+// unavailable.
+func (s *drReplicationPrimary) WarmIndexFromJournal(journal *drStreamJournal) (int, error) {
+	if journal == nil {
+		return 0, fmt.Errorf("no journal available")
+	}
+
+	s.indexMu.Lock()
+	defer s.indexMu.Unlock()
+
+	var count int
+	var lastIdx uint64
+	err := journal.replayAll(func(e physical.ChangeStreamEntry) error {
+		kid := s.scanner.ComputeKID(e.Key)
+		switch e.OpType {
+		case physical.PutOperation:
+			s.indexKIDToVID[kid] = s.scanner.ComputeVIDWithSealWrap(e.Value, e.SealWrap)
+			s.indexKIDToKey[kid] = e.Key
+		case physical.DeleteOperation:
+			delete(s.indexKIDToVID, kid)
+			delete(s.indexKIDToKey, kid)
+		}
+		if e.RaftIndex > lastIdx {
+			lastIdx = e.RaftIndex
+		}
+		count++
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	s.indexInitialized = true
+	s.indexLastFullScan = time.Now().UTC()
+	if lastIdx > 0 {
+		s.indexApplied.Store(lastIdx)
+	}
+	return count, nil
+}
+
+// WarmIndex proactively builds the in-memory KID/VID index. It first
+// attempts a fast path by replaying the local stream journal (sequential
+// disk reads). If that succeeds the index is immediately usable. A
+// background full physical scan is scheduled only when the journal is
+// unavailable or empty. This ensures that after a leader election the
+// new leader can serve checkpoints almost immediately.
+func (s *drReplicationPrimary) WarmIndex(ctx context.Context) {
+	s.indexMu.RLock()
+	initialized := s.indexInitialized
+	s.indexMu.RUnlock()
+	if initialized {
+		return
+	}
+
+	// Fast path: try journal-based warmup first.
+	if s.streamJournal != nil {
+		start := time.Now()
+		count, err := s.WarmIndexFromJournal(s.streamJournal)
+		if err == nil && count > 0 {
+			s.logger.Info("checkpoint index warmed from journal",
+				"keys", len(s.indexKIDToVID),
+				"journal_entries_replayed", count,
+				"duration", time.Since(start).Round(time.Millisecond))
+			metrics.SetGauge([]string{"replication", "dr", "checkpoint", "index_keys"}, float32(len(s.indexKIDToVID)))
+			return
+		}
+		if err != nil {
+			s.logger.Debug("journal-based index warmup unavailable, falling back to full scan", "error", err)
+		}
+	}
+
+	// Slow path: full physical scan in background.
+	go func() {
+		start := time.Now()
+		s.logger.Info("warming checkpoint index via full scan in background")
+
+		idx := s.indexApplied.Load()
+		checkpoint := reconciler.Checkpoint{CommitIndex: idx}
+		rs, err := s.scanner.ScanPhysical(ctx, s.core.physical, checkpoint)
+		if err != nil {
+			if ctx.Err() != nil {
+				return // node stepped down; expected
+			}
+			s.logger.Warn("background index warm-up failed", "error", err)
+			return
+		}
+		s.resetIndexFromSet(rs)
+		s.logger.Info("checkpoint index warmed via full scan", "keys", rs.KeyCount, "duration", time.Since(start).Round(time.Millisecond))
+		metrics.SetGauge([]string{"replication", "dr", "checkpoint", "index_keys"}, float32(rs.KeyCount))
+	}()
 }
 
 func (s *drReplicationPrimary) applyRuntimeTuning(cfg *DRConfig) {

@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -202,6 +203,12 @@ type drRelationshipManager struct {
 	mu     sync.RWMutex
 	config *DRConfig
 
+	// dispatcher is the FSM change stream hook that maintains the
+	// stream journal on ALL primary-cluster Raft nodes and delegates
+	// to the primary when this node is the active leader. It is
+	// created once and outlives individual primary instances.
+	dispatcher *drChangeStreamDispatcher
+
 	// primary is non-nil when this cluster is a DR primary.
 	primary *drReplicationPrimary
 
@@ -227,10 +234,50 @@ func newDRRelationshipManager(core *Core, logger log.Logger) *drRelationshipMana
 	if logger == nil {
 		logger = log.NewNullLogger()
 	}
+
+	namedLogger := logger.Named("dr-manager")
+
+	// Determine a persistent journal directory. If the underlying
+	// physical backend is Raft, use a subdirectory of its data path
+	// so journal segments survive restarts and leader elections.
+	// For non-Raft backends (e.g. in-memory test backends), create an
+	// isolated temp directory to avoid cross-test contamination.
+	var journalDir string
+	if rb, ok := core.underlyingPhysical.(*raft.RaftBackend); ok {
+		journalDir = rb.JournalDir()
+	} else {
+		tmp, err := os.MkdirTemp("", "openbao-dr-journal-*")
+		if err != nil {
+			namedLogger.Warn("failed to create temp journal dir", "error", err)
+		} else {
+			journalDir = tmp
+		}
+	}
+
+	// Create the shared stream journal and dispatcher. The dispatcher
+	// is registered as the FSM change stream hook so it runs on ALL
+	// nodes in the primary cluster (leaders and followers). This
+	// ensures the journal is populated before a node becomes leader.
+	journal := newDRStreamJournal(namedLogger, journalDir)
+	if err := journal.configure(true, drDefaultStreamJournalMaxBytes, drDefaultStreamJournalSegmentBytes, drDefaultStreamJournalRetention); err != nil {
+		namedLogger.Warn("failed to initialize shared DR stream journal", "error", err)
+	}
+
+	dispatcher := &drChangeStreamDispatcher{
+		journal: journal,
+		logger:  namedLogger,
+	}
+
+	// Register the dispatcher's OnChange as the FSM hook immediately.
+	if csb, ok := core.underlyingPhysical.(physical.ChangeStreamBackend); ok {
+		csb.HookChangeStream(dispatcher.OnChange)
+	}
+
 	return &drRelationshipManager{
 		core:            core,
-		logger:          logger.Named("dr-manager"),
+		logger:          namedLogger,
 		config:          &DRConfig{Mode: DRModeDisabled},
+		dispatcher:      dispatcher,
 		lastSeenWriteAt: make(map[string]time.Time),
 		latestSeenAt:    make(map[string]int64),
 	}
@@ -346,7 +393,7 @@ func (m *drRelationshipManager) LoadConfig(ctx context.Context) error {
 	switch config.Mode {
 	case DRModePrimary:
 		m.logger.Info("restoring DR primary mode from config", "cluster_id", config.ClusterID)
-		m.primary = NewDRReplicationPrimary(m.core, config.ReplSalt, m.logger)
+		m.primary = NewDRReplicationPrimary(m.core, config.ReplSalt, m.logger, m.dispatcherJournal())
 		m.applyPrimaryTunablesLocked()
 
 		// Restore persisted dirty bitmap so post-restart reconciliation
@@ -355,9 +402,10 @@ func (m *drRelationshipManager) LoadConfig(ctx context.Context) error {
 			m.logger.Warn("failed to load persisted dirty bitmap", "error", err)
 		}
 
-		// Re-wire the change stream hook.
-		if csb, ok := m.core.underlyingPhysical.(physical.ChangeStreamBackend); ok {
-			csb.HookChangeStream(m.primary.OnChange)
+		// Attach the primary to the dispatcher so the FSM hook
+		// now also drives ring buffer, subscriber fan-out, etc.
+		if m.dispatcher != nil {
+			m.dispatcher.setPrimary(m.primary)
 		}
 
 		// Seed indexApplied with the current Raft applied index so the
@@ -366,6 +414,10 @@ func (m *drRelationshipManager) LoadConfig(ctx context.Context) error {
 		if rb, ok := m.core.underlyingPhysical.(*raft.RaftBackend); ok {
 			m.primary.SeedAppliedIndex(rb.AppliedIndex())
 		}
+
+		// Proactively warm the checkpoint index in the background so the
+		// first RequestCheckpoint does not pay the full-scan cost.
+		m.primary.WarmIndex(m.core.activeContext)
 
 		// Re-register the cluster handler.
 		m.handler = newDRReplicationClusterHandler(m.core, m.primary, m.logger)
@@ -407,6 +459,15 @@ func (m *drRelationshipManager) LoadConfig(ctx context.Context) error {
 		}
 	}
 
+	return nil
+}
+
+// dispatcherJournal returns the shared stream journal from the
+// dispatcher, or nil if no dispatcher is configured.
+func (m *drRelationshipManager) dispatcherJournal() *drStreamJournal {
+	if m.dispatcher != nil {
+		return m.dispatcher.journal
+	}
 	return nil
 }
 
@@ -473,12 +534,13 @@ func (m *drRelationshipManager) EnablePrimary(ctx context.Context) error {
 	}
 
 	// Initialize the primary-side gRPC server.
-	m.primary = NewDRReplicationPrimary(m.core, replSalt, m.logger)
+	m.primary = NewDRReplicationPrimary(m.core, replSalt, m.logger, m.dispatcherJournal())
 	m.applyPrimaryTunablesLocked()
 
-	// Wire up the change stream hook.
-	if csb, ok := m.core.underlyingPhysical.(physical.ChangeStreamBackend); ok {
-		csb.HookChangeStream(m.primary.OnChange)
+	// Attach the primary to the dispatcher so the FSM hook
+	// now also drives ring buffer, subscriber fan-out, etc.
+	if m.dispatcher != nil {
+		m.dispatcher.setPrimary(m.primary)
 	}
 
 	// Seed indexApplied with the current Raft applied index so the
@@ -487,6 +549,10 @@ func (m *drRelationshipManager) EnablePrimary(ctx context.Context) error {
 	if rb, ok := m.core.underlyingPhysical.(*raft.RaftBackend); ok {
 		m.primary.SeedAppliedIndex(rb.AppliedIndex())
 	}
+
+	// Proactively warm the checkpoint index in the background so the
+	// first RequestCheckpoint does not pay the full-scan cost.
+	m.primary.WarmIndex(ctx)
 
 	// Register the DR handler on the cluster listener for mTLS-secured gRPC.
 	m.handler = newDRReplicationClusterHandler(m.core, m.primary, m.logger)
@@ -516,6 +582,12 @@ func (m *drRelationshipManager) DisablePrimary(ctx context.Context) error {
 
 	// Unregister the DR handler from the cluster listener.
 	unregisterDRHandler(m.core)
+
+	// Detach the primary from the dispatcher; the journal continues
+	// accumulating on this node so a future leader promotion is fast.
+	if m.dispatcher != nil {
+		m.dispatcher.clearPrimary()
+	}
 
 	// Stop the tombstone GC before releasing the primary.
 	if m.primary != nil && m.primary.tombstoneGC != nil {

@@ -221,6 +221,13 @@ func (r *RaftBackend) HookChangeStream(hook physical.ChangeStreamFunc) {
 	r.fsm.hookChangeStream(hook)
 }
 
+// JournalDir returns a directory under the Raft data path suitable for
+// storing DR stream journal segments. The directory survives restarts
+// and is local to this node.
+func (r *RaftBackend) JournalDir() string {
+	return filepath.Join(r.dataDir, "dr-stream-journal")
+}
+
 // LeaderJoinInfo contains information required by a node to join itself as a
 // follower to an existing raft cluster
 type LeaderJoinInfo struct {
