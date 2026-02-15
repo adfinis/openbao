@@ -1243,6 +1243,11 @@ type DRHeartbeatResponse struct {
 	// the current leader is, enabling fast reconnection after stepdowns
 	// without requiring a load balancer.
 	LeaderClusterAddr string `protobuf:"bytes,4,opt,name=leader_cluster_addr,json=leaderClusterAddr,proto3" json:"leader_cluster_addr,omitempty"`
+	// active_cluster_cert is the DER-encoded cluster TLS certificate
+	// of the active primary node. The secondary adds it to a dynamic
+	// trust pool so that after a leadership change the new leader's
+	// certificate can be verified without InsecureSkipVerify.
+	ActiveClusterCert []byte `protobuf:"bytes,5,opt,name=active_cluster_cert,json=activeClusterCert,proto3" json:"active_cluster_cert,omitempty"`
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -1303,6 +1308,13 @@ func (x *DRHeartbeatResponse) GetLeaderClusterAddr() string {
 		return x.LeaderClusterAddr
 	}
 	return ""
+}
+
+func (x *DRHeartbeatResponse) GetActiveClusterCert() []byte {
+	if x != nil {
+		return x.ActiveClusterCert
+	}
+	return nil
 }
 
 // DRRedirectDetail is attached as a gRPC status detail when a standby
@@ -1597,12 +1609,13 @@ const file_vault_dr_replication_service_proto_rawDesc = "" +
 	"\x0frelationship_id\x18\x01 \x01(\tR\x0erelationshipId\x12#\n" +
 	"\rapplied_index\x18\x02 \x01(\x04R\fappliedIndex\x12\x12\n" +
 	"\x04term\x18\x03 \x01(\x04R\x04term\x12\x17\n" +
-	"\anode_id\x18\x04 \x01(\tR\x06nodeId\"\xba\x01\n" +
+	"\anode_id\x18\x04 \x01(\tR\x06nodeId\"\xea\x01\n" +
 	"\x13DRHeartbeatResponse\x12#\n" +
 	"\rprimary_index\x18\x01 \x01(\x04R\fprimaryIndex\x12!\n" +
 	"\fprimary_term\x18\x02 \x01(\x04R\vprimaryTerm\x12+\n" +
 	"\x11replication_state\x18\x03 \x01(\rR\x10replicationState\x12.\n" +
-	"\x13leader_cluster_addr\x18\x04 \x01(\tR\x11leaderClusterAddr\"B\n" +
+	"\x13leader_cluster_addr\x18\x04 \x01(\tR\x11leaderClusterAddr\x12.\n" +
+	"\x13active_cluster_cert\x18\x05 \x01(\fR\x11activeClusterCert\"B\n" +
 	"\x10DRRedirectDetail\x12.\n" +
 	"\x13leader_cluster_addr\x18\x01 \x01(\tR\x11leaderClusterAddr\"\x98\x01\n" +
 	"\x12SyncKeyringRequest\x12'\n" +

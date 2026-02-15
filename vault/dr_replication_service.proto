@@ -267,6 +267,12 @@ message DRHeartbeatResponse {
     // the current leader is, enabling fast reconnection after stepdowns
     // without requiring a load balancer.
     string leader_cluster_addr = 4;
+
+    // active_cluster_cert is the DER-encoded cluster TLS certificate
+    // of the active primary node. The secondary adds it to a dynamic
+    // trust pool so that after a leadership change the new leader's
+    // certificate can be verified without InsecureSkipVerify.
+    bytes active_cluster_cert = 5;
 }
 
 // DRRedirectDetail is attached as a gRPC status detail when a standby
