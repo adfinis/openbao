@@ -493,12 +493,36 @@ func (s *drReplicationPrimary) OnChange(entries []physical.ChangeStreamEntry) {
 }
 
 // StreamChanges implements DRReplicationServer.StreamChanges.
+// requireActiveNode checks whether this node is the active leader.
+// If it is, it returns nil. If it is a standby, it looks up the
+// current leader's cluster address and returns a gRPC Unavailable
+// status with a DRRedirectDetail so the secondary can reconnect to
+// the actual leader. This allows secondaries to discover the new
+// leader after a stepdown without requiring a load balancer.
+func (s *drReplicationPrimary) requireActiveNode() error {
+	if !s.core.standby.Load() {
+		return nil // we are the active node
+	}
+	// Look up the current leader's cluster address.
+	_, _, clusterAddr, err := s.core.Leader()
+	if err != nil || clusterAddr == "" {
+		return status.Errorf(codes.Unavailable, "node is standby and leader address is unknown")
+	}
+	st, _ := status.New(codes.Unavailable, "node is standby; use leader at "+clusterAddr).
+		WithDetails(&DRRedirectDetail{LeaderClusterAddr: clusterAddr})
+	return st.Err()
+}
+
 // The primary streams storage mutations to the secondary in real time
 // as EntryBatch messages (batched for throughput). The RPC is
 // bidirectional: the secondary sends an init message followed by
 // periodic WindowUpdate credits; the primary sends batched entries
 // gated by available credits.
 func (s *drReplicationPrimary) StreamChanges(stream grpc.BidiStreamingServer[StreamChangesUpstream, EntryBatch]) error {
+	if err := s.requireActiveNode(); err != nil {
+		return err
+	}
+
 	// --- Handshake: first upstream message must be init ---
 	initMsg, err := stream.Recv()
 	if err != nil {
@@ -518,8 +542,25 @@ func (s *drReplicationPrimary) StreamChanges(stream grpc.BidiStreamingServer[Str
 		return fmt.Errorf("failed to generate subscriber ID: %w", err)
 	}
 
+	// Derive the subscriber context from BOTH the gRPC stream context and
+	// the core's active context. The stream must terminate when either:
+	//   (a) the gRPC connection breaks (stream.Context() cancelled), or
+	//   (b) this node loses leadership (activeContext cancelled on stepdown/seal).
+	// Without (b), a stepdown leaves the gRPC stream open but idle: the
+	// primary stops pushing entries (OnChange runs on the new leader) while
+	// the secondary blocks on Recv() and never detects the disconnect.
 	ctx, cancel := context.WithCancel(stream.Context())
 	defer cancel()
+
+	// Monitor the active context; cancel the subscriber if leadership is lost.
+	go func() {
+		select {
+		case <-ctx.Done():
+			// Stream already closing -- nothing to do.
+		case <-s.core.activeContext.Done():
+			cancel()
+		}
+	}()
 
 	initialWindow := int64(req.InitialWindow)
 	if initialWindow <= 0 {
@@ -1213,6 +1254,9 @@ func (s *drReplicationPrimary) FetchEntries(req *FetchEntriesRequest, stream grp
 
 // Heartbeat implements DRReplicationServer.Heartbeat.
 func (s *drReplicationPrimary) Heartbeat(ctx context.Context, req *DRHeartbeatRequest) (*DRHeartbeatResponse, error) {
+	if err := s.requireActiveNode(); err != nil {
+		return nil, err
+	}
 	if err := s.authorizeRelationship(ctx, req.RelationshipId, DRRelationshipStateRegistered, DRRelationshipStateActive); err != nil {
 		return nil, err
 	}
@@ -1239,10 +1283,19 @@ func (s *drReplicationPrimary) Heartbeat(ctx context.Context, req *DRHeartbeatRe
 		reportedIndex = raftApplied
 	}
 
+	// Include this node's cluster address so the secondary always knows
+	// where the current leader is, enabling redirect-based reconnection
+	// after stepdowns without requiring a load balancer.
+	var leaderClusterAddr string
+	if _, _, addr, err := s.core.Leader(); err == nil {
+		leaderClusterAddr = addr
+	}
+
 	return &DRHeartbeatResponse{
-		PrimaryIndex:     reportedIndex,
-		PrimaryTerm:      primaryTerm,
-		ReplicationState: uint32(s.core.ReplicationState()),
+		PrimaryIndex:      reportedIndex,
+		PrimaryTerm:       primaryTerm,
+		ReplicationState:  uint32(s.core.ReplicationState()),
+		LeaderClusterAddr: leaderClusterAddr,
 	}, nil
 }
 

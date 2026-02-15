@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -2449,6 +2450,69 @@ func TestOnChange_IndexAdvanceMarkerInjected(t *testing.T) {
 	}
 }
 
+// TestStreamChanges_CancelledOnStepdown verifies that when the core's
+// activeContext is cancelled (simulating a leadership stepdown), an
+// in-flight StreamChanges call exits promptly. Without this, the
+// secondary would block on Recv() indefinitely and never reconnect.
+func TestStreamChanges_CancelledOnStepdown(t *testing.T) {
+	primary, relID, fingerprint := newCreditTestPrimary(t, 5*time.Second)
+
+	// Create a cancellable activeContext on the core to simulate stepdown.
+	activeCtx, simulateStepdown := context.WithCancel(context.Background())
+	primary.core.activeContext = activeCtx
+
+	streamCtx := context.WithValue(context.Background(), drPeerFingerprintContextKey{}, fingerprint)
+
+	stream := &creditTestBidiStream{
+		ctx: streamCtx,
+		initMsg: &StreamChangesUpstream{
+			Msg: &StreamChangesUpstream_Init{
+				Init: &StreamChangesRequest{
+					RelationshipId: relID,
+					InitialWindow:  10,
+				},
+			},
+		},
+		creditCh: make(chan *StreamChangesUpstream),
+		sentCh:   make(chan *EntryChange, 100),
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- primary.StreamChanges(stream)
+	}()
+
+	// Wait for the subscriber to register.
+	time.Sleep(200 * time.Millisecond)
+	primary.mu.Lock()
+	subCount := len(primary.subscribers)
+	primary.mu.Unlock()
+	if subCount == 0 {
+		t.Fatal("expected at least one subscriber after StreamChanges started")
+	}
+
+	// Simulate a stepdown by cancelling the active context.
+	simulateStepdown()
+
+	// StreamChanges should exit promptly (within 2 seconds).
+	select {
+	case err := <-errCh:
+		// We expect an error (context cancelled). The exact error is
+		// not important; what matters is that the call terminated.
+		t.Logf("StreamChanges exited with: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("StreamChanges did not exit within 2s after activeContext cancellation (stepdown)")
+	}
+
+	// After exit, the subscriber should be cleaned up.
+	primary.mu.Lock()
+	subCount = len(primary.subscribers)
+	primary.mu.Unlock()
+	if subCount != 0 {
+		t.Fatalf("expected 0 subscribers after StreamChanges exit, got %d", subCount)
+	}
+}
+
 // TestApplyStreamChange_IndexAdvanceMarker verifies that an entry with
 // an empty key (index-advance marker) is silently ignored by
 // applyStreamChange (no storage write, no error).
@@ -2468,5 +2532,83 @@ func TestApplyStreamChange_IndexAdvanceMarker(t *testing.T) {
 
 	if err := secondary.applyStreamChange(context.Background(), marker); err != nil {
 		t.Fatalf("applyStreamChange on marker should return nil, got: %v", err)
+	}
+}
+
+// TestRequireActiveNode_Active verifies that requireActiveNode returns nil
+// when the node is the active leader.
+func TestRequireActiveNode_Active(t *testing.T) {
+	primary := &drReplicationPrimary{
+		core: &Core{},
+	}
+	// standby defaults to false (active).
+	if err := primary.requireActiveNode(); err != nil {
+		t.Fatalf("expected nil for active node, got: %v", err)
+	}
+}
+
+// TestRequireActiveNode_Standby verifies that requireActiveNode returns
+// a gRPC Unavailable error with a DRRedirectDetail when the node is a standby.
+func TestRequireActiveNode_Standby(t *testing.T) {
+	primary := &drReplicationPrimary{
+		core: &Core{},
+	}
+	primary.core.standby.Store(true)
+
+	err := primary.requireActiveNode()
+	if err == nil {
+		t.Fatal("expected error for standby node, got nil")
+	}
+
+	// The error should carry a DRRedirectDetail since the standby's
+	// Leader() returns empty in test (no HA backend), but we verify
+	// the code doesn't panic and returns Unavailable.
+	st, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("expected gRPC status error, got: %v", err)
+	}
+	if st.Code() != codes.Unavailable {
+		t.Fatalf("expected Unavailable, got: %v", st.Code())
+	}
+}
+
+// TestExtractDRRedirect verifies that extractDRRedirect correctly
+// parses a DRRedirectDetail from a gRPC status error.
+func TestExtractDRRedirect(t *testing.T) {
+	// Build a status with a DRRedirectDetail.
+	wantAddr := "https://leader.example.com:8201"
+	st, err := status.New(codes.Unavailable, "standby redirect").
+		WithDetails(&DRRedirectDetail{LeaderClusterAddr: wantAddr})
+	if err != nil {
+		t.Fatalf("failed to build status with details: %v", err)
+	}
+
+	got, ok := extractDRRedirect(st.Err())
+	if !ok {
+		t.Fatal("expected redirect to be extracted")
+	}
+	if got != wantAddr {
+		t.Fatalf("got addr %q, want %q", got, wantAddr)
+	}
+
+	// Verify a non-redirect error returns false.
+	_, ok = extractDRRedirect(fmt.Errorf("some other error"))
+	if ok {
+		t.Fatal("expected no redirect for plain error")
+	}
+}
+
+// TestErrDRRedirect_ControllerHandling verifies that errDRRedirect is
+// correctly unwrapped by errors.As.
+func TestErrDRRedirect_ControllerHandling(t *testing.T) {
+	orig := &errDRRedirect{LeaderAddr: "https://new-leader:8201"}
+	wrapped := fmt.Errorf("stream failed: %w", orig)
+
+	var redirect *errDRRedirect
+	if !errors.As(wrapped, &redirect) {
+		t.Fatal("errors.As should unwrap errDRRedirect")
+	}
+	if redirect.LeaderAddr != "https://new-leader:8201" {
+		t.Fatalf("got %q, want %q", redirect.LeaderAddr, "https://new-leader:8201")
 	}
 }

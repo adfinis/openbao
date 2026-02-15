@@ -24,6 +24,7 @@ import (
 	metrics "github.com/hashicorp/go-metrics/compat"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	"github.com/openbao/openbao/helper/namespace"
 	"github.com/openbao/openbao/physical/replication/reconciler"
@@ -31,6 +32,31 @@ import (
 	"github.com/openbao/openbao/sdk/v2/logical"
 	"github.com/openbao/openbao/sdk/v2/physical"
 )
+
+// errDRRedirect is returned when a DR gRPC call is redirected to the
+// active leader. The controller uses LeaderAddr to reconnect.
+type errDRRedirect struct {
+	LeaderAddr string
+}
+
+func (e *errDRRedirect) Error() string {
+	return fmt.Sprintf("DR redirect to leader at %s", e.LeaderAddr)
+}
+
+// extractDRRedirect checks whether a gRPC error contains a
+// DRRedirectDetail and returns the leader address if so.
+func extractDRRedirect(err error) (string, bool) {
+	st, ok := status.FromError(err)
+	if !ok {
+		return "", false
+	}
+	for _, detail := range st.Details() {
+		if rd, ok := detail.(*DRRedirectDetail); ok && rd.LeaderClusterAddr != "" {
+			return rd.LeaderClusterAddr, true
+		}
+	}
+	return "", false
+}
 
 // drNeverReplicateExactPaths lists storage paths that must never be
 // replicated from the primary to the secondary. These entries are
@@ -233,6 +259,11 @@ type drReplicationSecondary struct {
 
 	// primaryCACert is the primary's TLS CA certificate for mTLS.
 	primaryCACert []byte
+
+	// lastKnownLeaderAddr caches the active leader's cluster address,
+	// updated on each heartbeat. Used for redirect-based reconnection
+	// after stepdowns.
+	lastKnownLeaderAddr atomic.Pointer[string]
 
 	// stopCh signals all goroutines to stop.
 	stopCh chan struct{}
@@ -522,9 +553,30 @@ func (s *drReplicationSecondary) Start(ctx context.Context) error {
 				s.logger.Warn("change stream disconnected", "error", err)
 				s.streamDisconnects.Add(1)
 				metrics.IncrCounter([]string{"replication", "dr", "secondary", "stream_disconnects"}, 1)
-				// Fall back to reconciliation.
+
+				// Check if the error is a redirect to a new leader.
+				if addr, ok := extractDRRedirect(err); ok {
+					s.logger.Info("redirected to new leader", "addr", addr)
+					s.setState(DRSecondaryReconciling)
+					return &errDRRedirect{LeaderAddr: addr}
+				}
+
+				// Check if we have a cached leader address from heartbeats
+				// that differs from our current connection. This handles the
+				// case where the stream broke due to a stepdown but the error
+				// itself doesn't carry a redirect.
+				if addrPtr := s.lastKnownLeaderAddr.Load(); addrPtr != nil && *addrPtr != "" {
+					s.logger.Info("stream disconnected, reconnecting to last known leader", "addr", *addrPtr)
+					s.setState(DRSecondaryReconciling)
+					return &errDRRedirect{LeaderAddr: *addrPtr}
+				}
+
+				// No redirect info available. Return the error to the
+				// controller loop so it can re-establish the gRPC
+				// connection via Connect(). This handles the LB case
+				// where the controller just redials the same address.
 				s.setState(DRSecondaryReconciling)
-				continue
+				return fmt.Errorf("stream disconnected, reconnecting: %w", err)
 			}
 
 		case DRSecondaryReconciling:
@@ -1103,10 +1155,22 @@ func (s *drReplicationSecondary) runHeartbeatLoop(ctx context.Context) {
 		})
 		cancel()
 		if err != nil || resp == nil {
+			// If the heartbeat returns a redirect, cache the leader address
+			// so the controller can use it for reconnection.
+			if err != nil {
+				if addr, ok := extractDRRedirect(err); ok {
+					s.lastKnownLeaderAddr.Store(&addr)
+				}
+			}
 			continue
 		}
 		s.primaryIndex.Store(resp.PrimaryIndex)
 		s.updateConvergenceTelemetry(resp.PrimaryIndex, s.lastAppliedIndex.Load(), time.Now().UTC())
+
+		// Cache the leader's cluster address for redirect-based reconnection.
+		if addr := resp.GetLeaderClusterAddr(); addr != "" {
+			s.lastKnownLeaderAddr.Store(&addr)
+		}
 	}
 }
 

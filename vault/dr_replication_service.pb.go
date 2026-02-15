@@ -1238,8 +1238,13 @@ type DRHeartbeatResponse struct {
 	PrimaryIndex     uint64                 `protobuf:"varint,1,opt,name=primary_index,json=primaryIndex,proto3" json:"primary_index,omitempty"`
 	PrimaryTerm      uint64                 `protobuf:"varint,2,opt,name=primary_term,json=primaryTerm,proto3" json:"primary_term,omitempty"`
 	ReplicationState uint32                 `protobuf:"varint,3,opt,name=replication_state,json=replicationState,proto3" json:"replication_state,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// leader_cluster_addr is the active primary's cluster gRPC address.
+	// Populated on every heartbeat so the secondary always knows where
+	// the current leader is, enabling fast reconnection after stepdowns
+	// without requiring a load balancer.
+	LeaderClusterAddr string `protobuf:"bytes,4,opt,name=leader_cluster_addr,json=leaderClusterAddr,proto3" json:"leader_cluster_addr,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *DRHeartbeatResponse) Reset() {
@@ -1293,6 +1298,61 @@ func (x *DRHeartbeatResponse) GetReplicationState() uint32 {
 	return 0
 }
 
+func (x *DRHeartbeatResponse) GetLeaderClusterAddr() string {
+	if x != nil {
+		return x.LeaderClusterAddr
+	}
+	return ""
+}
+
+// DRRedirectDetail is attached as a gRPC status detail when a standby
+// node receives a DR replication RPC that must be handled by the active
+// leader. The secondary should reconnect to the address in
+// leader_cluster_addr.
+type DRRedirectDetail struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	LeaderClusterAddr string                 `protobuf:"bytes,1,opt,name=leader_cluster_addr,json=leaderClusterAddr,proto3" json:"leader_cluster_addr,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *DRRedirectDetail) Reset() {
+	*x = DRRedirectDetail{}
+	mi := &file_vault_dr_replication_service_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DRRedirectDetail) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DRRedirectDetail) ProtoMessage() {}
+
+func (x *DRRedirectDetail) ProtoReflect() protoreflect.Message {
+	mi := &file_vault_dr_replication_service_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DRRedirectDetail.ProtoReflect.Descriptor instead.
+func (*DRRedirectDetail) Descriptor() ([]byte, []int) {
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *DRRedirectDetail) GetLeaderClusterAddr() string {
+	if x != nil {
+		return x.LeaderClusterAddr
+	}
+	return ""
+}
+
 // SyncKeyringRequest is sent by the secondary during bootstrap to
 // request the primary's keyring.
 type SyncKeyringRequest struct {
@@ -1306,7 +1366,7 @@ type SyncKeyringRequest struct {
 
 func (x *SyncKeyringRequest) Reset() {
 	*x = SyncKeyringRequest{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[19]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1318,7 +1378,7 @@ func (x *SyncKeyringRequest) String() string {
 func (*SyncKeyringRequest) ProtoMessage() {}
 
 func (x *SyncKeyringRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[19]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1331,7 +1391,7 @@ func (x *SyncKeyringRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncKeyringRequest.ProtoReflect.Descriptor instead.
 func (*SyncKeyringRequest) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{19}
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *SyncKeyringRequest) GetRelationshipId() string {
@@ -1379,7 +1439,7 @@ type SyncKeyringResponse struct {
 
 func (x *SyncKeyringResponse) Reset() {
 	*x = SyncKeyringResponse{}
-	mi := &file_vault_dr_replication_service_proto_msgTypes[20]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1391,7 +1451,7 @@ func (x *SyncKeyringResponse) String() string {
 func (*SyncKeyringResponse) ProtoMessage() {}
 
 func (x *SyncKeyringResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vault_dr_replication_service_proto_msgTypes[20]
+	mi := &file_vault_dr_replication_service_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1404,7 +1464,7 @@ func (x *SyncKeyringResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncKeyringResponse.ProtoReflect.Descriptor instead.
 func (*SyncKeyringResponse) Descriptor() ([]byte, []int) {
-	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{20}
+	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *SyncKeyringResponse) GetKeyringEntry() []byte {
@@ -1537,11 +1597,14 @@ const file_vault_dr_replication_service_proto_rawDesc = "" +
 	"\x0frelationship_id\x18\x01 \x01(\tR\x0erelationshipId\x12#\n" +
 	"\rapplied_index\x18\x02 \x01(\x04R\fappliedIndex\x12\x12\n" +
 	"\x04term\x18\x03 \x01(\x04R\x04term\x12\x17\n" +
-	"\anode_id\x18\x04 \x01(\tR\x06nodeId\"\x8a\x01\n" +
+	"\anode_id\x18\x04 \x01(\tR\x06nodeId\"\xba\x01\n" +
 	"\x13DRHeartbeatResponse\x12#\n" +
 	"\rprimary_index\x18\x01 \x01(\x04R\fprimaryIndex\x12!\n" +
 	"\fprimary_term\x18\x02 \x01(\x04R\vprimaryTerm\x12+\n" +
-	"\x11replication_state\x18\x03 \x01(\rR\x10replicationState\"\x98\x01\n" +
+	"\x11replication_state\x18\x03 \x01(\rR\x10replicationState\x12.\n" +
+	"\x13leader_cluster_addr\x18\x04 \x01(\tR\x11leaderClusterAddr\"B\n" +
+	"\x10DRRedirectDetail\x12.\n" +
+	"\x13leader_cluster_addr\x18\x01 \x01(\tR\x11leaderClusterAddr\"\x98\x01\n" +
 	"\x12SyncKeyringRequest\x12'\n" +
 	"\x0frelationship_id\x18\x01 \x01(\tR\x0erelationshipId\x126\n" +
 	"\x17client_ephemeral_pubkey\x18\x02 \x01(\fR\x15clientEphemeralPubkey\x12!\n" +
@@ -1576,7 +1639,7 @@ func file_vault_dr_replication_service_proto_rawDescGZIP() []byte {
 	return file_vault_dr_replication_service_proto_rawDescData
 }
 
-var file_vault_dr_replication_service_proto_msgTypes = make([]protoimpl.MessageInfo, 21)
+var file_vault_dr_replication_service_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
 var file_vault_dr_replication_service_proto_goTypes = []any{
 	(*EntryChange)(nil),           // 0: vault.EntryChange
 	(*StreamChangesUpstream)(nil), // 1: vault.StreamChangesUpstream
@@ -1597,8 +1660,9 @@ var file_vault_dr_replication_service_proto_goTypes = []any{
 	(*EntryBatch)(nil),            // 16: vault.EntryBatch
 	(*DRHeartbeatRequest)(nil),    // 17: vault.DRHeartbeatRequest
 	(*DRHeartbeatResponse)(nil),   // 18: vault.DRHeartbeatResponse
-	(*SyncKeyringRequest)(nil),    // 19: vault.SyncKeyringRequest
-	(*SyncKeyringResponse)(nil),   // 20: vault.SyncKeyringResponse
+	(*DRRedirectDetail)(nil),      // 19: vault.DRRedirectDetail
+	(*SyncKeyringRequest)(nil),    // 20: vault.SyncKeyringRequest
+	(*SyncKeyringResponse)(nil),   // 21: vault.SyncKeyringResponse
 }
 var file_vault_dr_replication_service_proto_depIdxs = []int32{
 	3,  // 0: vault.StreamChangesUpstream.init:type_name -> vault.StreamChangesRequest
@@ -1617,7 +1681,7 @@ var file_vault_dr_replication_service_proto_depIdxs = []int32{
 	12, // 13: vault.DRReplication.ExchangeRangeDigests:input_type -> vault.RangeDigestRequest
 	15, // 14: vault.DRReplication.FetchEntries:input_type -> vault.FetchEntriesRequest
 	17, // 15: vault.DRReplication.Heartbeat:input_type -> vault.DRHeartbeatRequest
-	19, // 16: vault.DRReplication.SyncKeyring:input_type -> vault.SyncKeyringRequest
+	20, // 16: vault.DRReplication.SyncKeyring:input_type -> vault.SyncKeyringRequest
 	16, // 17: vault.DRReplication.StreamChanges:output_type -> vault.EntryBatch
 	5,  // 18: vault.DRReplication.RequestCheckpoint:output_type -> vault.CheckpointResponse
 	7,  // 19: vault.DRReplication.ExchangeDirtyBitmap:output_type -> vault.DirtyBitmapMessage
@@ -1625,7 +1689,7 @@ var file_vault_dr_replication_service_proto_depIdxs = []int32{
 	13, // 21: vault.DRReplication.ExchangeRangeDigests:output_type -> vault.RangeDigestResponse
 	16, // 22: vault.DRReplication.FetchEntries:output_type -> vault.EntryBatch
 	18, // 23: vault.DRReplication.Heartbeat:output_type -> vault.DRHeartbeatResponse
-	20, // 24: vault.DRReplication.SyncKeyring:output_type -> vault.SyncKeyringResponse
+	21, // 24: vault.DRReplication.SyncKeyring:output_type -> vault.SyncKeyringResponse
 	17, // [17:25] is the sub-list for method output_type
 	9,  // [9:17] is the sub-list for method input_type
 	9,  // [9:9] is the sub-list for extension type_name
@@ -1648,7 +1712,7 @@ func file_vault_dr_replication_service_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_vault_dr_replication_service_proto_rawDesc), len(file_vault_dr_replication_service_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   21,
+			NumMessages:   22,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

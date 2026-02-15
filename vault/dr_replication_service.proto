@@ -261,6 +261,20 @@ message DRHeartbeatResponse {
     uint64 primary_index = 1;
     uint64 primary_term = 2;
     uint32 replication_state = 3;
+
+    // leader_cluster_addr is the active primary's cluster gRPC address.
+    // Populated on every heartbeat so the secondary always knows where
+    // the current leader is, enabling fast reconnection after stepdowns
+    // without requiring a load balancer.
+    string leader_cluster_addr = 4;
+}
+
+// DRRedirectDetail is attached as a gRPC status detail when a standby
+// node receives a DR replication RPC that must be handled by the active
+// leader. The secondary should reconnect to the address in
+// leader_cluster_addr.
+message DRRedirectDetail {
+    string leader_cluster_addr = 1;
 }
 
 // SyncKeyringRequest is sent by the secondary during bootstrap to
