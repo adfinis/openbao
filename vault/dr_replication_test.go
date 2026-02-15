@@ -5,16 +5,25 @@ package vault
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -917,7 +926,7 @@ func TestDRPrimary_ChangeStreamFanout(t *testing.T) {
 	replSalt := make([]byte, 32)
 	rand.Read(replSalt)
 
-	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
 
 	// Simulate changes.
 	changes := []physical.ChangeStreamEntry{
@@ -945,7 +954,7 @@ func TestDRPrimary_SeedAppliedIndex(t *testing.T) {
 	replSalt := make([]byte, 32)
 	rand.Read(replSalt)
 
-	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
 
 	// Initially zero.
 	if got := primary.indexApplied.Load(); got != 0 {
@@ -997,7 +1006,7 @@ func TestDRPrimary_RevokeRelationshipTerminatesOnlyMatchingStreams(t *testing.T)
 	replSalt := make([]byte, 32)
 	rand.Read(replSalt)
 
-	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
 
 	ctxA, cancelA := context.WithCancel(context.Background())
 	ctxB, cancelB := context.WithCancel(context.Background())
@@ -1052,7 +1061,7 @@ func TestDRPrimary_CheckpointCacheBudgetEnforced(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	replSalt := make([]byte, 32)
 	rand.Read(replSalt)
-	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
 	primary.checkpointGlobalBudget = 128
 	primary.checkpointPerRelationshipBudget = 128
 
@@ -1073,7 +1082,7 @@ func TestDRPrimary_CheckpointCachePerRelationshipEviction(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	replSalt := make([]byte, 32)
 	rand.Read(replSalt)
-	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
 	primary.checkpointGlobalBudget = 1 << 20
 	primary.checkpointPerRelationshipBudget = 1 << 20
 	primary.maxCheckpointsPerRelationship = 2
@@ -1130,7 +1139,7 @@ func TestDRPrimary_ExchangeRangeChecksums_CheckpointTupleMismatch(t *testing.T) 
 	core, _, _ := TestCoreUnsealed(t)
 	replSalt := make([]byte, 32)
 	rand.Read(replSalt)
-	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
 
 	var start [32]byte
 	cp := &drCheckpointCacheEntry{
@@ -1165,7 +1174,7 @@ func TestDRPrimary_StreamBufferHorizonSeconds(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	replSalt := make([]byte, 32)
 	rand.Read(replSalt)
-	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
 
 	primary.bufMu.Lock()
 	primary.changeBuffer = make([]physical.ChangeStreamEntry, 500)
@@ -1184,7 +1193,7 @@ func TestDRPrimary_ReadCheckpointEntryChange_ExpectedVIDMismatch(t *testing.T) {
 	replSalt := make([]byte, 32)
 	rand.Read(replSalt)
 
-	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
 	ctx := context.Background()
 
 	key := "secret/data/demo"
@@ -1254,7 +1263,7 @@ func TestDRPrimary_ReadCheckpointEntryChange_UsesArtifactNotLiveStorage(t *testi
 	replSalt := make([]byte, 32)
 	rand.Read(replSalt)
 
-	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
 	ctx := context.Background()
 
 	key := "secret/data/dr-artifact"
@@ -1453,7 +1462,7 @@ func TestDRPrimary_AllowWriteRequest_BackpressureRejectsNonExempt(t *testing.T) 
 	core, _, _ := TestCoreUnsealed(t)
 	replSalt := make([]byte, 32)
 	rand.Read(replSalt)
-	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
 
 	primary.backpressureEnabled = true
 	primary.backpressureDegraded = 0.80
@@ -1505,7 +1514,7 @@ func TestDRPrimary_ShouldThrottleCheckpointBuild_UsesActiveLagSignal(t *testing.
 	core, _, _ := TestCoreUnsealed(t)
 	replSalt := make([]byte, 32)
 	rand.Read(replSalt)
-	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
 
 	primary.bufMaxSize = 100
 	primary.bufMaxBytes = 1024
@@ -1545,7 +1554,7 @@ func TestDRPrimary_LaggingSubscribersActiveCount_ExpiresWindow(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	replSalt := make([]byte, 32)
 	rand.Read(replSalt)
-	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
 
 	primary.streamLaggingSubscribersActive.Store(3)
 	primary.streamLaggingLastEventUnix.Store(time.Now().Add(-2 * drCheckpointLaggingActiveWindow).Unix())
@@ -1559,7 +1568,7 @@ func TestDRPrimary_AllowForcedCheckpointBuild_Cooldown(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	replSalt := make([]byte, 32)
 	rand.Read(replSalt)
-	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
 
 	if !primary.allowForcedCheckpointBuild("rel-a") {
 		t.Fatal("expected first forced checkpoint admission to pass")
@@ -1611,7 +1620,7 @@ func TestDRPrimary_ExchangeDirtyBitmap_PostRestartReturnsAllDirty(t *testing.T) 
 	core, _, _ := TestCoreUnsealed(t)
 	replSalt := make([]byte, 32)
 	rand.Read(replSalt)
-	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
 
 	// Freshly created primary has dirtyMapStart == 0 (simulating post-restart).
 	if primary.dirtyMapStart != 0 {
@@ -1638,7 +1647,7 @@ func TestDRPrimary_DirtyBitmapPersistenceAndReload(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	replSalt := make([]byte, 32)
 	rand.Read(replSalt)
-	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
 
 	// Simulate writes to populate the dirty bitmap.
 	primary.OnChange([]physical.ChangeStreamEntry{
@@ -1663,7 +1672,7 @@ func TestDRPrimary_DirtyBitmapPersistenceAndReload(t *testing.T) {
 	primary.dirtyMapMu.RUnlock()
 
 	// Create a new primary (simulating restart) and load from storage.
-	primary2 := NewDRReplicationPrimary(core, replSalt, core.logger)
+	primary2 := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
 	if err := primary2.loadDirtyBitmap(context.Background()); err != nil {
 		t.Fatalf("loadDirtyBitmap failed: %v", err)
 	}
@@ -1685,7 +1694,7 @@ func TestDRPrimary_ExchangeDirtyBitmap_InitializedBitmapUsesActual(t *testing.T)
 	core, _, _ := TestCoreUnsealed(t)
 	replSalt := make([]byte, 32)
 	rand.Read(replSalt)
-	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
 
 	// Simulate a write that initializes the dirty bitmap.
 	primary.OnChange([]physical.ChangeStreamEntry{
@@ -1733,7 +1742,7 @@ func TestDRTombstoneGC_ComputesWatermarkFromSecondaryPressure(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	replSalt := make([]byte, 32)
 	rand.Read(replSalt)
-	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
 	defer primary.tombstoneGC.Stop()
 
 	now := time.Now()
@@ -1763,7 +1772,7 @@ func TestDRTombstoneGC_DisconnectedPeersExcludedFromWatermark(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	replSalt := make([]byte, 32)
 	rand.Read(replSalt)
-	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
 	defer primary.tombstoneGC.Stop()
 
 	now := time.Now()
@@ -1793,7 +1802,7 @@ func TestDRTombstoneGC_NoActivePeersUsesLocalIndex(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	replSalt := make([]byte, 32)
 	rand.Read(replSalt)
-	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
 	defer primary.tombstoneGC.Stop()
 
 	primary.indexApplied.Store(200)
@@ -1883,7 +1892,7 @@ func newCreditTestPrimary(t *testing.T, creditTimeout time.Duration) (*drReplica
 	replSalt := make([]byte, 32)
 	rand.Read(replSalt)
 
-	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
 	defer func() {
 		if primary.tombstoneGC != nil {
 			primary.tombstoneGC.Stop()
@@ -2364,7 +2373,7 @@ func TestOnChange_IndexReplicable(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	replSalt := make([]byte, 32)
 	rand.Read(replSalt)
-	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
 
 	// Batch 1: only replicable entries.
 	primary.OnChange([]physical.ChangeStreamEntry{
@@ -2406,7 +2415,7 @@ func TestOnChange_IndexAdvanceMarkerInjected(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	replSalt := make([]byte, 32)
 	rand.Read(replSalt)
-	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
 
 	// Register a fake subscriber.
 	ch := make(chan physical.ChangeStreamEntry, 16)
@@ -2610,5 +2619,763 @@ func TestErrDRRedirect_ControllerHandling(t *testing.T) {
 	}
 	if redirect.LeaderAddr != "https://new-leader:8201" {
 		t.Fatalf("got %q, want %q", redirect.LeaderAddr, "https://new-leader:8201")
+	}
+}
+
+// TestClassifyReconcileFailure_Redirect verifies that a gRPC error
+// with a DRRedirectDetail is classified as drReconcileFailureRedirect,
+// and that shouldRetryReconcile returns false for it.
+func TestClassifyReconcileFailure_Redirect(t *testing.T) {
+	st, err := status.New(codes.Unavailable, "node is standby").
+		WithDetails(&DRRedirectDetail{LeaderClusterAddr: "https://leader:8201"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	class := classifyReconcileFailure(st.Err())
+	if class != drReconcileFailureRedirect {
+		t.Fatalf("expected redirect class, got %q", class)
+	}
+
+	// Redirect should never be retried.
+	core, _, _ := TestCoreUnsealed(t)
+	sec := &drReplicationSecondary{core: core, logger: core.logger}
+	if sec.shouldRetryReconcile(class) {
+		t.Fatal("redirect should not be retryable")
+	}
+}
+
+// TestClassifyReconcileFailure_NonRedirect verifies that a plain
+// gRPC Unavailable without DRRedirectDetail is NOT classified as redirect.
+func TestClassifyReconcileFailure_NonRedirect(t *testing.T) {
+	err := status.Errorf(codes.Unavailable, "connection refused")
+	class := classifyReconcileFailure(err)
+	if class == drReconcileFailureRedirect {
+		t.Fatal("plain Unavailable should not be classified as redirect")
+	}
+}
+
+// TestClassifyReconcileFailure_WrappedRedirect verifies that a gRPC
+// redirect error wrapped with fmt.Errorf (as runReconciliation does)
+// is still classified as drReconcileFailureRedirect.
+func TestClassifyReconcileFailure_WrappedRedirect(t *testing.T) {
+	st, err := status.New(codes.Unavailable, "node is standby; use leader at https://leader:8201").
+		WithDetails(&DRRedirectDetail{LeaderClusterAddr: "https://leader:8201"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the wrapping done by runReconciliation.
+	wrapped := fmt.Errorf("failed to request checkpoint: %w", st.Err())
+
+	class := classifyReconcileFailure(wrapped)
+	if class != drReconcileFailureRedirect {
+		t.Fatalf("expected redirect class for wrapped error, got %q", class)
+	}
+
+	// Verify extractDRRedirect also works on the wrapped error.
+	addr, ok := extractDRRedirect(wrapped)
+	if !ok {
+		t.Fatal("expected extractDRRedirect to find redirect in wrapped error")
+	}
+	if addr != "https://leader:8201" {
+		t.Fatalf("got addr %q, want %q", addr, "https://leader:8201")
+	}
+
+	// Double-wrap to simulate additional layers.
+	doubleWrapped := fmt.Errorf("reconciliation: %w", wrapped)
+	class = classifyReconcileFailure(doubleWrapped)
+	if class != drReconcileFailureRedirect {
+		t.Fatalf("expected redirect class for double-wrapped error, got %q", class)
+	}
+}
+
+// ---------- Dynamic TLS trust pool tests ----------
+
+// generateTestCert creates a self-signed DER-encoded certificate for testing.
+func generateTestCert(t *testing.T, cn string) ([]byte, *x509.Certificate) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: cn},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return der, parsed
+}
+
+func TestDRClusterClient_VerifyKnownCert(t *testing.T) {
+	der, _ := generateTestCert(t, "fw-known")
+	fp := drCertFingerprint(der)
+
+	var mu sync.RWMutex
+	pool := map[string]*trustedPrimaryCert{
+		fp: {derBytes: der, lastSeen: time.Now().Add(-time.Minute)},
+	}
+
+	client := &drReplicationClusterClient{
+		logger:         log.NewNullLogger(),
+		trustedCertsMu: &mu,
+		trustedCerts:   pool,
+	}
+
+	verifier := client.VerifyPeerCertificate()
+	if verifier == nil {
+		t.Fatal("expected non-nil verifier")
+	}
+
+	// Verification should succeed for a known cert.
+	if err := verifier([][]byte{der}, nil); err != nil {
+		t.Fatalf("unexpected error for known cert: %v", err)
+	}
+
+	// lastSeen should have been refreshed.
+	mu.RLock()
+	entry := pool[fp]
+	mu.RUnlock()
+	if time.Since(entry.lastSeen) > time.Second {
+		t.Fatalf("lastSeen not refreshed: %v ago", time.Since(entry.lastSeen))
+	}
+}
+
+func TestDRClusterClient_VerifyTOFU(t *testing.T) {
+	der, parsed := generateTestCert(t, "fw-unknown")
+
+	var mu sync.RWMutex
+	pool := make(map[string]*trustedPrimaryCert)
+
+	client := &drReplicationClusterClient{
+		logger:         log.NewNullLogger(),
+		trustedCertsMu: &mu,
+		trustedCerts:   pool,
+	}
+
+	verifier := client.VerifyPeerCertificate()
+
+	// Unknown cert should be accepted (TOFU) and added to pool.
+	if err := verifier([][]byte{der}, nil); err != nil {
+		t.Fatalf("unexpected error for TOFU cert: %v", err)
+	}
+
+	fp := drCertFingerprint(der)
+	mu.RLock()
+	entry, ok := pool[fp]
+	mu.RUnlock()
+	if !ok {
+		t.Fatal("cert not added to pool after TOFU")
+	}
+	if time.Since(entry.lastSeen) > time.Second {
+		t.Fatalf("lastSeen not set correctly: %v ago", time.Since(entry.lastSeen))
+	}
+
+	// Verify the stored DER bytes match.
+	h := sha256.Sum256(entry.derBytes)
+	gotFP := hex.EncodeToString(h[:])
+	wantFP := drCertFingerprint(parsed.Raw)
+	if gotFP != wantFP {
+		t.Fatalf("stored fingerprint mismatch: got %s, want %s", gotFP, wantFP)
+	}
+}
+
+func TestDRClusterClient_VerifyEmptyCerts(t *testing.T) {
+	var mu sync.RWMutex
+	pool := make(map[string]*trustedPrimaryCert)
+
+	client := &drReplicationClusterClient{
+		logger:         log.NewNullLogger(),
+		trustedCertsMu: &mu,
+		trustedCerts:   pool,
+	}
+
+	verifier := client.VerifyPeerCertificate()
+
+	// Empty rawCerts should fail.
+	if err := verifier(nil, nil); err == nil {
+		t.Fatal("expected error for nil rawCerts")
+	}
+	if err := verifier([][]byte{}, nil); err == nil {
+		t.Fatal("expected error for empty rawCerts")
+	}
+}
+
+func TestDRTrustPool_TTLEviction(t *testing.T) {
+	der1, _ := generateTestCert(t, "fw-fresh")
+	der2, _ := generateTestCert(t, "fw-stale")
+	fp1 := drCertFingerprint(der1)
+	fp2 := drCertFingerprint(der2)
+
+	var mu sync.RWMutex
+	pool := map[string]*trustedPrimaryCert{
+		fp1: {derBytes: der1, lastSeen: time.Now()},                                      // fresh
+		fp2: {derBytes: der2, lastSeen: time.Now().Add(-(trustedCertTTL + time.Minute))}, // stale
+	}
+
+	client := &drReplicationClusterClient{
+		logger:         log.NewNullLogger(),
+		trustedCertsMu: &mu,
+		trustedCerts:   pool,
+	}
+
+	client.pruneTrustedCerts()
+
+	mu.RLock()
+	defer mu.RUnlock()
+	if _, ok := pool[fp1]; !ok {
+		t.Fatal("fresh cert should not have been pruned")
+	}
+	if _, ok := pool[fp2]; ok {
+		t.Fatal("stale cert should have been pruned")
+	}
+}
+
+func TestHeartbeatResponse_ActiveClusterCert(t *testing.T) {
+	der, parsed := generateTestCert(t, "fw-primary-leader")
+
+	var mu sync.RWMutex
+	pool := make(map[string]*trustedPrimaryCert)
+
+	client := &drReplicationClusterClient{
+		logger:         log.NewNullLogger(),
+		trustedCertsMu: &mu,
+		trustedCerts:   pool,
+	}
+
+	// Simulate heartbeat delivering the active cluster cert.
+	client.addTrustedCert(der)
+
+	fp := drCertFingerprint(parsed.Raw)
+	mu.RLock()
+	entry, ok := pool[fp]
+	mu.RUnlock()
+	if !ok {
+		t.Fatal("cert not added to pool from heartbeat")
+	}
+	if time.Since(entry.lastSeen) > time.Second {
+		t.Fatal("lastSeen not set correctly")
+	}
+
+	// Calling addTrustedCert again should refresh lastSeen.
+	mu.RLock()
+	firstSeen := entry.lastSeen
+	mu.RUnlock()
+	time.Sleep(10 * time.Millisecond)
+	client.addTrustedCert(der)
+
+	mu.RLock()
+	secondSeen := pool[fp].lastSeen
+	mu.RUnlock()
+	if !secondSeen.After(firstSeen) {
+		t.Fatalf("lastSeen was not refreshed on duplicate add: first=%v, second=%v", firstSeen, secondSeen)
+	}
+}
+
+func TestInitTrustedPool(t *testing.T) {
+	_, parsed := generateTestCert(t, "fw-activation")
+	pool := make(map[string]*trustedPrimaryCert)
+
+	initTrustedPool(pool, parsed)
+
+	fp := drCertFingerprint(parsed.Raw)
+	if _, ok := pool[fp]; !ok {
+		t.Fatal("activation cert not seeded into pool")
+	}
+
+	// Calling again should not duplicate or reset lastSeen.
+	origSeen := pool[fp].lastSeen
+	time.Sleep(10 * time.Millisecond)
+	initTrustedPool(pool, parsed)
+	if pool[fp].lastSeen != origSeen {
+		t.Fatal("initTrustedPool should not overwrite existing entry")
+	}
+	if len(pool) != 1 {
+		t.Fatalf("pool should have exactly 1 entry, got %d", len(pool))
+	}
+}
+
+func TestDRCertFingerprint(t *testing.T) {
+	der, _ := generateTestCert(t, "fw-test-fp")
+
+	fp := drCertFingerprint(der)
+
+	// Verify it matches manual computation.
+	h := sha256.Sum256(der)
+	want := hex.EncodeToString(h[:])
+	if fp != want {
+		t.Fatalf("fingerprint mismatch: got %s, want %s", fp, want)
+	}
+
+	// Different certs should have different fingerprints.
+	der2, _ := generateTestCert(t, "fw-test-fp-2")
+	fp2 := drCertFingerprint(der2)
+	if fp == fp2 {
+		t.Fatal("different certs should have different fingerprints")
+	}
+}
+
+// --- FetchEntries stepdown cancellation test ---
+
+// fetchTestServerStream is a mock grpc.ServerStreamingServer[EntryBatch]
+// for testing the FetchEntries handler.
+type fetchTestServerStream struct {
+	ctx       context.Context
+	sendCount atomic.Int64
+	// sendDelay adds a small delay per Send call so the test can cancel
+	// activeContext before the handler finishes all iterations.
+	sendDelay time.Duration
+}
+
+func (s *fetchTestServerStream) SetHeader(_ metadata.MD) error  { return nil }
+func (s *fetchTestServerStream) SendHeader(_ metadata.MD) error { return nil }
+func (s *fetchTestServerStream) SetTrailer(_ metadata.MD)       {}
+func (s *fetchTestServerStream) Context() context.Context       { return s.ctx }
+func (s *fetchTestServerStream) SendMsg(any) error              { return nil }
+func (s *fetchTestServerStream) RecvMsg(any) error              { return io.EOF }
+
+func (s *fetchTestServerStream) Send(_ *EntryBatch) error {
+	s.sendCount.Add(1)
+	if s.sendDelay > 0 {
+		time.Sleep(s.sendDelay)
+	}
+	return nil
+}
+
+// TestFetchEntries_CancelledOnStepdown verifies that when the core's
+// activeContext is cancelled (simulating a leadership stepdown), an
+// in-flight FetchEntries call exits promptly. Without this, the
+// secondary's stream.Recv() would block indefinitely, stalling
+// reconciliation.
+func TestFetchEntries_CancelledOnStepdown(t *testing.T) {
+	primary, relID, fingerprint := newCreditTestPrimary(t, 5*time.Second)
+
+	// Create a cancellable activeContext to simulate stepdown.
+	activeCtx, simulateStepdown := context.WithCancel(context.Background())
+	primary.core.activeContext = activeCtx
+
+	// Inject a checkpoint with an empty kidToVID. KIDs in the request
+	// that are not in kidToVID produce delete entries (with
+	// includeDeletes=true), bypassing the checkpoint artifact store.
+	cpID := "test-fetch-stepdown-cp"
+	primary.checkpointMu.Lock()
+	if primary.checkpoints == nil {
+		primary.checkpoints = make(map[string]*drCheckpointCacheEntry)
+	}
+	primary.checkpoints[cpID] = &drCheckpointCacheEntry{
+		checkpoint:     reconciler.Checkpoint{ID: cpID, CommitIndex: 100},
+		relationshipID: relID,
+		createdAt:      time.Now(),
+		kidToVID:       make(map[[32]byte][32]byte),
+	}
+	primary.checkpointMu.Unlock()
+
+	// Build 10000 KIDs for the request. With includeDeletes=true and
+	// empty kidToVID, each produces a delete entry. At 100 per batch
+	// that's 100 Send calls if the handler runs to completion.
+	const numKIDs = 10000
+	kids := make([][]byte, numKIDs)
+	for i := range kids {
+		kid := make([]byte, 32)
+		binary.BigEndian.PutUint64(kid, uint64(i))
+		kids[i] = kid
+	}
+
+	streamCtx := context.WithValue(context.Background(), drPeerFingerprintContextKey{}, fingerprint)
+	stream := &fetchTestServerStream{
+		ctx:       streamCtx,
+		sendDelay: time.Millisecond, // 1ms per Send to give cancel time
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- primary.FetchEntries(&FetchEntriesRequest{
+			CheckpointId:    cpID,
+			CheckpointIndex: 100,
+			Kids:            kids,
+			IncludeDeletes:  true,
+		}, stream)
+	}()
+
+	// Let a few batches through, then simulate stepdown.
+	time.Sleep(10 * time.Millisecond)
+	simulateStepdown()
+
+	select {
+	case err := <-errCh:
+		sends := stream.sendCount.Load()
+		t.Logf("FetchEntries exited with: %v (after %d sends)", err, sends)
+		if err == nil {
+			t.Error("expected an error after activeContext cancellation")
+		}
+		// The handler should have aborted early. With 10000 KIDs at
+		// 100 per batch, a full run would need 100 sends. We expect
+		// significantly fewer because the ctx.Err() check in the loop
+		// terminates the handler after activeContext is cancelled.
+		if sends >= 100 {
+			t.Errorf("expected early abort (<100 sends), got %d sends", sends)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("FetchEntries did not exit within 3s after activeContext cancellation (stepdown)")
+	}
+}
+
+// TestIsReconciliationRequired verifies that the helper correctly
+// identifies error messages indicating the primary's buffer/journal
+// cannot satisfy catch-up.
+func TestIsReconciliationRequired(t *testing.T) {
+	tests := []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{fmt.Errorf("connection reset"), false},
+		{fmt.Errorf("change stream apply stalled for 1m30s; reconciliation required"), true},
+		{fmt.Errorf("change stream apply queue full (capacity=64 batches); reconciliation required"), true},
+		{fmt.Errorf("buffer too old: secondary missing from 100 (inclusive), oldest buffered 500; reconciliation required"), true},
+		{fmt.Errorf("journal too old: secondary missing from 100"), true},
+		{fmt.Errorf("failed to open change stream: rpc error: code = FailedPrecondition desc = buffer too old"), true},
+		{fmt.Errorf("change stream error: EOF"), false},
+		{&errDRRedirect{LeaderAddr: "https://leader:8201"}, false},
+	}
+	for _, tt := range tests {
+		got := isReconciliationRequired(tt.err)
+		if got != tt.want {
+			t.Errorf("isReconciliationRequired(%v) = %v, want %v", tt.err, got, tt.want)
+		}
+	}
+}
+
+// --- Dispatcher Tests ---
+
+// TestDispatcher_JournalAlwaysWritten verifies that the dispatcher
+// always writes to the journal, even when no primary is attached.
+func TestDispatcher_JournalAlwaysWritten(t *testing.T) {
+	dir := t.TempDir()
+	journal := newDRStreamJournal(nil, dir)
+	if err := journal.configure(true, drDefaultStreamJournalMaxBytes, drDefaultStreamJournalSegmentBytes, drDefaultStreamJournalRetention); err != nil {
+		t.Fatal(err)
+	}
+
+	dispatcher := &drChangeStreamDispatcher{
+		journal: journal,
+		logger:  log.NewNullLogger(),
+	}
+
+	entries := []physical.ChangeStreamEntry{
+		{OpType: physical.PutOperation, Key: "secret/a", Value: []byte("v1"), RaftIndex: 10},
+		{OpType: physical.PutOperation, Key: "secret/b", Value: []byte("v2"), RaftIndex: 11},
+		{OpType: physical.PutOperation, Key: "core/dr-replication/config", Value: []byte("skip"), RaftIndex: 12},
+	}
+
+	// No primary attached -- journal should still receive entries.
+	dispatcher.OnChange(entries)
+
+	_, segs, oldest, newest := journal.stats()
+	if segs == 0 {
+		t.Fatal("expected at least one journal segment after OnChange")
+	}
+	if oldest != 10 || newest != 11 {
+		t.Fatalf("expected journal range [10,11], got [%d,%d]", oldest, newest)
+	}
+
+	// Verify non-replicable entry was filtered out.
+	var count int
+	if err := journal.replayAll(func(e physical.ChangeStreamEntry) error {
+		count++
+		if e.Key == "core/dr-replication/config" {
+			t.Fatal("non-replicable entry should have been filtered")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("expected 2 journal entries, got %d", count)
+	}
+}
+
+// TestDispatcher_DelegatesToPrimary verifies that when a primary is
+// attached, the dispatcher calls its onChangePrimaryPath.
+func TestDispatcher_DelegatesToPrimary(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+
+	dir := t.TempDir()
+	journal := newDRStreamJournal(nil, dir)
+	if err := journal.configure(true, drDefaultStreamJournalMaxBytes, drDefaultStreamJournalSegmentBytes, drDefaultStreamJournalRetention); err != nil {
+		t.Fatal(err)
+	}
+
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, journal)
+	dispatcher := &drChangeStreamDispatcher{
+		journal: journal,
+		primary: primary,
+		logger:  core.logger,
+	}
+
+	entries := []physical.ChangeStreamEntry{
+		{OpType: physical.PutOperation, Key: "secret/x", Value: []byte("val"), RaftIndex: 100},
+	}
+
+	dispatcher.OnChange(entries)
+
+	// Primary ring buffer should have the entry.
+	primary.bufMu.RLock()
+	bufLen := len(primary.changeBuffer)
+	primary.bufMu.RUnlock()
+	if bufLen != 1 {
+		t.Fatalf("expected 1 entry in primary ring buffer, got %d", bufLen)
+	}
+
+	// indexApplied should be updated.
+	if got := primary.indexApplied.Load(); got != 100 {
+		t.Fatalf("expected indexApplied=100, got %d", got)
+	}
+}
+
+// TestDispatcher_LeaderTransitionJournalContinuity simulates a leader
+// election: entries are written while no primary is attached (follower
+// period), then a primary is attached (new leader). The journal should
+// contain entries from both periods.
+func TestDispatcher_LeaderTransitionJournalContinuity(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+
+	dir := t.TempDir()
+	journal := newDRStreamJournal(nil, dir)
+	if err := journal.configure(true, drDefaultStreamJournalMaxBytes, drDefaultStreamJournalSegmentBytes, drDefaultStreamJournalRetention); err != nil {
+		t.Fatal(err)
+	}
+
+	dispatcher := &drChangeStreamDispatcher{
+		journal: journal,
+		logger:  core.logger,
+	}
+
+	// Phase 1: Follower period -- no primary attached.
+	for i := uint64(1); i <= 50; i++ {
+		dispatcher.OnChange([]physical.ChangeStreamEntry{
+			{OpType: physical.PutOperation, Key: fmt.Sprintf("secret/key-%d", i), Value: []byte("v"), RaftIndex: i},
+		})
+	}
+
+	// Phase 2: Become leader -- attach primary.
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, journal)
+	dispatcher.setPrimary(primary)
+
+	for i := uint64(51); i <= 100; i++ {
+		dispatcher.OnChange([]physical.ChangeStreamEntry{
+			{OpType: physical.PutOperation, Key: fmt.Sprintf("secret/key-%d", i), Value: []byte("v"), RaftIndex: i},
+		})
+	}
+
+	// Journal should have ALL 100 entries.
+	var journalCount int
+	if err := journal.replayAll(func(e physical.ChangeStreamEntry) error {
+		journalCount++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if journalCount != 100 {
+		t.Fatalf("expected 100 journal entries, got %d", journalCount)
+	}
+
+	// Primary ring buffer should only have entries from phase 2 (50 entries).
+	primary.bufMu.RLock()
+	bufLen := len(primary.changeBuffer)
+	primary.bufMu.RUnlock()
+	if bufLen != 50 {
+		t.Fatalf("expected 50 entries in ring buffer, got %d", bufLen)
+	}
+
+	// Verify journal can satisfy catch-up from index 1.
+	var replayCount int
+	if err := journal.replayRange(1, 51, func(e physical.ChangeStreamEntry) error {
+		replayCount++
+		return nil
+	}); err != nil {
+		t.Fatalf("journal replay for follower-period entries failed: %v", err)
+	}
+	if replayCount != 50 {
+		t.Fatalf("expected 50 entries from journal catch-up, got %d", replayCount)
+	}
+}
+
+// TestDispatcher_SetClearPrimary verifies setPrimary/clearPrimary toggle.
+func TestDispatcher_SetClearPrimary(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+
+	dir := t.TempDir()
+	journal := newDRStreamJournal(nil, dir)
+	if err := journal.configure(true, drDefaultStreamJournalMaxBytes, drDefaultStreamJournalSegmentBytes, drDefaultStreamJournalRetention); err != nil {
+		t.Fatal(err)
+	}
+
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, journal)
+	dispatcher := &drChangeStreamDispatcher{
+		journal: journal,
+		logger:  core.logger,
+	}
+
+	// Set primary.
+	dispatcher.setPrimary(primary)
+	dispatcher.mu.RLock()
+	if dispatcher.primary != primary {
+		t.Fatal("expected primary to be set")
+	}
+	dispatcher.mu.RUnlock()
+
+	// Clear primary.
+	dispatcher.clearPrimary()
+	dispatcher.mu.RLock()
+	if dispatcher.primary != nil {
+		t.Fatal("expected primary to be nil after clear")
+	}
+	dispatcher.mu.RUnlock()
+}
+
+// TestFilterDRReplicableEntries verifies the standalone filter function.
+func TestFilterDRReplicableEntries(t *testing.T) {
+	entries := []physical.ChangeStreamEntry{
+		{Key: "secret/data/foo", RaftIndex: 1},
+		{Key: "core/dr-replication/config", RaftIndex: 2},
+		{Key: "core/raft/tls/keyring", RaftIndex: 3},
+		{Key: "secret/data/bar", RaftIndex: 4},
+	}
+
+	replicable := filterDRReplicableEntries(entries)
+	if len(replicable) != 2 {
+		t.Fatalf("expected 2 replicable entries, got %d", len(replicable))
+	}
+	if replicable[0].Key != "secret/data/foo" || replicable[1].Key != "secret/data/bar" {
+		t.Fatalf("unexpected entries: %v", replicable)
+	}
+}
+
+// --- Journal-Based Index Warmup Tests ---
+
+// TestWarmIndexFromJournal verifies that replaying journal entries
+// produces the same KID/VID mappings as direct OnChange processing.
+func TestWarmIndexFromJournal(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+
+	dir := t.TempDir()
+	journal := newDRStreamJournal(nil, dir)
+	if err := journal.configure(true, drDefaultStreamJournalMaxBytes, drDefaultStreamJournalSegmentBytes, drDefaultStreamJournalRetention); err != nil {
+		t.Fatal(err)
+	}
+
+	// Build a reference primary that processes entries via OnChange.
+	refPrimary := NewDRReplicationPrimary(core, replSalt, core.logger, journal)
+
+	entries := []physical.ChangeStreamEntry{
+		{OpType: physical.PutOperation, Key: "secret/a", Value: []byte("v1"), RaftIndex: 10},
+		{OpType: physical.PutOperation, Key: "secret/b", Value: []byte("v2"), RaftIndex: 11},
+		{OpType: physical.PutOperation, Key: "secret/c", Value: []byte("v3"), RaftIndex: 12},
+		{OpType: physical.DeleteOperation, Key: "secret/a", RaftIndex: 13},
+	}
+	refPrimary.OnChange(entries)
+
+	// Build a new primary and warm its index purely from the journal.
+	newPrimary := NewDRReplicationPrimary(core, replSalt, core.logger, journal)
+	count, err := newPrimary.WarmIndexFromJournal(journal)
+	if err != nil {
+		t.Fatalf("WarmIndexFromJournal failed: %v", err)
+	}
+	if count != 4 {
+		t.Fatalf("expected 4 entries replayed, got %d", count)
+	}
+
+	// Verify the new primary's index matches the reference.
+	refPrimary.indexMu.RLock()
+	newPrimary.indexMu.RLock()
+
+	if len(newPrimary.indexKIDToVID) != len(refPrimary.indexKIDToVID) {
+		t.Fatalf("index size mismatch: new=%d ref=%d", len(newPrimary.indexKIDToVID), len(refPrimary.indexKIDToVID))
+	}
+	for kid, vid := range refPrimary.indexKIDToVID {
+		newVID, ok := newPrimary.indexKIDToVID[kid]
+		if !ok {
+			t.Fatalf("key %x missing in new index", kid[:8])
+		}
+		if newVID != vid {
+			t.Fatalf("VID mismatch for key %x", kid[:8])
+		}
+	}
+	for kid, key := range refPrimary.indexKIDToKey {
+		newKey, ok := newPrimary.indexKIDToKey[kid]
+		if !ok {
+			t.Fatalf("key mapping %x missing in new index", kid[:8])
+		}
+		if newKey != key {
+			t.Fatalf("key mapping mismatch for %x: new=%q ref=%q", kid[:8], newKey, key)
+		}
+	}
+
+	newPrimary.indexMu.RUnlock()
+	refPrimary.indexMu.RUnlock()
+
+	// Verify delete was processed: "secret/a" should NOT be in new index.
+	kidA := newPrimary.scanner.ComputeKID("secret/a")
+	newPrimary.indexMu.RLock()
+	if _, ok := newPrimary.indexKIDToVID[kidA]; ok {
+		t.Fatal("deleted key 'secret/a' should not be in the index")
+	}
+	newPrimary.indexMu.RUnlock()
+
+	// Verify initialized flag.
+	newPrimary.indexMu.RLock()
+	if !newPrimary.indexInitialized {
+		t.Fatal("expected index to be marked as initialized")
+	}
+	newPrimary.indexMu.RUnlock()
+}
+
+// TestWarmIndexFromJournal_EmptyJournal verifies the error path when
+// the journal has no segments.
+func TestWarmIndexFromJournal_EmptyJournal(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+
+	dir := t.TempDir()
+	journal := newDRStreamJournal(nil, dir)
+	if err := journal.configure(true, drDefaultStreamJournalMaxBytes, drDefaultStreamJournalSegmentBytes, drDefaultStreamJournalRetention); err != nil {
+		t.Fatal(err)
+	}
+
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, journal)
+	_, err := primary.WarmIndexFromJournal(journal)
+	if err == nil {
+		t.Fatal("expected error for empty journal")
+	}
+}
+
+// TestWarmIndexFromJournal_NilJournal verifies graceful handling.
+func TestWarmIndexFromJournal_NilJournal(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
+	_, err := primary.WarmIndexFromJournal(nil)
+	if err == nil {
+		t.Fatal("expected error for nil journal")
 	}
 }

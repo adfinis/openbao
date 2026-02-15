@@ -84,7 +84,7 @@ func setupDRPair(t *testing.T) (primary *Core, secondary *Core, primaryServer *d
 	replSalt = make([]byte, 32)
 	rand.Read(replSalt)
 
-	primaryServer = NewDRReplicationPrimary(primary, replSalt, primary.logger)
+	primaryServer = NewDRReplicationPrimary(primary, replSalt, primary.logger, nil)
 	return
 }
 
@@ -408,10 +408,11 @@ func TestDRIntegration_BufferOverflowDetection(t *testing.T) {
 	replSalt := make([]byte, 32)
 	rand.Read(replSalt)
 
-	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
 
-	// Fill the buffer.
-	for i := 0; i < 10000; i++ {
+	// Fill the buffer to exactly its capacity.
+	bufSize := drStreamBufferMaxEntries
+	for i := 0; i < bufSize; i++ {
 		primary.OnChange([]physical.ChangeStreamEntry{
 			{
 				OpType:    physical.PutOperation,
@@ -434,7 +435,7 @@ func TestDRIntegration_BufferOverflowDetection(t *testing.T) {
 			OpType:    physical.PutOperation,
 			Key:       "key-overflow",
 			Value:     []byte("value"),
-			RaftIndex: 10001,
+			RaftIndex: uint64(bufSize + 1),
 		},
 	})
 
@@ -839,7 +840,7 @@ func TestDRIntegration_HeartbeatPrimaryTerm(t *testing.T) {
 		},
 	})
 
-	primary := NewDRReplicationPrimary(core, replSalt, core.logger)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
 
 	resp, err := primary.Heartbeat(rpcCtx, &DRHeartbeatRequest{
 		RelationshipId: token.RelationshipID,
