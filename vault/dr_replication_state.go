@@ -67,9 +67,15 @@ type DRConfig struct {
 	// RelationshipID is the active relationship ID on secondary nodes.
 	RelationshipID string `json:"relationship_id,omitempty"`
 
-	// PrimaryCACert is the primary's TLS CA certificate (DER-encoded).
+	// PrimaryCACert is the primary's DR transport CA certificate (DER-encoded).
 	// Persisted so the secondary can re-establish mTLS after a restart.
+	// This is the sole trust anchor for verifying primary identity.
 	PrimaryCACert []byte `json:"primary_ca_cert,omitempty"`
+
+	// ReconcileIntegrityMode controls Phase A match behavior.
+	// "performance" (default): Phase A match skips to next range.
+	// "strict": Phase A match requires top-level RangeDescriptor confirmation.
+	ReconcileIntegrityMode string `json:"reconcile_integrity_mode,omitempty"`
 
 	// Optional DR runtime tuning knobs. Zero values mean "use defaults".
 	CheckpointTTLSeconds        int64   `json:"checkpoint_ttl_seconds,omitempty"`
@@ -132,12 +138,14 @@ type DRActivationToken struct {
 	// ReplSalt is the shared HMAC key for KID derivation.
 	ReplSalt []byte `json:"repl_salt"`
 
-	// CACert is the primary's TLS CA certificate (DER).
-	CACert []byte `json:"ca_cert,omitempty"`
+	// DRTransportCACert is the primary's DR transport CA certificate (DER).
+	// This is the sole trust anchor for verifying primary identity over
+	// the DR gRPC transport.
+	DRTransportCACert []byte `json:"dr_transport_ca_cert,omitempty"`
 
 	// PrimaryAPICACert is the CA certificate used to validate the
 	// primary API endpoint during secondary registration. If empty,
-	// CACert is used.
+	// DRTransportCACert is used.
 	PrimaryAPICACert []byte `json:"primary_api_ca_cert,omitempty"`
 
 	// PrimaryAPIServerName overrides the TLS ServerName for primary
@@ -215,6 +223,11 @@ type drRelationshipManager struct {
 	// handler is the cluster handler for the primary side. Stored here
 	// so the registration endpoint and LoadConfig can add trusted certs.
 	handler *drReplicationClusterHandler
+
+	// transportCA is the DR transport CA used to sign per-leader
+	// certificates and embedded in activation tokens. Non-nil when
+	// primary mode is enabled.
+	transportCA *drTransportCA
 
 	// secondary is non-nil when this cluster is a DR secondary.
 	secondary *drReplicationSecondary
@@ -393,6 +406,20 @@ func (m *drRelationshipManager) LoadConfig(ctx context.Context) error {
 	switch config.Mode {
 	case DRModePrimary:
 		m.logger.Info("restoring DR primary mode from config", "cluster_id", config.ClusterID)
+
+		// Load the DR transport CA from barrier storage so the handler can
+		// mint a CA-signed leaf cert. Without this, new leaders after a
+		// stepdown would fall back to the self-signed cluster cert and
+		// secondaries would reject the connection.
+		transportCA, err := loadDRTransportCA(m.core)
+		if err != nil {
+			m.logger.Error("failed to load DR transport CA during config restore", "error", err)
+		} else if transportCA != nil {
+			m.transportCA = transportCA
+		} else {
+			m.logger.Warn("no DR transport CA found in storage; DR secondaries may reject connections")
+		}
+
 		m.primary = NewDRReplicationPrimary(m.core, config.ReplSalt, m.logger, m.dispatcherJournal())
 		m.applyPrimaryTunablesLocked()
 
@@ -419,8 +446,14 @@ func (m *drRelationshipManager) LoadConfig(ctx context.Context) error {
 		// first RequestCheckpoint does not pay the full-scan cost.
 		m.primary.WarmIndex(m.core.activeContext)
 
-		// Re-register the cluster handler.
+		// Re-register the cluster handler with a CA-signed leaf cert.
 		m.handler = newDRReplicationClusterHandler(m.core, m.primary, m.logger)
+		if m.transportCA != nil {
+			if err := m.handler.SetTransportCA(m.transportCA); err != nil {
+				m.logger.Error("failed to mint DR transport leaf cert on restore", "error", err)
+			}
+			m.handler.startLeafRenewal(m.transportCA)
+		}
 		registerDRHandler(m.core, m.handler)
 
 		// Restore trusted secondary certs from storage.
@@ -460,6 +493,31 @@ func (m *drRelationshipManager) LoadConfig(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// Teardown cleanly shuts down DR replication state when the node steps
+// down (preSeal). It unregisters the cluster handler (stopping the leaf
+// renewal goroutine and gRPC server), cancels the secondary controller
+// loop, and clears in-memory state so the next postUnseal/LoadConfig
+// cycle starts fresh. The persisted config is NOT touched -- only the
+// runtime state is reset.
+func (m *drRelationshipManager) Teardown() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.handler != nil {
+		unregisterDRHandler(m.core) // calls handler.Stop() via StopHandler
+		m.handler = nil
+	}
+
+	if m.secondaryLoopCancel != nil {
+		m.secondaryLoopCancel()
+		m.secondaryLoopCancel = nil
+	}
+
+	m.primary = nil
+	m.secondary = nil
+	m.transportCA = nil
 }
 
 // dispatcherJournal returns the shared stream journal from the
@@ -533,6 +591,25 @@ func (m *drRelationshipManager) EnablePrimary(ctx context.Context) error {
 		return err
 	}
 
+	// Generate or load the DR transport CA. This CA signs per-leader
+	// certificates and is embedded in activation tokens as the sole
+	// trust anchor for cross-cluster mTLS.
+	transportCA, err := loadDRTransportCA(m.core)
+	if err != nil {
+		m.config = oldConfig
+		return fmt.Errorf("failed to load DR transport CA: %w", err)
+	}
+	if transportCA == nil {
+		transportCA, err = generateDRTransportCA(m.core)
+		if err != nil {
+			m.config = oldConfig
+			return fmt.Errorf("failed to generate DR transport CA: %w", err)
+		}
+		m.logger.Info("generated new DR transport CA",
+			"spki_hash", transportCA.spkiHash())
+	}
+	m.transportCA = transportCA
+
 	// Initialize the primary-side gRPC server.
 	m.primary = NewDRReplicationPrimary(m.core, replSalt, m.logger, m.dispatcherJournal())
 	m.applyPrimaryTunablesLocked()
@@ -556,7 +633,15 @@ func (m *drRelationshipManager) EnablePrimary(ctx context.Context) error {
 
 	// Register the DR handler on the cluster listener for mTLS-secured gRPC.
 	m.handler = newDRReplicationClusterHandler(m.core, m.primary, m.logger)
+	if err := m.handler.SetTransportCA(m.transportCA); err != nil {
+		m.logger.Error("failed to mint DR transport leaf cert", "error", err)
+		// Non-fatal: handler will fall back to self-signed cluster cert
+		// but secondaries will reject the connection. Log loudly.
+	}
 	registerDRHandler(m.core, m.handler)
+
+	// Start background leaf cert renewal.
+	m.handler.startLeafRenewal(m.transportCA)
 
 	m.core.replicationState.Store(uint32(consts.ReplicationDRPrimary))
 
@@ -621,7 +706,7 @@ func (m *drRelationshipManager) EnableSecondary(ctx context.Context, token *DRAc
 		RelationshipID: token.RelationshipID,
 		ReplSalt:       token.ReplSalt,
 		PrimaryAddr:    token.PrimaryAddr,
-		PrimaryCACert:  token.CACert,
+		PrimaryCACert:  token.DRTransportCACert,
 
 		FallbackEnabled:          drDefaultFallbackEnabled,
 		FallbackStallSeconds:     int64(drDefaultFallbackStall / time.Second),
@@ -643,7 +728,7 @@ func (m *drRelationshipManager) EnableSecondary(ctx context.Context, token *DRAc
 		m.logger,
 	)
 	m.applySecondaryTunablesLocked()
-	m.secondary.primaryCACert = token.CACert
+	m.secondary.primaryCACert = token.DRTransportCACert
 
 	m.core.replicationState.Store(uint32(consts.ReplicationDRSecondary))
 
@@ -834,6 +919,9 @@ func (m *drRelationshipManager) RequestSecondaryResnapshot(reason string) error 
 	if m.config == nil || m.config.Mode != DRModeSecondary || m.secondary == nil {
 		return fmt.Errorf("not in DR secondary mode")
 	}
+	// Reset the monotonic checkpoint high-water mark so the resnapshot
+	// can accept any checkpoint_index from the primary.
+	m.secondary.resetCheckpointHighWaterMark()
 	m.secondary.RequestResnapshot(reason)
 	return nil
 }

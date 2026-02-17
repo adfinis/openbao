@@ -2435,6 +2435,13 @@ func (c *Core) preSeal() error {
 	c.stopRaftActiveNode()
 	c.cancelNamespaceDeletion()
 
+	// Tear down DR replication state before key rotation. This
+	// unregisters the handler (preventing stale cert/key mismatches)
+	// and stops the leaf renewal goroutine.
+	if c.drManager != nil {
+		c.drManager.Teardown()
+	}
+
 	if err := c.invalidations.Stop(); err != nil {
 		result = multierror.Append(result, fmt.Errorf("error tearing down invalidations: %w", err))
 	}

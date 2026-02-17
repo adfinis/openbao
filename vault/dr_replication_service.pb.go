@@ -1441,12 +1441,16 @@ type SyncKeyringResponse struct {
 	// server_ephemeral_pubkey is the primary's ephemeral public key used
 	// for ECDH key agreement.
 	ServerEphemeralPubkey []byte `protobuf:"bytes,4,opt,name=server_ephemeral_pubkey,json=serverEphemeralPubkey,proto3" json:"server_ephemeral_pubkey,omitempty"`
-	// wrap_nonce is the AEAD nonce used to encrypt wrapped_root_key.
+	// wrap_nonce is the GCM IV used to encrypt wrapped_root_key.
 	WrapNonce []byte `protobuf:"bytes,5,opt,name=wrap_nonce,json=wrapNonce,proto3" json:"wrap_nonce,omitempty"`
 	// wrap_aad_version is the protocol version encoded in AEAD AAD.
 	WrapAadVersion uint32 `protobuf:"varint,6,opt,name=wrap_aad_version,json=wrapAadVersion,proto3" json:"wrap_aad_version,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// server_nonce is a 32-byte random value used as part of the HKDF
+	// salt (client_nonce || server_nonce). Separate from the GCM IV
+	// (wrap_nonce) to avoid dual-role bytes.
+	ServerNonce   []byte `protobuf:"bytes,7,opt,name=server_nonce,json=serverNonce,proto3" json:"server_nonce,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *SyncKeyringResponse) Reset() {
@@ -1519,6 +1523,13 @@ func (x *SyncKeyringResponse) GetWrapAadVersion() uint32 {
 		return x.WrapAadVersion
 	}
 	return 0
+}
+
+func (x *SyncKeyringResponse) GetServerNonce() []byte {
+	if x != nil {
+		return x.ServerNonce
+	}
+	return nil
 }
 
 var File_vault_dr_replication_service_proto protoreflect.FileDescriptor
@@ -1621,7 +1632,7 @@ const file_vault_dr_replication_service_proto_rawDesc = "" +
 	"\x12SyncKeyringRequest\x12'\n" +
 	"\x0frelationship_id\x18\x01 \x01(\tR\x0erelationshipId\x126\n" +
 	"\x17client_ephemeral_pubkey\x18\x02 \x01(\fR\x15clientEphemeralPubkey\x12!\n" +
-	"\fclient_nonce\x18\x03 \x01(\fR\vclientNonce\"\x8b\x02\n" +
+	"\fclient_nonce\x18\x03 \x01(\fR\vclientNonce\"\xae\x02\n" +
 	"\x13SyncKeyringResponse\x12#\n" +
 	"\rkeyring_entry\x18\x01 \x01(\fR\fkeyringEntry\x12$\n" +
 	"\x0eroot_key_entry\x18\x02 \x01(\fR\frootKeyEntry\x12(\n" +
@@ -1629,7 +1640,8 @@ const file_vault_dr_replication_service_proto_rawDesc = "" +
 	"\x17server_ephemeral_pubkey\x18\x04 \x01(\fR\x15serverEphemeralPubkey\x12\x1d\n" +
 	"\n" +
 	"wrap_nonce\x18\x05 \x01(\fR\twrapNonce\x12(\n" +
-	"\x10wrap_aad_version\x18\x06 \x01(\rR\x0ewrapAadVersion2\xeb\x04\n" +
+	"\x10wrap_aad_version\x18\x06 \x01(\rR\x0ewrapAadVersion\x12!\n" +
+	"\fserver_nonce\x18\a \x01(\fR\vserverNonce2\xeb\x04\n" +
 	"\rDRReplication\x12F\n" +
 	"\rStreamChanges\x12\x1c.vault.StreamChangesUpstream\x1a\x11.vault.EntryBatch\"\x00(\x010\x01\x12J\n" +
 	"\x11RequestCheckpoint\x12\x18.vault.CheckpointRequest\x1a\x19.vault.CheckpointResponse\"\x00\x12M\n" +

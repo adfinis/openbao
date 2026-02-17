@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/openbao/openbao/sdk/v2/logical"
@@ -225,6 +226,29 @@ func (m *drRelationshipManager) ListRelationships(ctx context.Context) ([]*DRRel
 		relationships = append(relationships, rel)
 	}
 	return relationships, nil
+}
+
+// findActiveRelationshipByFingerprint scans all relationships for one that
+// has a matching secondary_cert_fingerprint and is not revoked. Returns nil
+// if no match is found. Caller must hold m.mu.
+func (m *drRelationshipManager) findActiveRelationshipByFingerprint(ctx context.Context, fingerprint string) (*DRRelationship, error) {
+	keys, err := m.core.barrier.List(ctx, drRelationshipsPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list relationships: %w", err)
+	}
+	for _, key := range keys {
+		rel, err := m.loadRelationship(ctx, key)
+		if err != nil {
+			continue
+		}
+		if rel.State == DRRelationshipStateRevoked {
+			continue
+		}
+		if strings.EqualFold(rel.SecondaryCertFingerprint, fingerprint) {
+			return rel, nil
+		}
+	}
+	return nil, nil
 }
 
 func (m *drRelationshipManager) GetRelationship(ctx context.Context, relationshipID string) (*DRRelationship, error) {

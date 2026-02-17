@@ -85,10 +85,11 @@ func (m *drRelationshipManager) GenerateActivationToken(ctx context.Context) (*D
 		BootstrapToken: bootstrapToken,
 	}
 
-	// Include the cluster CA cert (DER) so the secondary
-	// can verify the primary's TLS identity.
-	if parsedCert := m.core.localClusterParsedCert.Load(); parsedCert != nil {
-		token.CACert = parsedCert.Raw
+	// Include the DR transport CA cert so the secondary can verify
+	// the primary's TLS identity. The transport CA is the sole trust
+	// anchor for cross-cluster mTLS.
+	if m.transportCA != nil {
+		token.DRTransportCACert = m.transportCA.certDER
 	}
 	// For API registration HTTPS verification, use the API listener chain CA
 	// where available; fall back to cluster CA if we cannot determine it.
@@ -96,7 +97,7 @@ func (m *drRelationshipManager) GenerateActivationToken(ctx context.Context) (*D
 		token.PrimaryAPICACert = apiCA
 	}
 	if len(token.PrimaryAPICACert) == 0 {
-		token.PrimaryAPICACert = token.CACert
+		token.PrimaryAPICACert = token.DRTransportCACert
 	}
 
 	if token.PrimaryAPIServerName == "" {
@@ -236,6 +237,16 @@ func (m *drRelationshipManager) ValidateBootstrapAndStoreCertWithSourceIP(ctx co
 		return fmt.Errorf("invalid secondary CA certificate: %w", err)
 	}
 
+	// Enforce fingerprint uniqueness: a secondary cert fingerprint can
+	// be bound to at most one active (non-revoked) relationship.
+	newFP := certFingerprintSHA256(cert)
+	if existingRel, fpErr := m.findActiveRelationshipByFingerprint(ctx, newFP); fpErr == nil && existingRel != nil {
+		if existingRel.RelationshipID != matchedRel.RelationshipID {
+			m.recordBootstrapFailureLocked(ctx, matchedRel, "duplicate fingerprint", now)
+			return fmt.Errorf("certificate fingerprint already bound to active relationship %q", existingRel.RelationshipID)
+		}
+	}
+
 	// Add the cert to the handler's trusted pool.
 	m.handler.AddTrustedCert(matchedRel.RelationshipID, cert)
 
@@ -304,7 +315,7 @@ func (m *drRelationshipManager) registerWithPrimary(ctx context.Context, token *
 	// API-specific CA if present; otherwise fall back to cluster CA.
 	caBytes := token.PrimaryAPICACert
 	if len(caBytes) == 0 {
-		caBytes = token.CACert
+		caBytes = token.DRTransportCACert
 	}
 	if len(caBytes) == 0 {
 		return fmt.Errorf("missing primary API CA certificate in activation token")
