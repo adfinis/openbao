@@ -101,20 +101,49 @@ graph TD
 2. DR transport fails closed if trusted cert context is unavailable (no plaintext/insecure DR link path).
 3. Every DR RPC is relationship-authorized.
 4. Revoked relationships are denied across all DR RPCs.
-5. Cross-cluster TLS verification uses a dynamic trust pool with TOFU fallback (see "Cross-Cluster TLS Trust Model" below).
+5. Cross-cluster TLS verification uses a CA-scoped dynamic trust pool pinned to the primary's DR transport CA (see "Cross-Cluster TLS Trust Model" below). No TOFU (Trust On First Use) is employed.
+6. Relationship identity is derived from the mTLS peer certificate fingerprint, not from request-supplied `relationship_id` values (see "Protocol Invariants" below).
+7. Bootstrap ECDH wrapping binds to `cluster_id`, `relationship_id`, secondary cert fingerprint, primary identity, and protocol version to prevent cross-cluster replay and unknown-key-share attacks.
+8. Checkpoint index monotonicity is enforced on the secondary to prevent rollback to older state.
 
 ### Cross-Cluster TLS Trust Model
 
-Each OpenBao cluster node generates its own self-signed cluster certificate with a unique CN (`fw-<fingerprint>`). During DR activation, the secondary receives the primary leader's certificate via the activation token. After a primary leadership change (stepdown), the new leader presents a different certificate that the secondary has never seen.
+#### DR Transport CA
 
-The DR transport solves this with a **dynamic trust pool** maintained on the secondary:
+When `dr/primary/enable` is called, the primary generates a **DR transport CA** -- a dedicated P-256 CA key pair stored encrypted in barrier storage at `core/dr-replication/transport-ca`. This CA is independent of the barrier seal, recovery keys, and any operator-managed PKI. Its sole purpose is to anchor trust for DR cross-cluster mTLS.
 
-1. **Seeding:** The pool is initialized with the activation token certificate when `Connect()` is called.
-2. **Heartbeat propagation:** Every `DRHeartbeatResponse` carries the active leader's DER-encoded cluster certificate (`active_cluster_cert`). The secondary adds (or refreshes) it in the pool on each heartbeat tick.
+Each primary-cluster node obtains a **DR transport leaf certificate** signed by this CA. The leaf is minted when the node starts serving DR RPCs (leader election, unseal) and contains the node's cluster address as a SAN. Leaf certificates are short-lived (default: 72 hours) and re-minted automatically before expiry.
+
+The DR transport CA public certificate is embedded in the `DRActivationToken.dr_transport_ca_cert` field. This is the **sole trust anchor** the secondary uses to verify primary identity.
+
+#### CA Rotation and Revocation
+
+The DR transport CA supports explicit rotation via `sys/replication/dr/primary/rotate-transport-ca`:
+
+1. **Trigger:** Operator-initiated POST request. An optional `auto_rotate_interval` tunable (default: disabled) can trigger automatic rotation before CA expiry.
+2. **Overlap window:** On rotation, the primary generates a new CA key pair and stores it alongside the old CA under `core/dr-replication/transport-ca-previous`. For the duration of the overlap window (`dr_transport_ca_overlap`, default: 72 hours), the secondary's trust pool accepts leaf certificates signed by **either** CA. The old CA is evicted after the overlap window expires.
+3. **Heartbeat CA propagation:** During the overlap window, `DRHeartbeatResponse` includes both `active_cluster_cert` (signed by the new CA) and `new_transport_ca_cert` (the new CA's DER-encoded public certificate). The secondary adds the new CA to its trust pool roots on receipt, enabling seamless transition without re-activation.
+4. **Activation token semantics:** New activation tokens carry the new CA. Existing active secondaries transition automatically via heartbeat propagation. Secondaries that are disconnected for longer than the overlap window require operator re-activation with a new token.
+5. **Break-glass revocation:** `sys/replication/dr/primary/rotate-transport-ca` with `revoke_previous=true` immediately drops the old CA from all heartbeat responses and signs a `ca_revocation_epoch` counter into subsequent heartbeats. Secondaries that receive this signal purge the old CA from their trust pool immediately. Secondaries that are disconnected during the break-glass window will fail to reconnect (their leaf certs were signed by the old CA) and require re-activation. This is the correct behavior: if the old CA key is compromised, all certificates it signed must be distrusted.
+
+| Scenario | Behavior |
+|---|---|
+| Normal rotation | Overlap window; secondaries transition via heartbeat |
+| Disconnected secondary during rotation | Reconnects using old-CA leaf during overlap; after overlap, requires re-activation |
+| Break-glass (suspected compromise) | Old CA immediately revoked; disconnected secondaries require re-activation |
+
+#### Dynamic Trust Pool (Secondary)
+
+The secondary maintains a **CA-scoped dynamic trust pool**:
+
+1. **Seeding:** The pool is initialized with the DR transport CA certificate from the activation token when `Connect()` is called.
+2. **Heartbeat propagation:** Every `DRHeartbeatResponse` carries the active leader's DER-encoded DR transport leaf certificate (`active_cluster_cert`), signed by the DR transport CA. The secondary verifies the certificate chains to the pinned DR transport CA before adding or refreshing it in the pool. Certificates that do not chain to the CA are rejected.
 3. **Custom TLS verification:** The `cluster.Client` interface exposes a `VerifyPeerCertificate()` callback. For DR connections, this callback checks the server's certificate against the trust pool:
    - **Known cert:** accepted immediately (fingerprint match in pool).
-   - **Unknown cert (TOFU):** accepted and added to the pool with a warning log. Security is maintained because the primary independently verifies the secondary via mTLS and gRPC relationship authorization -- a rogue server without the secondary's private key cannot complete the handshake.
+   - **Unknown cert:** verified against the pinned DR transport CA. If the certificate chains to the CA, it is accepted and added to the pool. If it does not chain to the CA, the connection is **rejected**.
 4. **TTL-based eviction:** Each pool entry has a `lastSeen` timestamp refreshed by heartbeats. Entries older than 10 minutes are pruned during heartbeat ticks, bounding pool size to ~1--3 certificates even in high-churn environments (e.g. Kubernetes pod recycling).
+
+This design eliminates TOFU (Trust On First Use). An on-path attacker who presents a certificate not signed by the DR transport CA cannot complete the TLS handshake, even if the secondary has never seen the legitimate leader's certificate before.
 
 ```mermaid
 sequenceDiagram
@@ -125,6 +154,7 @@ sequenceDiagram
 
     Note over Sec,LeaderA: Normal operation
     LeaderA->>Sec: Heartbeat(active_cluster_cert=A_cert)
+    Sec->>Sec: Verify A_cert chains to DR transport CA
     Sec->>Sec: trustedPool.Add(A_cert)
 
     Note over LeaderA,LeaderB: Stepdown occurs
@@ -135,14 +165,40 @@ sequenceDiagram
     LB->>LeaderB: Route to new leader
     LeaderB->>Sec: TLS: presents B_cert
     Sec->>Sec: VerifyPeerCert: B_cert not in pool
-    Sec->>Sec: TOFU accept + log warn
+    Sec->>Sec: Verify B_cert chains to DR transport CA
+    Sec->>Sec: Accept + add to pool
     Sec->>LeaderB: gRPC Heartbeat succeeds
-    Sec->>Sec: trustedPool.Add(B_cert from heartbeat)
+    Sec->>Sec: trustedPool.Refresh(B_cert from heartbeat)
 
     Note over Sec,LeaderB: Future reconnects to B are fully verified
 ```
 
 Non-DR cluster-internal connections (`requestForwardingClusterClient`, `raftLayer`) return `nil` from `VerifyPeerCertificate()` and continue to use standard Go TLS verification.
+
+#### Leaf Certificate Verification Mode
+
+DR transport leaf certificates include the node's cluster address as a DNS SAN for diagnostic purposes (operator can inspect which node minted the cert). However, the secondary's `VerifyPeerCertificate` callback does **not** perform hostname/SAN verification against the connection target address. Identity verification relies entirely on:
+
+1. **CA chain pinning:** The leaf must chain to the pinned DR transport CA.
+2. **Relationship authorization:** Every RPC extracts the peer certificate fingerprint from the TLS state and validates it against the stored `secondary_cert_fingerprint`.
+
+This design is intentional. In load-balanced and cloud-native deployments, the connection target hostname frequently differs from the node's cluster address (e.g., HAProxy VIP, Kubernetes Service DNS). SAN-based hostname verification would be brittle in these environments without adding meaningful security, because the CA-pinning + relationship-authz combination already provides mutual identity binding. DNS is not a trust boundary in this protocol.
+
+For environments that require explicit hostname verification (e.g., policy mandating RFC 6125 compliance), the `dr_transport_verify_server_name` tunable can be set to a specific hostname. When set, `VerifyPeerCertificate` additionally checks that the leaf certificate's SAN matches the configured name.
+
+### Protocol Invariants
+
+The following invariants are enforced at the protocol level and are not subject to configuration:
+
+1. **Relationship identity is derived from the mTLS peer certificate, not from request fields.** The `relationship_id` in RPC requests is not a trust anchor. On every DR RPC, the primary extracts the peer certificate fingerprint from the TLS connection state and verifies it matches the `secondary_cert_fingerprint` stored for the claimed relationship. A valid secondary cannot access another relationship's data because it lacks the other relationship's private key. This prevents confused-deputy attacks.
+
+2. **All DR RPCs fail closed on missing or invalid peer certificate.** If the peer did not present a certificate, or if the fingerprint does not match any active relationship, the RPC is rejected with `PermissionDenied`.
+
+3. **Relationship state transitions are monotonic.** `pending -> registered -> active -> revoked` is the only valid forward path. Revoked relationships cannot be reactivated; a new activation token must be generated.
+
+4. **One certificate fingerprint, one relationship.** A secondary cluster certificate fingerprint can be bound to at most one active (non-revoked) relationship. Registration rejects a fingerprint that is already associated with another active relationship (`duplicate_fingerprint` error). This prevents a single secondary from acquiring multiple relationship contexts and ensures clean revocation semantics.
+
+5. **Authoritative identity field:** The `secondary_cert_fingerprint` (SHA-256 of the secondary's **leaf** certificate DER) is the authoritative identity binding. The `secondary_ca_cert` field is stored for mTLS trust pool setup (allowing the primary to verify the secondary's TLS handshake) but is not used for per-RPC authorization. This means secondary leaf certificate rotation requires updating the relationship's fingerprint. Rotation without re-bootstrap is supported via `sys/replication/dr/primary/relationships/:id/rotate-secondary-cert`, which atomically updates the stored fingerprint after validating the new cert chains to the same `secondary_ca_cert` (or a new CA if both are provided).
 
 ## Protocol and API Surface
 
@@ -158,6 +214,8 @@ Non-DR cluster-internal connections (`requestForwardingClusterClient`, `raftLaye
 | List relationships | GET | `sys/replication/dr/primary/relationships` |
 | Relationship status | GET | `sys/replication/dr/primary/relationships/:id/status` |
 | Revoke relationship | POST | `sys/replication/dr/primary/relationships/:id/revoke` |
+| Rotate DR transport CA | POST | `sys/replication/dr/primary/rotate-transport-ca` |
+| Rotate secondary cert | POST | `sys/replication/dr/primary/relationships/:id/rotate-secondary-cert` |
 | Enable secondary | POST | `sys/replication/dr/secondary/enable` |
 | Disable secondary | POST | `sys/replication/dr/secondary/disable` |
 | Promote secondary | POST | `sys/replication/dr/secondary/promote` |
@@ -216,8 +274,8 @@ Relationship-scoped activation token fields:
 - `primary_addr`
 - `primary_api_addr`
 - `repl_salt`
-- `ca_cert`
-- `primary_api_ca_cert` (optional)
+- `dr_transport_ca_cert` -- DER-encoded DR transport CA public certificate; the sole trust anchor for verifying primary identity over the DR gRPC transport
+- `primary_api_ca_cert` (optional) -- CA for HTTPS API registration; may differ from the DR transport CA
 - `primary_api_server_name` (optional)
 - `bootstrap_token`
 
@@ -241,16 +299,26 @@ Per-relationship stored data:
 
 ### Bootstrap Security
 
-Bootstrap uses ECDH + AEAD wrapping:
+Bootstrap uses X25519 ECDH + AES-256-GCM AEAD wrapping with transcript binding:
 
-1. Secondary sends `client_ephemeral_pubkey` and `client_nonce`.
-2. Primary returns:
-   - `wrapped_root_key`
-   - `server_ephemeral_pubkey`
-   - `wrap_nonce`
-   - `wrap_aad_version`
-   - encrypted `core/keyring` and `core/root-key` entries
-3. Secondary unwraps locally and adopts key material.
+1. Secondary sends `client_ephemeral_pubkey` (X25519) and `client_nonce` (32 bytes, `crypto/rand`).
+2. Primary derives the shared secret via ECDH, generates `server_ephemeral_pubkey`, `server_nonce` (32 bytes, `crypto/rand`), and `gcm_iv` (12 bytes, `crypto/rand`).
+3. Key derivation: `HKDF-SHA256(shared_secret, salt=client_nonce||server_nonce, info="openbao-dr-root-key-wrap-v1")` produces a 256-bit wrap key. The HKDF salt is composed exclusively of high-entropy random nonces; the GCM IV is generated independently.
+4. Primary encrypts root key with AES-256-GCM using the wrap key, `gcm_iv` as IV, and **AAD** containing:
+   - `relationship_id`
+   - `cluster_id` (primary cluster)
+   - `secondary_cert_fp` (SHA-256 fingerprint of secondary's cluster certificate)
+   - `primary_identity` (SHA-256 SPKI hash of the DR transport CA public key)
+   - `version` (protocol version, currently `1`)
+   - `client_nonce_hex`
+5. Primary returns: `wrapped_root_key`, `server_ephemeral_pubkey`, `server_nonce`, `gcm_iv`, `wrap_aad_version`, encrypted `core/keyring` and `core/root-key` entries.
+6. Secondary unwraps locally using its ephemeral private key and the same AAD construction, then adopts key material.
+
+**Replay and cross-cluster resistance:** The AAD binds the wrapped material to a specific cluster, relationship, and both peer identities. An attacker who replays a captured bootstrap response to a different cluster or relationship will fail AAD verification. The `client_nonce` (generated fresh per bootstrap attempt) ensures each handshake produces a unique shared secret and wrap key.
+
+**One-time-use:** The `bootstrap_token` is burned (cleared from storage) on successful registration. A replayed or reused token is rejected. Expired pending relationships are garbage-collected periodically.
+
+**Atomic registration:** The registration operation (`ValidateBootstrapAndStoreCert`) is atomic: validate token, persist relationship state + secondary fingerprint, and burn token are performed as a single barrier write transaction (compare-and-swap on the relationship entry). This prevents race replays where two concurrent registration attempts with the same token could both succeed. If the CAS write fails (e.g., another registration raced), the second attempt receives a `token_already_consumed` error.
 
 No plaintext root key flow exists.
 
@@ -276,11 +344,22 @@ DR intentionally excludes cluster-local/internal paths from both stream fanout a
 
 The reconciliation protocol uses two digest layers with distinct properties:
 
-**Phase A -- CRC64-XOR (coarse prefilter):**
+**Phase A -- CRC64-XOR (performance hint):**
 
 - `ComputeRangeChecksum` produces a 64-bit XOR of `CRC64(KID) ^ CRC64(VID)` per item, plus `count`.
-- CRC64-XOR is a fast, non-cryptographic prefilter. A Phase A match (checksum and count equal) causes the range to be skipped without entering Phase B. The false-equality probability per range is bounded by 2^-64 for the CRC64 component (count must also match). Across 1024 ranges per reconciliation cycle, the probability of any undetected divergence is approximately 2^-54, which is negligible for the non-Byzantine threat model.
+- CRC64-XOR is a fast, non-cryptographic prefilter used as a **performance hint** to identify likely-equal ranges. The false-equality probability per range is bounded by 2^-64 for the CRC64 component (count must also match). Across 1024 ranges per reconciliation cycle, the probability of any undetected divergence is approximately 2^-54, which is negligible for the non-Byzantine threat model.
 - CRC64-XOR is commutative (order-independent). This is correct for set comparison: two sets with the same (KID, VID) pairs produce the same checksum regardless of iteration order.
+
+**Reconciliation integrity modes:**
+
+The `reconcile_integrity_mode` tunable controls how Phase A matches are handled:
+
+- `performance` (default): A Phase A match (checksum and count equal) causes the range to be skipped without entering Phase B. This is safe under the non-Byzantine threat model and provides maximum throughput.
+- `strict` (**recommended for regulated environments**): A Phase A match triggers a lightweight **top-level RangeDescriptor** comparison (256-bit SHA256-XOR pair + count) before the range is skipped. The RangeDescriptor is cached during checkpoint build, so this check adds negligible overhead (one descriptor compare per clean range; measured at <0.1% additional reconciliation wall time in benchmarks). If the RangeDescriptor does not match, the range enters Phase B drill-down despite the CRC64 match. This mode provides a cryptographically strong integrity check (2^-256 false-equality probability) at every range boundary, suitable for environments that require deterministic correctness guarantees rather than probabilistic bounds.
+
+In both modes, Phase B remains the **authoritative integrity check** for any range that enters drill-down.
+
+**Guidance for regulated deployments:** Organizations subject to compliance frameworks (SOC 2, FedRAMP, PCI-DSS) that require evidence of data integrity should use `strict` mode. The `performance` mode's 2^-54 undetected-divergence probability is mathematically negligible but may not satisfy auditors who require non-probabilistic integrity assurances. The existence of `strict` mode with deterministic SHA256-based verification provides a clear compliance answer without altering the core reconciliation mechanics.
 
 **Phase B -- RangeDescriptor (authoritative equality):**
 
@@ -374,6 +453,7 @@ flowchart TD
 6. Reconciliation scanning is transactional-snapshot aware and fail-closed on `ListPage/Get` errors.
 7. Reconcile session fencing (`checkpoint_id` + `checkpoint_index`) is enforced across all range/fetch/prefix phases.
 8. Reconcile/resnapshot fetches are served from immutable checkpoint artifacts only; live primary storage drift is not consulted for checkpoint-fenced reads.
+9. **Monotonic checkpoint index:** The secondary persists a `highest_committed_checkpoint_index` per relationship. A new reconciliation session is rejected if its `checkpoint_index` is lower than the persisted high-water mark, preventing rollback to older state (which could resurrect revoked credentials or policies). Operator-initiated resnapshot (`sys/replication/dr/secondary/resnapshot`) with `confirm_rollback_ok=true` resets the high-water mark to allow recovery from catastrophic divergence. Resnapshot without `confirm_rollback_ok=true` is rejected. The resnapshot endpoint emits an audit log event including the old and new high-water mark values (`dr_checkpoint_hwm_reset`, containing `old_hwm`, `new_hwm=0`, `reason`, `source_ip`). This endpoint requires `sys/*` root privileges.
 
 ## Resource Controls and Fail-Closed Behavior
 
@@ -416,6 +496,14 @@ If admission still fails, `RequestCheckpoint` fails with precondition error.
 - Disk-backed stream journal extends replay horizon and is consulted when catch-up start index is older than the oldest buffered entry.
 - Because the journal dispatcher runs on all primary-cluster nodes, a new leader inherits a populated journal from its follower period. This eliminates the need for reconciliation fallback after routine leader elections -- the new leader can serve catch-up from its own journal.
 - Journal segments are stored in a persistent subdirectory of the Raft data path (`{raft_data_dir}/dr-stream-journal/`), not a temporary directory.
+- **Confidentiality:** Journal entries are in the ciphertext domain only. The stream journal stores raw `ChangeStreamEntry` records as emitted by the Raft FSM below the barrier. No plaintext keys or decrypted values are written to journal segments.
+- **At-rest protections:** Journal files inherit the same filesystem permissions and disk encryption protections as the Raft data directory. Operators should ensure the Raft data directory is on encrypted storage if at-rest encryption is required.
+- **Retention and deletion:** Journal segment retention is bounded by `drDefaultStreamJournalRetention` (default: 2h) and `drDefaultStreamJournalMaxBytes` (default: 4 GiB). Expired segments are deleted by the retention pruner. Secure deletion (overwrite-before-delete) is best-effort and depends on the underlying filesystem/storage layer.
+- **Integrity and tamper evidence:** Journal segments are a replay optimization, not authoritative state. If a node's local journal directory is corrupted or tampered:
+  - Journal replay validates Raft index monotonicity on each entry. An out-of-order or duplicate index is treated as corruption and causes the replay to abort.
+  - Entry shape validation checks for required fields (`op_type`, `key`, `raft_index`). Malformed entries cause the replay to abort.
+  - On any corruption or validation failure, the node refuses to serve journal-based catch-up for that index range and returns `FailedPrecondition` to the secondary, forcing a full reconciliation instead. This is fail-closed behavior: corrupted journals never produce incorrect replicated state.
+  - Corruption is logged at `WARN` level with the affected index range and segment file for operator investigation.
 - Journal replay is relationship-authorized and index-ordered; if missing/expired, reconnect fails closed and secondary must reconcile.
 
 ### Stream Buffer & Journal Defaults (Primary)
@@ -440,6 +528,17 @@ If admission still fails, `RequestCheckpoint` fails with precondition error.
 - Max stream resume attempts before reconciliation: 3 (`drMaxStreamResumeAttempts`)
 - Controller redirect failure max: 2 consecutive failures before reverting to config address
 - Apply yield duration: 1ms between batch commits (`drDefaultApplyYieldDuration`)
+
+### Abuse and DoS Limits
+
+The following limits bound resource consumption under adversarial or misconfiguration scenarios:
+
+- **Redirect rate limiting:** Max 10 redirects per relationship per 60-second sliding window (`drMaxRedirectsPerMinute`). Exceeding this triggers exponential backoff (starting at 2s, capped at 30s) before the next connection attempt. This prevents leader-flapping amplification.
+- **gRPC message size:** The DR gRPC server enforces explicit `MaxRecvMsgSize` and `MaxSendMsgSize` of 16 MiB (`drGRPCMaxMessageSize`). This bounds decompression cost for gzip-compressed messages and prevents unbounded memory allocation from malformed or oversized messages.
+- **Per-RPC rate limits:** `RequestCheckpoint` is limited to 1 request per relationship per 60 seconds (`drCheckpointRateLimit`). `FetchEntries` throughput is bounded by the reconcile budget (`drDefaultReconcileMaxRPCBytes`, default: 128 MiB per session).
+- **Decompression safety:** gRPC's built-in gzip decompressor respects the `MaxRecvMsgSize` limit. In Go's gRPC implementation, `MaxRecvMsgSize` is enforced on the **decompressed** payload size: the framework reads the compressed bytes, decompresses into a bounded buffer, and rejects if the decompressed size exceeds the limit. This prevents zip-bomb attacks where a small compressed message decompresses to an oversized payload.
+- **Per-item blob size:** Individual secret values within `FetchEntries` responses are bounded by the per-entry storage limit (512 KiB default, configurable via `max_entry_size`). The DR transport does not implement chunking for oversized values; entries that exceed `max_entry_size` at the primary are rejected at write time and never enter the replication stream. If a primary's `max_entry_size` is increased after initial configuration, the DR gRPC `MaxRecvMsgSize` should be reviewed to ensure it accommodates the largest possible `EntryBatch`.
+- **Batch bounds:** `EntryBatch` messages are bounded by both entry count (default: 64 entries per batch, `drDefaultStreamBatchMaxEntries`) and byte size (default: 1 MiB per batch, `drDefaultStreamBatchMaxBytes`). These are hard caps enforced at the sender; the receiver additionally validates batch size against `MaxRecvMsgSize` at the gRPC layer.
 
 ### Pipelined Stream Application & Flow Control
 
@@ -499,7 +598,7 @@ After each successful batch commit in the DR apply path (both streaming and reco
 
 Independently, the Secondary sends its `lastAppliedIndex` every 2s via the `Heartbeat` RPC. The Primary uses this for DR-aware ingress admission (write throttling) -- a coarser-grained mechanism that protects the entire system, complementing the per-subscriber credit flow control.
 
-The heartbeat response also carries the active leader's cluster TLS certificate (`active_cluster_cert`) and cluster address (`leader_cluster_addr`). The secondary uses these to maintain a dynamic trust pool for TLS verification after leadership changes and to enable redirect-based reconnection (see "Cross-Cluster TLS Trust Model").
+The heartbeat response also carries the active leader's DR transport leaf certificate (`active_cluster_cert`) and cluster address (`leader_cluster_addr`). The secondary verifies that `active_cluster_cert` chains to the pinned DR transport CA before adding it to the trust pool. This provides a secure refresh mechanism for leader certificate rotation without TOFU (see "Cross-Cluster TLS Trust Model").
 
 ## Performance & Limits
 
@@ -660,10 +759,30 @@ Representative metrics emitted include:
 
 Secondary promotion path:
 
-1. Stop DR ingest.
+1. Stop DR ingest and verify the ingest loop has terminated. The `lastAppliedIndex` must be stable (unchanged) for at least 2 seconds to confirm no in-flight applies.
 2. Transition from DR secondary semantics to standalone operation with DR mode set to `disabled`.
 3. Resume serving client writes on the promoted cluster.
 4. Operator may explicitly re-enable DR primary mode to accept new secondaries.
+
+### Promotion Safety
+
+Promotion is a high-risk operation. The following safeguards prevent accidental split-brain:
+
+1. **Operator confirmation:** The `sys/replication/dr/secondary/promote` endpoint requires an explicit `confirm_primary_unreachable=true` parameter. Without it, the request is rejected with an error instructing the operator to confirm that the primary is unreachable. This is a procedural safeguard, not a connectivity check.
+
+2. **Ingest quiesce barrier:** Before transitioning mode, the promotion path verifies that the DR ingest loop has been cancelled and that `lastAppliedIndex` has been stable for a brief quiesce window (default: 2 seconds). This ensures no partial batch is in flight.
+
+3. **Reconciliation guard:** If the secondary is actively reconciling (`DRSecondaryReconciling` state), promotion emits a warning but proceeds. The operator is advised to wait for reconciliation to complete before promoting to minimize data lag.
+
+4. **Relationship termination on promote:** Promotion transitions the cluster from secondary to standalone. As part of this transition, all DR relationship state is cleared: the secondary's relationship entry is removed, the trust pool is flushed, and the DR gRPC client connection is terminated. The promoted cluster no longer presents itself as a secondary on any control plane. This prevents the promoted cluster from accidentally re-entering secondary mode or continuing to ingest from a (potentially recovering) primary.
+
+5. **Audit events:** Promotion emits structured audit log events at each stage:
+   - `dr_secondary_promote_requested`: logged when the API request is received; includes `source_ip`, `confirm_primary_unreachable`, `last_applied_index`, `last_known_primary_index`, `estimated_data_loss_entries`.
+   - `dr_secondary_promote_quiesce`: logged after the quiesce barrier completes; includes `index_before`, `index_after`, `quiesce_window_ms`.
+   - `dr_secondary_promoted`: logged after successful mode transition; includes `old_mode`, `new_mode`, `duration_ms`, any warnings.
+   These events provide an auditable record of the promotion decision and its data-loss implications.
+
+6. **Promotion token (future work):** For environments requiring stronger guarantees, a future enhancement will allow the primary to generate a time-limited promotion token that the secondary must present to promote. This provides cryptographic proof that the primary intended to delegate authority.
 
 ## Testing Expectations
 
@@ -685,9 +804,17 @@ Core validation includes:
    - revoke during reconcile abort
 7. Leader-election journal continuity: verify new leader can serve stream catch-up from journal accumulated during follower period without reconciliation.
 8. Journal-based index warmup: verify index built from journal replay matches full-scan result.
-9. Dynamic TLS trust pool: known cert verification, TOFU acceptance and pool update, TTL-based eviction, heartbeat cert propagation.
+9. CA-scoped TLS trust pool: known cert verification, CA chain validation for unknown certs, rejection of certs not chaining to DR transport CA, TTL-based eviction, heartbeat cert refresh.
 10. Standby node redirect: verify RPCs hitting a standby return a redirect with the active leader's address.
 11. Stream resume fast-path: verify transient disconnects attempt resume before falling back to reconciliation.
+12. Monotonic checkpoint index: verify secondary rejects checkpoint_index lower than highest committed; verify resnapshot resets the high-water mark.
+13. Bootstrap AAD binding: verify wrapped root key cannot be unwrapped with mismatched cluster_id, relationship_id, or secondary cert fingerprint.
+14. Redirect rate limiting: verify excessive redirects trigger backoff and do not cause unbounded reconnection churn.
+15. Promotion safety: verify promote is rejected without `confirm_primary_unreachable=true`; verify ingest quiesce barrier waits for stable lastAppliedIndex; verify DR relationships are terminated on promotion; verify audit events emitted.
+16. CA rotation: verify overlap window accepts both old and new CA certs; verify break-glass rotation immediately drops old CA; verify heartbeat CA propagation delivers new CA to secondaries.
+17. Resnapshot confirmation: verify resnapshot is rejected without `confirm_rollback_ok=true`; verify audit log event includes old/new HWM.
+18. Certificate fingerprint uniqueness: verify registration rejects a fingerprint already bound to another active relationship.
+19. Journal corruption: verify corrupted journal entries cause fail-closed behavior (abort replay, force reconciliation).
 
 ## Rationale and Alternatives
 
@@ -705,6 +832,19 @@ Alternatives rejected:
 - **Merkle-tree reconciliation** -- Imposes a hierarchical hash composition where parent digests are derived from child digests, creating a persistent tree structure that must be maintained on the write path. Our flat segmentation approach computes digests directly from items on demand, avoiding write-path overhead and patent-adjacent tree maintenance semantics.
 - **Plaintext root-key bootstrap** -- Violates security invariants; replaced with ECDH + AEAD wrapped key exchange.
 - **Insecure transport fallback** -- Fails-open on network compromise; rejected in favor of strict mTLS with no fallback path.
+
+## Attested Checkpoints (Optional Extension)
+
+For regulated and multi-organization deployments, the primary can produce **signed checkpoint attestations** that provide tamper-evident proof of reconciliation state:
+
+1. **Checkpoint manifest digest:** During checkpoint build, the primary computes a `checkpoint_manifest_digest` -- a SHA-256 hash over the sorted range descriptors, entry counts, and checkpoint metadata (checkpoint_id, checkpoint_index, timestamp).
+2. **Attestation signature:** The primary signs the manifest digest using the DR transport CA private key (or a separate dedicated attestation key if key separation is required). The signature is included in the `CheckpointResponse` as `checkpoint_attestation`.
+3. **Secondary storage:** The secondary stores the attestation alongside the checkpoint metadata. Attestations are exportable via `sys/replication/dr/status` for external audit systems.
+4. **Equivocation detection:** In multi-secondary topologies, each secondary can export its stored attestation for a given `checkpoint_index`. An external auditor (or a future built-in tool) can compare attestations across secondaries to detect equivocation: if the primary produced different manifest digests for the same `checkpoint_index` to different secondaries, the signatures will differ, revealing inconsistency.
+
+This extension adds no overhead to the normal replication path (signing occurs once per checkpoint build, not per entry). It provides a compliance-friendly integrity evidence trail without requiring Byzantine fault tolerance in the core protocol.
+
+**Status:** This extension is defined in the RFC for forward compatibility. The `checkpoint_attestation` field is reserved in the proto definition. Implementation is gated on operator demand and will be enabled via a `checkpoint_attestation_enabled` tunable.
 
 ## Operational Notes
 
@@ -759,9 +899,12 @@ Alternatives rejected:
 | Relationship authorization checks | `vault/dr_relationship_authz.go` (`ValidateRelationshipAccess`) and `vault/dr_replication.go` (`authorizeRelationship`) |
 | Revocation semantics | `vault/dr_relationship_authz.go` (`RevokeRelationship`) and `vault/dr_replication.go` (`RevokeRelationship`) |
 | Heartbeat last-seen throttling | `vault/dr_relationship_authz.go` (`MarkRelationshipSeen`) |
-| Cluster cert trust and fingerprint propagation | `vault/dr_cluster.go` (`drReplicationClusterClient`, `trustedPrimaryCert`, `VerifyPeerCertificate`, `addTrustedCert`, `pruneTrustedCerts`, `initTrustedPool`) and `vault/dr_replication.go` (`peerCertFingerprintFromContext`) |
-| Dynamic TLS trust pool (secondary) | `vault/dr_replication_secondary.go` (`trustedPrimaryCerts` pool, `Connect` pool init, `runHeartbeatLoop` cert add/prune) |
+| DR transport CA generation and storage | `vault/dr_transport_ca.go` (`generateDRTransportCA`, `signDRTransportLeafCert`, `loadDRTransportCA`) |
+| Cluster cert trust and fingerprint propagation | `vault/dr_cluster.go` (`drReplicationClusterClient`, `trustedPrimaryCert`, `VerifyPeerCertificate`, `addTrustedCert`, `pruneTrustedCerts`, `initTrustedPool`, `verifyCertChainToCA`) and `vault/dr_replication.go` (`peerCertFingerprintFromContext`) |
+| CA-scoped TLS trust pool (secondary) | `vault/dr_replication_secondary.go` (`trustedPrimaryCerts` pool, `Connect` pool init, `runHeartbeatLoop` cert CA-verify/add/prune) |
 | Cluster.Client TLS verification callback | `vault/cluster/cluster.go` (`VerifyPeerCertificate` interface method, `GetContextDialerFunc` callback wiring) |
+| Monotonic checkpoint index enforcement | `vault/dr_reconcile_session.go` (`beginReconcileSession` monotonicity check, `highestCommittedCheckpointIndex` persist/load) |
+| Promotion safety controls | `vault/dr_failover.go` (`DRFailover` quiesce barrier, `confirm_primary_unreachable` check) |
 
 ### API and Operational Wiring
 
@@ -823,9 +966,14 @@ Alternatives rejected:
 | Tombstone GC watermark computation | `TestDRTombstoneGC_ComputesWatermarkFromSecondaryPressure`, `TestDRTombstoneGC_DisconnectedPeersExcludedFromWatermark`, `TestDRTombstoneGC_NoActivePeersUsesLocalIndex` (`vault/dr_replication_test.go`) |
 | Credit-based WindowUpdate flow control | `TestStreamChanges_InitialWindowRespected`, `TestStreamChanges_CreditFlowControl`, `TestStreamChanges_CreditTimeout` (`vault/dr_replication_test.go`) |
 | EntryBatch stream batching | `TestStreamChanges_BatchSizeRespected` (`vault/dr_replication_test.go`) |
-| Dynamic TLS trust pool (known cert, TOFU, eviction) | `TestDRClusterClient_VerifyKnownCert`, `TestDRClusterClient_VerifyTOFU`, `TestDRClusterClient_VerifyEmptyCerts`, `TestDRTrustPool_TTLEviction`, `TestHeartbeatResponse_ActiveClusterCert`, `TestInitTrustedPool`, `TestDRCertFingerprint` (`vault/dr_replication_test.go`) |
+| CA-scoped TLS trust pool (known cert, CA chain verify, rejection, eviction) | `TestDRClusterClient_VerifyKnownCert`, `TestDRClusterClient_VerifyCAChain`, `TestDRClusterClient_RejectNonCACert`, `TestDRClusterClient_VerifyEmptyCerts`, `TestDRTrustPool_TTLEviction`, `TestHeartbeatResponse_ActiveClusterCert`, `TestInitTrustedPool`, `TestDRCertFingerprint` (`vault/dr_replication_test.go`) |
+| DR transport CA generation and leaf signing | `TestDRTransportCA_Generate`, `TestDRTransportCA_SignLeaf`, `TestDRTransportCA_LoadFromStorage` (`vault/dr_transport_ca_test.go`) |
 | Shared journal dispatcher (all-node journal, primary delegation, leader transition) | `TestDispatcher_JournalAlwaysWritten`, `TestDispatcher_DelegatesToPrimary`, `TestDispatcher_LeaderTransitionJournalContinuity`, `TestDispatcher_SetClearPrimary`, `TestFilterDRReplicableEntries` (`vault/dr_replication_test.go`) |
 | Journal-based index warmup | `TestWarmIndexFromJournal`, `TestWarmIndexFromJournal_EmptyJournal`, `TestWarmIndexFromJournal_NilJournal` (`vault/dr_replication_test.go`) |
+| Monotonic checkpoint index | `TestReconcileSession_MonotonicCheckpointIndex`, `TestReconcileSession_ResnapshotResetsHighWaterMark` (`vault/dr_replication_test.go`) |
+| Bootstrap AAD binding | `TestBootstrapAAD_ClusterIDBinding`, `TestBootstrapAAD_SecondaryFPBinding`, `TestBootstrapAAD_PrimaryIdentityBinding` (`vault/dr_replication_crypto_test.go`) |
+| Promotion safety | `TestDRFailover_RequiresConfirmation`, `TestDRFailover_QuiesceBarrier` (`vault/dr_failover_test.go`) |
+| Redirect rate limiting | `TestSecondaryController_RedirectRateLimit`, `TestSecondaryController_RedirectBackoff` (`vault/dr_secondary_controller_test.go`) |
 
 ## Demo (CLI)
 

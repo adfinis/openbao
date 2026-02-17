@@ -6,6 +6,7 @@ package vault
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -45,6 +46,12 @@ type drReplicationClusterHandler struct {
 	logger     log.Logger
 	stopCh     chan struct{}
 
+	// drLeafCertMu protects drLeafCertDER / drLeafParsedCert / drLeafPrivateKey.
+	drLeafCertMu     sync.RWMutex
+	drLeafCertDER    []byte // DER-encoded leaf cert signed by DR transport CA
+	drLeafParsedCert *x509.Certificate
+	drLeafPrivateKey *ecdsa.PrivateKey // snapshot of the key used when minting the leaf
+
 	// certMu protects trustedSecondaryCerts.
 	certMu sync.RWMutex
 	// trustedSecondaryCerts holds per-relationship trusted certificates.
@@ -53,11 +60,20 @@ type drReplicationClusterHandler struct {
 
 // newDRReplicationClusterHandler creates and registers the DR gRPC handler
 // on the cluster listener.
+const (
+	// drGRPCMaxMessageSize bounds the maximum gRPC message size for the
+	// DR replication service. This limits decompression cost for gzip
+	// messages and prevents unbounded memory allocation.
+	drGRPCMaxMessageSize = 16 * 1024 * 1024 // 16 MiB
+)
+
 func newDRReplicationClusterHandler(core *Core, drServer *drReplicationPrimary, logger log.Logger) *drReplicationClusterHandler {
 	grpcServer := grpc.NewServer(
 		grpc.KeepaliveParams(keepalive.ServerParameters{
 			Time: 2 * core.clusterHeartbeatInterval,
 		}),
+		grpc.MaxRecvMsgSize(drGRPCMaxMessageSize),
+		grpc.MaxSendMsgSize(drGRPCMaxMessageSize),
 	)
 	RegisterDRReplicationServer(grpcServer, drServer)
 
@@ -71,8 +87,81 @@ func newDRReplicationClusterHandler(core *Core, drServer *drReplicationPrimary, 
 	}
 }
 
-// ServerLookup returns the cluster TLS certificate for incoming connections.
+// SetTransportCA mints a short-lived leaf certificate signed by the DR
+// transport CA using this node's cluster key pair. The leaf is presented
+// to secondaries in the TLS handshake so they can verify it chains to
+// the CA from the activation token.
+func (h *drReplicationClusterHandler) SetTransportCA(ca *drTransportCA) error {
+	privKey := h.core.localClusterPrivateKey.Load()
+	if privKey == nil {
+		return errors.New("no local cluster private key available")
+	}
+
+	clusterAddr := h.core.ClusterAddr()
+
+	leafDER, err := signDRTransportLeafCert(ca, &privKey.PublicKey, clusterAddr)
+	if err != nil {
+		return fmt.Errorf("failed to mint DR leaf certificate: %w", err)
+	}
+
+	parsed, err := x509.ParseCertificate(leafDER)
+	if err != nil {
+		return fmt.Errorf("failed to parse minted DR leaf certificate: %w", err)
+	}
+
+	h.drLeafCertMu.Lock()
+	h.drLeafCertDER = leafDER
+	h.drLeafParsedCert = parsed
+	h.drLeafPrivateKey = privKey // snapshot: must match the public key in the leaf cert
+	h.drLeafCertMu.Unlock()
+
+	h.logger.Info("minted DR transport leaf certificate",
+		"cn", parsed.Subject.CommonName,
+		"not_after", parsed.NotAfter,
+		"fingerprint", drCertFingerprint(leafDER))
+
+	return nil
+}
+
+// ActiveDRLeafCertDER returns a copy of the currently minted DR transport
+// leaf certificate DER bytes. Returns nil when no DR leaf is available.
+func (h *drReplicationClusterHandler) ActiveDRLeafCertDER() []byte {
+	if h == nil {
+		return nil
+	}
+
+	h.drLeafCertMu.RLock()
+	defer h.drLeafCertMu.RUnlock()
+
+	if len(h.drLeafCertDER) == 0 {
+		return nil
+	}
+	out := make([]byte, len(h.drLeafCertDER))
+	copy(out, h.drLeafCertDER)
+	return out
+}
+
+// ServerLookup returns the DR transport leaf certificate for incoming
+// connections. If a CA-signed leaf has been minted, it is presented
+// together with the transport CA cert as the chain. Falls back to the
+// node's self-signed cluster cert only if no DR leaf has been minted yet.
 func (h *drReplicationClusterHandler) ServerLookup(ctx context.Context, clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	h.drLeafCertMu.RLock()
+	leafDER := h.drLeafCertDER
+	leafParsed := h.drLeafParsedCert
+	leafKey := h.drLeafPrivateKey
+	h.drLeafCertMu.RUnlock()
+
+	if leafDER != nil && leafParsed != nil && leafKey != nil {
+		return &tls.Certificate{
+			Certificate: [][]byte{leafDER},
+			PrivateKey:  leafKey, // use the snapshot taken at mint time
+			Leaf:        leafParsed,
+		}, nil
+	}
+
+	// Fallback: no DR leaf cert minted yet, use self-signed cluster cert.
+	h.logger.Warn("no DR transport leaf cert available, falling back to cluster cert")
 	currCert := h.core.localClusterCert.Load()
 	if currCert == nil {
 		return nil, errors.New("dr replication connection but no local cert")
@@ -90,6 +179,29 @@ func (h *drReplicationClusterHandler) ServerLookup(ctx context.Context, clientHe
 		PrivateKey:  h.core.localClusterPrivateKey.Load(),
 		Leaf:        h.core.localClusterParsedCert.Load(),
 	}, nil
+}
+
+// startLeafRenewal launches a background goroutine that re-mints the DR
+// leaf certificate at half the leaf validity interval. The goroutine
+// stops when the handler's stopCh is closed.
+func (h *drReplicationClusterHandler) startLeafRenewal(ca *drTransportCA) {
+	renewInterval := drTransportLeafValidity / 2
+	go func() {
+		ticker := time.NewTicker(renewInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := h.SetTransportCA(ca); err != nil {
+					h.logger.Error("failed to renew DR transport leaf cert", "error", err)
+				} else {
+					h.logger.Info("renewed DR transport leaf certificate")
+				}
+			case <-h.stopCh:
+				return
+			}
+		}
+	}()
 }
 
 // CALookup returns the CA certificates for verifying client connections.
@@ -236,7 +348,9 @@ func drCertFingerprint(der []byte) string {
 // connecting to the primary's DR replication gRPC service over mTLS.
 type drReplicationClusterClient struct {
 	core *Core
-	// primaryCACert is the primary's CA certificate from the activation token.
+	// primaryCACert is the primary's DR transport CA certificate from
+	// the activation token. This is the sole trust anchor used to
+	// verify primary identity.
 	primaryCACert *x509.Certificate
 	logger        log.Logger
 
@@ -304,13 +418,12 @@ func (c *drReplicationClusterClient) CACert(ctx context.Context) *x509.Certifica
 }
 
 // VerifyPeerCertificate returns a callback that checks the primary's
-// server certificate against a dynamically maintained trust pool.
+// server certificate against a dynamically maintained CA-scoped trust pool.
 //
 // Known certs (from heartbeats) are verified immediately. Unknown
-// certs are accepted via TOFU (Trust On First Use) and added to the
-// pool; the next heartbeat from that leader refreshes them. Security
-// for TOFU connections is maintained by the primary's independent
-// mTLS verification of the secondary plus gRPC relationship authz.
+// certs are verified against the DR transport CA from the activation
+// token. If the certificate chains to the CA, it is accepted and
+// added to the pool. If it does not chain, the connection is rejected.
 func (c *drReplicationClusterClient) VerifyPeerCertificate() func([][]byte, [][]*x509.Certificate) error {
 	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 		if len(rawCerts) == 0 {
@@ -331,10 +444,24 @@ func (c *drReplicationClusterClient) VerifyPeerCertificate() func([][]byte, [][]
 			return nil
 		}
 
-		// TOFU: accept the unknown cert and add it to the pool.
-		// The primary still verifies *us* via mTLS + gRPC authz,
-		// so a rogue server without the secondary's cert cannot
-		// complete the handshake.
+		// Unknown cert: verify it chains to the DR transport CA.
+		if c.primaryCACert == nil {
+			return errors.New("dr: no DR transport CA configured; cannot verify server certificate")
+		}
+
+		if err := verifyCertChainToCA(rawCerts[0], c.primaryCACert); err != nil {
+			cn := "(unknown)"
+			if cert, parseErr := x509.ParseCertificate(rawCerts[0]); parseErr == nil {
+				cn = cert.Subject.CommonName
+			}
+			c.logger.Warn("rejected primary certificate: does not chain to DR transport CA",
+				"fingerprint", fp,
+				"cn", cn,
+				"error", err)
+			return fmt.Errorf("dr: server certificate does not chain to DR transport CA: %w", err)
+		}
+
+		// Certificate chains to the CA -- accept and add to pool.
 		c.trustedCertsMu.Lock()
 		c.trustedCerts[fp] = &trustedPrimaryCert{
 			derBytes: append([]byte(nil), rawCerts[0]...),
@@ -342,12 +469,11 @@ func (c *drReplicationClusterClient) VerifyPeerCertificate() func([][]byte, [][]
 		}
 		c.trustedCertsMu.Unlock()
 
-		// Parse the cert for logging only; non-fatal if it fails.
 		cn := "(unknown)"
 		if cert, err := x509.ParseCertificate(rawCerts[0]); err == nil {
 			cn = cert.Subject.CommonName
 		}
-		c.logger.Warn("accepted unverified primary certificate (TOFU)",
+		c.logger.Info("accepted primary certificate verified against DR transport CA",
 			"fingerprint", fp,
 			"cn", cn)
 		return nil
@@ -355,19 +481,39 @@ func (c *drReplicationClusterClient) VerifyPeerCertificate() func([][]byte, [][]
 }
 
 // addTrustedCert adds or refreshes a DER-encoded certificate in the
-// trust pool. Called from the heartbeat loop.
-func (c *drReplicationClusterClient) addTrustedCert(der []byte) {
+// trust pool. Called from the heartbeat loop. The certificate must
+// chain to the DR transport CA or it is rejected.
+func (c *drReplicationClusterClient) addTrustedCert(der []byte) error {
 	fp := drCertFingerprint(der)
-	c.trustedCertsMu.Lock()
-	defer c.trustedCertsMu.Unlock()
-	if entry, ok := c.trustedCerts[fp]; ok {
+
+	c.trustedCertsMu.RLock()
+	entry, known := c.trustedCerts[fp]
+	c.trustedCertsMu.RUnlock()
+
+	if known {
+		c.trustedCertsMu.Lock()
 		entry.lastSeen = time.Now()
-	} else {
-		c.trustedCerts[fp] = &trustedPrimaryCert{
-			derBytes: append([]byte(nil), der...),
-			lastSeen: time.Now(),
+		c.trustedCertsMu.Unlock()
+		return nil
+	}
+
+	// Verify chain to DR transport CA before adding.
+	if c.primaryCACert != nil {
+		if err := verifyCertChainToCA(der, c.primaryCACert); err != nil {
+			c.logger.Warn("rejected heartbeat certificate: does not chain to DR transport CA",
+				"fingerprint", fp,
+				"error", err)
+			return fmt.Errorf("heartbeat certificate does not chain to DR transport CA: %w", err)
 		}
 	}
+
+	c.trustedCertsMu.Lock()
+	c.trustedCerts[fp] = &trustedPrimaryCert{
+		derBytes: append([]byte(nil), der...),
+		lastSeen: time.Now(),
+	}
+	c.trustedCertsMu.Unlock()
+	return nil
 }
 
 // pruneTrustedCerts removes entries whose lastSeen exceeds the TTL.

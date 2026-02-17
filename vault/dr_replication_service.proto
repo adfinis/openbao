@@ -268,10 +268,12 @@ message DRHeartbeatResponse {
     // without requiring a load balancer.
     string leader_cluster_addr = 4;
 
-    // active_cluster_cert is the DER-encoded cluster TLS certificate
-    // of the active primary node. The secondary adds it to a dynamic
-    // trust pool so that after a leadership change the new leader's
-    // certificate can be verified without InsecureSkipVerify.
+    // active_cluster_cert is the DER-encoded DR transport leaf
+    // certificate of the active primary node (signed by the DR
+    // transport CA from the activation token). The secondary adds it
+    // to a dynamic trust pool so that after a leadership change the
+    // new leader's certificate can be verified without
+    // InsecureSkipVerify.
     bytes active_cluster_cert = 5;
 }
 
@@ -308,9 +310,14 @@ message SyncKeyringResponse {
     // for ECDH key agreement.
     bytes server_ephemeral_pubkey = 4;
 
-    // wrap_nonce is the AEAD nonce used to encrypt wrapped_root_key.
+    // wrap_nonce is the GCM IV used to encrypt wrapped_root_key.
     bytes wrap_nonce = 5;
 
     // wrap_aad_version is the protocol version encoded in AEAD AAD.
     uint32 wrap_aad_version = 6;
+
+    // server_nonce is a 32-byte random value used as part of the HKDF
+    // salt (client_nonce || server_nonce). Separate from the GCM IV
+    // (wrap_nonce) to avoid dual-role bytes.
+    bytes server_nonce = 7;
 }

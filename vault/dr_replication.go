@@ -183,6 +183,9 @@ type drReplicationPrimary struct {
 	// metrics
 	entriesDropped atomic.Uint64
 	scanFailures   atomic.Uint64
+	// heartbeatMissingDRLeafWarned suppresses repeated warning spam when
+	// heartbeats cannot include the active DR transport leaf certificate.
+	heartbeatMissingDRLeafWarned atomic.Bool
 	// streamLaggingSubscribers counts forced disconnects due to subscriber lag.
 	streamLaggingSubscribers atomic.Uint64
 	// streamLaggingSubscribersActive tracks recent lagging pressure in a short window.
@@ -1474,12 +1477,21 @@ func (s *drReplicationPrimary) Heartbeat(ctx context.Context, req *DRHeartbeatRe
 		leaderClusterAddr = addr
 	}
 
-	// Include the active node's cluster TLS certificate so the
+	// Include the active node's DR transport leaf certificate so the
 	// secondary can build a dynamic trust pool for server certificate
 	// verification after leadership changes.
 	var activeClusterCert []byte
-	if certPtr := s.core.localClusterCert.Load(); certPtr != nil {
-		activeClusterCert = *certPtr
+	if mgr := s.core.drManager; mgr != nil {
+		if handler := mgr.Handler(); handler != nil {
+			activeClusterCert = handler.ActiveDRLeafCertDER()
+		}
+	}
+	if len(activeClusterCert) == 0 {
+		if s.heartbeatMissingDRLeafWarned.CompareAndSwap(false, true) {
+			s.logger.Warn("no DR transport leaf certificate available for heartbeat; active_cluster_cert omitted")
+		}
+	} else {
+		s.heartbeatMissingDRLeafWarned.Store(false)
 	}
 
 	return &DRHeartbeatResponse{
@@ -1540,9 +1552,28 @@ func (s *drReplicationPrimary) SyncKeyring(ctx context.Context, req *SyncKeyring
 	if err != nil {
 		return nil, fmt.Errorf("failed to get barrier keyring: %w", err)
 	}
-	wrappedRootKey, serverPub, wrapNonce, aadVersion, err := wrapRootKeyForSecondary(
+	// Derive AAD binding parameters for the wrap:
+	// - clusterID from the DR config
+	// - secondaryCertFP from the mTLS peer identity
+	// - primaryIdentity from the DR transport CA SPKI hash
+	mgr := s.core.drManager
+	wrapClusterID := ""
+	wrapPrimaryIdentity := ""
+	if mgr != nil {
+		cfg := mgr.Config()
+		wrapClusterID = cfg.ClusterID
+		if mgr.transportCA != nil {
+			wrapPrimaryIdentity = mgr.transportCA.spkiHash()
+		}
+	}
+	wrapSecondaryFP, _ := peerCertFingerprintFromContext(ctx)
+
+	wrappedRootKey, serverPub, srvNonce, gcmIV, aadVersion, err := wrapRootKeyForSecondary(
 		keyring.RootKey(),
 		req.RelationshipId,
+		wrapClusterID,
+		wrapSecondaryFP,
+		wrapPrimaryIdentity,
 		req.ClientEphemeralPubkey,
 		req.ClientNonce,
 	)
@@ -1553,7 +1584,8 @@ func (s *drReplicationPrimary) SyncKeyring(ctx context.Context, req *SyncKeyring
 	resp := &SyncKeyringResponse{
 		WrappedRootKey:        wrappedRootKey,
 		ServerEphemeralPubkey: serverPub,
-		WrapNonce:             wrapNonce,
+		ServerNonce:           srvNonce,
+		WrapNonce:             gcmIV,
 		WrapAadVersion:        aadVersion,
 	}
 	if keyringEntry != nil {

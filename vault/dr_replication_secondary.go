@@ -9,7 +9,9 @@ import (
 	"context"
 	"crypto/ecdh"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -234,6 +236,10 @@ const (
 	drDefaultApplyYieldDuration = 1 * time.Millisecond
 )
 
+// drHeartbeatInterval controls DR heartbeat cadence. Kept as a package var
+// so tests can shorten it for deterministic execution time.
+var drHeartbeatInterval = 2 * time.Second
+
 func (s DRSecondaryState) String() string {
 	switch s {
 	case DRSecondaryIdle:
@@ -338,14 +344,16 @@ type drReplicationSecondary struct {
 	lastReconcileActivityAt      atomic.Int64 // unix timestamp
 	lastReconcileApplyAt         atomic.Int64 // unix timestamp
 
-	sessionMu                  sync.RWMutex
-	activeCheckpointID         string
-	activeCheckpointIndex      uint64
-	sessionStart               time.Time
-	streamPausedAt             uint64
-	lastReconcileFailReason    string
-	lastRangeManifestCount     int
-	lastReconcileFailureByType map[string]uint64
+	sessionMu                          sync.RWMutex
+	activeCheckpointID                 string
+	activeCheckpointIndex              uint64
+	highestCommittedCheckpointIndex    uint64 // monotonic high-water mark
+	highestCommittedCheckpointIndexSet bool   // true once loaded/initialized
+	sessionStart                       time.Time
+	streamPausedAt                     uint64
+	lastReconcileFailReason            string
+	lastRangeManifestCount             int
+	lastReconcileFailureByType         map[string]uint64
 
 	// Additional heavy-load observability counters.
 	scanFailures            atomic.Uint64
@@ -482,6 +490,12 @@ func newDRReplicationSecondary(core *Core, replSalt []byte, relationshipID strin
 func (s *drReplicationSecondary) Connect(ctx context.Context, primaryAddr string, opts ...grpc.DialOption) error {
 	s.logger.Info("connecting to primary", "addr", primaryAddr)
 
+	// Load the monotonic checkpoint high-water mark from barrier storage
+	// on first connect (or after restart).
+	if !s.highestCommittedCheckpointIndexSet {
+		s.loadCheckpointHighWaterMark()
+	}
+
 	// Strip the scheme (https://) from the address -- gRPC expects host:port only.
 	primaryAddr = strings.TrimPrefix(primaryAddr, "https://")
 	primaryAddr = strings.TrimPrefix(primaryAddr, "http://")
@@ -555,7 +569,8 @@ func (s *drReplicationSecondary) Start(ctx context.Context) error {
 	}
 	heartbeatCtx, heartbeatCancel := context.WithCancel(ctx)
 	defer heartbeatCancel()
-	go s.runHeartbeatLoop(heartbeatCtx)
+	heartbeatErrCh := make(chan error, 1)
+	go s.runHeartbeatLoop(heartbeatCtx, heartbeatErrCh)
 
 	for {
 		select {
@@ -563,6 +578,13 @@ func (s *drReplicationSecondary) Start(ctx context.Context) error {
 			return ctx.Err()
 		case <-s.stopCh:
 			return nil
+		case err := <-heartbeatErrCh:
+			if err != nil {
+				// Cancel any in-flight stream so Start can return and the
+				// controller reconnect loop can establish a fresh transport.
+				s.cancelActiveStream()
+				return fmt.Errorf("heartbeat trust validation failed: %w", err)
+			}
 		default:
 		}
 
@@ -606,6 +628,12 @@ func (s *drReplicationSecondary) Start(ctx context.Context) error {
 				continue
 			}
 			s.markReconcileSuccess()
+			s.sessionMu.RLock()
+			commitIdx := s.activeCheckpointIndex
+			s.sessionMu.RUnlock()
+			if commitIdx > 0 {
+				s.commitCheckpointIndex(commitIdx)
+			}
 
 			// After initial reconciliation, the storage contains the
 			// primary's data (including token salt, mount table, etc.)
@@ -721,6 +749,12 @@ func (s *drReplicationSecondary) Start(ctx context.Context) error {
 				continue
 			}
 			s.markReconcileSuccess()
+			s.sessionMu.RLock()
+			reconcileCommitIdx := s.activeCheckpointIndex
+			s.sessionMu.RUnlock()
+			if reconcileCommitIdx > 0 {
+				s.commitCheckpointIndex(reconcileCommitIdx)
+			}
 			s.streamResumeAttempts = 0
 			s.setState(DRSecondaryStreaming)
 
@@ -749,6 +783,12 @@ func (s *drReplicationSecondary) Start(ctx context.Context) error {
 				continue
 			}
 			s.markReconcileSuccess()
+			s.sessionMu.RLock()
+			resnapshotCommitIdx := s.activeCheckpointIndex
+			s.sessionMu.RUnlock()
+			if resnapshotCommitIdx > 0 {
+				s.commitCheckpointIndex(resnapshotCommitIdx)
+			}
 			s.streamResumeAttempts = 0
 			s.setState(DRSecondaryStreaming)
 
@@ -1255,8 +1295,8 @@ func (s *drReplicationSecondary) rpcContext(ctx context.Context) (context.Contex
 	return context.WithTimeout(ctx, deadline)
 }
 
-func (s *drReplicationSecondary) runHeartbeatLoop(ctx context.Context) {
-	ticker := time.NewTicker(2 * time.Second)
+func (s *drReplicationSecondary) runHeartbeatLoop(ctx context.Context, errCh chan<- error) {
+	ticker := time.NewTicker(drHeartbeatInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -1294,11 +1334,24 @@ func (s *drReplicationSecondary) runHeartbeatLoop(ctx context.Context) {
 			s.lastKnownLeaderAddr.Store(&addr)
 		}
 
-		// Add the active leader's cluster certificate to the
-		// dynamic trust pool and prune expired entries.
+		// Verify and add the active leader's cluster certificate to the
+		// CA-scoped trust pool and prune expired entries.
 		if cert := resp.GetActiveClusterCert(); len(cert) > 0 {
 			if cl := s.drClusterClient; cl != nil {
-				cl.addTrustedCert(cert)
+				if err := cl.addTrustedCert(cert); err != nil {
+					wrappedErr := fmt.Errorf("heartbeat certificate rejected by trust pool: %w", err)
+					s.logger.Error("heartbeat certificate rejected by trust pool; forcing reconnect", "error", wrappedErr)
+					// Cancel any active stream immediately so the
+					// reconnect controller can take over.
+					s.cancelActiveStream()
+					if errCh != nil {
+						select {
+						case errCh <- wrappedErr:
+						default:
+						}
+					}
+					return
+				}
 				cl.pruneTrustedCerts()
 			}
 		}
@@ -1589,7 +1642,9 @@ func (s *drReplicationSecondary) performResnapshot(ctx context.Context, reason s
 		return fmt.Errorf("failed to request checkpoint for resnapshot: %w", err)
 	}
 
-	s.beginReconcileSession(checkpoint.CheckpointId, checkpoint.CommitIndex)
+	if err := s.beginReconcileSession(checkpoint.CheckpointId, checkpoint.CommitIndex); err != nil {
+		return fmt.Errorf("failed to begin reconcile session: %w", err)
+	}
 	defer s.endReconcileSession()
 
 	full := reconciler.RangeSpan{}
@@ -1827,12 +1882,40 @@ func (s *drReplicationSecondary) bootstrapKeyring(ctx context.Context) error {
 		return fmt.Errorf("bootstrap aborted: secondary stopped")
 	}
 
+	// Derive the same AAD binding parameters used by the primary:
+	// - clusterID from the DR config
+	// - secondary's own cert fingerprint
+	// - primary identity from the DR transport CA SPKI hash
+	unwrapClusterID := ""
+	unwrapPrimaryIdentity := ""
+	if mgr := s.core.drManager; mgr != nil {
+		cfg := mgr.Config()
+		unwrapClusterID = cfg.ClusterID
+	}
+	if len(s.primaryCACert) > 0 {
+		if caCert, parseErr := x509.ParseCertificate(s.primaryCACert); parseErr == nil {
+			// Compute SPKI hash to match what the primary used.
+			if spki, spkiErr := x509.MarshalPKIXPublicKey(caCert.PublicKey); spkiErr == nil {
+				h := sha256.Sum256(spki)
+				unwrapPrimaryIdentity = hex.EncodeToString(h[:])
+			}
+		}
+	}
+	unwrapSecondaryFP := ""
+	if localCert := s.core.localClusterParsedCert.Load(); localCert != nil {
+		unwrapSecondaryFP = certFingerprintSHA256(localCert)
+	}
+
 	rootKey, err := unwrapRootKeyFromPrimary(
 		resp.WrappedRootKey,
 		s.relationshipID,
+		unwrapClusterID,
+		unwrapSecondaryFP,
+		unwrapPrimaryIdentity,
 		resp.ServerEphemeralPubkey,
 		clientPriv,
 		clientNonce,
+		resp.ServerNonce,
 		resp.WrapNonce,
 		resp.WrapAadVersion,
 	)
@@ -2631,7 +2714,9 @@ func (s *drReplicationSecondary) runReconciliation(ctx context.Context) error {
 	s.logger.Info("checkpoint established",
 		"checkpoint_id", checkpoint.CheckpointId,
 		"primary_commit_index", checkpoint.CommitIndex)
-	s.beginReconcileSession(checkpoint.CheckpointId, checkpoint.CommitIndex)
+	if err := s.beginReconcileSession(checkpoint.CheckpointId, checkpoint.CommitIndex); err != nil {
+		return fmt.Errorf("failed to begin reconcile session: %w", err)
+	}
 	defer s.endReconcileSession()
 
 	// Step 2: Build local reconciliation set.
@@ -3063,7 +3148,9 @@ func hashEntryShard(change *EntryChange, shards int) int {
 func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, checkpoint *CheckpointResponse, localSet *reconciler.ReconciliationSet, startTime time.Time) error {
 	ownedSession := false
 	if err := s.assertActiveCheckpoint(checkpoint.CheckpointId, checkpoint.CommitIndex); err != nil {
-		s.beginReconcileSession(checkpoint.CheckpointId, checkpoint.CommitIndex)
+		if beginErr := s.beginReconcileSession(checkpoint.CheckpointId, checkpoint.CommitIndex); beginErr != nil {
+			return fmt.Errorf("failed to begin reconcile session: %w", beginErr)
+		}
 		ownedSession = true
 	}
 	if ownedSession {
