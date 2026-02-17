@@ -596,6 +596,7 @@ func TestDRIntegration_TokenParsingValidation(t *testing.T) {
 func TestDRIntegration_LoadConfigRestoresPrimary(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	ctx := context.Background()
+	setupTestClusterCert(t, core)
 
 	mgr := newDRRelationshipManager(core, core.logger)
 	core.drManager = mgr
@@ -620,6 +621,136 @@ func TestDRIntegration_LoadConfigRestoresPrimary(t *testing.T) {
 	}
 	if mgr2.Primary() == nil {
 		t.Fatal("expected primary server after LoadConfig")
+	}
+
+	// Verify that the handler was created with a CA-signed leaf cert
+	// (not falling back to the self-signed cluster cert).
+	handler := mgr2.Handler()
+	if handler == nil {
+		t.Fatal("expected handler after LoadConfig")
+	}
+	tlsCert, err := handler.ServerLookup(ctx, &tls.ClientHelloInfo{})
+	if err != nil {
+		t.Fatalf("ServerLookup failed: %v", err)
+	}
+	if tlsCert == nil || tlsCert.Leaf == nil {
+		t.Fatal("expected non-nil TLS certificate from ServerLookup")
+	}
+	if tlsCert.Leaf.Subject.CommonName != "openbao-dr-transport-leaf" {
+		t.Fatalf("expected CN 'openbao-dr-transport-leaf', got %q", tlsCert.Leaf.Subject.CommonName)
+	}
+	if tlsCert.PrivateKey == nil {
+		t.Fatal("expected non-nil private key in TLS certificate")
+	}
+}
+
+// --- Test: Teardown cleans up handler ---
+
+func TestDRIntegration_TeardownCleansUpHandler(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	setupTestClusterCert(t, core)
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	core.drManager = mgr
+
+	if err := mgr.EnablePrimary(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if mgr.Handler() == nil {
+		t.Fatal("expected handler after EnablePrimary")
+	}
+	if mgr.Primary() == nil {
+		t.Fatal("expected primary after EnablePrimary")
+	}
+
+	// Simulate stepdown: call Teardown.
+	mgr.Teardown()
+
+	if mgr.Handler() != nil {
+		t.Fatal("expected nil handler after Teardown")
+	}
+	if mgr.Primary() != nil {
+		t.Fatal("expected nil primary after Teardown")
+	}
+
+	// Mode should still be primary (config is preserved).
+	if mgr.Mode() != DRModePrimary {
+		t.Fatalf("expected mode to remain primary after Teardown, got %s", mgr.Mode())
+	}
+}
+
+// --- Test: Reactivation after Teardown mints correct leaf cert ---
+
+func TestDRIntegration_ReactivationAfterTeardown(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	setupTestClusterCert(t, core)
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	core.drManager = mgr
+
+	// Enable primary -- mints leaf cert with the current cluster key.
+	if err := mgr.EnablePrimary(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	handler1 := mgr.Handler()
+	cert1, err := handler1.ServerLookup(ctx, &tls.ClientHelloInfo{})
+	if err != nil {
+		t.Fatalf("ServerLookup before teardown failed: %v", err)
+	}
+	oldKey := cert1.PrivateKey.(*ecdsa.PrivateKey)
+
+	// Simulate stepdown.
+	mgr.Teardown()
+
+	// Simulate key rotation (what setupCluster does on re-activation).
+	newKey, err := ecdsa.GenerateKey(elliptic.P521(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	core.localClusterPrivateKey.Store(newKey)
+
+	// Simulate re-activation: create a new manager and LoadConfig.
+	mgr2 := newDRRelationshipManager(core, core.logger)
+	core.drManager = mgr2
+	if err := mgr2.LoadConfig(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	handler2 := mgr2.Handler()
+	if handler2 == nil {
+		t.Fatal("expected handler after LoadConfig")
+	}
+
+	cert2, err := handler2.ServerLookup(ctx, &tls.ClientHelloInfo{})
+	if err != nil {
+		t.Fatalf("ServerLookup after reactivation failed: %v", err)
+	}
+	if cert2.Leaf == nil {
+		t.Fatal("expected leaf cert after reactivation")
+	}
+	if cert2.Leaf.Subject.CommonName != "openbao-dr-transport-leaf" {
+		t.Fatalf("expected CN 'openbao-dr-transport-leaf', got %q", cert2.Leaf.Subject.CommonName)
+	}
+
+	// The private key in the TLS cert must be the NEW key (not the old one).
+	leafKey := cert2.PrivateKey.(*ecdsa.PrivateKey)
+	if leafKey.Equal(oldKey) {
+		t.Fatal("expected leaf cert to use the new cluster key, but it still uses the old one")
+	}
+	if !leafKey.Equal(newKey) {
+		t.Fatal("expected leaf cert private key to match the new cluster key")
+	}
+
+	// Verify the leaf cert's public key matches the private key (no mismatch).
+	leafPub, ok := cert2.Leaf.PublicKey.(*ecdsa.PublicKey)
+	if !ok {
+		t.Fatal("expected ECDSA public key in leaf cert")
+	}
+	if !leafPub.Equal(&newKey.PublicKey) {
+		t.Fatal("leaf cert public key does not match the new cluster key -- cert/key mismatch")
 	}
 }
 
@@ -856,6 +987,107 @@ func TestDRIntegration_HeartbeatPrimaryTerm(t *testing.T) {
 	// Response should have been populated.
 	if resp == nil {
 		t.Fatal("expected non-nil heartbeat response")
+	}
+	if len(resp.ActiveClusterCert) == 0 {
+		t.Fatal("expected heartbeat to include active_cluster_cert")
+	}
+
+	leaf, err := x509.ParseCertificate(resp.ActiveClusterCert)
+	if err != nil {
+		t.Fatalf("failed to parse active_cluster_cert: %v", err)
+	}
+	if leaf.Subject.CommonName != "openbao-dr-transport-leaf" {
+		t.Fatalf("expected DR transport leaf CN, got %q", leaf.Subject.CommonName)
+	}
+	if len(token.DRTransportCACert) == 0 {
+		t.Fatal("expected activation token to include DR transport CA cert")
+	}
+	caCert, err := x509.ParseCertificate(token.DRTransportCACert)
+	if err != nil {
+		t.Fatalf("failed to parse DR transport CA cert from token: %v", err)
+	}
+	if err := verifyCertChainToCA(resp.ActiveClusterCert, caCert); err != nil {
+		t.Fatalf("heartbeat cert did not chain to DR transport CA: %v", err)
+	}
+
+	// The advertised heartbeat cert must be the DR transport leaf, not the
+	// core's self-signed local cluster cert.
+	if local := core.localClusterCert.Load(); local != nil && bytes.Equal(resp.ActiveClusterCert, *local) {
+		t.Fatal("heartbeat advertised the local cluster certificate instead of DR transport leaf")
+	}
+}
+
+func TestDRIntegration_HeartbeatOmitsActiveClusterCertWithoutDRLeaf(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+
+	setupTestClusterCert(t, core)
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	core.drManager = mgr
+	if err := mgr.EnablePrimary(ctx); err != nil {
+		t.Fatal(err)
+	}
+	token, err := mgr.GenerateActivationToken(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	secondaryKey, err := ecdsa.GenerateKey(elliptic.P521(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondaryTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(56),
+		Subject:               pkix.Name{CommonName: "heartbeat-secondary-no-leaf"},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	secondaryCertDER, err := x509.CreateCertificate(rand.Reader, secondaryTemplate, secondaryTemplate, &secondaryKey.PublicKey, secondaryKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.ValidateBootstrapAndStoreCert(ctx, token.RelationshipID, token.BootstrapToken, secondaryCertDER); err != nil {
+		t.Fatal(err)
+	}
+	secondaryCert, err := x509.ParseCertificate(secondaryCertDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a transient state where no DR transport leaf is available.
+	handler := mgr.Handler()
+	if handler == nil {
+		t.Fatal("expected DR handler after enabling primary")
+	}
+	handler.drLeafCertMu.Lock()
+	handler.drLeafCertDER = nil
+	handler.drLeafParsedCert = nil
+	handler.drLeafPrivateKey = nil
+	handler.drLeafCertMu.Unlock()
+
+	rpcCtx := peer.NewContext(ctx, &peer.Peer{
+		AuthInfo: credentials.TLSInfo{
+			State: tls.ConnectionState{
+				PeerCertificates: []*x509.Certificate{secondaryCert},
+			},
+		},
+	})
+
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
+	resp, err := primary.Heartbeat(rpcCtx, &DRHeartbeatRequest{
+		RelationshipId: token.RelationshipID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.ActiveClusterCert) != 0 {
+		t.Fatal("expected heartbeat to omit active_cluster_cert when no DR transport leaf is available")
 	}
 }
 
@@ -1264,9 +1496,12 @@ func TestDRIntegration_RootKeyTransferBootstrap(t *testing.T) {
 	if _, err := rand.Read(clientNonce); err != nil {
 		t.Fatal(err)
 	}
-	wrappedRootKey, serverPub, wrapNonce, aadVersion, err := wrapRootKeyForSecondary(
+	wrappedRootKey, serverPub, srvNonce, gcmIV, aadVersion, err := wrapRootKeyForSecondary(
 		primaryKR.RootKey(),
 		"rel-test",
+		"cluster-test",
+		"secondary-fp-test",
+		"primary-identity-test",
 		clientPriv.PublicKey().Bytes(),
 		clientNonce,
 	)
@@ -1278,7 +1513,8 @@ func TestDRIntegration_RootKeyTransferBootstrap(t *testing.T) {
 		KeyringEntry:          keyringEntry.Value,
 		WrappedRootKey:        wrappedRootKey,
 		ServerEphemeralPubkey: serverPub,
-		WrapNonce:             wrapNonce,
+		ServerNonce:           srvNonce,
+		WrapNonce:             gcmIV,
 		WrapAadVersion:        aadVersion,
 	}
 	if rootKeyEntry != nil {
@@ -1288,9 +1524,13 @@ func TestDRIntegration_RootKeyTransferBootstrap(t *testing.T) {
 	rootKey, err := unwrapRootKeyFromPrimary(
 		resp.WrappedRootKey,
 		"rel-test",
+		"cluster-test",
+		"secondary-fp-test",
+		"primary-identity-test",
 		resp.ServerEphemeralPubkey,
 		clientPriv,
 		clientNonce,
+		resp.ServerNonce,
 		resp.WrapNonce,
 		resp.WrapAadVersion,
 	)

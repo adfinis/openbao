@@ -31,6 +31,7 @@ import (
 	"github.com/openbao/openbao/physical/replication/reconciler"
 	"github.com/openbao/openbao/sdk/v2/logical"
 	"github.com/openbao/openbao/sdk/v2/physical"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
@@ -231,7 +232,7 @@ func TestDRRelationshipManager_BootstrapTokenExpires(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := mgr.ValidateBootstrapAndStoreCert(ctx, token.RelationshipID, token.BootstrapToken, token.CACert); err == nil || !strings.Contains(err.Error(), "expired") {
+	if err := mgr.ValidateBootstrapAndStoreCert(ctx, token.RelationshipID, token.BootstrapToken, token.DRTransportCACert); err == nil || !strings.Contains(err.Error(), "expired") {
 		t.Fatalf("expected expired bootstrap token error, got: %v", err)
 	}
 
@@ -263,7 +264,7 @@ func TestDRRelationshipManager_BootstrapTokenAttemptLockout(t *testing.T) {
 	}
 
 	for i := 0; i < drBootstrapMaxFailedAttempts; i++ {
-		if err := mgr.ValidateBootstrapAndStoreCert(ctx, token.RelationshipID, "wrong-token", token.CACert); err == nil {
+		if err := mgr.ValidateBootstrapAndStoreCert(ctx, token.RelationshipID, "wrong-token", token.DRTransportCACert); err == nil {
 			t.Fatalf("expected bootstrap attempt %d to fail", i+1)
 		}
 	}
@@ -279,7 +280,7 @@ func TestDRRelationshipManager_BootstrapTokenAttemptLockout(t *testing.T) {
 		t.Fatalf("expected failed attempts >= %d, got %d", drBootstrapMaxFailedAttempts, rel.FailedAttempts)
 	}
 
-	if err := mgr.ValidateBootstrapAndStoreCert(ctx, token.RelationshipID, token.BootstrapToken, token.CACert); err == nil || !strings.Contains(err.Error(), "locked") {
+	if err := mgr.ValidateBootstrapAndStoreCert(ctx, token.RelationshipID, token.BootstrapToken, token.DRTransportCACert); err == nil || !strings.Contains(err.Error(), "locked") {
 		t.Fatalf("expected lockout error when using correct token during lockout, got %v", err)
 	}
 }
@@ -299,7 +300,7 @@ func TestDRRelationshipManager_BootstrapTokenSourceIPBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := mgr.ValidateBootstrapAndStoreCertWithSourceIP(ctx, token.RelationshipID, token.BootstrapToken, token.CACert, "10.20.30.40"); err != nil {
+	if err := mgr.ValidateBootstrapAndStoreCertWithSourceIP(ctx, token.RelationshipID, token.BootstrapToken, token.DRTransportCACert, "10.20.30.40"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -745,7 +746,7 @@ func TestDRFailover_NotSecondary(t *testing.T) {
 	core.drManager = newDRRelationshipManager(core, core.logger)
 
 	// Failover should fail when not in secondary mode.
-	_, err := core.DRFailover(ctx)
+	_, err := core.DRFailover(ctx, true)
 	if err == nil {
 		t.Fatal("expected error for failover when not secondary")
 	}
@@ -773,7 +774,7 @@ func TestDRFailover_FromSecondary(t *testing.T) {
 	// Simulate some applied entries.
 	mgr.secondary.lastAppliedIndex.Store(500)
 
-	result, err := core.DRFailover(ctx)
+	result, err := core.DRFailover(ctx, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -810,7 +811,7 @@ func TestDRFailoverToPrimary(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result, err := core.DRFailoverToPrimary(ctx)
+	result, err := core.DRFailoverToPrimary(ctx, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2715,6 +2716,92 @@ func generateTestCert(t *testing.T, cn string) ([]byte, *x509.Certificate) {
 	return der, parsed
 }
 
+type drTestClient struct {
+	streamChangesFn          func(context.Context, ...grpc.CallOption) (grpc.BidiStreamingClient[StreamChangesUpstream, EntryBatch], error)
+	requestCheckpointFn      func(context.Context, *CheckpointRequest, ...grpc.CallOption) (*CheckpointResponse, error)
+	exchangeDirtyBitmapFn    func(context.Context, *DirtyBitmapMessage, ...grpc.CallOption) (*DirtyBitmapMessage, error)
+	exchangeRangeChecksumsFn func(context.Context, *RangeChecksumRequest, ...grpc.CallOption) (*RangeChecksumResponse, error)
+	exchangeRangeDigestsFn   func(context.Context, *RangeDigestRequest, ...grpc.CallOption) (*RangeDigestResponse, error)
+	fetchEntriesFn           func(context.Context, *FetchEntriesRequest, ...grpc.CallOption) (grpc.ServerStreamingClient[EntryBatch], error)
+	heartbeatFn              func(context.Context, *DRHeartbeatRequest, ...grpc.CallOption) (*DRHeartbeatResponse, error)
+	syncKeyringFn            func(context.Context, *SyncKeyringRequest, ...grpc.CallOption) (*SyncKeyringResponse, error)
+}
+
+func (c *drTestClient) StreamChanges(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[StreamChangesUpstream, EntryBatch], error) {
+	if c.streamChangesFn == nil {
+		return nil, errors.New("not implemented")
+	}
+	return c.streamChangesFn(ctx, opts...)
+}
+
+func (c *drTestClient) RequestCheckpoint(ctx context.Context, in *CheckpointRequest, opts ...grpc.CallOption) (*CheckpointResponse, error) {
+	if c.requestCheckpointFn == nil {
+		return nil, errors.New("not implemented")
+	}
+	return c.requestCheckpointFn(ctx, in, opts...)
+}
+
+func (c *drTestClient) ExchangeDirtyBitmap(ctx context.Context, in *DirtyBitmapMessage, opts ...grpc.CallOption) (*DirtyBitmapMessage, error) {
+	if c.exchangeDirtyBitmapFn == nil {
+		return nil, errors.New("not implemented")
+	}
+	return c.exchangeDirtyBitmapFn(ctx, in, opts...)
+}
+
+func (c *drTestClient) ExchangeRangeChecksums(ctx context.Context, in *RangeChecksumRequest, opts ...grpc.CallOption) (*RangeChecksumResponse, error) {
+	if c.exchangeRangeChecksumsFn == nil {
+		return nil, errors.New("not implemented")
+	}
+	return c.exchangeRangeChecksumsFn(ctx, in, opts...)
+}
+
+func (c *drTestClient) ExchangeRangeDigests(ctx context.Context, in *RangeDigestRequest, opts ...grpc.CallOption) (*RangeDigestResponse, error) {
+	if c.exchangeRangeDigestsFn == nil {
+		return nil, errors.New("not implemented")
+	}
+	return c.exchangeRangeDigestsFn(ctx, in, opts...)
+}
+
+func (c *drTestClient) FetchEntries(ctx context.Context, in *FetchEntriesRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[EntryBatch], error) {
+	if c.fetchEntriesFn == nil {
+		return nil, errors.New("not implemented")
+	}
+	return c.fetchEntriesFn(ctx, in, opts...)
+}
+
+func (c *drTestClient) Heartbeat(ctx context.Context, in *DRHeartbeatRequest, opts ...grpc.CallOption) (*DRHeartbeatResponse, error) {
+	if c.heartbeatFn == nil {
+		return nil, errors.New("not implemented")
+	}
+	return c.heartbeatFn(ctx, in, opts...)
+}
+
+func (c *drTestClient) SyncKeyring(ctx context.Context, in *SyncKeyringRequest, opts ...grpc.CallOption) (*SyncKeyringResponse, error) {
+	if c.syncKeyringFn == nil {
+		return nil, errors.New("not implemented")
+	}
+	return c.syncKeyringFn(ctx, in, opts...)
+}
+
+type blockingEntryBatchBidiClient struct {
+	ctx context.Context
+}
+
+func (s *blockingEntryBatchBidiClient) Header() (metadata.MD, error) { return nil, nil }
+func (s *blockingEntryBatchBidiClient) Trailer() metadata.MD         { return nil }
+func (s *blockingEntryBatchBidiClient) CloseSend() error             { return nil }
+func (s *blockingEntryBatchBidiClient) Context() context.Context     { return s.ctx }
+func (s *blockingEntryBatchBidiClient) SendMsg(any) error            { return nil }
+func (s *blockingEntryBatchBidiClient) RecvMsg(any) error            { return nil }
+func (s *blockingEntryBatchBidiClient) Send(*StreamChangesUpstream) error {
+	return nil
+}
+
+func (s *blockingEntryBatchBidiClient) Recv() (*EntryBatch, error) {
+	<-s.ctx.Done()
+	return nil, s.ctx.Err()
+}
+
 func TestDRClusterClient_VerifyKnownCert(t *testing.T) {
 	der, _ := generateTestCert(t, "fw-known")
 	fp := drCertFingerprint(der)
@@ -2749,42 +2836,88 @@ func TestDRClusterClient_VerifyKnownCert(t *testing.T) {
 	}
 }
 
-func TestDRClusterClient_VerifyTOFU(t *testing.T) {
-	der, parsed := generateTestCert(t, "fw-unknown")
+func TestDRClusterClient_VerifyCASignedCert(t *testing.T) {
+	// Generate a CA.
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test-dr-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Generate a leaf cert signed by the CA.
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "openbao-dr-transport-leaf"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, caCert, &leafKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	var mu sync.RWMutex
 	pool := make(map[string]*trustedPrimaryCert)
 
-	client := &drReplicationClusterClient{
+	// Without a CA, unknown certs should be rejected.
+	clientNoCA := &drReplicationClusterClient{
 		logger:         log.NewNullLogger(),
 		trustedCertsMu: &mu,
 		trustedCerts:   pool,
 	}
-
-	verifier := client.VerifyPeerCertificate()
-
-	// Unknown cert should be accepted (TOFU) and added to pool.
-	if err := verifier([][]byte{der}, nil); err != nil {
-		t.Fatalf("unexpected error for TOFU cert: %v", err)
+	verifier := clientNoCA.VerifyPeerCertificate()
+	if err := verifier([][]byte{leafDER}, nil); err == nil {
+		t.Fatal("expected error for unknown cert without CA configured")
 	}
 
-	fp := drCertFingerprint(der)
+	// With a CA, a CA-signed leaf cert should be accepted and added to pool.
+	clientWithCA := &drReplicationClusterClient{
+		logger:         log.NewNullLogger(),
+		trustedCertsMu: &mu,
+		trustedCerts:   pool,
+		primaryCACert:  caCert,
+	}
+	verifier = clientWithCA.VerifyPeerCertificate()
+	if err := verifier([][]byte{leafDER}, nil); err != nil {
+		t.Fatalf("unexpected error for CA-signed cert: %v", err)
+	}
+
+	fp := drCertFingerprint(leafDER)
 	mu.RLock()
 	entry, ok := pool[fp]
 	mu.RUnlock()
 	if !ok {
-		t.Fatal("cert not added to pool after TOFU")
+		t.Fatal("CA-signed cert not added to pool")
 	}
 	if time.Since(entry.lastSeen) > time.Second {
 		t.Fatalf("lastSeen not set correctly: %v ago", time.Since(entry.lastSeen))
 	}
 
-	// Verify the stored DER bytes match.
-	h := sha256.Sum256(entry.derBytes)
-	gotFP := hex.EncodeToString(h[:])
-	wantFP := drCertFingerprint(parsed.Raw)
-	if gotFP != wantFP {
-		t.Fatalf("stored fingerprint mismatch: got %s, want %s", gotFP, wantFP)
+	// Self-signed cert (not from the CA) should be rejected.
+	selfDER, _ := generateTestCert(t, "fw-self-signed")
+	if err := verifier([][]byte{selfDER}, nil); err == nil {
+		t.Fatal("expected error for self-signed cert not chaining to CA")
 	}
 }
 
@@ -2852,7 +2985,9 @@ func TestHeartbeatResponse_ActiveClusterCert(t *testing.T) {
 	}
 
 	// Simulate heartbeat delivering the active cluster cert.
-	client.addTrustedCert(der)
+	if err := client.addTrustedCert(der); err != nil {
+		t.Fatalf("addTrustedCert failed: %v", err)
+	}
 
 	fp := drCertFingerprint(parsed.Raw)
 	mu.RLock()
@@ -2870,13 +3005,66 @@ func TestHeartbeatResponse_ActiveClusterCert(t *testing.T) {
 	firstSeen := entry.lastSeen
 	mu.RUnlock()
 	time.Sleep(10 * time.Millisecond)
-	client.addTrustedCert(der)
+	if err := client.addTrustedCert(der); err != nil {
+		t.Fatalf("addTrustedCert refresh failed: %v", err)
+	}
 
 	mu.RLock()
 	secondSeen := pool[fp].lastSeen
 	mu.RUnlock()
 	if !secondSeen.After(firstSeen) {
 		t.Fatalf("lastSeen was not refreshed on duplicate add: first=%v, second=%v", firstSeen, secondSeen)
+	}
+}
+
+func TestDRSecondary_Start_HeartbeatCertRejectForcesReconnect(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+
+	replSalt := make([]byte, drReplSaltLen)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-heartbeat-fail", log.NewNullLogger())
+	secondary.transportReady.Store(true)
+	secondary.state.Store(int32(DRSecondaryStreaming))
+
+	_, trustedCA := generateTestCert(t, "dr-trusted-ca")
+	rejectedCertDER, _ := generateTestCert(t, "dr-rejected-heartbeat")
+
+	var trustedMu sync.RWMutex
+	secondary.drClusterClient = &drReplicationClusterClient{
+		core:           core,
+		primaryCACert:  trustedCA,
+		logger:         log.NewNullLogger(),
+		trustedCertsMu: &trustedMu,
+		trustedCerts:   make(map[string]*trustedPrimaryCert),
+	}
+
+	secondary.client = &drTestClient{
+		streamChangesFn: func(ctx context.Context, _ ...grpc.CallOption) (grpc.BidiStreamingClient[StreamChangesUpstream, EntryBatch], error) {
+			return &blockingEntryBatchBidiClient{ctx: ctx}, nil
+		},
+		heartbeatFn: func(context.Context, *DRHeartbeatRequest, ...grpc.CallOption) (*DRHeartbeatResponse, error) {
+			return &DRHeartbeatResponse{
+				PrimaryIndex:      1,
+				PrimaryTerm:       1,
+				ReplicationState:  uint32(DRSecondaryStreaming),
+				LeaderClusterAddr: "127.0.0.1:8201",
+				ActiveClusterCert: rejectedCertDER,
+			}, nil
+		},
+	}
+
+	prevInterval := drHeartbeatInterval
+	drHeartbeatInterval = 10 * time.Millisecond
+	defer func() { drHeartbeatInterval = prevInterval }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := secondary.Start(ctx)
+	if err == nil {
+		t.Fatal("expected Start to fail after heartbeat certificate rejection")
+	}
+	if !strings.Contains(err.Error(), "heartbeat trust validation failed") {
+		t.Fatalf("expected heartbeat trust validation failure, got: %v", err)
 	}
 }
 
