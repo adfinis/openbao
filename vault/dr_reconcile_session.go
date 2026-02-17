@@ -9,6 +9,7 @@ import (
 	"time"
 
 	metrics "github.com/hashicorp/go-metrics/compat"
+	"github.com/openbao/openbao/sdk/v2/logical"
 )
 
 type drReconcileFailureClass string
@@ -38,15 +39,81 @@ const (
 	drReconcileRetryCapUnknown            = uint64(6)
 )
 
-func (s *drReplicationSecondary) beginReconcileSession(checkpointID string, checkpointIndex uint64) {
+func (s *drReplicationSecondary) beginReconcileSession(checkpointID string, checkpointIndex uint64) error {
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
+
+	// Enforce monotonic checkpoint index to prevent rollback.
+	if s.highestCommittedCheckpointIndexSet && checkpointIndex < s.highestCommittedCheckpointIndex {
+		return fmt.Errorf("checkpoint_index %d is lower than highest committed %d; "+
+			"use sys/replication/dr/secondary/resnapshot to force reset",
+			checkpointIndex, s.highestCommittedCheckpointIndex)
+	}
+
 	s.activeCheckpointID = checkpointID
 	s.activeCheckpointIndex = checkpointIndex
 	s.sessionStart = time.Now().UTC()
 	s.streamPausedAt = s.lastAppliedIndex.Load()
 	s.lastRangeManifestCount = 0
 	s.lastReconcileActivityAt.Store(s.sessionStart.Unix())
+	return nil
+}
+
+// commitCheckpointIndex advances the monotonic checkpoint high-water mark
+// and persists it to barrier storage. Called on successful reconciliation.
+func (s *drReplicationSecondary) commitCheckpointIndex(checkpointIndex uint64) {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+
+	if checkpointIndex > s.highestCommittedCheckpointIndex {
+		s.highestCommittedCheckpointIndex = checkpointIndex
+		s.highestCommittedCheckpointIndexSet = true
+
+		// Best-effort persist; failure is logged but does not block reconciliation.
+		if err := s.persistCheckpointHighWaterMark(checkpointIndex); err != nil {
+			s.logger.Warn("failed to persist checkpoint high-water mark",
+				"checkpoint_index", checkpointIndex,
+				"error", err)
+		}
+	}
+}
+
+// resetCheckpointHighWaterMark clears the monotonic checkpoint constraint.
+// Called by operator-initiated resnapshot to allow recovery from catastrophic divergence.
+func (s *drReplicationSecondary) resetCheckpointHighWaterMark() {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+
+	s.highestCommittedCheckpointIndex = 0
+	s.highestCommittedCheckpointIndexSet = false
+	_ = s.persistCheckpointHighWaterMark(0)
+	s.logger.Info("checkpoint high-water mark reset by operator resnapshot")
+}
+
+const drCheckpointHWMPath = "core/dr-replication/checkpoint-hwm"
+
+func (s *drReplicationSecondary) persistCheckpointHighWaterMark(index uint64) error {
+	data := fmt.Sprintf("%d", index)
+	entry := &logical.StorageEntry{
+		Key:   drCheckpointHWMPath,
+		Value: []byte(data),
+	}
+	return s.core.barrier.Put(s.core.activeContext, entry)
+}
+
+func (s *drReplicationSecondary) loadCheckpointHighWaterMark() {
+	entry, err := s.core.barrier.Get(s.core.activeContext, drCheckpointHWMPath)
+	if err != nil || entry == nil {
+		return
+	}
+	var hwm uint64
+	if _, err := fmt.Sscanf(string(entry.Value), "%d", &hwm); err == nil && hwm > 0 {
+		s.sessionMu.Lock()
+		s.highestCommittedCheckpointIndex = hwm
+		s.highestCommittedCheckpointIndexSet = true
+		s.sessionMu.Unlock()
+		s.logger.Info("loaded checkpoint high-water mark", "checkpoint_index", hwm)
+	}
 }
 
 func (s *drReplicationSecondary) endReconcileSession() {

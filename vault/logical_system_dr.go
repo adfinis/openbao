@@ -314,6 +314,14 @@ func (b *SystemBackend) drReplicationPaths() []*framework.Path {
 				OperationVerb:   "promote",
 			},
 
+			Fields: map[string]*framework.FieldSchema{
+				"confirm_primary_unreachable": {
+					Type:        framework.TypeBool,
+					Default:     false,
+					Description: "Operator confirmation that the primary cluster is unreachable. Required for promotion to proceed.",
+				},
+			},
+
 			Operations: map[logical.Operation]framework.OperationHandler{
 				logical.UpdateOperation: &framework.PathOperation{
 					Callback: b.handleDRSecondaryPromote,
@@ -332,7 +340,7 @@ func (b *SystemBackend) drReplicationPaths() []*framework.Path {
 			},
 
 			HelpSynopsis:    "Promote DR secondary",
-			HelpDescription: "Promotes this DR secondary to a standalone primary. This is the disaster recovery failover operation.",
+			HelpDescription: "Promotes this DR secondary to a standalone primary. Requires confirm_primary_unreachable=true as an operator safety check.",
 		},
 
 		// --- Secondary resnapshot trigger ---
@@ -342,6 +350,13 @@ func (b *SystemBackend) drReplicationPaths() []*framework.Path {
 				OperationPrefix: "replication-dr-secondary",
 				OperationVerb:   "resnapshot",
 			},
+			Fields: map[string]*framework.FieldSchema{
+				"confirm_rollback_ok": {
+					Type:        framework.TypeBool,
+					Default:     false,
+					Description: "Operator confirmation that resetting the checkpoint high-water mark is acceptable. Required because resnapshot allows the secondary to accept older checkpoint indices.",
+				},
+			},
 			Operations: map[logical.Operation]framework.OperationHandler{
 				logical.UpdateOperation: &framework.PathOperation{
 					Callback:                  b.handleDRSecondaryResnapshot,
@@ -350,7 +365,7 @@ func (b *SystemBackend) drReplicationPaths() []*framework.Path {
 				},
 			},
 			HelpSynopsis:    "Trigger DR secondary resnapshot",
-			HelpDescription: "Requests a protocol-scoped full-copy resnapshot from the primary checkpoint.",
+			HelpDescription: "Requests a protocol-scoped full-copy resnapshot from the primary checkpoint. Requires confirm_rollback_ok=true.",
 		},
 
 		// --- DR tuning ---
@@ -910,12 +925,35 @@ func (b *SystemBackend) handleDRSecondaryResnapshot(ctx context.Context, req *lo
 	if mgr == nil {
 		return logical.ErrorResponse("DR replication not initialized"), nil
 	}
+
+	confirmRollback := d.Get("confirm_rollback_ok").(bool)
+	if !confirmRollback {
+		return logical.ErrorResponse(
+			"resnapshot resets the checkpoint high-water mark, which allows the secondary to accept older checkpoint indices; " +
+				"set confirm_rollback_ok=true to proceed"), nil
+	}
+
+	// Log the HWM reset for audit trail.
+	oldHWM := uint64(0)
+	if sec := mgr.Secondary(); sec != nil {
+		sec.sessionMu.RLock()
+		oldHWM = sec.highestCommittedCheckpointIndex
+		sec.sessionMu.RUnlock()
+	}
+	b.Core.logger.Info("DR resnapshot: checkpoint high-water mark reset",
+		"old_hwm", oldHWM,
+		"new_hwm", 0,
+		"reason", "manual-api",
+		"source_ip", req.Connection.RemoteAddr)
+
 	if err := mgr.RequestSecondaryResnapshot("manual-api"); err != nil {
 		return logical.ErrorResponse(err.Error()), nil
 	}
 	return &logical.Response{
 		Data: map[string]interface{}{
-			"message": "DR secondary resnapshot requested",
+			"message":  "DR secondary resnapshot requested",
+			"old_hwm":  oldHWM,
+			"reset_to": 0,
 		},
 	}, nil
 }
@@ -1103,6 +1141,8 @@ func (b *SystemBackend) handleDRSecondaryPromote(ctx context.Context, req *logic
 		return logical.ErrorResponse("DR replication not initialized"), nil
 	}
 
+	confirmPrimaryUnreachable := d.Get("confirm_primary_unreachable").(bool)
+
 	// Capture data loss metrics before promotion stops the secondary.
 	var lastAppliedIndex, lastKnownPrimaryIndex uint64
 	var estimatedDataLossEntries uint64
@@ -1114,17 +1154,21 @@ func (b *SystemBackend) handleDRSecondaryPromote(ctx context.Context, req *logic
 		}
 	}
 
-	if err := mgr.PromoteSecondary(ctx); err != nil {
+	result, err := b.Core.DRFailover(ctx, confirmPrimaryUnreachable)
+	if err != nil {
 		return logical.ErrorResponse(err.Error()), nil
 	}
 
 	data := map[string]interface{}{
 		"message":                     "DR secondary promoted to standalone primary",
-		"last_applied_index":          lastAppliedIndex,
+		"last_applied_index":          result.LastAppliedIndex,
 		"last_known_primary_index":    lastKnownPrimaryIndex,
 		"estimated_data_loss_entries": estimatedDataLossEntries,
+		"duration":                    result.Duration.String(),
 	}
-	if estimatedDataLossEntries > 0 {
+	if result.Warning != "" {
+		data["warning"] = result.Warning
+	} else if estimatedDataLossEntries > 0 {
 		data["warning"] = fmt.Sprintf(
 			"approximately %d entries may not have been replicated before promotion",
 			estimatedDataLossEntries,

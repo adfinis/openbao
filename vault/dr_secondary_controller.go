@@ -46,6 +46,13 @@ func (m *drRelationshipManager) startSecondaryControllerLocked() {
 		redirectFailures := 0        // consecutive failures on a redirected address
 		const redirectFailureMax = 2 // after this many, revert to configAddr
 
+		// Redirect rate limiting: track timestamps to enforce max
+		// redirects per sliding window.
+		const drMaxRedirectsPerMinute = 10
+		const redirectWindow = 60 * time.Second
+		redirectTimestamps := make([]time.Time, 0, drMaxRedirectsPerMinute)
+		redirectBackoff := time.Duration(0)
+
 		for {
 			select {
 			case <-loopCtx.Done():
@@ -95,12 +102,43 @@ func (m *drRelationshipManager) startSecondaryControllerLocked() {
 				// so the next Connect() goes to the actual leader.
 				var redirect *errDRRedirect
 				if errors.As(err, &redirect) && redirect.LeaderAddr != "" {
+					// Enforce redirect rate limit: if we've had too many
+					// redirects in the sliding window, apply exponential backoff.
+					now := time.Now()
+					cutoff := now.Add(-redirectWindow)
+					filtered := redirectTimestamps[:0]
+					for _, ts := range redirectTimestamps {
+						if ts.After(cutoff) {
+							filtered = append(filtered, ts)
+						}
+					}
+					redirectTimestamps = append(filtered, now)
+
+					if len(redirectTimestamps) > drMaxRedirectsPerMinute {
+						if redirectBackoff == 0 {
+							redirectBackoff = 2 * time.Second
+						} else {
+							redirectBackoff *= 2
+						}
+						if redirectBackoff > maxBackoff {
+							redirectBackoff = maxBackoff
+						}
+						m.logger.Warn("redirect rate limit exceeded; applying backoff",
+							"redirects_in_window", len(redirectTimestamps),
+							"backoff", redirectBackoff)
+						if !sleepCtx(loopCtx, redirectBackoff) {
+							return
+						}
+					} else {
+						redirectBackoff = 0
+					}
+
 					m.logger.Info("DR secondary redirected to new leader",
 						"old_addr", primaryAddr,
 						"new_addr", redirect.LeaderAddr)
 					primaryAddr = redirect.LeaderAddr
 					redirectFailures = 0
-					// Reconnect immediately without backoff.
+					// Reconnect (rate-limited above if needed).
 					continue
 				}
 
