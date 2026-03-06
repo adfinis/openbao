@@ -6,6 +6,7 @@ package vault
 import (
 	"context"
 	"encoding/json"
+	"path"
 	"reflect"
 	"strings"
 	"testing"
@@ -49,6 +50,44 @@ func TestMount_ReadOnlyViewDuringMount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
+}
+
+func TestPersistMountsDeleteDoesNotNeedNamespaceList(t *testing.T) {
+	c, _, _ := TestCoreUnsealed(t)
+	if _, ok := c.barrier.(logical.TransactionalStorage); !ok {
+		t.Skip("transactional storage required")
+	}
+
+	ctx := namespace.RootContext(nil)
+	newTable := c.mounts.shallowClone()
+	removed, err := newTable.remove(ctx, "secret/")
+	require.NoError(t, err)
+	require.NotNil(t, removed)
+
+	view := NamespaceView(c.barrier, namespace.RootNamespace)
+	storagePath := path.Join(coreMountConfigPath, removed.UUID)
+	entry, err := view.Get(ctx, storagePath)
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+
+	done := make(chan error, 1)
+	c.namespaceStore.lock.Lock()
+	go func() {
+		done <- c.persistMounts(ctx, nil, newTable, &removed.Local, removed.UUID)
+	}()
+
+	select {
+	case err := <-done:
+		c.namespaceStore.lock.Unlock()
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		c.namespaceStore.lock.Unlock()
+		t.Fatal("persistMounts blocked on namespace store lock while deleting a single mount")
+	}
+
+	entry, err = view.Get(ctx, storagePath)
+	require.NoError(t, err)
+	require.Nil(t, entry)
 }
 
 func TestLogicalMountMetrics(t *testing.T) {

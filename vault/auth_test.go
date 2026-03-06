@@ -5,6 +5,7 @@ package vault
 
 import (
 	"context"
+	"path"
 	"strings"
 	"testing"
 	"time"
@@ -46,6 +47,54 @@ func TestAuth_ReadOnlyViewDuringMount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
+}
+
+func TestPersistAuthDeleteDoesNotNeedNamespaceList(t *testing.T) {
+	c, _, _ := TestCoreUnsealed(t)
+	if _, ok := c.barrier.(logical.TransactionalStorage); !ok {
+		t.Skip("transactional storage required")
+	}
+
+	c.credentialBackends["noop"] = func(context.Context, *logical.BackendConfig) (logical.Backend, error) {
+		return &NoopBackend{BackendType: logical.TypeCredential}, nil
+	}
+
+	ctx := namespace.RootContext(nil)
+	require.NoError(t, c.enableCredential(ctx, &MountEntry{
+		Table: credentialTableType,
+		Path:  "noop/",
+		Type:  "noop",
+	}))
+
+	newTable := c.auth.shallowClone()
+	removed, err := newTable.remove(ctx, "noop/")
+	require.NoError(t, err)
+	require.NotNil(t, removed)
+
+	view := NamespaceView(c.barrier, namespace.RootNamespace)
+	storagePath := path.Join(coreAuthConfigPath, removed.UUID)
+	entry, err := view.Get(ctx, storagePath)
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+
+	done := make(chan error, 1)
+	c.namespaceStore.lock.Lock()
+	go func() {
+		done <- c.persistAuth(ctx, nil, newTable, &removed.Local, removed.UUID)
+	}()
+
+	select {
+	case err := <-done:
+		c.namespaceStore.lock.Unlock()
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		c.namespaceStore.lock.Unlock()
+		t.Fatal("persistAuth blocked on namespace store lock while deleting a single auth mount")
+	}
+
+	entry, err = view.Get(ctx, storagePath)
+	require.NoError(t, err)
+	require.Nil(t, entry)
 }
 
 func TestAuthMountMetrics(t *testing.T) {
