@@ -359,6 +359,9 @@ type drReplicationClusterClient struct {
 	// persists across reconnects.
 	trustedCertsMu *sync.RWMutex
 	trustedCerts   map[string]*trustedPrimaryCert
+
+	clientCertMu sync.RWMutex
+	clientCertFP string
 }
 
 // ClientLookup returns the client TLS certificate for outgoing connections.
@@ -385,6 +388,7 @@ func (c *drReplicationClusterClient) ClientLookup(ctx context.Context, requestIn
 		// activation token, so we compare the server's acceptable CA
 		// with the primary's raw subject.
 		if c.primaryCACert != nil && bytes.Equal(subj, c.primaryCACert.RawSubject) {
+			c.setLastClientCertFingerprint(certFingerprintSHA256(parsedCert))
 			return &tls.Certificate{
 				Certificate: [][]byte{localCert},
 				PrivateKey:  c.core.localClusterPrivateKey.Load(),
@@ -393,6 +397,7 @@ func (c *drReplicationClusterClient) ClientLookup(ctx context.Context, requestIn
 		}
 		// Also match against the local cert's issuer (same-cluster case).
 		if bytes.Equal(subj, parsedCert.RawIssuer) {
+			c.setLastClientCertFingerprint(certFingerprintSHA256(parsedCert))
 			return &tls.Certificate{
 				Certificate: [][]byte{localCert},
 				PrivateKey:  c.core.localClusterPrivateKey.Load(),
@@ -402,6 +407,25 @@ func (c *drReplicationClusterClient) ClientLookup(ctx context.Context, requestIn
 	}
 
 	return nil, nil
+}
+
+func (c *drReplicationClusterClient) setLastClientCertFingerprint(fp string) {
+	if c == nil || fp == "" {
+		return
+	}
+	c.clientCertMu.Lock()
+	c.clientCertFP = fp
+	c.clientCertMu.Unlock()
+}
+
+func (c *drReplicationClusterClient) LastClientCertFingerprint() string {
+	if c == nil {
+		return ""
+	}
+	c.clientCertMu.RLock()
+	fp := c.clientCertFP
+	c.clientCertMu.RUnlock()
+	return fp
 }
 
 // ServerName returns empty because after a leadership change the

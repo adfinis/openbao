@@ -749,9 +749,11 @@ func (b *SystemBackend) handleDRSecondaryEnable(ctx context.Context, req *logica
 	if token.RelationshipID == "" {
 		return logical.ErrorResponse("activation token missing relationship_id"), nil
 	}
-	if token.PrimaryAddr == "" {
-		return logical.ErrorResponse("activation token missing primary_addr"), nil
+	token.PrimaryAddrs = normalizePrimaryAddrs(token.PrimaryAddrs)
+	if len(token.PrimaryAddrs) == 0 {
+		return logical.ErrorResponse("activation token missing primary_addrs"), nil
 	}
+	token.PrimaryAddr = token.PrimaryAddrs[0]
 	if len(token.ReplSalt) != drReplSaltLen {
 		return logical.ErrorResponse("activation token has invalid repl_salt (expected %d bytes, got %d)", drReplSaltLen, len(token.ReplSalt)), nil
 	}

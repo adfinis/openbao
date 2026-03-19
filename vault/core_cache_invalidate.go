@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +17,7 @@ import (
 	metrics "github.com/hashicorp/go-metrics/compat"
 	"github.com/openbao/openbao/helper/fairshare"
 	"github.com/openbao/openbao/helper/namespace"
+	"github.com/openbao/openbao/sdk/v2/logical"
 	"github.com/openbao/openbao/sdk/v2/physical"
 	"github.com/openbao/openbao/vault/barrier"
 	"github.com/openbao/openbao/vault/policy"
@@ -29,7 +31,14 @@ const (
 	maxInvalidateTime       = 30 * time.Second
 	maxPluginInvalidateTime = 2 * time.Second
 	maxDispatchers          = 128
+
+	drKeyTransitionTimeout        = 90 * time.Second
+	drKeyTransitionBackoffMin     = 100 * time.Millisecond
+	drKeyTransitionBackoffMax     = 2 * time.Second
+	drKeyTransitionDeferredKeyCap = 20000
 )
+
+var errDRKeyTransitionQueueOverflow = errors.New("DR key-transition deferred invalidation queue overflow")
 
 func (c *Core) Invalidate(key ...string) {
 	c.invalidations.Add(key...)
@@ -264,6 +273,622 @@ func isLoginMFA(key string) bool {
 		strings.HasPrefix(key, barrier.SystemBarrierPrefix+mfaLoginEnforcementPrefix)
 }
 
+type drSecondaryKeyTransitionState struct {
+	mu sync.Mutex
+
+	active     bool
+	replaying  bool
+	deadline   time.Time
+	generation uint64
+
+	deferredKeys []string
+	deferredSet  map[string]struct{}
+
+	workerRunning    bool
+	workerGeneration uint64
+}
+
+func errorChainContains(err error, matcher func(error) bool) bool {
+	if err == nil || matcher == nil {
+		return false
+	}
+
+	stack := []error{err}
+	for depth := 0; len(stack) > 0 && depth < 256; depth++ {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if cur == nil {
+			continue
+		}
+
+		if matcher(cur) {
+			return true
+		}
+
+		switch wrapped := any(cur).(type) {
+		case interface{ Unwrap() error }:
+			stack = append(stack, wrapped.Unwrap())
+		case interface{ Unwrap() []error }:
+			stack = append(stack, wrapped.Unwrap()...)
+		}
+	}
+
+	return false
+}
+
+func isTransientBarrierDecryptFailure(err error) bool {
+	return errorChainContains(err, func(cur error) bool {
+		msg := strings.ToLower(cur.Error())
+		return strings.Contains(msg, "cipher: message authentication failed") ||
+			(strings.Contains(msg, "decryption failed") && strings.Contains(msg, "authentication failed")) ||
+			(strings.Contains(msg, "failed to decrypt") && strings.Contains(msg, "authentication failed"))
+	})
+}
+
+func isReadOnlyStorageError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, logical.ErrReadOnly) {
+		return true
+	}
+
+	return errorChainContains(err, func(cur error) bool {
+		msg := strings.ToLower(cur.Error())
+		return strings.Contains(msg, "readonly storage") ||
+			strings.Contains(msg, "read-only storage")
+	})
+}
+
+func isTransitionTransientInvalidationError(err error, transitionActive bool) bool {
+	if err == nil {
+		return false
+	}
+	if isTransientBarrierDecryptFailure(err) {
+		return true
+	}
+	if transitionActive && isReadOnlyStorageError(err) {
+		return true
+	}
+	return transitionActive && errors.Is(err, errLoadAuditFailed)
+}
+
+func (c *Core) beginDRKeyTransition(reason string) (uint64, bool) {
+	if c == nil {
+		return 0, false
+	}
+
+	now := time.Now()
+	state := &c.drSecondaryKeyTransition
+
+	state.mu.Lock()
+	started := false
+	switch {
+	case !state.active || now.After(state.deadline):
+		state.active = true
+		state.replaying = false
+		state.generation++
+		state.deadline = now.Add(drKeyTransitionTimeout)
+		state.workerRunning = false
+		state.workerGeneration = 0
+		started = true
+	case state.replaying:
+		// Start a fresh generation when a new transition event arrives while
+		// replaying deferred keys.
+		state.generation++
+		state.replaying = false
+		state.deadline = now.Add(drKeyTransitionTimeout)
+		state.workerRunning = false
+		state.workerGeneration = 0
+		started = true
+	}
+	if state.deferredSet == nil {
+		state.deferredSet = make(map[string]struct{})
+	}
+	generation := state.generation
+	deadline := state.deadline
+	deferredCount := len(state.deferredKeys)
+	state.mu.Unlock()
+
+	if started {
+		metrics.IncrCounter([]string{"replication", "dr", "secondary", "key_transition_started_total"}, 1)
+		c.logger.Warn("DR key transition started", "generation", generation, "deadline", deadline, "reason", reason)
+	}
+	metrics.SetGauge([]string{"replication", "dr", "secondary", "key_transition_deferred_keys_current"}, float32(deferredCount))
+
+	return generation, started
+}
+
+func (c *Core) isDRKeyTransitionActive() bool {
+	if c == nil {
+		return false
+	}
+
+	state := &c.drSecondaryKeyTransition
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	return state.active
+}
+
+func (c *Core) isDRKeyTransitionReplaying() bool {
+	if c == nil {
+		return false
+	}
+
+	state := &c.drSecondaryKeyTransition
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	return state.active && state.replaying
+}
+
+func (c *Core) isDRKeyTransitionGenerationActive(generation uint64) bool {
+	if c == nil {
+		return false
+	}
+
+	state := &c.drSecondaryKeyTransition
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	return state.active && state.generation == generation
+}
+
+func (c *Core) drKeyTransitionDeadline(generation uint64) (time.Time, bool) {
+	if c == nil {
+		return time.Time{}, false
+	}
+
+	state := &c.drSecondaryKeyTransition
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	if !state.active || state.generation != generation {
+		return time.Time{}, false
+	}
+	return state.deadline, true
+}
+
+func (c *Core) markDRKeyTransitionWorkerStarted(generation uint64) bool {
+	if c == nil {
+		return false
+	}
+
+	state := &c.drSecondaryKeyTransition
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	if !state.active || state.generation != generation {
+		return false
+	}
+	if state.workerRunning && state.workerGeneration == generation {
+		return false
+	}
+
+	state.workerRunning = true
+	state.workerGeneration = generation
+	return true
+}
+
+func (c *Core) markDRKeyTransitionWorkerStopped(generation uint64) {
+	if c == nil {
+		return
+	}
+
+	state := &c.drSecondaryKeyTransition
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	if state.workerGeneration == generation {
+		state.workerRunning = false
+	}
+}
+
+func (c *Core) markDRKeyTransitionReplaying(generation uint64, replaying bool) bool {
+	if c == nil {
+		return false
+	}
+
+	state := &c.drSecondaryKeyTransition
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	if !state.active || state.generation != generation {
+		return false
+	}
+	state.replaying = replaying
+	return true
+}
+
+func (c *Core) recordDeferredInvalidation(key string) (uint64, error) {
+	if c == nil {
+		return 0, fmt.Errorf("core unavailable for deferred invalidation")
+	}
+
+	state := &c.drSecondaryKeyTransition
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	if !state.active {
+		return 0, fmt.Errorf("DR key transition is not active")
+	}
+	if state.deferredSet == nil {
+		state.deferredSet = make(map[string]struct{})
+	}
+	if _, exists := state.deferredSet[key]; exists {
+		return state.generation, nil
+	}
+	if len(state.deferredKeys) >= drKeyTransitionDeferredKeyCap {
+		return state.generation, errDRKeyTransitionQueueOverflow
+	}
+
+	state.deferredSet[key] = struct{}{}
+	state.deferredKeys = append(state.deferredKeys, key)
+	metrics.SetGauge([]string{"replication", "dr", "secondary", "key_transition_deferred_keys_current"}, float32(len(state.deferredKeys)))
+	return state.generation, nil
+}
+
+func (c *Core) snapshotDeferredInvalidations(generation uint64) ([]string, bool) {
+	if c == nil {
+		return nil, false
+	}
+
+	state := &c.drSecondaryKeyTransition
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	if !state.active || state.generation != generation {
+		return nil, false
+	}
+
+	keys := make([]string, len(state.deferredKeys))
+	copy(keys, state.deferredKeys)
+	return keys, true
+}
+
+func (c *Core) endDRKeyTransition(generation uint64) bool {
+	if c == nil {
+		return false
+	}
+
+	state := &c.drSecondaryKeyTransition
+	state.mu.Lock()
+	if !state.active || state.generation != generation {
+		state.mu.Unlock()
+		return false
+	}
+
+	deferredCount := len(state.deferredKeys)
+	state.active = false
+	state.replaying = false
+	state.deadline = time.Time{}
+	state.deferredKeys = nil
+	state.deferredSet = nil
+	state.workerRunning = false
+	state.workerGeneration = 0
+	state.mu.Unlock()
+
+	metrics.SetGauge([]string{"replication", "dr", "secondary", "key_transition_deferred_keys_current"}, 0)
+	c.logger.Info("DR key transition completed", "generation", generation, "deferred_keys", deferredCount)
+	return true
+}
+
+func (ij *invalidationJob) isDRSecondaryNode() bool {
+	core := ij.im.core
+	if core == nil {
+		return false
+	}
+	if core.drManager != nil && core.drManager.Mode() == DRModeSecondary {
+		return true
+	}
+	return core.isDRKeyTransitionActive()
+}
+
+func (ij *invalidationJob) deferInvalidation(reason string) error {
+	core := ij.im.core
+	if core == nil {
+		return nil
+	}
+
+	generation, _ := core.beginDRKeyTransition(reason)
+	generation, err := core.recordDeferredInvalidation(ij.key)
+	if err != nil {
+		if errors.Is(err, errDRKeyTransitionQueueOverflow) {
+			metrics.IncrCounter([]string{"replication", "dr", "secondary", "key_transition_queue_overflow_total"}, 1)
+			ij.im.dispacherLogger.Error("DR key-transition deferred queue overflow; failing closed",
+				"generation", generation, "key", ij.key, "cap", drKeyTransitionDeferredKeyCap)
+		}
+		ij.fatal = true
+		return err
+	}
+
+	ij.im.ensureDRKeyTransitionWorker(generation)
+	return nil
+}
+
+func (ij *invalidationJob) isDecryptSensitiveInvalidationKey(key string) bool {
+	switch {
+	case strings.HasPrefix(key, namespaceStoreSubPath):
+		return true
+	case strings.HasPrefix(key, barrier.SystemBarrierPrefix+quotas.StoragePrefix):
+		return true
+	case key == coreAuditConfigPath || key == coreLocalAuditConfigPath:
+		return true
+	case isLegacyMountPath(key):
+		return true
+	case isTransactionalMountPath(key):
+		return true
+	case isMissedMountKey(ij.key):
+		return true
+	default:
+		return false
+	}
+}
+
+func (ij *invalidationJob) shouldDeferInvalidation(key string) bool {
+	if !ij.isDRSecondaryNode() {
+		return false
+	}
+
+	core := ij.im.core
+	if core == nil || !core.isDRKeyTransitionActive() || core.isDRKeyTransitionReplaying() {
+		return false
+	}
+
+	if key == drConfigPath || isKeyringPath(key) {
+		return false
+	}
+
+	return ij.isDecryptSensitiveInvalidationKey(key)
+}
+
+func (ij *invalidationJob) drConfigInvalidation(ctx context.Context) error {
+	core := ij.im.core
+	if core == nil {
+		return nil
+	}
+
+	generation, _ := core.beginDRKeyTransition("dr config invalidation")
+	ij.im.ensureDRKeyTransitionWorker(generation)
+
+	if core.drManager == nil {
+		ij.fatal = true
+		return fmt.Errorf("DR config invalidation received but DR manager is unavailable")
+	}
+
+	mode, err := core.drManager.RefreshConfigFromStorage(ctx)
+	if err != nil {
+		if isTransitionTransientInvalidationError(err, true) {
+			ij.im.dispacherLogger.Warn("transient failure refreshing DR config during key transition",
+				"generation", generation, "key", ij.key, "error", err)
+			return nil
+		}
+		ij.fatal = true
+		return fmt.Errorf("failed to refresh DR config from invalidation: %w", err)
+	}
+
+	if mode != DRModeSecondary {
+		core.endDRKeyTransition(generation)
+	}
+
+	return nil
+}
+
+func (ij *invalidationJob) keyringInvalidation() error {
+	core := ij.im.core
+	if core == nil {
+		return nil
+	}
+
+	generation, _ := core.beginDRKeyTransition("keyring invalidation")
+	ij.im.ensureDRKeyTransitionWorker(generation)
+	return nil
+}
+
+func (ij *invalidationJob) executePotentiallyFatalInvalidation(ctx context.Context, operation string, fn func(context.Context) error) error {
+	err := fn(ctx)
+	if err == nil {
+		return nil
+	}
+
+	transitionActive := false
+	if ij.im != nil && ij.im.core != nil {
+		transitionActive = ij.im.core.isDRKeyTransitionActive()
+	}
+
+	if ij.isDRSecondaryNode() && isTransitionTransientInvalidationError(err, transitionActive) {
+		ij.im.dispacherLogger.Warn("deferring decrypt-sensitive invalidation during DR key transition",
+			"operation", operation, "key", ij.key, "error", err, "transition_active", transitionActive)
+		return ij.deferInvalidation(fmt.Sprintf("transient decrypt failure in %s", operation))
+	}
+
+	ij.fatal = true
+	return err
+}
+
+func (im *invalidationManager) ensureDRKeyTransitionWorker(generation uint64) {
+	if im == nil || im.core == nil || generation == 0 {
+		return
+	}
+
+	if !im.core.markDRKeyTransitionWorkerStarted(generation) {
+		return
+	}
+
+	go im.runDRKeyTransitionWorker(generation)
+}
+
+func (im *invalidationManager) runDRKeyTransitionWorker(generation uint64) {
+	defer im.core.markDRKeyTransitionWorkerStopped(generation)
+
+	backoff := drKeyTransitionBackoffMin
+	for {
+		deadline, ok := im.core.drKeyTransitionDeadline(generation)
+		if !ok {
+			return
+		}
+
+		if time.Now().After(deadline) {
+			metrics.IncrCounter([]string{"replication", "dr", "secondary", "key_transition_timeout_total"}, 1)
+			im.dispacherLogger.Error("DR key transition timed out; failing closed",
+				"generation", generation, "deadline", deadline)
+			im.core.restart()
+			return
+		}
+
+		metrics.IncrCounter([]string{"replication", "dr", "secondary", "key_transition_resync_attempts_total"}, 1)
+		err := im.drKeyTransitionResyncAttempt(generation)
+		if err == nil {
+			metrics.IncrCounter([]string{"replication", "dr", "secondary", "key_transition_resync_success_total"}, 1)
+			im.replayDeferredInvalidations(generation)
+			return
+		}
+
+		im.dispacherLogger.Warn("DR key-transition resync attempt failed",
+			"generation", generation, "error", err)
+		if !isTransitionTransientInvalidationError(err, true) {
+			im.dispacherLogger.Error("fatal DR key-transition resync error; failing closed",
+				"generation", generation, "error", err)
+			im.core.restart()
+			return
+		}
+
+		if !im.drKeyTransitionWait(backoff) {
+			return
+		}
+		backoff *= 2
+		if backoff > drKeyTransitionBackoffMax {
+			backoff = drKeyTransitionBackoffMax
+		}
+	}
+}
+
+func (im *invalidationManager) drKeyTransitionWait(wait time.Duration) bool {
+	if wait <= 0 {
+		return true
+	}
+
+	jittered := wait
+	if wait > time.Millisecond {
+		lower := wait / 2
+		jittered = lower + time.Duration(rand.Int63n(int64(wait-lower)+1))
+	}
+
+	timer := time.NewTimer(jittered)
+	defer timer.Stop()
+
+	var quitContextDone <-chan struct{}
+	if im.quitContext != nil {
+		quitContextDone = im.quitContext.Done()
+	}
+
+	select {
+	case <-timer.C:
+		return true
+	case <-im.quitCh:
+		return false
+	case <-quitContextDone:
+		return false
+	}
+}
+
+func (im *invalidationManager) drKeyTransitionResyncAttempt(generation uint64) error {
+	core := im.core
+	if core == nil || core.barrier == nil {
+		return fmt.Errorf("barrier unavailable for DR key-transition resync")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), maxInvalidateTime)
+	defer cancel()
+
+	if err := core.barrier.ReloadRootKey(ctx); err != nil {
+		if isTransientBarrierDecryptFailure(err) {
+			if recoverErr := im.recoverDRRootKeyFromStoredKeys(ctx); recoverErr != nil {
+				return fmt.Errorf("failed to reload root key: %w (stored-key recovery failed: %v)", err, recoverErr)
+			}
+			im.dispacherLogger.Info("recovered DR root key from stored keys after decrypt mismatch", "generation", generation)
+		} else {
+			return fmt.Errorf("failed to reload root key: %w", err)
+		}
+	}
+	if err := core.barrier.ReloadKeyring(ctx); err != nil {
+		return fmt.Errorf("failed to reload keyring: %w", err)
+	}
+	if err := core.ensureRaftTLSKeyringForDRSecondary(ctx); err != nil {
+		return fmt.Errorf("failed to ensure raft TLS keyring for DR secondary: %w", err)
+	}
+	if err := core.checkRaftTLSKeyUpgrades(ctx); err != nil {
+		return fmt.Errorf("failed to refresh raft TLS keyring: %w", err)
+	}
+	if core.drManager != nil {
+		if _, err := core.drManager.RefreshConfigFromStorage(ctx); err != nil {
+			return fmt.Errorf("failed to refresh DR config from storage: %w", err)
+		}
+	}
+
+	im.dispacherLogger.Info("DR key-transition resync attempt succeeded", "generation", generation)
+	return nil
+}
+
+func (im *invalidationManager) recoverDRRootKeyFromStoredKeys(ctx context.Context) error {
+	core := im.core
+	if core == nil || core.seal == nil || core.barrier == nil {
+		return fmt.Errorf("core, seal, or barrier unavailable for stored-key recovery")
+	}
+
+	keys, err := core.seal.GetStoredKeys(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to fetch stored keys: %w", err)
+	}
+	if len(keys) == 0 || len(keys[0]) == 0 {
+		return fmt.Errorf("stored keys are empty")
+	}
+
+	if err := core.barrier.SetRootKey(keys[0]); err != nil {
+		return fmt.Errorf("failed to set barrier root key from stored key: %w", err)
+	}
+	if err := core.barrier.ReloadKeyring(ctx); err != nil {
+		return fmt.Errorf("failed to reload keyring after stored-key recovery: %w", err)
+	}
+
+	return nil
+}
+
+func (im *invalidationManager) replayDeferredInvalidations(generation uint64) {
+	core := im.core
+	if core == nil {
+		return
+	}
+
+	keys, ok := core.snapshotDeferredInvalidations(generation)
+	if !ok {
+		return
+	}
+
+	if !core.markDRKeyTransitionReplaying(generation, true) {
+		return
+	}
+	defer core.markDRKeyTransitionReplaying(generation, false)
+
+	im.dispacherLogger.Info("starting DR key-transition replay",
+		"generation", generation, "deferred_keys", len(keys))
+
+	for _, key := range keys {
+		if !core.isDRKeyTransitionGenerationActive(generation) {
+			im.dispacherLogger.Info("stopping DR key-transition replay due to generation handoff",
+				"generation", generation)
+			return
+		}
+		im.Add(key)
+	}
+
+	metrics.IncrCounter([]string{"replication", "dr", "secondary", "key_transition_replay_success_total"}, float32(len(keys)))
+	im.dispacherLogger.Info("completed DR key-transition replay",
+		"generation", generation, "replayed_keys", len(keys))
+	core.endDRKeyTransition(generation)
+}
+
 func (ij *invalidationJob) Execute() error {
 	ij.im.dispacherLogger.Trace("processing invalidation", "key", ij.key)
 	defer ij.im.dispacherLogger.Trace("concluding processing of invalidation", "key", ij.key)
@@ -364,30 +989,30 @@ func (ij *invalidationJob) Execute() error {
 
 	// Now handle the actual event.
 	key := ij.nsKey
+	if ij.shouldDeferInvalidation(key) {
+		return ij.deferInvalidation(fmt.Sprintf("transition active for %s", key))
+	}
+
 	switch {
 	case strings.HasPrefix(key, namespaceStoreSubPath):
-		ij.fatal = true
-		return ij.namespaceInvalidation(ctx)
+		return ij.executePotentiallyFatalInvalidation(ctx, "namespace", ij.namespaceInvalidation)
 	case strings.HasPrefix(key, barrier.SystemBarrierPrefix+policy.ACLSubPath):
 		// Policy invalidation is not fatal as it contains a LRU cache: we
 		// know removal is strict and it is only potentially preloading an
 		// entry which may err.
 		return ij.policyInvalidation(ctx)
 	case strings.HasPrefix(key, barrier.SystemBarrierPrefix+quotas.StoragePrefix):
-		ij.fatal = true
-		return ij.quotaInvalidation(ctx)
+		return ij.executePotentiallyFatalInvalidation(ctx, "quota", ij.quotaInvalidation)
 	case key == coreAuditConfigPath || key == coreLocalAuditConfigPath:
-		ij.fatal = true
-		return ij.auditInvalidation(ctx)
+		return ij.executePotentiallyFatalInvalidation(ctx, "audit", ij.auditInvalidation)
 	case isLegacyMountPath(key):
-		ij.fatal = true
-		return ij.legacyMountInvalidation(ctx)
+		return ij.executePotentiallyFatalInvalidation(ctx, "legacy_mount", ij.legacyMountInvalidation)
 	case isTransactionalMountPath(key):
-		ij.fatal = true
-		return ij.transactionalMountInvalidation(ctx)
+		return ij.executePotentiallyFatalInvalidation(ctx, "transactional_mount", ij.transactionalMountInvalidation)
+	case key == drConfigPath:
+		return ij.drConfigInvalidation(ctx)
 	case isKeyringPath(key):
-		// The HA subsystem handles keyring rotations via the
-		// periodicCheckKeyUpgrades(...) actor.
+		return ij.keyringInvalidation()
 	case strings.HasPrefix(ij.key, coreLeaderPrefix):
 		// The HA subsystem handles leadership changes.
 	case strings.HasPrefix(ij.key, pluginCatalogPath):

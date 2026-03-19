@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"os"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -46,6 +45,14 @@ const (
 	// of orphaned leader keys, to prevent slamming the backend.
 	leaderPrefixCleanDelay = 200 * time.Millisecond
 )
+
+func isBenignLeadershipSetupError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, context.Canceled) ||
+		errors.Is(err, barrier.ErrBarrierSealed)
+}
 
 // Standby checks if the Vault is in standby mode.
 // Usage of this function at core initialization/setup stage is not advised
@@ -719,11 +726,11 @@ func (c *Core) waitForLeadership(manualStepDownCh, stopCh <-chan struct{}) {
 			}
 
 			if err := c.performKeyUpgrades(activeCtx); err != nil {
-				c.logger.Error("error performing key upgrades", "error", err)
-
-				// If we fail due to anything other than a context canceled
-				// error we should shutdown as we may have the incorrect Keys.
-				if !strings.Contains(err.Error(), context.Canceled.Error()) {
+				benign := isBenignLeadershipSetupError(err)
+				if benign {
+					c.logger.Warn("benign leadership setup error; returning to standby loop", "error", err)
+				} else {
+					c.logger.Error("fatal leadership setup error; shutting down", "error", err)
 					// We call this in a goroutine so that we can give up the
 					// statelock and have this shut us down; sealInternal has a
 					// workflow where it watches for the stopCh to close so we want
@@ -736,13 +743,10 @@ func (c *Core) waitForLeadership(manualStepDownCh, stopCh <-chan struct{}) {
 				c.stateLock.Unlock()
 				metrics.MeasureSince([]string{"core", "leadership_setup_failed"}, activeTime)
 
-				// If we are shutting down we should return from this function,
-				// otherwise continue
-				if !strings.Contains(err.Error(), context.Canceled.Error()) {
-					continue
-				} else {
+				if benign {
 					return
 				}
+				continue
 			}
 		}
 

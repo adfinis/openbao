@@ -21,6 +21,7 @@ import (
 	"github.com/hashicorp/go-discover"
 	discoverk8s "github.com/hashicorp/go-discover/provider/k8s"
 	"github.com/hashicorp/go-hclog"
+	metrics "github.com/hashicorp/go-metrics/compat"
 	"github.com/hashicorp/go-secure-stdlib/tlsutil"
 	"github.com/hashicorp/go-uuid"
 	wrapping "github.com/openbao/go-kms-wrapping/v2"
@@ -34,8 +35,10 @@ import (
 )
 
 var (
-	raftTLSStoragePath    = "core/raft/tls"
-	raftTLSRotationPeriod = 24 * time.Hour
+	raftTLSStoragePath       = "core/raft/tls"
+	raftTLSRotationPeriod    = 24 * time.Hour
+	errRaftTLSKeyringMissing = errors.New("no keyring found")
+	errRaftTLSKeyringCorrupt = errors.New("raft TLS keyring is corrupt")
 
 	raftAutopilotConfigurationStoragePath = "core/raft/autopilot/configuration"
 
@@ -190,6 +193,13 @@ func (c *Core) setupRaftActiveNode(ctx context.Context) error {
 	}
 
 	raftBackend.SetupAutopilot(c.activeContext.Load(), autopilotConfig, c.raftFollowerStates, c.disableAutopilot)
+
+	// DR secondaries can temporarily lose the local raft TLS keyring during
+	// keyring bootstrap root-key swap/purge. Repair it before normal upgrade
+	// checks to avoid recurring "no keyring found" failures.
+	if err := c.ensureRaftTLSKeyringForDRSecondary(ctx); err != nil {
+		return err
+	}
 
 	// Reload the raft TLS keys to ensure we are using the latest version.
 	if err := c.checkRaftTLSKeyUpgrades(ctx); err != nil {
@@ -551,14 +561,117 @@ func (c *Core) raftReadTLSKeyring(ctx context.Context) (*raft.TLSKeyring, error)
 		return nil, err
 	}
 	if tlsKeyringEntry == nil {
-		return nil, errors.New("no keyring found")
+		return nil, errRaftTLSKeyringMissing
 	}
 	var keyring raft.TLSKeyring
 	if err := tlsKeyringEntry.DecodeJSON(&keyring); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", errRaftTLSKeyringCorrupt, err)
 	}
 
 	return &keyring, nil
+}
+
+func (c *Core) isPersistedDRSecondary(ctx context.Context) (bool, error) {
+	entry, err := c.barrier.Get(ctx, drConfigPath)
+	if err != nil {
+		return false, err
+	}
+	if entry == nil {
+		return false, nil
+	}
+
+	var cfg DRConfig
+	if err := entry.DecodeJSON(&cfg); err != nil {
+		return false, err
+	}
+
+	return cfg.Mode == DRModeSecondary, nil
+}
+
+// isDRSecondaryRuntimeMode determines whether this node should apply DR
+// secondary-specific behavior. Runtime DR mode is authoritative when available.
+// Persisted config is only used as a fallback when runtime mode is indeterminate.
+func (c *Core) isDRSecondaryRuntimeMode(ctx context.Context) (bool, error) {
+	if c.drManager != nil {
+		switch c.drManager.Mode() {
+		case DRModeSecondary:
+			return true, nil
+		case DRModePrimary:
+			return false, nil
+		}
+	}
+
+	return c.isPersistedDRSecondary(ctx)
+}
+
+func shouldRecreateRaftTLSKeyringForDRSecondary(isDRSecondary bool, keyring *raft.TLSKeyring, readErr error) bool {
+	if !isDRSecondary {
+		return false
+	}
+	if readErr != nil {
+		return errors.Is(readErr, errRaftTLSKeyringMissing) ||
+			errors.Is(readErr, errRaftTLSKeyringCorrupt)
+	}
+	if keyring == nil {
+		return true
+	}
+	return keyring.GetActive() == nil
+}
+
+// drSecondarySelfHealWriteAllowed returns true when this node is allowed to
+// write barrier entries as part of DR secondary self-heal.
+//
+// DR invalidation processing runs on standby nodes too, but standby nodes are
+// intentionally read-only. Recreating raft TLS keyrings from those nodes can
+// fail with read-only errors and destabilize the cluster.
+func (c *Core) drSecondarySelfHealWriteAllowed() bool {
+	if c == nil {
+		return false
+	}
+	return !c.standby.Load()
+}
+
+func (c *Core) ensureRaftTLSKeyringForDRSecondary(ctx context.Context) error {
+	if c.GetRaftBackend() == nil {
+		return nil
+	}
+
+	isDRSecondary, err := c.isDRSecondaryRuntimeMode(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to determine DR mode for raft TLS keyring self-heal: %w", err)
+	}
+
+	keyring, readErr := c.raftReadTLSKeyring(ctx)
+	if !shouldRecreateRaftTLSKeyringForDRSecondary(isDRSecondary, keyring, readErr) {
+		return nil
+	}
+
+	reason := "missing_or_unreadable"
+	if readErr == nil && keyring != nil && keyring.GetActive() == nil {
+		reason = "no_active_key"
+	}
+	if !c.drSecondarySelfHealWriteAllowed() {
+		metrics.IncrCounter([]string{"replication", "dr", "secondary", "raft_tls_keyring_self_heal_deferred_total"}, 1)
+		c.logger.Info("DR secondary raft TLS keyring self-heal deferred on standby node",
+			"reason", reason, "error", readErr)
+		return nil
+	}
+
+	c.logger.Warn("DR secondary raft TLS keyring self-heal triggered", "reason", reason, "error", readErr)
+	metrics.IncrCounter([]string{"replication", "dr", "secondary", "raft_tls_keyring_self_heal_triggered_total"}, 1)
+
+	if _, err := c.raftForceRecreateTLSKeyring(ctx); err != nil {
+		metrics.IncrCounter([]string{"replication", "dr", "secondary", "raft_tls_keyring_self_heal_failed_total"}, 1)
+		return fmt.Errorf("failed to recreate raft TLS keyring for DR secondary: %w", err)
+	}
+	if err := c.checkRaftTLSKeyUpgrades(ctx); err != nil {
+		metrics.IncrCounter([]string{"replication", "dr", "secondary", "raft_tls_keyring_self_heal_failed_total"}, 1)
+		return fmt.Errorf("failed to apply recreated raft TLS keyring for DR secondary: %w", err)
+	}
+
+	metrics.IncrCounter([]string{"replication", "dr", "secondary", "raft_tls_keyring_self_heal_succeeded_total"}, 1)
+	c.logger.Info("DR secondary raft TLS keyring self-heal complete")
+	return nil
 }
 
 // raftCreateTLSKeyring creates the initial TLS key and the TLS Keyring for raft
@@ -611,7 +724,7 @@ func (c *Core) raftCreateTLSKeyring(ctx context.Context) (*raft.TLSKeyring, erro
 // current key) and applied to the running Raft backend so the cluster
 // can immediately resume TLS-secured peer communication.
 func (c *Core) raftForceRecreateTLSKeyring(ctx context.Context) (*raft.TLSKeyring, error) {
-	raftBackend := c.getRaftBackend()
+	raftBackend := c.GetRaftBackend()
 	if raftBackend == nil {
 		return nil, errors.New("raft backend not in use")
 	}
@@ -629,7 +742,7 @@ func (c *Core) raftForceRecreateTLSKeyring(ctx context.Context) (*raft.TLSKeyrin
 	_ = c.barrier.Delete(ctx, raftTLSStoragePath)
 
 	// 2. Generate a fresh TLS key.
-	raftTLSKey, err := raft.GenerateTLSKey(c.secureRandomReader)
+	raftTLSKey, err := raft.GenerateTLSKey()
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate raft TLS key: %w", err)
 	}

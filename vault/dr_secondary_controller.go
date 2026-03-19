@@ -12,8 +12,88 @@ import (
 	metrics "github.com/hashicorp/go-metrics/compat"
 )
 
+type drPrimaryAddrRing struct {
+	candidates []string
+	index      map[string]int
+	current    int
+	failures   int
+}
+
+func newDRPrimaryAddrRing(addrs []string) *drPrimaryAddrRing {
+	normalized := normalizePrimaryAddrs(addrs)
+	r := &drPrimaryAddrRing{
+		candidates: normalized,
+		index:      make(map[string]int, len(normalized)),
+	}
+	for i, addr := range normalized {
+		r.index[addr] = i
+	}
+	return r
+}
+
+func (r *drPrimaryAddrRing) Size() int {
+	return len(r.candidates)
+}
+
+func (r *drPrimaryAddrRing) Current() string {
+	if len(r.candidates) == 0 {
+		return ""
+	}
+	return r.candidates[r.current]
+}
+
+func (r *drPrimaryAddrRing) MarkSuccess() {
+	r.failures = 0
+}
+
+func (r *drPrimaryAddrRing) Add(addr string) (string, bool) {
+	addr = normalizePrimaryAddr(addr)
+	if addr == "" {
+		return "", false
+	}
+	if _, ok := r.index[addr]; ok {
+		return addr, false
+	}
+	r.candidates = append(r.candidates, addr)
+	r.index[addr] = len(r.candidates) - 1
+	return addr, true
+}
+
+func (r *drPrimaryAddrRing) Use(addr string) bool {
+	addr = normalizePrimaryAddr(addr)
+	if addr == "" {
+		return false
+	}
+	idx, ok := r.index[addr]
+	if !ok {
+		return false
+	}
+	r.current = idx
+	return true
+}
+
+func (r *drPrimaryAddrRing) RotateFailure() (oldAddr, nextAddr string, rotated bool, cycleComplete bool) {
+	if len(r.candidates) == 0 {
+		return "", "", false, true
+	}
+	oldAddr = r.candidates[r.current]
+	r.failures++
+	cycleComplete = (r.failures % len(r.candidates)) == 0
+	if len(r.candidates) > 1 {
+		r.current = (r.current + 1) % len(r.candidates)
+		rotated = true
+	}
+	nextAddr = r.candidates[r.current]
+	return oldAddr, nextAddr, rotated, cycleComplete
+}
+
 func (m *drRelationshipManager) startSecondaryControllerLocked() {
-	if m.secondary == nil || m.config.PrimaryAddr == "" {
+	initialPrimaryAddrs := normalizePrimaryAddrs(m.config.PrimaryAddrs)
+	if m.secondary == nil || len(initialPrimaryAddrs) == 0 {
+		return
+	}
+	if !m.shouldRunSecondaryControllerLocked() {
+		m.logger.Debug("skipping DR secondary controller start on standby node")
 		return
 	}
 	if m.secondaryLoopCancel != nil {
@@ -24,11 +104,9 @@ func (m *drRelationshipManager) startSecondaryControllerLocked() {
 	// the loop terminates automatically when this node steps down or is
 	// sealed (activeContext cancelled). The explicit cancel() is still
 	// used by DisableSecondary / Promote to stop the controller on demand.
-	loopCtx, cancel := context.WithCancel(m.core.activeContext)
+	loopCtx, cancel := context.WithCancel(m.core.activeContext.Load())
 	m.secondaryLoopCancel = cancel
 
-	configAddr := m.config.PrimaryAddr // original address from config (e.g. HAProxy)
-	primaryAddr := configAddr
 	secondary := m.secondary
 
 	go func() {
@@ -43,8 +121,12 @@ func (m *drRelationshipManager) startSecondaryControllerLocked() {
 
 		backoff := 500 * time.Millisecond
 		const maxBackoff = 30 * time.Second
-		redirectFailures := 0        // consecutive failures on a redirected address
-		const redirectFailureMax = 2 // after this many, revert to configAddr
+		addrRing := newDRPrimaryAddrRing(initialPrimaryAddrs)
+		if addrRing.Size() == 0 {
+			m.logger.Warn("DR secondary controller has no primary addresses; exiting")
+			return
+		}
+		primaryAddr := addrRing.Current()
 
 		// Redirect rate limiting: track timestamps to enforce max
 		// redirects per sliding window.
@@ -65,35 +147,35 @@ func (m *drRelationshipManager) startSecondaryControllerLocked() {
 				secondary.connectFailures.Add(1)
 				metrics.IncrCounter([]string{"replication", "dr", "secondary", "connect_retries"}, 1)
 				metrics.IncrCounter([]string{"replication", "dr", "secondary", "connect_failures"}, 1)
-				metrics.SetGauge([]string{"replication", "dr", "secondary", "connect_backoff_seconds"}, float32(backoff.Seconds()))
 				m.logger.Warn("DR secondary connect failed; retrying",
 					"primary_addr", primaryAddr,
-					"backoff", backoff,
 					"error", err)
-				jitter := time.Duration(randIntn(int(backoff / 5)))
-				if !sleepCtx(loopCtx, backoff+jitter) {
-					return // context cancelled during backoff
-				}
-				backoff *= 2
-				if backoff > maxBackoff {
-					backoff = maxBackoff
+
+				oldAddr, nextAddr, rotated, cycleComplete := addrRing.RotateFailure()
+				primaryAddr = nextAddr
+				if rotated {
+					m.logger.Info("DR secondary rotating to next primary candidate after connect failure",
+						"old_addr", oldAddr,
+						"new_addr", nextAddr)
 				}
 
-				// If we're using a redirected address and it keeps
-				// failing, revert to the original config address (LB).
-				if primaryAddr != configAddr {
-					redirectFailures++
-					if redirectFailures >= redirectFailureMax {
-						m.logger.Warn("redirect address unreachable, reverting to config address",
-							"redirect_addr", primaryAddr,
-							"config_addr", configAddr)
-						primaryAddr = configAddr
-						redirectFailures = 0
+				if cycleComplete {
+					metrics.SetGauge([]string{"replication", "dr", "secondary", "connect_backoff_seconds"}, float32(backoff.Seconds()))
+					jitter := time.Duration(randIntn(int(backoff / 5)))
+					if !sleepCtx(loopCtx, backoff+jitter) {
+						return // context cancelled during backoff
 					}
+					backoff *= 2
+					if backoff > maxBackoff {
+						backoff = maxBackoff
+					}
+				} else {
+					metrics.SetGauge([]string{"replication", "dr", "secondary", "connect_backoff_seconds"}, 0)
 				}
 				continue
 			}
 
+			addrRing.MarkSuccess()
 			backoff = 500 * time.Millisecond
 			metrics.SetGauge([]string{"replication", "dr", "secondary", "connect_backoff_seconds"}, float32(backoff.Seconds()))
 			err := secondary.Start(loopCtx)
@@ -133,11 +215,23 @@ func (m *drRelationshipManager) startSecondaryControllerLocked() {
 						redirectBackoff = 0
 					}
 
-					m.logger.Info("DR secondary redirected to new leader",
-						"old_addr", primaryAddr,
-						"new_addr", redirect.LeaderAddr)
-					primaryAddr = redirect.LeaderAddr
-					redirectFailures = 0
+					hintedAddr, added := addrRing.Add(redirect.LeaderAddr)
+					if hintedAddr != "" && added {
+						m.logger.Info("DR secondary discovered new primary candidate from redirect",
+							"addr", hintedAddr)
+					}
+					if hintedAddr != "" {
+						oldAddr := primaryAddr
+						addrRing.Use(hintedAddr)
+						primaryAddr = addrRing.Current()
+						if oldAddr != primaryAddr {
+							m.logger.Info("DR secondary redirected to new leader",
+								"old_addr", oldAddr,
+								"new_addr", primaryAddr)
+						}
+					}
+
+					addrRing.MarkSuccess()
 					// Reconnect (rate-limited above if needed).
 					continue
 				}
@@ -145,28 +239,54 @@ func (m *drRelationshipManager) startSecondaryControllerLocked() {
 				m.logger.Warn("DR secondary replication loop exited; reconnecting",
 					"error", err)
 
-				// If we're using a redirected address and Start()
-				// failed (e.g. retry cap exhausted), the address may
-				// be unreachable. Fall back to the config address so
-				// the next Connect() goes through the LB/HAProxy.
-				if primaryAddr != configAddr {
-					redirectFailures++
-					if redirectFailures >= redirectFailureMax {
-						m.logger.Warn("redirect address not working, reverting to config address",
-							"redirect_addr", primaryAddr,
-							"config_addr", configAddr)
-						primaryAddr = configAddr
-						redirectFailures = 0
+				if isDRTransportReconnectError(err) {
+					oldAddr, nextAddr, rotated, cycleComplete := addrRing.RotateFailure()
+					primaryAddr = nextAddr
+					if rotated {
+						m.logger.Info("DR secondary rotating to next primary candidate after transport failure",
+							"old_addr", oldAddr,
+							"new_addr", nextAddr)
 					}
+					if cycleComplete {
+						jitter := time.Duration(randIntn(int(backoff / 5)))
+						if !sleepCtx(loopCtx, backoff+jitter) {
+							return // context cancelled during backoff
+						}
+						backoff *= 2
+						if backoff > maxBackoff {
+							backoff = maxBackoff
+						}
+					}
+					continue
 				}
 
+				addrRing.MarkSuccess()
 				jitter := time.Duration(randIntn(int(backoff / 5)))
 				if !sleepCtx(loopCtx, backoff+jitter) {
 					return // context cancelled during backoff
 				}
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
 			}
 		}
 	}()
+}
+
+func (m *drRelationshipManager) shouldRunSecondaryControllerLocked() bool {
+	if m == nil || m.core == nil || m.secondary == nil {
+		return false
+	}
+
+	// During HA standby read-only unseal, core.standby is true and we do not
+	// hold the HA lock. In that state DR streaming/bootstrap must not run on
+	// the node.
+	if m.core.standby.Load() && m.core.heldHALock == nil {
+		return false
+	}
+
+	return true
 }
 
 // sleepCtx blocks for d or until ctx is cancelled. Returns true if the

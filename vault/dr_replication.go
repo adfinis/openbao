@@ -638,7 +638,7 @@ func (s *drReplicationPrimary) StreamChanges(stream grpc.BidiStreamingServer[Str
 		select {
 		case <-ctx.Done():
 			// Stream already closing -- nothing to do.
-		case <-s.core.activeContext.Done():
+		case <-s.core.activeContext.Load().Done():
 			cancel()
 		}
 	}()
@@ -954,6 +954,9 @@ func (s *drReplicationPrimary) ExchangeDirtyBitmap(ctx context.Context, req *Dir
 	if err := s.requireActiveNode(); err != nil {
 		return nil, err
 	}
+	if err := s.authorizeRelationship(ctx, req.RelationshipId, DRRelationshipStateRegistered, DRRelationshipStateActive); err != nil {
+		return nil, err
+	}
 	s.dirtyMapMu.RLock()
 	defer s.dirtyMapMu.RUnlock()
 
@@ -1240,7 +1243,7 @@ func (s *drReplicationPrimary) FetchEntries(req *FetchEntriesRequest, stream grp
 	go func() {
 		select {
 		case <-ctx.Done():
-		case <-s.core.activeContext.Done():
+		case <-s.core.activeContext.Load().Done():
 			cancel()
 		}
 	}()
@@ -1566,7 +1569,16 @@ func (s *drReplicationPrimary) SyncKeyring(ctx context.Context, req *SyncKeyring
 			wrapPrimaryIdentity = mgr.transportCA.spkiHash()
 		}
 	}
-	wrapSecondaryFP, _ := peerCertFingerprintFromContext(ctx)
+	if wrapClusterID == "" {
+		return nil, status.Error(codes.FailedPrecondition, "DR cluster ID unavailable for key wrap")
+	}
+	if wrapPrimaryIdentity == "" {
+		return nil, status.Error(codes.FailedPrecondition, "DR transport CA identity unavailable for key wrap")
+	}
+	wrapSecondaryFP, err := peerCertFingerprintFromContext(ctx)
+	if err != nil || wrapSecondaryFP == "" {
+		return nil, status.Errorf(codes.PermissionDenied, "failed to derive secondary certificate fingerprint: %v", err)
+	}
 
 	wrappedRootKey, serverPub, srvNonce, gcmIV, aadVersion, err := wrapRootKeyForSecondary(
 		keyring.RootKey(),
@@ -2568,15 +2580,12 @@ func (s *drReplicationPrimary) allowWriteRequest(path string) (bool, string) {
 }
 
 func isDRBackpressureExemptPath(path string) bool {
+	path = strings.Trim(path, "/")
 	if path == "" {
 		return true
 	}
 	if path == "sys/health" || path == "sys/seal-status" ||
 		strings.HasPrefix(path, "sys/replication/dr/") {
-		return true
-	}
-	if strings.HasSuffix(path, "/sys/health") || strings.HasSuffix(path, "/sys/seal-status") ||
-		strings.Contains(path, "/sys/replication/dr/") {
 		return true
 	}
 	return false

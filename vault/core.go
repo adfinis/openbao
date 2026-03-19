@@ -478,6 +478,10 @@ type Core struct {
 
 	// drManager manages the DR replication lifecycle.
 	drManager *drRelationshipManager
+	// drSecondaryKeyTransition tracks DR secondary key-transition state on
+	// standbys. During transition, decrypt-sensitive invalidations are deferred
+	// and replayed after key resync.
+	drSecondaryKeyTransition drSecondaryKeyTransitionState
 
 	// uiConfig contains UI configuration
 	uiConfig *UIConfig

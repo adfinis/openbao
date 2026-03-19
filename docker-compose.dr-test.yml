@@ -1,0 +1,169 @@
+# DR Replication Test Setup
+#
+# Three single-node Raft clusters for testing DR replication end-to-end
+# (one primary, two independent DR secondaries).
+#
+# Usage:
+#   1. Build the image (if not already built):
+#        make docker-dev
+#
+#   2. Start the clusters:
+#        docker compose -f docker-compose.dr-test.yml up
+#
+#   3. In another terminal, init and unseal all clusters:
+#
+#      # Primary
+#      export BAO_ADDR=http://localhost:8800
+#      bao operator init -key-shares=1 -key-threshold=1
+#      bao operator unseal <unseal-key>
+#      export BAO_TOKEN=<root-token>
+#
+#      # Secondary
+#      export BAO_ADDR=http://localhost:8900
+#      bao operator init -key-shares=1 -key-threshold=1
+#      bao operator unseal <unseal-key>
+#      export BAO_TOKEN=<root-token>
+#
+#      # Secondary 2
+#      export BAO_ADDR=http://localhost:9000
+#      bao operator init -key-shares=1 -key-threshold=1
+#      bao operator unseal <unseal-key>
+#      export BAO_TOKEN=<root-token>
+#
+#   4. Set up DR replication:
+#
+#      # Enable primary
+#      BAO_ADDR=http://localhost:8800 bao write -f sys/replication/dr/primary/enable
+#
+#      # Generate activation token for secondary
+#      BAO_ADDR=http://localhost:8800 bao write -f sys/replication/dr/primary/secondary-token
+#      # Copy the "token" JSON value as TOKEN1
+#
+#      # Enable secondary
+#      BAO_ADDR=http://localhost:8900 bao write sys/replication/dr/secondary/enable \
+#        token="$TOKEN1"
+#
+#      # Generate activation token for secondary2
+#      BAO_ADDR=http://localhost:8800 bao write -f sys/replication/dr/primary/secondary-token
+#      # Copy the "token" JSON value as TOKEN2
+#
+#      # Enable secondary2
+#      BAO_ADDR=http://localhost:9000 bao write sys/replication/dr/secondary/enable \
+#        token="$TOKEN2"
+#
+#      # Check status
+#      BAO_ADDR=http://localhost:8800 bao read sys/replication/dr/status
+#      BAO_ADDR=http://localhost:8900 bao read sys/replication/dr/status
+#      BAO_ADDR=http://localhost:9000 bao read sys/replication/dr/status
+#
+#   5. Tear down:
+#        docker compose -f docker-compose.dr-test.yml down -v
+
+services:
+  primary:
+    image: openbao:dev
+    command: ["server"]
+    environment:
+      BAO_LOCAL_CONFIG: |
+        {
+          "storage": {
+            "raft": {
+              "path": "/openbao/file",
+              "node_id": "primary"
+            }
+          },
+          "listener": [{
+            "tcp": {
+              "address": "0.0.0.0:8200",
+              "tls_disable": true,
+              "cluster_address": "0.0.0.0:8201"
+            }
+          }],
+          "api_addr": "http://primary:8200",
+          "cluster_addr": "https://primary:8201",
+          "disable_mlock": true,
+          "log_level": "debug"
+        }
+    ports:
+      - "8800:8200"
+      - "8801:8201"
+    volumes:
+      - primary-data:/openbao/file
+    cap_add: [IPC_LOCK]
+    networks:
+      - dr-net
+
+  secondary:
+    image: openbao:dev
+    command: ["server"]
+    environment:
+      BAO_LOCAL_CONFIG: |
+        {
+          "storage": {
+            "raft": {
+              "path": "/openbao/file",
+              "node_id": "secondary"
+            }
+          },
+          "listener": [{
+            "tcp": {
+              "address": "0.0.0.0:8200",
+              "tls_disable": true,
+              "cluster_address": "0.0.0.0:8201"
+            }
+          }],
+          "api_addr": "http://secondary:8200",
+          "cluster_addr": "https://secondary:8201",
+          "disable_mlock": true,
+          "log_level": "debug"
+        }
+    ports:
+      - "8900:8200"
+      - "8901:8201"
+    volumes:
+      - secondary-data:/openbao/file
+    cap_add: [IPC_LOCK]
+    networks:
+      - dr-net
+
+  secondary2:
+    image: openbao:dev
+    command: ["server"]
+    environment:
+      BAO_LOCAL_CONFIG: |
+        {
+          "storage": {
+            "raft": {
+              "path": "/openbao/file",
+              "node_id": "secondary2"
+            }
+          },
+          "listener": [{
+            "tcp": {
+              "address": "0.0.0.0:8200",
+              "tls_disable": true,
+              "cluster_address": "0.0.0.0:8201"
+            }
+          }],
+          "api_addr": "http://secondary2:8200",
+          "cluster_addr": "https://secondary2:8201",
+          "disable_mlock": true,
+          "log_level": "debug"
+        }
+    ports:
+      - "9000:8200"
+      - "9001:8201"
+    volumes:
+      - secondary2-data:/openbao/file
+    cap_add: [IPC_LOCK]
+    networks:
+      - dr-net
+
+volumes:
+  primary-data:
+  secondary-data:
+  secondary2-data:
+
+networks:
+  dr-net:
+    driver: bridge

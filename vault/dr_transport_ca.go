@@ -132,7 +132,7 @@ func generateDRTransportCA(core *Core) (*drTransportCA, error) {
 		Key:   drTransportCAPath,
 		Value: bundleBytes,
 	}
-	if err := core.barrier.Put(core.activeContext, entry); err != nil {
+	if err := core.barrier.Put(core.activeContext.Load(), entry); err != nil {
 		return nil, fmt.Errorf("failed to persist DR transport CA: %w", err)
 	}
 
@@ -142,7 +142,7 @@ func generateDRTransportCA(core *Core) (*drTransportCA, error) {
 // loadDRTransportCA loads the DR transport CA from barrier storage.
 // Returns nil, nil if no CA has been generated yet.
 func loadDRTransportCA(core *Core) (*drTransportCA, error) {
-	entry, err := core.barrier.Get(core.activeContext, drTransportCAPath)
+	entry, err := core.barrier.Get(core.activeContext.Load(), drTransportCAPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load DR transport CA: %w", err)
 	}
@@ -224,9 +224,8 @@ func verifyCertChainToCA(certDER []byte, caCert *x509.Certificate) error {
 	opts := x509.VerifyOptions{
 		Roots:     pool,
 		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
-		// Skip time validation for the leaf -- the CA controls validity
-		// and TTL eviction handles freshness.
-		CurrentTime: cert.NotBefore.Add(1 * time.Second),
+		// Validate certificate lifetime at current time.
+		CurrentTime: time.Now().UTC(),
 	}
 
 	if _, err := cert.Verify(opts); err != nil {

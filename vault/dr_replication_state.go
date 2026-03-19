@@ -61,8 +61,12 @@ type DRConfig struct {
 	// ReplSalt is the shared HMAC key for KID derivation.
 	ReplSalt []byte `json:"repl_salt"`
 
-	// PrimaryAddr is the gRPC address of the primary (set on secondary).
+	// PrimaryAddr mirrors the first entry in PrimaryAddrs for convenience.
 	PrimaryAddr string `json:"primary_addr,omitempty"`
+
+	// PrimaryAddrs is the ordered candidate set of primary cluster gRPC
+	// addresses used by secondary reconnect logic.
+	PrimaryAddrs []string `json:"primary_addrs,omitempty"`
 
 	// RelationshipID is the active relationship ID on secondary nodes.
 	RelationshipID string `json:"relationship_id,omitempty"`
@@ -128,8 +132,12 @@ type DRActivationToken struct {
 	// RelationshipID identifies the specific DR relationship.
 	RelationshipID string `json:"relationship_id"`
 
-	// PrimaryAddr is the primary's cluster gRPC address.
+	// PrimaryAddr mirrors the first entry in PrimaryAddrs for convenience.
 	PrimaryAddr string `json:"primary_addr"`
+
+	// PrimaryAddrs is the ordered candidate set of primary cluster gRPC
+	// addresses used for reconnect/failover without a load balancer.
+	PrimaryAddrs []string `json:"primary_addrs,omitempty"`
 
 	// PrimaryAPIAddr is the primary's HTTP API address (for the
 	// secondary to register its cert before mTLS connection).
@@ -165,6 +173,41 @@ const (
 	DRRelationshipStateActive     DRRelationshipState = "active"
 	DRRelationshipStateRevoked    DRRelationshipState = "revoked"
 )
+
+func normalizePrimaryAddr(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return ""
+	}
+	if strings.HasPrefix(addr, "http://") {
+		addr = "https://" + strings.TrimPrefix(addr, "http://")
+	}
+	if !strings.HasPrefix(addr, "https://") {
+		addr = "https://" + addr
+	}
+	return addr
+}
+
+func normalizePrimaryAddrs(primaryAddrs []string) []string {
+	out := make([]string, 0, len(primaryAddrs))
+	seen := make(map[string]struct{}, len(primaryAddrs))
+	add := func(addr string) {
+		addr = normalizePrimaryAddr(addr)
+		if addr == "" {
+			return
+		}
+		if _, ok := seen[addr]; ok {
+			return
+		}
+		seen[addr] = struct{}{}
+		out = append(out, addr)
+	}
+
+	for _, addr := range primaryAddrs {
+		add(addr)
+	}
+	return out
+}
 
 type DRRelationship struct {
 	RelationshipID string              `json:"relationship_id"`
@@ -444,7 +487,7 @@ func (m *drRelationshipManager) LoadConfig(ctx context.Context) error {
 
 		// Proactively warm the checkpoint index in the background so the
 		// first RequestCheckpoint does not pay the full-scan cost.
-		m.primary.WarmIndex(m.core.activeContext)
+		m.primary.WarmIndex(m.core.activeContext.Load())
 
 		// Re-register the cluster handler with a CA-signed leaf cert.
 		m.handler = newDRReplicationClusterHandler(m.core, m.primary, m.logger)
@@ -464,9 +507,17 @@ func (m *drRelationshipManager) LoadConfig(ctx context.Context) error {
 		m.core.replicationState.Store(uint32(consts.ReplicationDRPrimary))
 
 	case DRModeSecondary:
+		normalizedPrimaryAddrs := normalizePrimaryAddrs(config.PrimaryAddrs)
+		if len(normalizedPrimaryAddrs) == 0 {
+			return fmt.Errorf("invalid DR secondary config: missing primary_addrs")
+		}
+		config.PrimaryAddrs = normalizedPrimaryAddrs
+		config.PrimaryAddr = normalizedPrimaryAddrs[0]
+
 		m.logger.Info("restoring DR secondary mode from config",
 			"cluster_id", config.ClusterID,
-			"primary_addr", config.PrimaryAddr)
+			"primary_addr", config.PrimaryAddr,
+			"primary_addrs", config.PrimaryAddrs)
 
 		if config.RelationshipID == "" {
 			return fmt.Errorf("invalid DR secondary config: missing relationship_id")
@@ -487,7 +538,7 @@ func (m *drRelationshipManager) LoadConfig(ctx context.Context) error {
 
 		m.core.replicationState.Store(uint32(consts.ReplicationDRSecondary))
 
-		if config.PrimaryAddr != "" {
+		if len(config.PrimaryAddrs) > 0 {
 			m.startSecondaryControllerLocked()
 		}
 	}
@@ -513,6 +564,15 @@ func (m *drRelationshipManager) Teardown() {
 	if m.secondaryLoopCancel != nil {
 		m.secondaryLoopCancel()
 		m.secondaryLoopCancel = nil
+	}
+
+	// Mirror DisablePrimary teardown behavior on stepdown so this node stops
+	// active-only primary processing when no longer leader.
+	if m.dispatcher != nil {
+		m.dispatcher.clearPrimary()
+	}
+	if m.primary != nil && m.primary.tombstoneGC != nil {
+		m.primary.tombstoneGC.Stop()
 	}
 
 	m.primary = nil
@@ -543,6 +603,60 @@ func (m *drRelationshipManager) saveConfig(ctx context.Context) error {
 	return m.core.barrier.Put(ctx, entry)
 }
 
+// PersistConfigSnapshot re-persist the in-memory DR configuration.
+// This is used by DR secondary bootstrap after root-key swap/purge to ensure
+// the persisted config is encrypted under the current barrier key.
+func (m *drRelationshipManager) PersistConfigSnapshot(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.config == nil {
+		return fmt.Errorf("DR config not initialized")
+	}
+
+	return m.saveConfig(ctx)
+}
+
+// RefreshConfigFromStorage reloads the persisted DR config into in-memory
+// manager state without changing runtime primary/secondary processes.
+// It is used by standby invalidation handling to pick up mode transitions
+// promptly during DR bootstrap key swaps.
+func (m *drRelationshipManager) RefreshConfigFromStorage(ctx context.Context) (DRMode, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entry, err := m.core.barrier.Get(ctx, drConfigPath)
+	if err != nil {
+		return m.config.Mode, fmt.Errorf("failed to read DR config: %w", err)
+	}
+	if entry == nil {
+		m.config = &DRConfig{Mode: DRModeDisabled}
+		return DRModeDisabled, nil
+	}
+
+	var config DRConfig
+	if err := json.Unmarshal(entry.Value, &config); err != nil {
+		return m.config.Mode, fmt.Errorf("failed to unmarshal DR config: %w", err)
+	}
+	applyDRConfigDefaults(&config)
+
+	if config.Mode == DRModeSecondary {
+		normalized := normalizePrimaryAddrs(config.PrimaryAddrs)
+		if len(normalized) == 0 && config.PrimaryAddr != "" {
+			normalized = normalizePrimaryAddrs([]string{config.PrimaryAddr})
+		}
+		config.PrimaryAddrs = normalized
+		if len(config.PrimaryAddrs) > 0 {
+			config.PrimaryAddr = config.PrimaryAddrs[0]
+		} else {
+			config.PrimaryAddr = ""
+		}
+	}
+
+	m.config = &config
+	return config.Mode, nil
+}
+
 // EnablePrimary enables DR primary mode on this cluster.
 func (m *drRelationshipManager) EnablePrimary(ctx context.Context) error {
 	m.mu.Lock()
@@ -563,7 +677,7 @@ func (m *drRelationshipManager) EnablePrimary(ctx context.Context) error {
 	}
 
 	oldConfig := m.config
-	m.config = &DRConfig{
+	newConfig := &DRConfig{
 		Mode:      DRModePrimary,
 		ClusterID: clusterID,
 		ReplSalt:  replSalt,
@@ -586,27 +700,26 @@ func (m *drRelationshipManager) EnablePrimary(ctx context.Context) error {
 		DRBackpressureCriticalMinQPS:        drBackpressureDefaultCriticalMinQPS,
 	}
 
-	if err := m.saveConfig(ctx); err != nil {
-		m.config = oldConfig
-		return err
-	}
-
 	// Generate or load the DR transport CA. This CA signs per-leader
 	// certificates and is embedded in activation tokens as the sole
 	// trust anchor for cross-cluster mTLS.
 	transportCA, err := loadDRTransportCA(m.core)
 	if err != nil {
-		m.config = oldConfig
 		return fmt.Errorf("failed to load DR transport CA: %w", err)
 	}
 	if transportCA == nil {
 		transportCA, err = generateDRTransportCA(m.core)
 		if err != nil {
-			m.config = oldConfig
 			return fmt.Errorf("failed to generate DR transport CA: %w", err)
 		}
 		m.logger.Info("generated new DR transport CA",
 			"spki_hash", transportCA.spkiHash())
+	}
+
+	m.config = newConfig
+	if err := m.saveConfig(ctx); err != nil {
+		m.config = oldConfig
+		return err
 	}
 	m.transportCA = transportCA
 
@@ -698,6 +811,11 @@ func (m *drRelationshipManager) EnableSecondary(ctx context.Context, token *DRAc
 	if token.RelationshipID == "" {
 		return fmt.Errorf("activation token missing relationship_id")
 	}
+	normalizedPrimaryAddrs := normalizePrimaryAddrs(token.PrimaryAddrs)
+	if len(normalizedPrimaryAddrs) == 0 {
+		return fmt.Errorf("activation token missing primary_addrs")
+	}
+	primaryAddr := normalizedPrimaryAddrs[0]
 
 	oldConfig := m.config
 	m.config = &DRConfig{
@@ -705,7 +823,8 @@ func (m *drRelationshipManager) EnableSecondary(ctx context.Context, token *DRAc
 		ClusterID:      token.ClusterID,
 		RelationshipID: token.RelationshipID,
 		ReplSalt:       token.ReplSalt,
-		PrimaryAddr:    token.PrimaryAddr,
+		PrimaryAddr:    primaryAddr,
+		PrimaryAddrs:   normalizedPrimaryAddrs,
 		PrimaryCACert:  token.DRTransportCACert,
 
 		FallbackEnabled:          drDefaultFallbackEnabled,
@@ -749,7 +868,8 @@ func (m *drRelationshipManager) EnableSecondary(ctx context.Context, token *DRAc
 
 	m.logger.Info("DR secondary mode enabled",
 		"cluster_id", token.ClusterID,
-		"primary_addr", token.PrimaryAddr)
+		"primary_addr", primaryAddr,
+		"primary_addrs", normalizedPrimaryAddrs)
 	return nil
 }
 
@@ -830,18 +950,12 @@ var drSecondaryAllowedPaths = []string{
 	"sys/step-down",
 }
 
-// isDRSecondaryAllowedPath returns true if the given request path is
-// allowed to perform write operations on a DR secondary. Uses suffix
-// matching so that namespace-prefixed paths (e.g. "ns1/sys/seal") are
-// also correctly matched.
+// isDRSecondaryAllowedPath returns true if the given canonical request path
+// is allowed to perform write operations on a DR secondary.
 func isDRSecondaryAllowedPath(path string) bool {
+	path = strings.Trim(path, "/")
 	for _, allowed := range drSecondaryAllowedPaths {
 		if path == allowed {
-			return true
-		}
-		// Namespace-aware: check if path ends with "/"+allowed
-		// (e.g. "ns1/sys/replication/dr/secondary/promote")
-		if strings.HasSuffix(path, "/"+allowed) {
 			return true
 		}
 	}

@@ -627,6 +627,23 @@ func (c *Core) switchedLockHandleRequest(httpCtx context.Context, req *logical.R
 		}
 	}
 
+	// DR secondary read-only enforcement: reject write requests except
+	// for DR status and promote endpoints.
+	//
+	// This check must run after namespace resolution so req.Path is in
+	// canonical routed form (without namespace path segments).
+	if c.drManager != nil && c.drManager.Mode() == DRModeSecondary {
+		if req.Operation == logical.UpdateOperation ||
+			req.Operation == logical.CreateOperation ||
+			req.Operation == logical.DeleteOperation ||
+			req.Operation == logical.PatchOperation {
+			// Allow DR-specific operations through.
+			if !isDRSecondaryAllowedPath(req.Path) {
+				return logical.ErrorResponse("request denied on DR secondary: this cluster is in read-only mode"), logical.ErrReadOnly
+			}
+		}
+	}
+
 	if ns.ID != namespace.RootNamespaceID {
 		// verify whether the namespace is either directly or inherently locked
 		lockedNS := c.namespaceStore.GetLockingNamespace(ns)

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/go-uuid"
+	hashiraft "github.com/hashicorp/raft"
 	"github.com/openbao/openbao/sdk/v2/logical"
 )
 
@@ -74,12 +75,40 @@ func (m *drRelationshipManager) GenerateActivationToken(ctx context.Context) (*D
 	}
 
 	// Get the cluster address for the primary.
-	clusterAddr := m.core.ClusterAddr()
+	clusterAddr := normalizePrimaryAddr(m.core.ClusterAddr())
+	primaryAddrs := normalizePrimaryAddrs([]string{clusterAddr})
+
+	// Add voter peer addresses from the raft configuration when available.
+	if rb := m.core.GetRaftBackend(); rb != nil {
+		peers, peersErr := rb.Peers(ctx)
+		if peersErr != nil {
+			m.logger.Warn("failed to enumerate raft peers for DR token", "error", peersErr)
+		} else {
+			peerAddrs := make([]string, 0, len(peers)+1)
+			peerAddrs = append(peerAddrs, clusterAddr)
+			for _, peer := range peers {
+				if peer.Suffrage != int(hashiraft.Voter) {
+					continue
+				}
+				peerAddrs = append(peerAddrs, peer.Address)
+			}
+			primaryAddrs = normalizePrimaryAddrs(peerAddrs)
+		}
+	}
+
+	if len(primaryAddrs) == 0 && clusterAddr != "" {
+		primaryAddrs = []string{clusterAddr}
+	}
+	primaryAddr := ""
+	if len(primaryAddrs) > 0 {
+		primaryAddr = primaryAddrs[0]
+	}
 
 	token := &DRActivationToken{
 		ClusterID:      m.config.ClusterID,
 		RelationshipID: relationshipID,
-		PrimaryAddr:    clusterAddr,
+		PrimaryAddr:    primaryAddr,
+		PrimaryAddrs:   primaryAddrs,
 		PrimaryAPIAddr: m.core.redirectAddr,
 		ReplSalt:       m.config.ReplSalt,
 		BootstrapToken: bootstrapToken,

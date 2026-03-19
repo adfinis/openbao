@@ -98,11 +98,11 @@ func (s *drReplicationSecondary) persistCheckpointHighWaterMark(index uint64) er
 		Key:   drCheckpointHWMPath,
 		Value: []byte(data),
 	}
-	return s.core.barrier.Put(s.core.activeContext, entry)
+	return s.core.barrier.Put(s.core.activeContext.Load(), entry)
 }
 
 func (s *drReplicationSecondary) loadCheckpointHighWaterMark() {
-	entry, err := s.core.barrier.Get(s.core.activeContext, drCheckpointHWMPath)
+	entry, err := s.core.barrier.Get(s.core.activeContext.Load(), drCheckpointHWMPath)
 	if err != nil || entry == nil {
 		return
 	}

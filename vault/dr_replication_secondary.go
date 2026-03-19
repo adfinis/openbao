@@ -114,18 +114,26 @@ func isDRReconcileExcludedPath(path string) bool {
 }
 
 func drPathMatches(path string, exact map[string]bool, prefixes []string) bool {
-	path = strings.TrimPrefix(path, "/")
-	if exact[path] {
-		return true
+	normalized := strings.Trim(path, "/")
+	if normalized == "" {
+		return false
 	}
-	for p := range exact {
-		if strings.HasSuffix(path, "/"+p) {
-			return true
+
+	candidates := []string{normalized}
+	if keySuffix, ok := strings.CutPrefix(normalized, namespaceBarrierPrefix); ok {
+		if namespaceUUID, namespacedKey, found := strings.Cut(keySuffix, "/"); found && namespaceUUID != "" && namespacedKey != "" {
+			candidates = append(candidates, namespacedKey)
 		}
 	}
-	for _, prefix := range prefixes {
-		if strings.HasPrefix(path, prefix) || strings.Contains(path, "/"+prefix) {
+
+	for _, candidate := range candidates {
+		if exact[candidate] {
 			return true
+		}
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(candidate, prefix) {
+				return true
+			}
 		}
 	}
 	return false
@@ -142,6 +150,33 @@ func isReconciliationRequired(err error) bool {
 	return strings.Contains(msg, "reconciliation required") ||
 		strings.Contains(msg, "buffer too old") ||
 		strings.Contains(msg, "journal too old")
+}
+
+// isDRTransportReconnectError returns true for transport-level RPC failures
+// where the secondary should hand control back to the controller loop to
+// reconnect, rather than retrying reconciliation in-place.
+func isDRTransportReconnectError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// If this is already a structured redirect, let redirect handling take over.
+	if _, ok := extractDRRedirect(err); ok {
+		return false
+	}
+
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "unsupported protocol") ||
+		strings.Contains(msg, "authentication handshake failed") {
+		return true
+	}
+
+	return strings.Contains(msg, "code = unavailable") &&
+		(strings.Contains(msg, "connection error") ||
+			strings.Contains(msg, "error while dialing") ||
+			strings.Contains(msg, "tls: internal error") ||
+			strings.Contains(msg, "unsupported protocol") ||
+			strings.Contains(msg, "authentication handshake failed"))
 }
 
 // DRSecondaryState represents the current state of the DR secondary.
@@ -536,7 +571,8 @@ func (s *drReplicationSecondary) Connect(ctx context.Context, primaryAddr string
 	cl.AddClient(consts.DRReplicationALPN, client)
 
 	dialerFunc := cl.GetContextDialerFunc(ctx, consts.DRReplicationALPN)
-	opts = append(opts,
+	opts = append(
+		opts,
 		grpc.WithContextDialer(dialerFunc),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.UseCompressor("gzip")),
@@ -664,6 +700,17 @@ func (s *drReplicationSecondary) Start(ctx context.Context) error {
 				s.streamDisconnects.Add(1)
 				metrics.IncrCounter([]string{"replication", "dr", "secondary", "stream_disconnects"}, 1)
 
+				// Transport-level errors should be handled by the
+				// controller reconnect loop, not by local resume/reconcile
+				// retries inside this Start() invocation.
+				if isDRTransportReconnectError(err) {
+					if hint := s.lastKnownLeaderAddr.Load(); hint != nil && *hint != "" {
+						s.logger.Info("stream transport error; reconnecting via leader hint", "addr", *hint)
+						return &errDRRedirect{LeaderAddr: *hint}
+					}
+					return fmt.Errorf("stream transport failure, reconnecting: %w", err)
+				}
+
 				// Redirect: must reconnect via controller to reach the new leader.
 				if addr, ok := extractDRRedirect(err); ok {
 					s.logger.Info("stream returned redirect to new leader", "addr", addr)
@@ -712,6 +759,18 @@ func (s *drReplicationSecondary) Start(ctx context.Context) error {
 			}
 			if err := s.runReconciliation(ctx); err != nil {
 				s.logger.Error("reconciliation failed", "error", err)
+
+				// Transport-level errors should immediately return to the
+				// controller reconnect loop; retrying reconciliation in
+				// place can cause a tight reconciling loop after stepdown.
+				if isDRTransportReconnectError(err) {
+					if hint := s.lastKnownLeaderAddr.Load(); hint != nil && *hint != "" {
+						s.logger.Info("reconciliation transport error; reconnecting via leader hint", "addr", *hint)
+						return &errDRRedirect{LeaderAddr: *hint}
+					}
+					return fmt.Errorf("reconciliation transport failure, reconnecting: %w", err)
+				}
+
 				class := s.markReconcileFailure(err)
 
 				// If the reconciler hit a standby (redirect), abort
@@ -766,6 +825,15 @@ func (s *drReplicationSecondary) Start(ctx context.Context) error {
 			}
 			if err := s.performResnapshot(ctx, reason); err != nil {
 				s.logger.Error("resnapshot fallback failed", "error", err)
+
+				if isDRTransportReconnectError(err) {
+					if hint := s.lastKnownLeaderAddr.Load(); hint != nil && *hint != "" {
+						s.logger.Info("resnapshot transport error; reconnecting via leader hint", "addr", *hint)
+						return &errDRRedirect{LeaderAddr: *hint}
+					}
+					return fmt.Errorf("resnapshot transport failure, reconnecting: %w", err)
+				}
+
 				class := s.markReconcileFailure(err)
 
 				// Redirect during resnapshot -- return to controller.
@@ -914,7 +982,7 @@ func (s *drReplicationSecondary) Promote() error {
 	// Force-recreate the keyring: delete the orphaned entry and
 	// generate a fresh one encrypted with the current (primary's)
 	// barrier key, then apply it to the running Raft backend.
-	if s.core.getRaftBackend() != nil {
+	if s.core.GetRaftBackend() != nil {
 		if _, err := s.core.raftForceRecreateTLSKeyring(ctx); err != nil {
 			s.logger.Error("failed to regenerate raft TLS keyring during promotion", "error", err)
 			return fmt.Errorf("failed to regenerate raft TLS keyring: %w", err)
@@ -951,7 +1019,7 @@ func (s *drReplicationSecondary) reloadCoreState(ctx context.Context) error {
 	// Load the primary's mount table from storage. This replaces the
 	// in-memory mount table but doesn't touch the router or backends.
 	s.logger.Info("reloading mount table from storage")
-	if err := s.core.loadMounts(ctx); err != nil {
+	if err := s.core.loadMounts(ctx, false); err != nil {
 		return fmt.Errorf("failed to reload mounts: %w", err)
 	}
 
@@ -964,7 +1032,7 @@ func (s *drReplicationSecondary) reloadCoreState(ctx context.Context) error {
 
 	// Reload auth backends from storage.
 	s.logger.Info("reloading auth backends from storage")
-	if err := s.core.loadCredentials(ctx); err != nil {
+	if err := s.core.loadCredentials(ctx, false); err != nil {
 		return fmt.Errorf("failed to reload credentials: %w", err)
 	}
 
@@ -982,7 +1050,7 @@ func (s *drReplicationSecondary) mountNewEntries(ctx context.Context) error {
 
 	for _, entry := range s.core.mounts.Entries {
 		// Check if this mount is already in the router.
-		nsCtx := namespace.ContextWithNamespace(ctx, entry.namespace)
+		nsCtx := namespace.ContextWithNamespace(ctx, entry.Namespace)
 		if s.core.router.MatchingMount(nsCtx, entry.Path) != "" {
 			continue
 		}
@@ -1902,8 +1970,25 @@ func (s *drReplicationSecondary) bootstrapKeyring(ctx context.Context) error {
 		}
 	}
 	unwrapSecondaryFP := ""
+	if s.drClusterClient != nil {
+		// Use the exact client certificate fingerprint selected during the
+		// mTLS handshake for this connection. This must match the fingerprint
+		// observed by the primary when building wrap AAD.
+		unwrapSecondaryFP = s.drClusterClient.LastClientCertFingerprint()
+	}
 	if localCert := s.core.localClusterParsedCert.Load(); localCert != nil {
-		unwrapSecondaryFP = certFingerprintSHA256(localCert)
+		if unwrapSecondaryFP == "" {
+			unwrapSecondaryFP = certFingerprintSHA256(localCert)
+		}
+	}
+	if unwrapClusterID == "" {
+		return fmt.Errorf("DR cluster ID unavailable for key unwrap")
+	}
+	if unwrapPrimaryIdentity == "" {
+		return fmt.Errorf("primary DR transport CA identity unavailable for key unwrap")
+	}
+	if unwrapSecondaryFP == "" {
+		return fmt.Errorf("secondary certificate fingerprint unavailable for key unwrap")
 	}
 
 	rootKey, err := unwrapRootKeyFromPrimary(
@@ -1981,6 +2066,20 @@ func (s *drReplicationSecondary) bootstrapKeyring(ctx context.Context) error {
 	if err := s.purgeStaleBarrierEntries(ctx); err != nil {
 		return fmt.Errorf("failed to purge stale entries: %w", err)
 	}
+	if mgr := s.core.drManager; mgr != nil {
+		if err := mgr.PersistConfigSnapshot(ctx); err != nil {
+			return fmt.Errorf("failed to repersist DR config after bootstrap purge: %w", err)
+		}
+	} else {
+		return fmt.Errorf("failed to repersist DR config after bootstrap purge: DR manager unavailable")
+	}
+	if err := s.core.ensureRaftTLSKeyringForDRSecondary(ctx); err != nil {
+		return fmt.Errorf("failed to ensure raft TLS keyring after bootstrap purge: %w", err)
+	}
+	generation, _ := s.core.beginDRKeyTransition("dr secondary bootstrap key transition")
+	if s.core.invalidations != nil {
+		s.core.invalidations.ensureDRKeyTransitionWorker(generation)
+	}
 
 	s.keyringBootstrapped.Store(true)
 	s.logger.Info("keyring bootstrap complete")
@@ -1996,6 +2095,9 @@ var drBootstrapPreservePaths = map[string]bool{
 	"core/root-key":                true, // replaced with primary's during bootstrap
 	"core/hsm/barrier-unseal-keys": true, // encrypted by local seal, just updated
 	"core/seal-config":             true, // unencrypted local seal config
+	"core/recovery-config":         true, // local auto-unseal recovery config
+	"core/recovery-key":            true, // local auto-unseal recovery key material
+	"core/cluster/local/info":      true, // local cluster metadata for status APIs
 }
 
 // purgeStaleBarrierEntries removes all entries from physical storage

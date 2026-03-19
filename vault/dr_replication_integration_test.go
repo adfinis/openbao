@@ -22,6 +22,7 @@ import (
 	"time"
 
 	log "github.com/hashicorp/go-hclog"
+	"github.com/openbao/openbao/helper/namespace"
 	"github.com/openbao/openbao/physical/replication/reconciler"
 	"github.com/openbao/openbao/sdk/v2/logical"
 	"github.com/openbao/openbao/sdk/v2/physical"
@@ -328,6 +329,8 @@ func TestDRIntegration_ReadOnlyEnforcement(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	ctx := context.Background()
 
+	TestCoreCreateNamespaces(t, core, &namespace.Namespace{Path: "ns1/"})
+
 	mgr := newDRRelationshipManager(core, core.logger)
 	core.drManager = mgr
 
@@ -335,6 +338,7 @@ func TestDRIntegration_ReadOnlyEnforcement(t *testing.T) {
 		ClusterID:      "test-ro",
 		RelationshipID: "rel-read-only",
 		PrimaryAddr:    "127.0.0.1:8201",
+		PrimaryAddrs:   []string{"127.0.0.1:8201"},
 		ReplSalt:       make([]byte, 32),
 	}
 	rand.Read(token.ReplSalt)
@@ -353,6 +357,16 @@ func TestDRIntegration_ReadOnlyEnforcement(t *testing.T) {
 		t.Fatalf("expected ErrReadOnly, got: %v", err)
 	}
 
+	// Verify suffix/substring lookalike paths are still blocked.
+	suffixBypassReq := &logical.Request{
+		Operation: logical.UpdateOperation,
+		Path:      "secret/data/foo/sys/seal",
+	}
+	_, err = core.switchedLockHandleRequest(ctx, suffixBypassReq, false)
+	if err != logical.ErrReadOnly {
+		t.Fatalf("expected ErrReadOnly for suffix lookalike path, got: %v", err)
+	}
+
 	// Verify that DR promote path is allowed.
 	promoteReq := &logical.Request{
 		Operation: logical.UpdateOperation,
@@ -363,6 +377,18 @@ func TestDRIntegration_ReadOnlyEnforcement(t *testing.T) {
 	// like missing context, but not read-only).
 	if err == logical.ErrReadOnly {
 		t.Fatal("promote path should not be blocked by read-only enforcement")
+	}
+
+	// Verify that namespace-routed promote path is evaluated using the
+	// canonical routed path and not rejected as read-only.
+	namespacedPromoteReq := &logical.Request{
+		Operation: logical.UpdateOperation,
+		Path:      "sys/replication/dr/secondary/promote",
+	}
+	nsCtx := namespace.ContextWithNamespaceHeader(ctx, "ns1")
+	_, err = core.switchedLockHandleRequest(nsCtx, namespacedPromoteReq, false)
+	if err == logical.ErrReadOnly {
+		t.Fatal("namespace-routed promote path should not be blocked by read-only enforcement")
 	}
 
 	// Verify read operations are allowed.
@@ -398,6 +424,9 @@ func TestDRIntegration_GapDetection(t *testing.T) {
 	}
 	if isDRSecondaryAllowedPath("sys/mounts") {
 		t.Error("sys/mounts should not be allowed")
+	}
+	if isDRSecondaryAllowedPath("ns1/sys/replication/dr/secondary/promote") {
+		t.Error("namespace-prefixed paths should not be allowed without namespace resolution")
 	}
 }
 
@@ -535,12 +564,13 @@ func TestDRIntegration_NamespacePathMatching(t *testing.T) {
 		t.Error("secret paths should not be allowed")
 	}
 
-	// Namespace-prefixed paths.
-	if !isDRSecondaryAllowedPath("ns1/sys/replication/dr/secondary/promote") {
-		t.Error("namespace-prefixed promote should be allowed")
+	// Namespace-prefixed paths are expected to be rejected at this helper
+	// layer; request handling resolves namespace and trims req.Path first.
+	if isDRSecondaryAllowedPath("ns1/sys/replication/dr/secondary/promote") {
+		t.Error("namespace-prefixed promote should not be directly allowed")
 	}
-	if !isDRSecondaryAllowedPath("org/team/sys/seal") {
-		t.Error("deeply nested namespace seal should be allowed")
+	if isDRSecondaryAllowedPath("org/team/sys/seal") {
+		t.Error("deeply nested namespace seal should not be directly allowed")
 	}
 	if isDRSecondaryAllowedPath("ns1/secret/data/test") {
 		t.Error("namespace-prefixed secret paths should not be allowed")
@@ -560,6 +590,7 @@ func TestDRIntegration_TokenParsingValidation(t *testing.T) {
 	token := &DRActivationToken{
 		RelationshipID: "rel-missing-cluster",
 		PrimaryAddr:    "127.0.0.1:8201",
+		PrimaryAddrs:   []string{"127.0.0.1:8201"},
 		ReplSalt:       make([]byte, 32),
 	}
 	if token.ClusterID != "" {
@@ -571,6 +602,7 @@ func TestDRIntegration_TokenParsingValidation(t *testing.T) {
 		ClusterID:      "test-cluster",
 		RelationshipID: "rel-valid-token",
 		PrimaryAddr:    "127.0.0.1:8201",
+		PrimaryAddrs:   []string{"127.0.0.1:8201"},
 		ReplSalt:       make([]byte, 32),
 	}
 	rand.Read(validToken.ReplSalt)
@@ -769,6 +801,7 @@ func TestDRIntegration_LoadConfigRestoresSecondary(t *testing.T) {
 		RelationshipID: "rel-restored",
 		ReplSalt:       replSalt,
 		PrimaryAddr:    "127.0.0.1:8201",
+		PrimaryAddrs:   []string{"127.0.0.1:8201"},
 	}
 	data, _ := json.Marshal(config)
 	core.barrier.Put(ctx, &logical.StorageEntry{
@@ -787,8 +820,8 @@ func TestDRIntegration_LoadConfigRestoresSecondary(t *testing.T) {
 	if mgr.Secondary() == nil {
 		t.Fatal("expected secondary to be created")
 	}
-	if mgr.Config().PrimaryAddr != "127.0.0.1:8201" {
-		t.Fatalf("expected primary addr 127.0.0.1:8201, got %s", mgr.Config().PrimaryAddr)
+	if mgr.Config().PrimaryAddr != "https://127.0.0.1:8201" {
+		t.Fatalf("expected primary addr https://127.0.0.1:8201, got %s", mgr.Config().PrimaryAddr)
 	}
 }
 
@@ -823,6 +856,7 @@ func TestDRIntegration_DisableCleanup(t *testing.T) {
 		ClusterID:      "cleanup-test",
 		RelationshipID: "rel-cleanup",
 		PrimaryAddr:    "127.0.0.1:9999",
+		PrimaryAddrs:   []string{"127.0.0.1:9999"},
 		ReplSalt:       make([]byte, 32),
 	}
 	rand.Read(token.ReplSalt)
@@ -1632,6 +1666,7 @@ func TestDRIntegration_PathExclusions(t *testing.T) {
 	// Reconcile-only exclusions: excluded from scanner but not from stream.
 	reconcileOnlyPaths := []string{
 		"core/keyring",
+		"namespaces/00000000-0000-0000-0000-000000000000/core/keyring",
 	}
 	for _, p := range reconcileOnlyPaths {
 		if isDRNeverReplicatePath(p) {
@@ -1648,6 +1683,10 @@ func TestDRIntegration_PathExclusions(t *testing.T) {
 		"core/mounts",
 		"sys/policy/default",
 		"core/root-key",
+		"logical/secret/core/raft/foo",
+		"logical/secret/team/core/keyring",
+		"logical/secret/team/core/dr-replication/config",
+		"logical/secret/team/namespaces/00000000-0000-0000-0000-000000000000/core/local-mounts/abc",
 	}
 	for _, p := range normalPaths {
 		if isDRNeverReplicatePath(p) {
@@ -1829,7 +1868,7 @@ func TestDRIntegration_RootKeyRotationHandling(t *testing.T) {
 
 	// Now simulate a keyring rotation on the primary.
 	// Rotate adds a new term key to the keyring.
-	newTerm, err := primary.barrier.Rotate(ctx, rand.Reader)
+	newTerm, err := primary.barrier.Rotate(ctx)
 	if err != nil {
 		t.Fatalf("primary keyring rotation failed: %v", err)
 	}

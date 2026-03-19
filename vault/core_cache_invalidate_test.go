@@ -99,6 +99,200 @@ func testCore_Invalidate_handleRequest(t require.TestingT, ctx context.Context, 
 	return resp
 }
 
+func TestInvalidation_TransientDecryptFailureClassifier(t *testing.T) {
+	t.Parallel()
+
+	require.False(t, isTransientBarrierDecryptFailure(nil))
+	require.False(t, isTransientBarrierDecryptFailure(fmt.Errorf("some other error")))
+	require.True(t, isTransientBarrierDecryptFailure(fmt.Errorf("decryption failed: cipher: message authentication failed")))
+	require.True(t, isTransientBarrierDecryptFailure(fmt.Errorf("wrapped decrypt error: %w", fmt.Errorf("cipher: message authentication failed"))))
+
+	require.True(t, isReadOnlyStorageError(logical.ErrReadOnly))
+	require.True(t, isReadOnlyStorageError(fmt.Errorf("wrapped: %w", logical.ErrReadOnly)))
+
+	require.True(t, isTransitionTransientInvalidationError(fmt.Errorf("wrapped audit load failure: %w", errLoadAuditFailed), true))
+	require.False(t, isTransitionTransientInvalidationError(fmt.Errorf("wrapped audit load failure: %w", errLoadAuditFailed), false))
+	require.True(t, isTransitionTransientInvalidationError(logical.ErrReadOnly, true))
+	require.False(t, isTransitionTransientInvalidationError(logical.ErrReadOnly, false))
+}
+
+func TestInvalidation_DRDecryptFailure_DefersDuringTransition(t *testing.T) {
+	t.Parallel()
+
+	core := &Core{logger: logger}
+	core.drManager = &drRelationshipManager{
+		core:   core,
+		logger: logger,
+		config: &DRConfig{Mode: DRModeSecondary},
+	}
+	ij := &invalidationJob{
+		im: &invalidationManager{
+			core:            core,
+			dispacherLogger: logger,
+		},
+		key: "core/mounts/test",
+	}
+
+	calls := 0
+	err := ij.executePotentiallyFatalInvalidation(context.Background(), "transactional_mount", func(context.Context) error {
+		calls++
+		return fmt.Errorf("unable to invalidate mount: decryption failed: cipher: message authentication failed")
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, 1, calls)
+	require.False(t, ij.fatal, "transient decrypt mismatch should be deferred in DR secondary")
+	require.True(t, core.isDRKeyTransitionActive())
+
+	core.drSecondaryKeyTransition.mu.Lock()
+	generation := core.drSecondaryKeyTransition.generation
+	core.drSecondaryKeyTransition.mu.Unlock()
+	keys, ok := core.snapshotDeferredInvalidations(generation)
+	require.True(t, ok)
+	require.Equal(t, []string{"core/mounts/test"}, keys)
+}
+
+func TestInvalidation_DRAuditLoadError_DefersWhileTransitionActive(t *testing.T) {
+	t.Parallel()
+
+	core := &Core{logger: logger}
+	core.drManager = &drRelationshipManager{
+		core:   core,
+		logger: logger,
+		config: &DRConfig{Mode: DRModeSecondary},
+	}
+	_, started := core.beginDRKeyTransition("unit test")
+	require.True(t, started)
+
+	ij := &invalidationJob{
+		im: &invalidationManager{
+			core:            core,
+			dispacherLogger: logger,
+		},
+		key: "core/audit",
+	}
+
+	err := ij.executePotentiallyFatalInvalidation(context.Background(), "audit", func(context.Context) error {
+		return fmt.Errorf("wrapped audit error: %w", errLoadAuditFailed)
+	})
+
+	require.NoError(t, err)
+	require.False(t, ij.fatal)
+}
+
+func TestInvalidation_DRConfigInvalidation_RefreshesRuntimeMode(t *testing.T) {
+	t.Parallel()
+
+	core, _, _ := TestCoreUnsealed(t)
+	mgr := core.drManager
+	require.NotNil(t, mgr)
+
+	mgr.mu.Lock()
+	mgr.config = &DRConfig{Mode: DRModeDisabled}
+	mgr.mu.Unlock()
+
+	cfg := &DRConfig{
+		Mode:           DRModeSecondary,
+		ClusterID:      "cluster-1",
+		RelationshipID: "rel-1",
+		ReplSalt:       []byte{1, 2, 3, 4},
+		PrimaryAddrs:   []string{"https://rws-bao-01:8201"},
+	}
+	entry, err := logical.StorageEntryJSON(drConfigPath, cfg)
+	require.NoError(t, err)
+	require.NoError(t, core.barrier.Put(context.Background(), entry))
+
+	ij := &invalidationJob{
+		im: &invalidationManager{
+			core:            core,
+			dispacherLogger: logger,
+		},
+		key:   drConfigPath,
+		nsKey: drConfigPath,
+	}
+
+	require.NoError(t, ij.drConfigInvalidation(context.Background()))
+	require.Equal(t, DRModeSecondary, core.drManager.Mode())
+	require.True(t, core.isDRKeyTransitionActive())
+}
+
+func TestInvalidation_DRTransitionQueueOverflow_IsFatal(t *testing.T) {
+	t.Parallel()
+
+	core := &Core{logger: logger}
+	core.drManager = &drRelationshipManager{
+		core:   core,
+		logger: logger,
+		config: &DRConfig{Mode: DRModeSecondary},
+	}
+	generation, started := core.beginDRKeyTransition("overflow test")
+	require.True(t, started)
+
+	core.drSecondaryKeyTransition.mu.Lock()
+	core.drSecondaryKeyTransition.deferredSet = make(map[string]struct{}, drKeyTransitionDeferredKeyCap)
+	core.drSecondaryKeyTransition.deferredKeys = make([]string, drKeyTransitionDeferredKeyCap)
+	for i := 0; i < drKeyTransitionDeferredKeyCap; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		core.drSecondaryKeyTransition.deferredKeys[i] = key
+		core.drSecondaryKeyTransition.deferredSet[key] = struct{}{}
+	}
+	core.drSecondaryKeyTransition.generation = generation
+	core.drSecondaryKeyTransition.mu.Unlock()
+
+	ij := &invalidationJob{
+		im: &invalidationManager{
+			core:            core,
+			dispacherLogger: logger,
+		},
+		key: "core/mounts/overflow",
+	}
+
+	err := ij.deferInvalidation("overflow")
+	require.ErrorIs(t, err, errDRKeyTransitionQueueOverflow)
+	require.True(t, ij.fatal)
+}
+
+func TestInvalidation_DRDecryptRetry_FatalOnNonDecryptFailure(t *testing.T) {
+	t.Parallel()
+
+	core := &Core{logger: logger}
+	core.drManager = &drRelationshipManager{
+		core:   core,
+		logger: logger,
+		config: &DRConfig{Mode: DRModeSecondary},
+	}
+	ij := &invalidationJob{
+		im: &invalidationManager{
+			core:            core,
+			dispacherLogger: logger,
+		},
+		key: "core/mounts/test",
+	}
+
+	err := ij.executePotentiallyFatalInvalidation(context.Background(), "transactional_mount", func(context.Context) error {
+		return fmt.Errorf("boom")
+	})
+
+	require.Error(t, err)
+	require.True(t, ij.fatal, "non-decrypt failures should remain fatal")
+}
+
+func TestInvalidation_DRStoredKeyRecoveryPath(t *testing.T) {
+	t.Parallel()
+
+	core, _, _ := TestCoreUnsealed(t)
+
+	keyring, err := core.barrier.Keyring()
+	require.NoError(t, err)
+	require.NoError(t, core.seal.SetStoredKeys(context.Background(), [][]byte{keyring.RootKey()}))
+
+	im := &invalidationManager{
+		core:            core,
+		dispacherLogger: logger,
+	}
+	require.NoError(t, im.recoverDRRootKeyFromStoredKeys(context.Background()))
+}
+
 func TestCore_Invalidate_Namespaces(t *testing.T) {
 	t.Parallel()
 	c, root := testCore_Invalidate_TestCore(t, nil)

@@ -9,6 +9,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
@@ -127,6 +128,52 @@ func TestDRRelationshipManager_EnablePrimary_SaveConfigFailureRollsBackState(t *
 	}
 }
 
+func TestDRRelationshipManager_EnablePrimary_TransportCAFailureDoesNotPersistPrimary(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	mgr := newDRRelationshipManager(core, core.logger)
+	ctx := context.Background()
+
+	// Persist initial disabled config to verify failed enable does not
+	// leave barrier state in primary mode.
+	if err := mgr.saveConfig(ctx); err != nil {
+		t.Fatalf("failed to persist initial config: %v", err)
+	}
+
+	// Corrupt persisted transport CA so EnablePrimary fails during CA load.
+	if err := core.barrier.Put(ctx, &logical.StorageEntry{
+		Key:   drTransportCAPath,
+		Value: []byte("invalid-ca-bundle"),
+	}); err != nil {
+		t.Fatalf("failed to seed corrupt transport CA: %v", err)
+	}
+
+	if err := mgr.EnablePrimary(ctx); err == nil {
+		t.Fatal("expected enable primary to fail with corrupted transport CA")
+	}
+	if mgr.Mode() != DRModeDisabled {
+		t.Fatalf("expected mode to remain disabled after failed enable, got %s", mgr.Mode())
+	}
+	if mgr.Primary() != nil {
+		t.Fatal("expected primary to remain nil after failed enable")
+	}
+
+	entry, err := core.barrier.Get(ctx, drConfigPath)
+	if err != nil {
+		t.Fatalf("failed to read persisted DR config: %v", err)
+	}
+	if entry == nil {
+		t.Fatal("expected persisted DR config entry")
+	}
+
+	var persisted DRConfig
+	if err := json.Unmarshal(entry.Value, &persisted); err != nil {
+		t.Fatalf("failed to decode persisted DR config: %v", err)
+	}
+	if persisted.Mode == DRModePrimary {
+		t.Fatal("failed enable left persisted DR mode as primary")
+	}
+}
+
 func TestDRRelationshipManager_EnableSecondary_SaveConfigFailureRollsBackState(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	mgr := newDRRelationshipManager(core, core.logger)
@@ -134,6 +181,8 @@ func TestDRRelationshipManager_EnableSecondary_SaveConfigFailureRollsBackState(t
 	token := &DRActivationToken{
 		ClusterID:      "cluster-1",
 		RelationshipID: "rel-1",
+		PrimaryAddr:    "127.0.0.1:8201",
+		PrimaryAddrs:   []string{"127.0.0.1:8201"},
 		ReplSalt:       make([]byte, drReplSaltLen),
 	}
 
@@ -161,6 +210,7 @@ func TestDRRelationshipManager_EnableSecondary_SaveConfigFailureRollsBackState(t
 func TestDRRelationshipManager_ActivationToken(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	ctx := context.Background()
+	core.clusterAddr.Store("https://primary.test.local:8201")
 
 	mgr := newDRRelationshipManager(core, core.logger)
 
@@ -184,6 +234,19 @@ func TestDRRelationshipManager_ActivationToken(t *testing.T) {
 	}
 	if len(token.ReplSalt) == 0 {
 		t.Fatal("expected non-empty repl salt in token")
+	}
+	if len(token.PrimaryAddrs) == 0 {
+		t.Fatal("expected non-empty primary_addrs in token")
+	}
+	primaryAddrFound := false
+	for _, addr := range token.PrimaryAddrs {
+		if addr == token.PrimaryAddr {
+			primaryAddrFound = true
+			break
+		}
+	}
+	if !primaryAddrFound {
+		t.Fatalf("expected primary_addr %q to be present in primary_addrs %v", token.PrimaryAddr, token.PrimaryAddrs)
 	}
 
 	// Token should be JSON-serializable.
@@ -375,6 +438,7 @@ func TestDRRelationshipManager_EnableDisableSecondary(t *testing.T) {
 		ClusterID:      "test-cluster-id",
 		RelationshipID: "rel-test-1",
 		PrimaryAddr:    "127.0.0.1:8201",
+		PrimaryAddrs:   []string{"127.0.0.1:8201"},
 		ReplSalt:       make([]byte, 32),
 	}
 	rand.Read(token.ReplSalt)
@@ -404,6 +468,76 @@ func TestDRRelationshipManager_EnableDisableSecondary(t *testing.T) {
 	}
 }
 
+func TestDRRelationshipManager_EnableSecondary_NormalizesPrimaryAddresses(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	mgr := newDRRelationshipManager(core, core.logger)
+
+	replSalt := make([]byte, drReplSaltLen)
+	rand.Read(replSalt)
+
+	tokenPrimaryAddrOnly := &DRActivationToken{
+		ClusterID:      "test-cluster-id",
+		RelationshipID: "rel-primary-addr-only",
+		PrimaryAddr:    "127.0.0.1:8201",
+		ReplSalt:       replSalt,
+	}
+	if err := mgr.EnableSecondary(ctx, tokenPrimaryAddrOnly); err == nil || !strings.Contains(err.Error(), "primary_addrs") {
+		t.Fatalf("expected primary_addr-only token to be rejected, got: %v", err)
+	}
+
+	tokenAddrsOnly := &DRActivationToken{
+		ClusterID:      "test-cluster-id",
+		RelationshipID: "rel-addrs-only",
+		PrimaryAddrs: []string{
+			"127.0.0.1:8201",
+			"https://127.0.0.2:8201",
+			"127.0.0.1:8201",
+		},
+		ReplSalt: replSalt,
+	}
+	if err := mgr.EnableSecondary(ctx, tokenAddrsOnly); err != nil {
+		t.Fatal(err)
+	}
+	cfg := mgr.Config()
+	if cfg.PrimaryAddr != "https://127.0.0.1:8201" {
+		t.Fatalf("unexpected normalized primary_addr: got %q", cfg.PrimaryAddr)
+	}
+	if len(cfg.PrimaryAddrs) != 2 {
+		t.Fatalf("expected 2 normalized primary_addrs, got %v", cfg.PrimaryAddrs)
+	}
+	if cfg.PrimaryAddrs[0] != "https://127.0.0.1:8201" || cfg.PrimaryAddrs[1] != "https://127.0.0.2:8201" {
+		t.Fatalf("unexpected primary_addrs ordering/content: %v", cfg.PrimaryAddrs)
+	}
+	if err := mgr.DisableSecondary(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	tokenMixed := &DRActivationToken{
+		ClusterID:      "test-cluster-id",
+		RelationshipID: "rel-mixed",
+		PrimaryAddr:    "http://127.0.0.9:8201",
+		PrimaryAddrs: []string{
+			"127.0.0.3:8201",
+			"https://127.0.0.9:8201",
+		},
+		ReplSalt: replSalt,
+	}
+	if err := mgr.EnableSecondary(ctx, tokenMixed); err != nil {
+		t.Fatal(err)
+	}
+	cfg = mgr.Config()
+	if cfg.PrimaryAddr != "https://127.0.0.3:8201" {
+		t.Fatalf("unexpected normalized primary_addr from mixed token: got %q", cfg.PrimaryAddr)
+	}
+	if len(cfg.PrimaryAddrs) != 2 {
+		t.Fatalf("expected 2 normalized primary_addrs from mixed token, got %v", cfg.PrimaryAddrs)
+	}
+	if cfg.PrimaryAddrs[0] != "https://127.0.0.3:8201" || cfg.PrimaryAddrs[1] != "https://127.0.0.9:8201" {
+		t.Fatalf("unexpected mixed primary_addrs ordering/content: %v", cfg.PrimaryAddrs)
+	}
+}
+
 func TestDRRelationshipManager_Promote(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	ctx := context.Background()
@@ -414,6 +548,7 @@ func TestDRRelationshipManager_Promote(t *testing.T) {
 		ClusterID:      "test-cluster-id",
 		RelationshipID: "rel-test-2",
 		PrimaryAddr:    "127.0.0.1:8201",
+		PrimaryAddrs:   []string{"127.0.0.1:8201"},
 		ReplSalt:       make([]byte, 32),
 	}
 	rand.Read(token.ReplSalt)
@@ -440,7 +575,7 @@ func TestDRPromote_SkipsRaftTLSKeyringWithoutRaftBackend(t *testing.T) {
 	ctx := context.Background()
 
 	// Verify this test core has no Raft backend.
-	if core.getRaftBackend() != nil {
+	if core.GetRaftBackend() != nil {
 		t.Skip("test requires non-Raft core")
 	}
 
@@ -449,6 +584,7 @@ func TestDRPromote_SkipsRaftTLSKeyringWithoutRaftBackend(t *testing.T) {
 		ClusterID:      "skip-raft-test",
 		RelationshipID: "rel-skip-raft",
 		PrimaryAddr:    "127.0.0.1:8201",
+		PrimaryAddrs:   []string{"127.0.0.1:8201"},
 		ReplSalt:       make([]byte, 32),
 	}
 	rand.Read(token.ReplSalt)
@@ -473,7 +609,7 @@ func TestRaftForceRecreateTLSKeyring_NoRaftBackend(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	ctx := context.Background()
 
-	if core.getRaftBackend() != nil {
+	if core.GetRaftBackend() != nil {
 		t.Skip("test requires non-Raft core")
 	}
 
@@ -674,6 +810,7 @@ func TestDRRelationshipManager_UpdateTuningAppliesSecondaryRuntime(t *testing.T)
 		RelationshipID: "rel-1",
 		ReplSalt:       make([]byte, drReplSaltLen),
 		PrimaryAddr:    "127.0.0.1:8201",
+		PrimaryAddrs:   []string{"127.0.0.1:8201"},
 	}
 	rand.Read(token.ReplSalt)
 
@@ -763,6 +900,7 @@ func TestDRFailover_FromSecondary(t *testing.T) {
 		ClusterID:      "test-cluster",
 		RelationshipID: "rel-test-3",
 		PrimaryAddr:    "127.0.0.1:8201",
+		PrimaryAddrs:   []string{"127.0.0.1:8201"},
 		ReplSalt:       make([]byte, 32),
 	}
 	rand.Read(token.ReplSalt)
@@ -803,6 +941,7 @@ func TestDRFailoverToPrimary(t *testing.T) {
 		ClusterID:      "test-cluster",
 		RelationshipID: "rel-test-4",
 		PrimaryAddr:    "127.0.0.1:8201",
+		PrimaryAddrs:   []string{"127.0.0.1:8201"},
 		ReplSalt:       make([]byte, 32),
 	}
 	rand.Read(token.ReplSalt)
@@ -1499,15 +1638,25 @@ func TestDRBackpressureExemptPath(t *testing.T) {
 		"sys/health",
 		"sys/seal-status",
 		"sys/replication/dr/tuning",
-		"root/sys/replication/dr/secondary/promote",
+		"/sys/replication/dr/secondary/promote/",
 	}
 	for _, path := range exempt {
 		if !isDRBackpressureExemptPath(path) {
 			t.Fatalf("expected path %q to be backpressure exempt", path)
 		}
 	}
-	if isDRBackpressureExemptPath("secret/data/demo") {
-		t.Fatal("expected normal data path to be non-exempt")
+
+	nonExempt := []string{
+		"secret/data/demo",
+		"root/sys/replication/dr/secondary/promote",
+		"secret/data/x/sys/replication/dr/y",
+		"secret/data/foo/sys/health",
+		"secret/data/foo/sys/seal-status",
+	}
+	for _, path := range nonExempt {
+		if isDRBackpressureExemptPath(path) {
+			t.Fatalf("expected path %q to be non-exempt", path)
+		}
 	}
 }
 
@@ -1617,19 +1766,59 @@ func TestDRPeerFingerprintFromContext_FallbackRemoteAddrMap(t *testing.T) {
 	}
 }
 
-func TestDRPrimary_ExchangeDirtyBitmap_PostRestartReturnsAllDirty(t *testing.T) {
+func registerDRRelationshipWithFingerprint(t *testing.T, mgr *drRelationshipManager, fingerprint string) string {
+	t.Helper()
+
+	token, err := mgr.GenerateActivationToken(context.Background())
+	if err != nil {
+		t.Fatalf("failed to generate activation token: %v", err)
+	}
+
+	rel, err := mgr.loadRelationship(context.Background(), token.RelationshipID)
+	if err != nil {
+		t.Fatalf("failed to load relationship: %v", err)
+	}
+	rel.State = DRRelationshipStateRegistered
+	rel.SecondaryCertFingerprint = fingerprint
+	if err := mgr.saveRelationship(context.Background(), rel); err != nil {
+		t.Fatalf("failed to persist relationship fingerprint: %v", err)
+	}
+
+	return token.RelationshipID
+}
+
+func setupDRPrimaryForDirtyBitmapAuthz(t *testing.T, fingerprint string) (*drRelationshipManager, *drReplicationPrimary, string, context.Context) {
+	t.Helper()
+
 	core, _, _ := TestCoreUnsealed(t)
-	replSalt := make([]byte, 32)
-	rand.Read(replSalt)
-	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
+	mgr := core.drManager
+	if mgr == nil {
+		t.Fatal("expected DR manager on core")
+	}
+	if err := mgr.EnablePrimary(context.Background()); err != nil {
+		t.Fatalf("failed to enable DR primary: %v", err)
+	}
+
+	relationshipID := registerDRRelationshipWithFingerprint(t, mgr, fingerprint)
+	primary := mgr.Primary()
+	if primary == nil {
+		t.Fatal("expected primary after enable")
+	}
+
+	rpcCtx := context.WithValue(context.Background(), drPeerFingerprintContextKey{}, fingerprint)
+	return mgr, primary, relationshipID, rpcCtx
+}
+
+func TestDRPrimary_ExchangeDirtyBitmap_PostRestartReturnsAllDirty(t *testing.T) {
+	_, primary, relationshipID, rpcCtx := setupDRPrimaryForDirtyBitmapAuthz(t, "test-dirty-post-restart-fp")
 
 	// Freshly created primary has dirtyMapStart == 0 (simulating post-restart).
 	if primary.dirtyMapStart != 0 {
 		t.Fatalf("expected dirtyMapStart to be 0, got %d", primary.dirtyMapStart)
 	}
 
-	resp, err := primary.ExchangeDirtyBitmap(context.Background(), &DirtyBitmapMessage{
-		RelationshipId: "rel-1",
+	resp, err := primary.ExchangeDirtyBitmap(rpcCtx, &DirtyBitmapMessage{
+		RelationshipId: relationshipID,
 		CheckpointId:   "cp-1",
 	})
 	if err != nil {
@@ -1692,10 +1881,7 @@ func TestDRPrimary_DirtyBitmapPersistenceAndReload(t *testing.T) {
 }
 
 func TestDRPrimary_ExchangeDirtyBitmap_InitializedBitmapUsesActual(t *testing.T) {
-	core, _, _ := TestCoreUnsealed(t)
-	replSalt := make([]byte, 32)
-	rand.Read(replSalt)
-	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
+	_, primary, relationshipID, rpcCtx := setupDRPrimaryForDirtyBitmapAuthz(t, "test-dirty-init-fp")
 
 	// Simulate a write that initializes the dirty bitmap.
 	primary.OnChange([]physical.ChangeStreamEntry{
@@ -1706,8 +1892,8 @@ func TestDRPrimary_ExchangeDirtyBitmap_InitializedBitmapUsesActual(t *testing.T)
 		t.Fatal("expected dirtyMapStart to be set after OnChange")
 	}
 
-	resp, err := primary.ExchangeDirtyBitmap(context.Background(), &DirtyBitmapMessage{
-		RelationshipId: "rel-1",
+	resp, err := primary.ExchangeDirtyBitmap(rpcCtx, &DirtyBitmapMessage{
+		RelationshipId: relationshipID,
 		CheckpointId:   "cp-1",
 	})
 	if err != nil {
@@ -1736,6 +1922,46 @@ func TestDRPrimary_ExchangeDirtyBitmap_InitializedBitmapUsesActual(t *testing.T)
 	}
 	if !anyDirty {
 		t.Fatal("expected at least one dirty range after write")
+	}
+}
+
+func TestDRPrimary_ExchangeDirtyBitmap_RequiresRelationshipAuthorization(t *testing.T) {
+	mgr, primary, relationshipID, rpcCtx := setupDRPrimaryForDirtyBitmapAuthz(t, "test-dirty-authz-fp-1")
+
+	// Valid relationship/fingerprint pairing succeeds.
+	if _, err := primary.ExchangeDirtyBitmap(rpcCtx, &DirtyBitmapMessage{
+		RelationshipId: relationshipID,
+		CheckpointId:   "cp-valid",
+	}); err != nil {
+		t.Fatalf("expected authorized bitmap exchange, got: %v", err)
+	}
+
+	// Empty relationship_id should fail validation.
+	if _, err := primary.ExchangeDirtyBitmap(rpcCtx, &DirtyBitmapMessage{
+		RelationshipId: "",
+		CheckpointId:   "cp-empty",
+	}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument for empty relationship_id, got: %v (%v)", err, status.Code(err))
+	}
+
+	// Wrong relationship/fingerprint pairing should be denied.
+	otherRelationshipID := registerDRRelationshipWithFingerprint(t, mgr, "test-dirty-authz-fp-2")
+	if _, err := primary.ExchangeDirtyBitmap(rpcCtx, &DirtyBitmapMessage{
+		RelationshipId: otherRelationshipID,
+		CheckpointId:   "cp-wrong-fingerprint",
+	}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected PermissionDenied for mismatched fingerprint, got: %v (%v)", err, status.Code(err))
+	}
+
+	// Revoked relationship should be denied.
+	if err := mgr.RevokeRelationship(context.Background(), relationshipID); err != nil {
+		t.Fatalf("failed to revoke relationship: %v", err)
+	}
+	if _, err := primary.ExchangeDirtyBitmap(rpcCtx, &DirtyBitmapMessage{
+		RelationshipId: relationshipID,
+		CheckpointId:   "cp-revoked",
+	}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected PermissionDenied for revoked relationship, got: %v (%v)", err, status.Code(err))
 	}
 }
 
@@ -1938,7 +2164,8 @@ func TestStreamChanges_InitialWindowRespected(t *testing.T) {
 	primary, relID, fingerprint := newCreditTestPrimary(t, 2*time.Second)
 
 	ctx, cancel := context.WithCancel(
-		context.WithValue(context.Background(), drPeerFingerprintContextKey{}, fingerprint))
+		context.WithValue(context.Background(), drPeerFingerprintContextKey{}, fingerprint),
+	)
 	defer cancel()
 
 	const initialWindow = 3
@@ -2003,7 +2230,8 @@ func TestStreamChanges_CreditFlowControl(t *testing.T) {
 	primary, relID, fingerprint := newCreditTestPrimary(t, 5*time.Second)
 
 	ctx, cancel := context.WithCancel(
-		context.WithValue(context.Background(), drPeerFingerprintContextKey{}, fingerprint))
+		context.WithValue(context.Background(), drPeerFingerprintContextKey{}, fingerprint),
+	)
 	defer cancel()
 
 	const initialWindow = 2
@@ -2086,7 +2314,8 @@ func TestStreamChanges_CreditTimeout(t *testing.T) {
 	primary, relID, fingerprint := newCreditTestPrimary(t, 500*time.Millisecond)
 
 	ctx, cancel := context.WithCancel(
-		context.WithValue(context.Background(), drPeerFingerprintContextKey{}, fingerprint))
+		context.WithValue(context.Background(), drPeerFingerprintContextKey{}, fingerprint),
+	)
 	defer cancel()
 
 	// Window of 1: the first entry is sent, the second triggers a wait.
@@ -2147,7 +2376,8 @@ func TestStreamChanges_CatchupDebitsCredits(t *testing.T) {
 	primary, relID, fingerprint := newCreditTestPrimary(t, 2*time.Second)
 
 	ctx, cancel := context.WithCancel(
-		context.WithValue(context.Background(), drPeerFingerprintContextKey{}, fingerprint))
+		context.WithValue(context.Background(), drPeerFingerprintContextKey{}, fingerprint),
+	)
 	defer cancel()
 
 	// Pre-populate the change buffer with 5 entries BEFORE the
@@ -2284,7 +2514,8 @@ func TestStreamChanges_BatchSizeRespected(t *testing.T) {
 	primary, relID, fingerprint := newCreditTestPrimary(t, 5*time.Second)
 
 	ctx, cancel := context.WithCancel(
-		context.WithValue(context.Background(), drPeerFingerprintContextKey{}, fingerprint))
+		context.WithValue(context.Background(), drPeerFingerprintContextKey{}, fingerprint),
+	)
 	defer cancel()
 
 	// Large initial window so the primary doesn't block on credits.
@@ -2469,7 +2700,7 @@ func TestStreamChanges_CancelledOnStepdown(t *testing.T) {
 
 	// Create a cancellable activeContext on the core to simulate stepdown.
 	activeCtx, simulateStepdown := context.WithCancel(context.Background())
-	primary.core.activeContext = activeCtx
+	primary.core.activeContext.Store(NewAtomicContext(activeCtx, simulateStepdown))
 
 	streamCtx := context.WithValue(context.Background(), drPeerFingerprintContextKey{}, fingerprint)
 
@@ -2836,6 +3067,41 @@ func TestDRClusterClient_VerifyKnownCert(t *testing.T) {
 	}
 }
 
+func TestDRClusterClient_ClientLookup_CachesPresentedFingerprint(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	setupTestClusterCert(t, core)
+
+	parsed := core.localClusterParsedCert.Load()
+	if parsed == nil {
+		t.Fatal("expected local parsed cert to be set")
+	}
+	raw := core.localClusterCert.Load()
+	if raw == nil || len(*raw) == 0 {
+		t.Fatal("expected local cluster cert bytes to be set")
+	}
+
+	client := &drReplicationClusterClient{
+		core:          core,
+		primaryCACert: parsed,
+		logger:        log.NewNullLogger(),
+	}
+
+	cert, err := client.ClientLookup(context.Background(), &tls.CertificateRequestInfo{
+		AcceptableCAs: [][]byte{parsed.RawIssuer},
+	})
+	if err != nil {
+		t.Fatalf("ClientLookup returned error: %v", err)
+	}
+	if cert == nil {
+		t.Fatal("ClientLookup returned nil cert")
+	}
+
+	wantFP := certFingerprintSHA256(parsed)
+	if gotFP := client.LastClientCertFingerprint(); gotFP != wantFP {
+		t.Fatalf("client fingerprint mismatch: got %q want %q", gotFP, wantFP)
+	}
+}
+
 func TestDRClusterClient_VerifyCASignedCert(t *testing.T) {
 	// Generate a CA.
 	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -3148,7 +3414,7 @@ func TestFetchEntries_CancelledOnStepdown(t *testing.T) {
 
 	// Create a cancellable activeContext to simulate stepdown.
 	activeCtx, simulateStepdown := context.WithCancel(context.Background())
-	primary.core.activeContext = activeCtx
+	primary.core.activeContext.Store(NewAtomicContext(activeCtx, simulateStepdown))
 
 	// Inject a checkpoint with an empty kidToVID. KIDs in the request
 	// that are not in kidToVID produce delete entries (with
@@ -3239,6 +3505,105 @@ func TestIsReconciliationRequired(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("isReconciliationRequired(%v) = %v, want %v", tt.err, got, tt.want)
 		}
+	}
+}
+
+func TestIsDRTransportReconnectError(t *testing.T) {
+	transportErr := fmt.Errorf("failed to request checkpoint: rpc error: code = Unavailable desc = connection error: desc = \"transport: Error while dialing: remote error: tls: internal error\"")
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{name: "transport unavailable", err: transportErr, want: true},
+		{name: "wrapped transport unavailable", err: fmt.Errorf("wrapped: %w", transportErr), want: true},
+		{name: "redirect", err: &errDRRedirect{LeaderAddr: "https://leader:8201"}, want: false},
+		{name: "unavailable without transport markers", err: fmt.Errorf("rpc error: code = Unavailable desc = backend down"), want: false},
+		{name: "unsupported protocol", err: fmt.Errorf("rpc error: code = Unavailable desc = connection error: desc = \"transport: authentication handshake failed: unsupported protocol\""), want: true},
+		{name: "auth handshake failed", err: fmt.Errorf("transport: authentication handshake failed"), want: true},
+		{name: "other error", err: fmt.Errorf("permission denied"), want: false},
+	}
+
+	for _, tt := range tests {
+		got := isDRTransportReconnectError(tt.err)
+		if got != tt.want {
+			t.Fatalf("%s: isDRTransportReconnectError(%v) = %v, want %v", tt.name, tt.err, got, tt.want)
+		}
+	}
+}
+
+func TestDRPrimaryAddrRing_RotationAndCycleBackoffState(t *testing.T) {
+	ring := newDRPrimaryAddrRing([]string{"127.0.0.1:8201", "https://127.0.0.2:8201"})
+	if ring.Current() != "https://127.0.0.1:8201" {
+		t.Fatalf("unexpected initial current address: %q", ring.Current())
+	}
+
+	oldAddr, nextAddr, rotated, cycleComplete := ring.RotateFailure()
+	if !rotated || cycleComplete {
+		t.Fatalf("expected first failure to rotate without cycle completion, rotated=%v cycle=%v", rotated, cycleComplete)
+	}
+	if oldAddr != "https://127.0.0.1:8201" || nextAddr != "https://127.0.0.2:8201" {
+		t.Fatalf("unexpected first rotation old/new: %q -> %q", oldAddr, nextAddr)
+	}
+
+	oldAddr, nextAddr, rotated, cycleComplete = ring.RotateFailure()
+	if !rotated || !cycleComplete {
+		t.Fatalf("expected second failure to rotate with cycle completion, rotated=%v cycle=%v", rotated, cycleComplete)
+	}
+	if oldAddr != "https://127.0.0.2:8201" || nextAddr != "https://127.0.0.1:8201" {
+		t.Fatalf("unexpected second rotation old/new: %q -> %q", oldAddr, nextAddr)
+	}
+}
+
+func TestDRPrimaryAddrRing_AddHintAndSelect(t *testing.T) {
+	ring := newDRPrimaryAddrRing([]string{"https://127.0.0.1:8201"})
+	if addr, added := ring.Add("127.0.0.1:8201"); added || addr != "https://127.0.0.1:8201" {
+		t.Fatalf("expected duplicate normalized address to be ignored, addr=%q added=%v", addr, added)
+	}
+	addr, added := ring.Add("http://127.0.0.9:8201")
+	if !added || addr != "https://127.0.0.9:8201" {
+		t.Fatalf("expected hint to be added and normalized, addr=%q added=%v", addr, added)
+	}
+	if !ring.Use("127.0.0.9:8201") {
+		t.Fatal("expected Use() to select added hint address")
+	}
+	if ring.Current() != "https://127.0.0.9:8201" {
+		t.Fatalf("unexpected current after Use: %q", ring.Current())
+	}
+}
+
+func TestDRSecondary_Start_ReconciliationTransportErrorUsesLeaderHintRedirect(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+
+	replSalt := make([]byte, drReplSaltLen)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-reconcile-transport-fail", log.NewNullLogger())
+	secondary.transportReady.Store(true)
+	secondary.state.Store(int32(DRSecondaryReconciling))
+
+	hint := "https://new-leader:8201"
+	secondary.lastKnownLeaderAddr.Store(&hint)
+
+	secondary.client = &drTestClient{
+		requestCheckpointFn: func(context.Context, *CheckpointRequest, ...grpc.CallOption) (*CheckpointResponse, error) {
+			return nil, fmt.Errorf("rpc error: code = Unavailable desc = connection error: desc = \"transport: Error while dialing: remote error: tls: internal error\"")
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := secondary.Start(ctx)
+	if err == nil {
+		t.Fatal("expected Start to return reconnect error for reconciliation transport failure")
+	}
+
+	var redirect *errDRRedirect
+	if !errors.As(err, &redirect) {
+		t.Fatalf("expected errDRRedirect, got: %v", err)
+	}
+	if redirect.LeaderAddr != hint {
+		t.Fatalf("expected leader hint %q, got %q", hint, redirect.LeaderAddr)
 	}
 }
 
@@ -3434,6 +3799,33 @@ func TestDispatcher_SetClearPrimary(t *testing.T) {
 		t.Fatal("expected primary to be nil after clear")
 	}
 	dispatcher.mu.RUnlock()
+}
+
+func TestDRRelationshipManager_TeardownClearsDispatcherPrimary(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	mgr := newDRRelationshipManager(core, core.logger)
+
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+	journal := newDRStreamJournal(nil, t.TempDir())
+	if err := journal.configure(true, drDefaultStreamJournalMaxBytes, drDefaultStreamJournalSegmentBytes, drDefaultStreamJournalRetention); err != nil {
+		t.Fatal(err)
+	}
+
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, journal)
+	mgr.primary = primary
+	mgr.dispatcher.setPrimary(primary)
+
+	mgr.Teardown()
+
+	mgr.dispatcher.mu.RLock()
+	defer mgr.dispatcher.mu.RUnlock()
+	if mgr.dispatcher.primary != nil {
+		t.Fatal("expected dispatcher primary to be cleared during teardown")
+	}
+	if mgr.primary != nil {
+		t.Fatal("expected manager primary to be cleared during teardown")
+	}
 }
 
 // TestFilterDRReplicableEntries verifies the standalone filter function.
