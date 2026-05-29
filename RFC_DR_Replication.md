@@ -1,1025 +1,617 @@
-# RFC: Native Cross-Cluster DR Replication for OpenBao
+---
+sidebar_label: Native DR replication
+description: |-
+  Native cross-cluster disaster recovery replication for OpenBao.
+---
 
-## Status
+# Native cross-cluster DR replication
 
-Draft, implementation-backed.
+**Status**: draft, proof-of-concept under active correctness validation.
 
 ## Summary
 
-This RFC defines OpenBao Disaster Recovery (DR) replication as a native, cross-cluster feature with security-first bootstrap and fail-closed reconciliation.
+This RFC proposes native disaster recovery (DR) replication for OpenBao across
+independent clusters. A primary cluster streams ordered storage mutations to one
+or more secondary clusters, and secondaries use checkpoint-fenced
+reconciliation to recover from stream gaps or disconnects.
 
-The current architecture uses:
+The design is intentionally fail-closed:
 
-- Two (or more) independent Raft clusters (primary and one or more secondaries)
-- Entry-level change streaming for normal operation with transactional batching
-- Disk-backed stream journal replay to extend reconnect horizon beyond in-memory ring depth, maintained on all primary-cluster nodes for leader-election resilience
-- Immutable disk-backed checkpoint artifact store for checkpoint-fenced fetches
-- Ordered hash-stream reconciliation for recovery (Dirty-range optimized)
-- Ciphertext-domain reconciliation/apply below the barrier
-- Journal-based checkpoint index warmup for fast recovery after leadership transitions
-- Convergence controller with lag-slope/rate-ratio fallback triggering
-- Primary ingress write backpressure with DR-aware bounded admission
-- Strict relationship authorization (cert fingerprint + relationship state)
-- Wrapped root-key bootstrap (no plaintext root-key transfer)
-- Strict mTLS transport model (no insecure fallback)
-- Multi-relationship primary support
+- DR transport uses mTLS with relationship-scoped authorization.
+- Bootstrap never transfers the root key in plaintext.
+- Reconciliation is bound to immutable checkpoint tuples.
+- Fetched range contents must prove completeness before deletes are inferred.
+- A secondary only advances `lastAppliedIndex` after every required apply and
+  delete phase succeeds.
 
-## Problem Statement
+This RFC reflects the current PoC direction after stress-test hardening. It
+does not treat dirty bitmaps, stream replay, or partial range fetches as
+authoritative unless their coverage and completeness are proven.
 
-OpenBao needed DR replication that is:
+## Problem statement
 
-- Cross-cluster (true failure-domain isolation)
-- Efficient for steady-state streaming and disconnection recovery
-- Safe under revocation and partial failures
-- Explicitly relationship-scoped for trust and lifecycle management
-- Operable under high-keyspace and hotspot divergence without unbounded memory or bandwidth use
+OpenBao does not currently provide native cross-cluster DR replication. Users
+who need a warm disaster recovery cluster must rely on external backup,
+restore, snapshot, or storage-level replication workflows. Those approaches
+have several limitations:
+
+- They do not provide a relationship-scoped OpenBao control plane.
+- They are not naturally tied to OpenBao authorization, seal, or key lifecycle.
+- They can couple primary and secondary failure domains.
+- They make failover state and promotion semantics operator-specific.
+- They do not give OpenBao a way to reason about stream gaps, divergence, or
+  partial reconciliation failures.
+
+The desired system is an OpenBao-native replication protocol that keeps a
+secondary cluster close to the primary while preserving strict safety during
+disconnects, revocation, failover, and high write load.
+
+## User-facing description
+
+Operators enable DR primary mode on a source cluster, create a bootstrap token
+for each secondary relationship, and enable DR secondary mode on one or more
+independent clusters.
+
+In normal operation, the secondary is read-only for replicated data and applies
+changes streamed from the primary. The secondary exposes status showing
+relationship state, last applied index, reconnect/reconcile activity, lag, and
+fallback counters.
+
+If the stream disconnects and replay is still available, the secondary resumes
+from its last applied index. If replay is not available, the secondary enters
+reconciliation. Reconciliation compares checkpoint-fenced range digests,
+fetches proven mismatched spans, applies fetched primary entries, deletes
+secondary-local entries that are absent from the proven primary set, and then
+advances its checkpoint.
+
+If the primary is permanently unavailable, an operator can promote a secondary.
+After promotion, the cluster becomes standalone and accepts local writes.
 
 ## Goals
 
-1. Provide native DR with independent primary/secondary clusters.
-2. Keep normal replication low-latency via ordered change stream.
-3. Make recovery bandwidth scale with mismatch regions/diffs, not full keyspace.
-4. Enforce strict security invariants (no plaintext root-key transfer, no insecure transport fallback).
-5. Support multiple concurrently active DR relationships from one primary.
-6. Fail closed on authorization, budget breaches, and partial apply failures.
-7. Optimize throughput via transactional batching to minimize storage IOPS impact.
-8. Decouple reconciliation scaling from storage size via Dirty Bitmaps.
+1. Provide native DR replication across independent OpenBao clusters.
+2. Support multiple secondary relationships from one primary.
+3. Keep steady-state replication low-latency with ordered change streaming.
+4. Recover from stream gaps without requiring full keyspace copy when possible.
+5. Fail closed on authorization, checkpoint, transport, proof, budget, and apply
+   failures.
+6. Avoid plaintext root-key transfer during bootstrap.
+7. Keep replicated data in the ciphertext storage domain.
+8. Preserve local-only cluster state such as seal configuration and DR
+   relationship configuration.
+9. Provide explicit promotion semantics for disaster recovery failover.
 
-## Non-Goals
+## Non-goals
 
-1. Keyspace partitioning by tenant/namespace.
-2. Merkle-tree or WAL-shipping reconciliation.
+1. Active-active writes across clusters.
+2. Tenant or namespace-level keyspace partitioning.
+3. Compatibility with any legacy DR protocol.
+4. Storage-layer replication outside OpenBao.
+5. Merkle tree persistence as the primary reconciliation strategy.
+6. A guarantee that secondaries can serve stale reads while still in secondary
+   mode.
 
-## Architecture Overview
+## Technical description
 
 ### Topology
 
-- Primary cluster: source of truth, serves DR gRPC and reconciliation artifacts.
-- Secondary cluster: independent Raft cluster, applies streamed/reconciled updates locally.
-- Relationship model: one primary may serve multiple independent secondaries, each with its own `relationship_id`, certificate identity, and lifecycle state.
+The topology has one primary OpenBao cluster and one or more secondary OpenBao
+clusters.
+
+The primary cluster remains the source of truth while DR is active. It serves
+DR gRPC endpoints, relationship management APIs, change streams, checkpoint
+metadata, range digests, and checkpoint-fenced entry fetches.
+
+Each secondary cluster is an independent OpenBao cluster with its own storage,
+seal, Raft state, and cluster identity. Secondary mode makes replicated data
+read-only to clients while allowing DR control operations.
 
 ```mermaid
 graph TD
-    subgraph Primary
-        W[Write Request] --> FSM[Raft FSM]
-        FSM -->|1. Update Data| DB[(Storage)]
-        FSM -->|2. Mark Range Dirty| BM[Dirty Bitmap]
-        FSM -->|3. Append to Log| Log[Stream Log]
-    end
+    ClientWrite["Client write"] --> PrimaryCore["Primary core"]
+    PrimaryCore --> PrimaryStorage["Primary storage"]
+    PrimaryCore --> ChangeStream["Ordered DR change stream"]
+    PrimaryCore --> Checkpoints["Checkpoint artifacts and digests"]
 
-    subgraph "Async Reconciler"
-        T[Timer Tick] -->|Check Dirty Bit| BM
-        BM -->|If Dirty| S[Stream Checksums]
-    end
+    ChangeStream --> SecondaryApply["Secondary stream apply"]
+    Checkpoints --> SecondaryReconcile["Secondary reconcile"]
+    SecondaryApply --> SecondaryStorage["Secondary storage"]
+    SecondaryReconcile --> SecondaryStorage
 
-    subgraph Secondary
-        Log -->|Stream| R[Receiver]
-        R -->|Batch Apply| SDB[(Sec. Storage)]
-        S -->|Pull Checksums| SR[Sec. Reconciler]
-    end
-    P -- "mTLS + relationship authz" --> S1
-    P -- "mTLS + relationship authz" --> S2
+    Relationship["Relationship authz and mTLS"] --> ChangeStream
+    Relationship --> Checkpoints
 ```
 
-### Runtime Modes
+### Relationship lifecycle
 
-1. Streaming mode:
-   - Primary emits ordered `ChangeStreamEntry` mutations.
-   - Primary retains replay history in in-memory ring plus on-disk stream journal segments. The stream journal is maintained by a two-layer `drChangeStreamDispatcher` that runs on **all primary-cluster Raft nodes** (leaders and followers). This ensures journal continuity across leader elections: when a follower becomes the new leader, its journal already contains entries from the follower period, eliminating the need for expensive reconciliation fallback.
-   - Journal segments are stored in a persistent subdirectory of the Raft data path (not a temporary directory) so they survive node restarts.
-   - Secondary applies mutations in transactional batches (where supported) to maximize throughput.
-   - Secondary tracks `lastAppliedIndex` and updates it upon successful batch commit.
+A DR relationship is identified by a `relationship_id` and is bound to the
+secondary's certificate identity. Request-supplied relationship IDs are not
+trusted on their own; primary-side authorization derives the caller identity
+from the mTLS peer certificate and checks persisted relationship state.
 
-2. Reconciliation mode:
-   - Triggered on stream gaps/disconnects or explicit catch-up failure.
-   - Uses dirty-map optimized ordered hash streaming.
-   - Fetched entries are applied in transactional batches to prevent timeouts and ensure catch-up speed exceeds arrival rate.
+The relationship lifecycle is:
 
-### Security Invariants
+1. Operator enables DR primary mode.
+2. Primary generates or loads DR transport CA state.
+3. Operator creates a secondary activation token.
+4. Secondary enables DR using that activation token.
+5. Secondary connects to the primary over mTLS.
+6. Primary authorizes every DR RPC against the relationship record.
+7. Operator can revoke the relationship, which denies further RPCs and
+   terminates matching streams.
 
-1. No plaintext root key is transferred.
-2. DR transport fails closed if trusted cert context is unavailable (no plaintext/insecure DR link path).
-3. Every DR RPC is relationship-authorized.
-4. Revoked relationships are denied across all DR RPCs.
-5. Cross-cluster TLS verification uses a CA-scoped dynamic trust pool pinned to the primary's DR transport CA (see "Cross-Cluster TLS Trust Model" below). No TOFU (Trust On First Use) is employed.
-6. Relationship identity is derived from the mTLS peer certificate fingerprint, not from request-supplied `relationship_id` values (see "Protocol Invariants" below).
-7. Bootstrap ECDH wrapping binds to `cluster_id`, `relationship_id`, secondary cert fingerprint, primary identity, and protocol version to prevent cross-cluster replay and unknown-key-share attacks.
-8. Checkpoint index monotonicity is enforced on the secondary to prevent rollback to older state.
+### Bootstrap
 
-### Cross-Cluster TLS Trust Model
+Bootstrap establishes trust and transfers only wrapped key material.
 
-#### DR Transport CA
+The activation token carries:
 
-When `dr/primary/enable` is called, the primary generates a **DR transport CA** -- a dedicated P-256 CA key pair stored encrypted in barrier storage at `core/dr-replication/transport-ca`. This CA is independent of the barrier seal, recovery keys, and any operator-managed PKI. Its sole purpose is to anchor trust for DR cross-cluster mTLS.
+- `relationship_id`
+- primary cluster identity
+- DR transport CA certificate
+- bootstrap endpoint information
+- wrapped bootstrap material
+- expiry and single-use semantics
 
-Each primary-cluster node obtains a **DR transport leaf certificate** signed by this CA. The leaf is minted when the node starts serving DR RPCs (leader election, unseal) and contains the node's cluster address as a SAN. Leaf certificates are short-lived (default: 72 hours) and re-minted automatically before expiry.
+The root key is not sent in plaintext. Bootstrap wrapping binds the exchange to
+the primary identity, secondary identity, relationship ID, cluster ID, and
+protocol version. This prevents cross-cluster replay and unknown-key-share
+attacks.
 
-The DR transport CA public certificate is embedded in the `DRActivationToken.dr_transport_ca_cert` field. This is the **sole trust anchor** the secondary uses to verify primary identity.
+After bootstrap, the secondary removes or preserves local-only state according
+to the replication exclusion rules below.
 
-#### CA Lifecycle (Current Implementation)
+### Transport trust model
 
-The DR transport CA is generated when primary mode is enabled and persisted under `core/dr-replication/transport-ca`. Current implementation does **not** expose an API endpoint for CA rotation/revocation. Operationally:
+DR traffic uses mTLS. The primary owns a dedicated DR transport CA. Primary
+nodes present leaf certificates signed by this CA. The secondary pins the DR
+transport CA from the activation token and rejects primary certificates that do
+not chain to it.
 
-1. Existing active secondaries trust the CA from their activation token.
-2. Heartbeats propagate active primary leaf certificates (`active_cluster_cert`) that must chain to that CA.
-3. If operators need to replace the CA today, the supported path is relationship re-bootstrap (new activation token + secondary re-enable flow).
+Heartbeat responses can propagate active primary leaf certificates, but those
+certificates are only accepted if they chain to the pinned DR transport CA. This
+avoids trust-on-first-use behavior.
 
-#### Dynamic Trust Pool (Secondary)
+The protocol has no insecure fallback. If trusted certificate context is
+missing or invalid, DR connection establishment fails.
 
-The secondary maintains a **CA-scoped dynamic trust pool**:
+### Replication domain
 
-1. **Seeding:** The pool is initialized with the DR transport CA certificate from the activation token when `Connect()` is called.
-2. **Heartbeat propagation:** Every `DRHeartbeatResponse` carries the active leader's DER-encoded DR transport leaf certificate (`active_cluster_cert`), signed by the DR transport CA. The secondary verifies the certificate chains to the pinned DR transport CA before adding or refreshing it in the pool. Certificates that do not chain to the CA are rejected.
-3. **Custom TLS verification:** The `cluster.Client` interface exposes a `VerifyPeerCertificate()` callback. For DR connections, this callback checks the server's certificate against the trust pool:
-   - **Known cert:** accepted immediately (fingerprint match in pool).
-   - **Unknown cert:** verified against the pinned DR transport CA. If the certificate chains to the CA, it is accepted and added to the pool. If it does not chain to the CA, the connection is **rejected**.
-4. **TTL-based eviction:** Each pool entry has a `lastSeen` timestamp refreshed by heartbeats. Entries older than 10 minutes are pruned during heartbeat ticks, bounding pool size to ~1--3 certificates even in high-churn environments (e.g. Kubernetes pod recycling).
+DR replication operates below the barrier in the ciphertext storage domain.
+Fetched values and streamed values are stored as encrypted physical entries.
+This avoids decrypting secrets for replication and preserves storage-level
+representation.
 
-This design eliminates TOFU (Trust On First Use). An on-path attacker who presents a certificate not signed by the DR transport CA cannot complete the TLS handshake, even if the secondary has never seen the legitimate leader's certificate before.
+Some paths are cluster-local and must not be replicated. Examples include local
+seal configuration, local root-key wrapping state, local mount/auth/audit tables
+when they represent secondary-local configuration, cluster identity, DR
+relationship configuration, and leadership coordination locks.
 
-```mermaid
-sequenceDiagram
-    participant Sec as Secondary
-    participant LB as HAProxy
-    participant LeaderA as PrimaryLeaderA
-    participant LeaderB as PrimaryLeaderB
+The implementation must centralize these exclusions and apply them consistently
+to stream apply, fetched entry apply, and inferred deletes.
 
-    Note over Sec,LeaderA: Normal operation
-    LeaderA->>Sec: Heartbeat(active_cluster_cert=A_cert)
-    Sec->>Sec: Verify A_cert chains to DR transport CA
-    Sec->>Sec: trustedPool.Add(A_cert)
+### Streaming mode
 
-    Note over LeaderA,LeaderB: Stepdown occurs
-    LeaderA--xSec: Stream breaks
+Streaming mode is the normal operating mode.
 
-    Note over Sec,LeaderB: Reconnection
-    Sec->>LB: Connect
-    LB->>LeaderB: Route to new leader
-    LeaderB->>Sec: TLS: presents B_cert
-    Sec->>Sec: VerifyPeerCert: B_cert not in pool
-    Sec->>Sec: Verify B_cert chains to DR transport CA
-    Sec->>Sec: Accept + add to pool
-    Sec->>LeaderB: gRPC Heartbeat succeeds
-    Sec->>Sec: trustedPool.Refresh(B_cert from heartbeat)
+The primary emits ordered physical storage changes with Raft indexes. The
+secondary applies those changes in deterministic batches. `lastAppliedIndex`
+only advances after the relevant batch has been durably applied.
 
-    Note over Sec,LeaderB: Future reconnects to B are fully verified
-```
+The stream supports reconnect. If the primary can replay from the secondary's
+last applied index, the secondary resumes streaming. If replay is unavailable
+or a gap is detected, the secondary enters reconciliation.
 
-Non-DR cluster-internal connections (`requestForwardingClusterClient`, `raftLayer`) return `nil` from `VerifyPeerCertificate()` and continue to use standard Go TLS verification.
+The PoC includes an in-memory stream buffer and disk-backed stream journal.
+The design intent is that journal replay extends the reconnect horizon and
+survives primary-node restarts and leader changes.
 
-#### Leaf Certificate Verification Mode
+### Checkpoints
 
-DR transport leaf certificates include the node's cluster address as a DNS SAN for diagnostic purposes (operator can inspect which node minted the cert). However, the secondary's `VerifyPeerCertificate` callback does **not** perform hostname/SAN verification against the connection target address. Identity verification relies entirely on:
+A checkpoint is an immutable primary-side view of replicated storage at a
+specific commit index.
 
-1. **CA chain pinning:** The leaf must chain to the pinned DR transport CA.
-2. **Relationship authorization:** Every RPC extracts the peer certificate fingerprint from the TLS state and validates it against the stored `secondary_cert_fingerprint`.
+Checkpoint identity is a tuple:
 
-This design is intentional. In load-balanced and cloud-native deployments, the connection target hostname frequently differs from the node's cluster address (e.g., HAProxy VIP, Kubernetes Service DNS). SAN-based hostname verification would be brittle in these environments without adding meaningful security, because the CA-pinning + relationship-authz combination already provides mutual identity binding. DNS is not a trust boundary in this protocol.
+- checkpoint ID
+- checkpoint commit index
+- relationship identity
 
-Current implementation does not expose a separate DR server-name verification tunable; DR transport identity is enforced by CA-chain pinning plus per-RPC relationship fingerprint authorization.
+All reconciliation RPCs are bound to that tuple. A secondary rejects fetched
+entry batches, range checksums, range digests, or delete phases that do not
+match the active checkpoint tuple.
 
-### Protocol Invariants
+The primary stores checkpoint artifacts so `FetchEntries` reads from the
+checkpoint view rather than live storage. This prevents live storage drift from
+corrupting reconciliation.
 
-The following invariants are enforced at the protocol level and are not subject to configuration:
+### Reconciliation overview
 
-1. **Relationship identity is derived from the mTLS peer certificate, not from request fields.** The `relationship_id` in RPC requests is not a trust anchor. On every DR RPC, the primary extracts the peer certificate fingerprint from the TLS connection state and verifies it matches the `secondary_cert_fingerprint` stored for the claimed relationship. A valid secondary cannot access another relationship's data because it lacks the other relationship's private key. This prevents confused-deputy attacks.
+Reconciliation repairs divergence when streaming cannot safely resume.
 
-2. **All DR RPCs fail closed on missing or invalid peer certificate.** If the peer did not present a certificate, or if the fingerprint does not match any active relationship, the RPC is rejected with `PermissionDenied`.
+The high-level flow is:
 
-3. **Relationship state transitions are monotonic.** `pending -> registered -> active -> revoked` is the only valid forward path. Revoked relationships cannot be reactivated; a new activation token must be generated.
+1. Secondary requests a checkpoint.
+2. Secondary scans local physical storage into KID/VID maps.
+3. Secondary selects ranges that require verification.
+4. Primary and secondary compare top-level range checksums.
+5. Mismatched ranges enter mandatory digest drill-down.
+6. Primary returns child range digests that fully cover each parent span.
+7. Secondary fetches mismatched spans.
+8. Secondary validates fetched content against the advertised digest proofs.
+9. Secondary applies fetched primary entries.
+10. Secondary deletes local-only keys only after the fetched remote set is
+    proven complete.
+11. Secondary advances `lastAppliedIndex` only after all phases succeed.
 
-4. **One certificate fingerprint, one relationship.** A secondary cluster certificate fingerprint can be bound to at most one active (non-revoked) relationship. Registration rejects a fingerprint that is already associated with another active relationship (`duplicate_fingerprint` error). This prevents a single secondary from acquiring multiple relationship contexts and ensures clean revocation semantics.
+### KID and VID model
 
-5. **Authoritative identity field:** The `secondary_cert_fingerprint` (SHA-256 of the secondary certificate DER currently registered) is the authoritative identity binding. The `secondary_ca_cert` field is stored for mTLS trust pool setup (allowing the primary to verify the secondary's TLS handshake) but is not used for per-RPC authorization.
+Reconciliation compares storage entries by:
 
-## Protocol and API Surface
+- KID: keyed identifier derived from the storage key and replication salt.
+- VID: value identifier derived from the ciphertext value and seal-wrap flag,
+  or a tombstone value for deletes.
 
-### System API Endpoints
+The primary and secondary compare KID/VID metadata first, then fetch concrete
+entries only for mismatched spans.
 
-| Use | Method | Path |
-|---|---|---|
-| DR status | GET | `sys/replication/dr/status` |
-| Enable primary | POST | `sys/replication/dr/primary/enable` |
-| Disable primary | POST | `sys/replication/dr/primary/disable` |
-| Generate activation token | POST | `sys/replication/dr/primary/secondary-token` |
-| Register secondary cert | POST | `sys/replication/dr/primary/register-secondary` |
-| List relationships | GET | `sys/replication/dr/primary/relationships` |
-| Relationship status | GET | `sys/replication/dr/primary/relationships/:id/status` |
-| Revoke relationship | POST | `sys/replication/dr/primary/relationships/:id/revoke` |
-| Enable secondary | POST | `sys/replication/dr/secondary/enable` |
-| Disable secondary | POST | `sys/replication/dr/secondary/disable` |
-| Promote secondary | POST | `sys/replication/dr/secondary/promote` |
-| Trigger secondary resnapshot | POST | `sys/replication/dr/secondary/resnapshot` |
-| Read DR tuning | GET | `sys/replication/dr/tuning` |
-| Update DR tuning | POST | `sys/replication/dr/tuning` |
+### Range checksums
 
-Auth model notes:
+Top-level range checksums are a coarse filter. They identify likely mismatched
+ranges but are not sufficient to prove fetched completeness.
 
-- `sys/replication/dr/status` is unauthenticated.
-- `sys/replication/dr/primary/register-secondary` is unauthenticated and bootstrap-token authenticated by payload.
-- Other DR system endpoints follow normal `sys/` root protections.
-- While in DR secondary mode, write requests are read-only blocked except:
-  - `sys/replication/dr/secondary/promote`
-  - `sys/replication/dr/secondary/disable`
-  - `sys/replication/dr/secondary/resnapshot`
-  - `sys/replication/dr/tuning`
-  - `sys/seal`
-  - `sys/step-down`
+A checksum match may skip the range only if range selection itself is proven
+complete for the checkpoint. A checksum mismatch always requires digest
+drill-down.
 
-### gRPC Service
+### Mandatory digest drill-down
 
-`vault/dr_replication_service.proto` defines:
+For each mismatched range, the secondary calls `ExchangeRangeDigests` with a
+parent span. The primary returns child digest descriptors.
+
+Each digest descriptor includes:
+
+- child span
+- count
+- XOR of SHA-256 over KIDs
+- XOR of SHA-256 over KID/VID pairs
+- approximate value bytes for planning
+
+The secondary rejects digest responses that:
+
+- are nil or empty
+- contain invalid spans
+- contain spans outside the parent
+- overlap
+- leave gaps in parent coverage
+- fail to advance split depth for a splittable parent
+- omit digest hash fields
+
+Because this is a greenfield feature, unsupported or failing drill-down does
+not fall back to an unproven fetch path. It fails reconciliation.
+
+### Fetch completeness proof
+
+For every fetched span, the secondary recomputes digest accumulators over the
+received entries and compares them to the primary's advertised digest.
+
+The secondary rejects fetched output that:
+
+- has a nil batch
+- has a checkpoint tuple mismatch
+- contains `failed_kids`
+- contains an entry without a resolvable KID
+- contains duplicate KIDs
+- contains KIDs outside the requested spans
+- omits entries required by the span digest
+- includes entries that make the recomputed digest differ
+
+Only after digest validation succeeds can the secondary treat the fetched set
+as the complete primary set for those spans.
+
+### Delete inference
+
+Range fetches stream primary-present entries. They do not naturally list
+secondary-local keys that no longer exist on the primary.
+
+After fetch completeness is proven, the secondary compares local KIDs in the
+fetched spans against remote KIDs received from the primary. Local KIDs absent
+from the proven remote set become candidate deletes.
+
+Deletes are applied after fetched puts complete. This ordering prevents
+transient replacement ordering issues and keeps the delete phase separately
+auditable. Delete application is fail-closed and checkpoint-bound.
+
+### Range selection completeness
+
+This is the main remaining correctness target.
+
+Dirty bitmaps are useful for reducing work, but they must not be treated as
+authority. A checkpoint cannot be marked applied unless the secondary has
+verified every relevant range or has a tuple-bound proof that skipped ranges
+were unchanged since the secondary's resume point.
+
+The required invariant is:
+
+> `lastAppliedIndex` must not advance for a checkpoint unless range selection
+> is complete for that checkpoint.
+
+Acceptable designs include:
+
+- always verifying all top-level ranges before checkpoint advancement
+- using dirty bitmaps only as priority hints
+- adding a checkpoint-bound coverage proof for skipped ranges
+- periodically forcing full top-level verification
+
+The PoC should not be considered correctness-complete until this invariant has
+an implementation and regression coverage.
+
+### Apply and commit rule
+
+Reconciliation has distinct phases:
+
+1. range comparison and drill-down
+2. fetch proof validation
+3. fetched put application
+4. inferred delete application
+5. checkpoint finalization
+
+If any phase fails, the secondary does not advance `lastAppliedIndex`. A later
+reconciliation attempt can retry from the previous committed state.
+
+### Resnapshot fallback
+
+When bounded reconciliation cannot converge, the secondary may perform a full
+resnapshot from a checkpoint. Resnapshot still uses checkpoint-fenced fetches
+and fail-closed apply semantics.
+
+Fallback is a recovery mechanism, not a way to bypass reconciliation proofs.
+It should be triggered by explicit operator action or by configured convergence
+policy after repeated bounded failures.
+
+### Promotion
+
+Promotion converts a DR secondary into a standalone cluster.
+
+Promotion must:
+
+- stop DR stream/reconciliation activity
+- clear secondary read-only enforcement
+- prevent use of stale primary relationship state
+- leave the promoted cluster with local ownership of future writes
+
+Promotion does not preserve an active relationship to the old primary.
+
+### API surface
+
+The expected HTTP API shape is:
+
+- `sys/replication/dr/primary/enable`
+- `sys/replication/dr/primary/disable`
+- `sys/replication/dr/primary/secondary-token`
+- `sys/replication/dr/primary/revoke-secondary`
+- `sys/replication/dr/secondary/enable`
+- `sys/replication/dr/secondary/disable`
+- `sys/replication/dr/secondary/promote`
+- `sys/replication/dr/status`
+
+The expected gRPC protocol includes:
 
 - `StreamChanges`
+- `Heartbeat`
 - `RequestCheckpoint`
 - `ExchangeDirtyBitmap`
 - `ExchangeRangeChecksums`
-- `ExchangeRangeDigests` (Fine-grained drill-down)
+- `ExchangeRangeDigests`
 - `FetchEntries`
-- `Heartbeat`
 - `SyncKeyring`
 
-Additive range-aware protocol elements:
-
-- `RangeSpan`
-- `DirtyBitmapMessage`
-- `RangeDigest`
-- `CheckpointResponse.range_plan_version`
-- `RangeDigestRequest` / `RangeDigestResponse`
-- `checkpoint_index` fencing fields on reconcile-phase requests (`RangeChecksumRequest`, `RangeDigestRequest`, `FetchEntriesRequest`)
-- `RangeChecksumRequest.range_ids` (based on dirty bitmap)
-- `FetchEntriesRequest.ranges`
-- `FetchEntriesRequest.items` (`FetchItem.kid`, `FetchItem.expected_vid`) for provenance-safe point fetches
-- `EntryChange.kid` for delete reconciliation when key text is unavailable
+All DR gRPC calls require mTLS and relationship authorization.
+
+### Resource controls
+
+The protocol needs bounded resource use:
+
+- checkpoint artifact retention budgets
+- checkpoint build throttling
+- stream replay horizon budgets
+- max in-flight reconcile tasks
+- max RPC bytes per reconciliation
+- max wall time per reconciliation
+- max split depth
+- max split count
+- batch sizes for fetched puts and deletes
+- bounded stream apply queues
+- primary-side backpressure when secondaries cannot converge
 
-## Relationship and Bootstrap Model
+Budget exhaustion is a reconciliation failure unless an operator explicitly
+chooses a fallback path.
 
-### DRActivationToken
+### Observability
 
-Relationship-scoped activation token fields:
+The status API should expose:
 
-- `cluster_id`
-- `relationship_id`
-- `primary_addrs` -- ordered candidate primary cluster addresses for reconnect/failover without an external load balancer (required by secondary enable path)
-- `primary_addr` -- informational mirror of the first `primary_addrs` entry
-- `primary_api_addr`
-- `repl_salt`
-- `dr_transport_ca_cert` -- DER-encoded DR transport CA public certificate; the sole trust anchor for verifying primary identity over the DR gRPC transport
-- `primary_api_ca_cert` (optional) -- CA for HTTPS API registration; may differ from the DR transport CA
-- `primary_api_server_name` (optional)
-- `bootstrap_token`
+- DR mode and secondary state
+- relationship ID
+- primary index
+- last applied index
+- active checkpoint tuple
+- reconcile phase
+- reconnect counters
+- fallback counters and last fallback reason
+- stream lag and apply rates
+- range task counts
+- budget usage
+- journal replay health
+- backpressure state
 
-### DRRelationship Persistence
+Metrics should make it possible to distinguish:
 
-Per-relationship stored data:
+- normal streaming
+- reconnect replay
+- reconciliation
+- resnapshot fallback
+- authz failures
+- checkpoint tuple failures
+- fetch proof failures
+- apply failures
+- budget failures
+- delete safety failures
 
-- `relationship_id`
-- `state` (`pending`, `registered`, `active`, `revoked`)
-- `secondary_cert_fingerprint`
-- `secondary_ca_cert`
-- `bootstrap_token`
-- `created_at`
-- `last_seen_at`
-- `expires_at`
-- `failed_attempts`
-- `locked_until`
-- `registered_from_ip`
-- `revoked_at`
-- `last_error`
+## Rationale and alternatives
+
+### Why OpenBao-native replication
+
+OpenBao-native replication can enforce OpenBao-specific invariants that storage
+replication and snapshot workflows cannot easily enforce: relationship authz,
+seal-aware bootstrap, ciphertext-domain apply, local path exclusions,
+checkpoint-fenced fetches, and fail-closed promotion behavior.
+
+### Why checkpoint-fenced reconciliation
+
+Reconciling against live primary storage can race with ongoing writes. A
+checkpoint gives the secondary a stable target. Every fetched entry and digest
+must be tied to the checkpoint tuple.
+
+### Why digest proof before deletes
 
-### Bootstrap Security
+Deletes are inferred from absence. Absence is only meaningful if the primary's
+response is complete. Digest proof validation turns "the primary did not send
+this key" into a defensible statement about the checkpoint.
 
-Bootstrap uses X25519 ECDH + AES-256-GCM AEAD wrapping with transcript binding:
-
-1. Secondary sends `client_ephemeral_pubkey` (X25519) and `client_nonce` (32 bytes, `crypto/rand`).
-2. Primary derives the shared secret via ECDH, generates `server_ephemeral_pubkey`, `server_nonce` (32 bytes, `crypto/rand`), and `gcm_iv` (12 bytes, `crypto/rand`).
-3. Key derivation: `HKDF-SHA256(shared_secret, salt=client_nonce||server_nonce, info="openbao-dr-root-key-wrap-v1")` produces a 256-bit wrap key. The HKDF salt is composed exclusively of high-entropy random nonces; the GCM IV is generated independently.
-4. Primary encrypts root key with AES-256-GCM using the wrap key, `gcm_iv` as IV, and **AAD** containing:
-   - `relationship_id`
-   - `cluster_id` (primary cluster)
-   - `secondary_cert_fp` (SHA-256 fingerprint of secondary's cluster certificate)
-   - `primary_identity` (SHA-256 SPKI hash of the DR transport CA public key)
-   - `version` (protocol version, currently `1`)
-   - `client_nonce_hex`
-5. Primary returns: `wrapped_root_key`, `server_ephemeral_pubkey`, `server_nonce`, `gcm_iv`, `wrap_aad_version`, encrypted `core/keyring` and `core/root-key` entries.
-6. Secondary unwraps locally using its ephemeral private key and the same AAD construction, then adopts key material.
-
-**Replay and cross-cluster resistance:** The AAD binds the wrapped material to a specific cluster, relationship, and both peer identities. An attacker who replays a captured bootstrap response to a different cluster or relationship will fail AAD verification. The `client_nonce` (generated fresh per bootstrap attempt) ensures each handshake produces a unique shared secret and wrap key.
-
-**One-time-use:** The `bootstrap_token` is burned (cleared from storage) on successful registration. A replayed or reused token is rejected. Expired pending relationships are garbage-collected periodically.
-
-**Registration serialization and one-time burn:** Registration (`ValidateBootstrapAndStoreCert`) runs under the DR manager lock. On success, the relationship is persisted with `state=registered`, `secondary_cert_fingerprint`, and `bootstrap_token=""` in one relationship write. Concurrent retries after first success fail closed because the relationship is no longer `pending` and/or the bootstrap token no longer matches, returning an invalid/already-used token error.
-
-No plaintext root key flow exists.
-
-### Post-Bootstrap Local-State Cleanup (Secondary)
-
-After keyring bootstrap, the secondary performs deterministic local cleanup to avoid stale-ciphertext failures:
-
-1. Purge stale local barrier entries created before the root-key swap.
-2. Preserve only local-critical paths:
-   - `core/keyring`
-   - `core/root-key`
-   - `core/hsm/barrier-unseal-keys`
-   - `core/seal-config`
-   - `core/recovery-config`
-   - `core/recovery-key`
-   - `core/cluster/local/info`
-3. Re-persist `core/dr-replication/config` from in-memory manager state (`PersistConfigSnapshot`) so it is encrypted under the current barrier key.
-4. Run DR-scoped Raft TLS keyring self-heal (`ensureRaftTLSKeyringForDRSecondary`) to recreate missing/corrupt/no-active keyrings and apply upgrades.
-5. Seed DR key-transition handling so standby invalidations can defer/replay decrypt-sensitive events during convergence.
-
-## Replication Data Model
-
-Reconciliation operates over encrypted storage identity pairs:
-
-- `KID = HMAC(repl_salt, canonical_storage_key)`
-- `VID = SHA256(ciphertext_bytes || seal_wrap_flag)` for present entries, tombstone representation for deletes.
-
-This keeps reconciliation below the barrier while preserving confidentiality of key names and values.
-
-### Replication Domain Exclusions
-
-DR intentionally excludes cluster-local/internal paths from both stream fanout and reconciliation so local node/cluster state does not pollute cross-cluster convergence.
-
-- Never-replicate (stream + reconcile): local seal/recovery/lock/raft/leader/cluster-local metadata and DR manager persistence paths (for example `core/hsm/barrier-unseal-keys`, `core/seal-config`, `core/recovery-config`, `core/recovery-key`, `core/lock`, `core/initialize-lock`, `core/cluster/local/*`, `core/leader/*`, `core/raft/*`, `core/dr-replication/*`).
-- Reconcile-only exclusion: `core/keyring` (handled by `SyncKeyring` bootstrap and stream updates rather than anti-entropy scan/fetch).
-
-## Reconciliation Algorithm (Ordered Hash Streams)
-
-### Digest Design and Guarantees
-
-The reconciliation protocol uses two digest layers with distinct properties:
-
-**Phase A -- CRC64-XOR (performance hint):**
-
-- `ComputeRangeChecksum` produces a 64-bit XOR of `CRC64(KID) ^ CRC64(VID)` per item, plus `count`.
-- CRC64-XOR is a fast, non-cryptographic prefilter used as a **performance hint** to identify likely-equal ranges. The false-equality probability per range is bounded by 2^-64 for the CRC64 component (count must also match). Across 1024 ranges per reconciliation cycle, the probability of any undetected divergence is approximately 2^-54, which is negligible for the non-Byzantine threat model.
-- CRC64-XOR is commutative (order-independent). This is correct for set comparison: two sets with the same (KID, VID) pairs produce the same checksum regardless of iteration order.
-
-**Current Phase A behavior:**
-
-- A Phase A checksum+count match is treated as converged and skipped.
-- Phase B `RangeDescriptor` comparison remains the authoritative integrity check for ranges that enter drill-down.
-- A `ReconcileIntegrityMode` config field exists in persisted DR config, but strict/alternate Phase A handling is not yet wired in the current runtime path.
-
-**Phase B -- RangeDescriptor (authoritative equality):**
-
-- `RangeDescriptor` contains `(count, XORKeyHash, XORValueHash)` where `XORKeyHash = XOR_i SHA256(KID_i)` and `XORValueHash = XOR_i SHA256(KID_i || VID_i)`. Both are 256-bit accumulators.
-- This is the authoritative equality check used during fine-grained drill-down (`ExchangeRangeDigests`). The false-equality probability is bounded by 2^-256, which is cryptographically negligible.
-- XOR of SHA256 outputs proves equality of the *set* of pairs, not ordering. This is intentional: reconciliation compares sets of (KID, VID) items, not sequences.
-
-**Invariants:**
-
-- Range descriptors assume a canonical set: each KID appears at most once per checkpoint. Duplicates would cause XOR cancellation. This invariant is enforced by the scanner which builds `KIDToVID` as a map (last-writer-wins) and by immutable checkpoint artifacts which are point-in-time snapshots.
-- Threat model is non-Byzantine. Digests are for divergence detection between a trusted primary and its secondaries, not for detecting a malicious primary producing adversarial checkpoint artifacts.
-
-### Phase A: Dirty Bitmap & Coarse Checksums
-
-1. Primary maintains a "Dirty Bitmap" of modified ranges (1024 static shards).
-2. On Reconcile, Primary sends `DirtyBitset` to Secondary.
-3. Secondary identifies matching dirty ranges.
-4. For each dirty range, Primary and Secondary exchange CRC64-XOR checksums plus entry count.
-5. If checksum and count match, the range is treated as converged (see "Digest Design and Guarantees" for false-equality bounds). If either differs, the range enters Phase B.
-
-### Phase B: Fine-Grained Drill-down
-
-1. For each mismatched range from Phase A, Secondary requests fine-grained digests (sub-ranges) via `ExchangeRangeDigests`.
-2. Primary splits the mismatched range in half, computes a `RangeDescriptor` (256-bit SHA256-XOR pair + count) for each sub-range, and returns them.
-3. Secondary compares sub-range `RangeDescriptor` digests against its local data, narrowing the diff to the smallest mismatched sub-ranges.
-4. Drill-down repeats recursively up to a configurable split depth limit.
-
-### Phase C: Stream the Diff
-
-1. Secondary identifies specific sub-ranges that differ (from Phase B).
-2. Secondary requests `FetchEntries` for those sub-ranges.
-3. Primary streams raw KV pairs for those ranges.
-4. Secondary applies updates in transactional batches.
-
-### Dirty Bitmap Optimization
-
-- **Mechanism:** Bitset of modified ranges.
-- **On Write:** Flag range ID as `dirty`.
-- **On Reconcile:** Only scan `dirty` ranges. Clean ranges are skipped entirely.
-
-### Phase D: Commit Rule
-
-`lastAppliedIndex` advances only if all admitted range work succeeds:
-
-- no unresolved `failed_kids`
-- no apply failures
-- no unresolved range failures
-- no checkpoint/session fence violations
-
-Any unresolved failure is a reconciliation failure and retries later.
-
-## Automatic Resnapshot Fallback
-
-To handle sustained lag where reconcile throughput cannot catch up with incoming writes, the secondary supports a hard-cutover fallback:
-
-1. Trigger conditions (configurable):
-   - lag-growth window (`convergence_stall_seconds`) exceeded
-   - apply/write rate ratio (`secondary_apply_rate_eps / primary_write_rate_eps`) below `convergence_min_rate_ratio`
-   - lag (`primary_index - last_applied_index`) above threshold
-   - and/or failure window threshold reached for `budget_exceeded|stalled|decode_exhausted`
-2. Secondary enters `resnapshotting` state.
-3. Secondary requests a fresh checkpoint and performs protocol-scoped full-copy fetch for full hash span.
-4. Secondary applies fetched entries, deletes local-only entries under checkpoint/session fencing, sets `lastAppliedIndex=checkpoint.commit_index`, and resumes streaming.
-5. Cooldown and per-hour limits bound fallback frequency.
-
-```mermaid
-flowchart TD
-    A["Request Reconcile"] --> B["Exchange Dirty Bitmap"]
-    B --> C["Stream Coarse Checksums for Dirty Ranges"]
-    C --> D{"Checksum Match?"}
-    D -- "Yes" --> E["Skip Range"]
-    D -- "No" --> F["Request Fine-Grained Checksums"]
-    F --> G["Compare Sub-Ranges"]
-    G --> H{"Sub-Range Match?"}
-    H -- "Yes" --> E
-    H -- "No" --> I["FetchEntries (Stream Diff)"]
-    I --> J["Apply Batch"]
-    J --> K{"All Ranges Done?"}
-    E --> K
-    K -- "Yes" --> L["Advance lastAppliedIndex"]
-    K -- "No" --> M["Retry/Fail"]
-```
-
-## Ordering and Correctness
-
-1. Change stream delivery is ordered by Raft index.
-2. Gap detection fails closed on forward jumps.
-3. Stale/old entries (`< lastAppliedIndex`) are ignored safely.
-4. Seal-wrap metadata is preserved in replication operations.
-5. Catch-up replay is inclusive on `last_applied_index` so reconnect can recover same-index multi-operation Raft entries.
-6. Reconciliation scanning is transactional-snapshot aware and fail-closed on `ListPage/Get` errors.
-7. Reconcile session fencing (`checkpoint_id` + `checkpoint_index`) is enforced across all range/fetch/prefix phases.
-8. Reconcile/resnapshot fetches are served from immutable checkpoint artifacts only; live primary storage drift is not consulted for checkpoint-fenced reads.
-9. **Monotonic checkpoint index:** The secondary persists a `highest_committed_checkpoint_index` per relationship. A new reconciliation session is rejected if its `checkpoint_index` is lower than the persisted high-water mark, preventing rollback to older state (which could resurrect revoked credentials or policies). Operator-initiated resnapshot (`sys/replication/dr/secondary/resnapshot`) with `confirm_rollback_ok=true` resets the high-water mark to allow recovery from catastrophic divergence. Resnapshot without `confirm_rollback_ok=true` is rejected. The endpoint logs a structured server event (`old_hwm`, `new_hwm=0`, `reason`, `source_ip`) and returns `old_hwm`/`reset_to` in the API response.
-
-## Resource Controls and Fail-Closed Behavior
-
-### Checkpoint Cache (Primary)
-
-- Global budget: 1 GiB
-- Per-relationship budget: 256 MiB
-- Max checkpoints per relationship: 8
-- Max checkpoints global: 16
-- TTL: 30 minutes
-
-Eviction order:
-
-1. Expired
-2. Oldest within relationship
-3. Oldest global
-
-If admission still fails, `RequestCheckpoint` fails with precondition error.
-
-### Checkpoint Artifact Store (Primary)
-
-- Enabled by default.
-- Immutable per-checkpoint records persisted on disk (`checkpoint_id`, `checkpoint_index`, KID/VID/key/sealwrap/tombstone/value_ref).
-- Value blobs are content-addressed and reused per artifact.
-- Independent budgets and TTL:
-  - Global budget: 8 GiB (default)
-  - Per-relationship budget: 2 GiB (default)
-  - TTL: 30 minutes (default)
-- Fetches fail closed with explicit reasons when artifacts are missing/expired.
-
-### Checkpoint Build Throttling (Primary)
-
-- Primary may temporarily deny `RequestCheckpoint` under high stream pressure (`budget_exceeded: primary stream pressure (...)`).
-- Throttling is bounded and bypassed periodically to prevent permanent starvation.
-- Status exposes throttle counters and stream-pressure telemetry.
-
-### Stream Replay Horizon (Primary)
-
-- In-memory ring remains the first replay source.
-- Disk-backed stream journal extends replay horizon and is consulted when catch-up start index is older than the oldest buffered entry.
-- Because the journal dispatcher runs on all primary-cluster nodes, a new leader inherits a populated journal from its follower period. This eliminates the need for reconciliation fallback after routine leader elections -- the new leader can serve catch-up from its own journal.
-- Journal segments are stored in a persistent subdirectory of the Raft data path (`{raft_data_dir}/dr-stream-journal/`), not a temporary directory.
-- **Confidentiality:** Journal entries are in the ciphertext domain only. The stream journal stores raw `ChangeStreamEntry` records as emitted by the Raft FSM below the barrier. No plaintext keys or decrypted values are written to journal segments.
-- **At-rest protections:** Journal files inherit the same filesystem permissions and disk encryption protections as the Raft data directory. Operators should ensure the Raft data directory is on encrypted storage if at-rest encryption is required.
-- **Retention and deletion:** Journal segment retention is bounded by `drDefaultStreamJournalRetention` (default: 2h) and `drDefaultStreamJournalMaxBytes` (default: 4 GiB). Expired segments are deleted by the retention pruner. Secure deletion (overwrite-before-delete) is best-effort and depends on the underlying filesystem/storage layer.
-- **Integrity and tamper evidence:** Journal segments are a replay optimization, not authoritative state. If a node's local journal directory is corrupted or tampered:
-  - Journal replay validates Raft index monotonicity on each entry. An out-of-order or duplicate index is treated as corruption and causes the replay to abort.
-  - Entry shape validation checks for required fields (`op_type`, `key`, `raft_index`). Malformed entries cause the replay to abort.
-  - On any corruption or validation failure, the node refuses to serve journal-based catch-up for that index range and returns `FailedPrecondition` to the secondary, forcing a full reconciliation instead. This is fail-closed behavior: corrupted journals never produce incorrect replicated state.
-  - Corruption is logged at `WARN` level with the affected index range and segment file for operator investigation.
-- Journal replay is relationship-authorized and index-ordered; if missing/expired, reconnect fails closed and secondary must reconcile.
-
-### Stream Buffer & Journal Defaults (Primary)
-
-- In-memory ring buffer: 50,000 entries / 256 MiB (`drStreamBufferMaxEntries`, `drStreamBufferMaxBytes`)
-- Journal max size: 4 GiB (`drDefaultStreamJournalMaxBytes`)
-- Journal segment size: 64 MiB (`drDefaultStreamJournalSegmentBytes`)
-- Journal retention: 2 hours (`drDefaultStreamJournalRetention`)
-- Journal flush interval: every 256 entries (`drDefaultStreamJournalFlushInterval`)
-
-### Reconcile Budgets (Secondary)
-
-- Max total ranges per reconciliation session: 1024 (`drRangeMaxTotalRanges`)
-- Max reconcile RPC bytes: 128 MiB
-- Max reconcile wall time: 30 minutes (`drDefaultReconcileMaxWallTime`)
-- Reconcile context timeout: 10 minutes (`drDefaultReconcileTimeout`) -- the outer context timeout per reconciliation invocation
-- Max inflight range tasks: 16 (bounded worker pool)
-- Checkpoint RPC timeout: 5 minutes (`drDefaultCheckpointRPCTimeout`) -- longer than general RPCs because the primary must build a checkpoint artifact (full storage scan + KID/VID index)
-
-### Stream Resume & Redirect Defaults (Secondary)
-
-- Max stream resume attempts before reconciliation: 3 (`drMaxStreamResumeAttempts`)
-- Apply yield duration: 1ms between batch commits (`drDefaultApplyYieldDuration`)
-
-### DR Key-Transition Invalidation (Secondary Standby)
-
-To prevent standby sealing during DR root-key transitions, invalidation uses a queue-and-replay state machine:
-
-1. Transition is entered on DR config/keyring invalidations or transient decrypt mismatches on decrypt-sensitive invalidations (namespace, quota, audit, legacy mount, transactional mount, mount-adjacent keys).
-2. Matching invalidations are deferred into a deduplicated queue (cap: 20,000 keys).
-3. A single transition worker performs resync attempts:
-   - `ReloadRootKey`
-   - `ReloadKeyring`
-   - `ensureRaftTLSKeyringForDRSecondary`
-   - `checkRaftTLSKeyUpgrades`
-   - `RefreshConfigFromStorage`
-4. Retry backoff is jittered and bounded (100ms to 2s) until the transition deadline (90s).
-5. On successful resync, deferred invalidations are replayed in order for that generation and transition ends.
-6. Queue overflow or transition timeout is fail-closed (`core.restart()`).
-7. Non-transient/non-DR errors remain fatal and follow normal restart behavior.
-
-### Abuse and DoS Limits
-
-The following limits bound resource consumption under adversarial or misconfiguration scenarios:
-
-- **Redirect rate limiting:** Max 10 redirects per relationship per 60-second sliding window (`drMaxRedirectsPerMinute`). Exceeding this triggers exponential backoff (starting at 2s, capped at 30s) before the next connection attempt. This prevents leader-flapping amplification.
-- **gRPC message size:** The DR gRPC server enforces explicit `MaxRecvMsgSize` and `MaxSendMsgSize` of 16 MiB (`drGRPCMaxMessageSize`). This bounds decompression cost for gzip-compressed messages and prevents unbounded memory allocation from malformed or oversized messages.
-- **Decompression safety:** gRPC's built-in gzip decompressor respects the `MaxRecvMsgSize` limit. In Go's gRPC implementation, `MaxRecvMsgSize` is enforced on the **decompressed** payload size: the framework reads the compressed bytes, decompresses into a bounded buffer, and rejects if the decompressed size exceeds the limit. This prevents zip-bomb attacks where a small compressed message decompresses to an oversized payload.
-- **Per-item blob size:** Individual secret values within `FetchEntries` responses are bounded by the per-entry storage limit (512 KiB default, configurable via `max_entry_size`). The DR transport does not implement chunking for oversized values; entries that exceed `max_entry_size` at the primary are rejected at write time and never enter the replication stream. If a primary's `max_entry_size` is increased after initial configuration, the DR gRPC `MaxRecvMsgSize` should be reviewed to ensure it accommodates the largest possible `EntryBatch`.
-- **Batch bounds:** `EntryBatch` messages are bounded by both entry count (default: 256 entries per batch, `drDefaultStreamBatchMaxEntries`) and byte size (default: 1 MiB per batch, `drDefaultStreamBatchMaxBytes`). These are hard caps enforced at the sender; the receiver additionally validates batch size against `MaxRecvMsgSize` at the gRPC layer.
-
-### Pipelined Stream Application & Flow Control
-
-The stream pipeline decouples Raft FSM apply from replication I/O and uses credit-based flow control to prevent both Head-of-Line blocking and unnecessary reconnect-reconcile cycles.
-
-#### Pipeline Stages
-
-1. **OnChange Fan-Out (Primary)**: The Raft FSM change stream hook is a two-layer dispatcher (`drChangeStreamDispatcher`). The base layer runs on **all** primary-cluster nodes: it filters non-replicable paths and appends entries to the on-disk stream journal. The primary layer (active only on the leader) handles ring buffer append, dirty bitmap update, index maintenance, and subscriber fan-out. Subscriber fan-out pushes entries into a bounded channel (`bufMaxSize` capacity) per subscriber. This operation is non-blocking: if a subscriber's channel is full, the subscriber's context is cancelled, forcing a reconnect. The fan-out never stalls the Raft apply path.
-
-2. **StreamChanges Send Loop (Primary)**: Each subscriber has a dedicated goroutine that reads entries from its channel and sends them to the Secondary via the bidirectional `StreamChanges` gRPC stream as `EntryBatch` messages. Entries are accumulated into batches (up to 256 entries or 1 MiB per batch) to reduce per-message gRPC framing overhead. Before each batch send, the loop consumes one credit per entry from the subscriber's credit counter. If no credits are available, it blocks (with a configurable timeout) until the Secondary replenishes them. Catch-up replay (from ring buffer and disk-backed journal) also batches entries for throughput.
-
-3. **Receive & Apply Queue (Secondary)**: The Secondary receives `EntryBatch` messages from the stream, unpacks individual entries, and pushes them into an internal `applyCh` (capacity = 4x batch size). Gap detection on Raft index discontinuities triggers a reconciliation fallback.
-
-4. **Apply Worker (Secondary)**: Consumes entries from `applyCh` in transactional batches (configurable max entries, bytes, and time window). After each successful flush, it sends the number of flushed entries to a credit-replenishment channel.
-
-5. **Credit Sender (Secondary)**: A dedicated goroutine reads from the credit-replenishment channel and sends `WindowUpdate` messages to the Primary, allowing it to resume sending.
-
-#### Credit-Based WindowUpdate Flow Control
-
-The `StreamChanges` RPC is bidirectional. The Secondary sends a `StreamChangesUpstream` envelope:
-
-- **First message**: `init` carrying `StreamChangesRequest` with `initial_window` (default: 4096 entries).
-- **Subsequent messages**: `WindowUpdate{credits: N}` sent after each batch flush, where N is the number of flushed entries.
-
-The Primary maintains a per-subscriber atomic credit counter:
-
-| Condition | Behavior |
-| --- | --- |
-| `credits > 0` | Send immediately, decrement counter |
-| `credits == 0` | Block up to `drCreditWaitTimeout` (default: 30s) for replenishment |
-| Timeout fires | Cancel subscriber (ResourceExhausted), secondary reconnects |
-| Channel overflow | Cancel subscriber immediately (unchanged safety net) |
-
-This creates natural end-to-end backpressure: the Primary sends at most as fast as the Secondary can flush, without requiring the Secondary to pre-negotiate a fixed rate.
-
-#### Reconnection & Catch-Up
-
-When a subscriber is cancelled (by credit timeout or channel overflow), the Secondary detects the stream error and enters a **stream resume fast-path**: it re-enters `runStream` up to `drMaxStreamResumeAttempts` (default: 3) times before falling back to reconciliation. Each resume attempt reconnects to the Primary's `StreamChanges` handler, which attempts catch-up from its in-memory ring buffer or disk-backed stream journal. After a leader election, the new leader's journal typically covers the secondary's gap (since the journal was maintained during the follower period), enabling stream resume without reconciliation. If the primary explicitly signals that catch-up is impossible (`reconciliation required`, `buffer too old`, or `journal too old`), the secondary skips remaining resume attempts and enters reconciliation immediately. If the gap is too old for both ring buffer and journal, the primary returns `FailedPrecondition` and the Secondary falls back to full reconciliation.
-
-#### Standby Node Rejection
-
-All mutating DR RPCs (`RequestCheckpoint`, `SyncKeyring`, `StreamChanges`, `ExchangeRangeChecksums`, `ExchangeRangeDigests`, `FetchEntries`) perform a `requireActiveNode` check. If the request reaches a standby (non-leader) node, it is rejected with a `DRRedirectDetail` gRPC status containing the active leader's cluster address. The secondary extracts this redirect and returns it to the controller loop for immediate reconnection.
-
-#### Secondary Controller Redirect Handling
-
-The secondary controller loop (`startSecondaryControllerLocked`) maintains an ordered, deduplicated candidate ring of primary cluster addresses:
-
-- persisted token/config candidates (`primary_addrs`)
-- redirect/heartbeat leader hints surfaced as `errDRRedirect`
-
-On `Connect()` failure or transport-level `Start()` failure (for example `tls: internal error`, `unsupported protocol`, handshake failures), the controller rotates to the next candidate immediately. Exponential backoff is applied only after a full failed cycle across all known candidates. Redirect hints are rate-limited before insertion to prevent hot redirect loops.
-
-This allows deterministic stepdown recovery without requiring a load balancer while keeping strict fail-closed TLS semantics.
-
-#### gRPC Transport Compression
-
-DR gRPC streams use gzip compression (`grpc.UseCompressor("gzip")`) to reduce bandwidth between primary and secondary clusters. Both client (secondary) and server (primary) register the gzip compressor at import time.
-
-#### Apply Yield
-
-After each successful batch commit in the DR apply path (both streaming and reconciliation), the secondary inserts a short pause (`drDefaultApplyYieldDuration`, default: 1ms). This prevents the apply worker from monopolizing the secondary's Raft subsystem and starving heartbeat processing, which can otherwise cause the secondary cluster to lose quorum under sustained write load.
-
-#### Heartbeat Pressure Signaling and Cert Propagation
-
-Independently, the Secondary sends its `lastAppliedIndex` every 2s via the `Heartbeat` RPC. The Primary uses this for DR-aware ingress admission (write throttling) -- a coarser-grained mechanism that protects the entire system, complementing the per-subscriber credit flow control.
-
-The heartbeat response also carries the active leader's DR transport leaf certificate (`active_cluster_cert`) and cluster address (`leader_cluster_addr`). The secondary verifies that `active_cluster_cert` chains to the pinned DR transport CA before adding it to the trust pool. This provides a secure refresh mechanism for leader certificate rotation without TOFU (see "Cross-Cluster TLS Trust Model").
-
-If heartbeat certificate verification fails, the secondary treats it as a hard trust failure: it cancels the active stream and returns control to the reconnect controller (fail-closed, no permissive continuation).
-
-## Performance & Limits
-
-| Feature | Scaling Limit | Optimization |
-| --- | --- | --- |
-| **Range Scanning** | Halts Primary FSM | **Dirty Bitmaps**: Only scan ranges modified since last check. |
-| **Stream Applier** | Serial application slow | **Batch Commit**: Group entries into 10-50ms commit batches. |
-| **Stream Buffer** | Memory pressure under write bursts | **Tuned Defaults**: 50,000 entries / 256 MiB ring buffer; disk-backed journal (4 GiB / 64 MiB segments / 2h retention) extends horizon. |
-| **Tombstones** | Infinite growth on high churn | **Epoch-Based GC**: Prune tombstones acknowledged by all peers. |
-| **Checkpoint Index Warmup** | Full O(N) scan on leader change | **Journal Replay**: Replay local stream journal to rebuild KID/VID index via sequential disk I/O instead of random-access storage scan. Full scan interval extended to 4 hours. |
-| **Apply Starvation** | Raft heartbeat starvation under load | **Apply Yield**: 1ms pause between batch commits to give secondary Raft heartbeat goroutines CPU time. |
-| **Bandwidth** | Cross-cluster WAN bandwidth | **gRPC gzip**: All DR streams use gzip compression. |
-
-### Epoch-Based Tombstone GC
-
-- **Mechanism:** Tag tombstones with `RaftIndex`.
-- **Cleanup:** Primary safe-deletes tombstones with `index < secondary_last_applied_index`.
-- **Safety:** "Global Low Watermark" for disconnected nodes (forced resnapshot if > days).
-
-### Reconcile Retry Control
-
-- Failure classes are tracked (`budget_exceeded`, `decode_exhausted`, `checkpoint_tuple_mismatch`, `checkpoint_artifact_missing`, `checkpoint_provenance_mismatch`, `apply_failed`, `auth_revoked`, `redirect`, `stalled`, `unknown`).
-- Per-class retry caps are enforced with cooldowns to avoid infinite hot-loop retries under sustained contention.
-- Checkpoint tuple/artifact/provenance classes use explicit cooldown paths before next attempt.
-- The `redirect` class is special: it bypasses retry logic entirely and immediately returns to the controller loop for reconnection to the actual leader node.
-
-### DR-Aware Backpressure (Primary)
-
-- A pressure controller computes `healthy|degraded|critical` from primary write rate, minimum secondary apply rate, lag, and stream horizon.
-- External mutating requests (`create|update|delete|patch`) are admitted with a bounded per-second cap in degraded/critical states.
-- Exempt paths: `sys/replication/dr/*`, `sys/health`, `sys/seal-status`.
-- Overflow is rejected with HTTP 429 and explicit status telemetry.
-
-### Fallback Policy (Secondary)
-
-- Automatic fallback is enabled by default.
-- Default stall threshold: 180s.
-- Default failure-window trigger: 3 failures in a 10-minute window (`budget_exceeded|stalled`).
-- Default minimum lag trigger: `2 * stream_buffer_max_entries` if not explicitly configured.
-- Cooldown and frequency limits: 10 minutes cooldown, max 2 fallback events per hour.
-
-## Revocation and Authz Behavior
-
-1. Revoke marks relationship state as `revoked` and persists it.
-2. Trusted cert material for that relationship is removed.
-3. Active streams for that relationship are terminated immediately.
-4. Other relationships remain unaffected.
-5. Stream path also performs periodic auth revalidation.
-
-## Token Abuse Resistance
-
-Bootstrap registration policy defaults:
-
-- TTL: 15 minutes
-- Max failed attempts: 5
-- Lockout: 30 minutes
-- Source-IP recording on successful registration
-
-On failed validation:
-
-- failed attempts are incremented and persisted
-- lockout is applied when threshold is reached
-- error context is recorded (`last_error`)
-- expired pending relationships are periodically garbage-collected from storage
-
-## Heartbeat and Persistence Throttling
-
-- In-memory liveness updates are immediate.
-- Persistent `last_seen_at` writes are throttled to once per 30 seconds per relationship.
-- Durable writes are forced on key state transitions (for example registration/activation/revocation paths).
-
-## Observability
-
-### Status Endpoint
-
-`GET sys/replication/dr/status` includes:
-
-- Mode and cluster metadata
-- Secondary counters/state (`primary_index`, `last_applied_index`, `reconcile_count`, `connect_retries`, `connect_failures`)
-- `reconcile_ranges_inflight`
-- `reconcile_ranges_failed`
-- `reconcile_budget_remaining_bytes`
-- `reconcile_active_checkpoint_id`
-- `reconcile_active_checkpoint_index`
-- `reconcile_fail_reason_last`
-- `reconcile_rpc_bytes_used`
-- `scan_failures_total`
-- `checkpoint_conflicts_total`
-- `reconcile_retries_total`
-- `reconcile_queue_depth`
-- `reconcile_task_retries_total`
-- `reconcile_stalled_total`
-- `reconcile_stuck_seconds`
-- `last_applied_age_seconds`
-- `reconcile_max_rpc_bytes`
-- `reconcile_max_wall_time_seconds`
-- `reconcile_max_inflight_tasks`
-- `stream_batch_max_entries`
-- `stream_batch_max_bytes`
-- `stream_batch_max_wait_milliseconds`
-- `checkpoint_cache_bytes`
-- `checkpoint_cache_items`
-- `checkpoint_cache_evictions`
-- `checkpoint_meta_bytes`
-- `checkpoint_value_bytes`
-- `checkpoint_admission_failures`
-- `checkpoint_throttle_total`
-- `checkpoint_throttle_bypass_total`
-- `stream_buffer_entries`
-- `stream_buffer_bytes`
-- `stream_lagging_subscribers_total`
-- `stream_lagging_subscribers_active`
-- `stream_subscribers_active`
-- `stream_buffer_horizon_seconds`
-- `checkpoint_ttl_seconds`
-- `checkpoint_global_budget_bytes`
-- `checkpoint_per_relationship_budget_bytes`
-- `revoked_streams_terminated`
-- `relationship_count_by_state`
-- `fallback_active`
-- `fallback_count`
-- `fallback_last_reason`
-- `fallback_last_at`
-- `reconcile_task_rate`
-- `primary_write_rate_eps`
-- `secondary_apply_rate_eps`
-- `lag_entries`
-- `lag_slope_eps`
-- `predicted_catchup_seconds`
-- `stream_journal_bytes`
-- `stream_journal_segments`
-- `stream_journal_oldest_index`
-- `journal_replay_attempts_total`
-- `journal_replay_success_total`
-- `journal_range_too_old_total`
-- `reconcile_put_workers_active`
-- `reconcile_delete_phase_seconds`
-- `checkpoint_artifact_bytes`
-- `checkpoint_artifact_items`
-- `checkpoint_artifact_evictions`
-- `checkpoint_artifact_build_seconds`
-- `checkpoint_conflicts_storage_drift_total`
-- `dr_backpressure_state`
-- `dr_backpressure_rejections_total`
-- `dr_backpressure_effective_qps_cap`
-
-### Metrics
-
-Representative metrics emitted include:
-
-- stream subscribers/buffer/drop counters
-- checkpoint cache bytes/items/evictions
-- range reconciliation counts (`ranges_total`, `ranges_mismatched`, `ranges_dirty`)
-- budget exceeded counts
-- RPC bytes usage
-- DR key-transition lifecycle (`replication/dr/secondary/key_transition_*`)
-- DR raft TLS keyring self-heal (`replication/dr/secondary/raft_tls_keyring_self_heal_*`)
-
-## Failover
-
-Secondary promotion path:
-
-1. Stop DR ingest and verify the ingest loop has terminated. The `lastAppliedIndex` must be stable (unchanged) for at least 2 seconds to confirm no in-flight applies.
-2. Transition from DR secondary semantics to standalone operation with DR mode set to `disabled`.
-3. Resume serving client writes on the promoted cluster.
-4. Operator may explicitly re-enable DR primary mode to accept new secondaries.
-
-### Promotion Safety
-
-Promotion is a high-risk operation. The following safeguards prevent accidental split-brain:
-
-1. **Operator confirmation:** The `sys/replication/dr/secondary/promote` endpoint requires an explicit `confirm_primary_unreachable=true` parameter. Without it, the request is rejected with an error instructing the operator to confirm that the primary is unreachable. This is a procedural safeguard, not a connectivity check.
-
-2. **Ingest quiesce barrier:** Before transitioning mode, the promotion path verifies that the DR ingest loop has been cancelled and that `lastAppliedIndex` has been stable for a brief quiesce window (default: 2 seconds). This ensures no partial batch is in flight.
-
-3. **Reconciliation guard:** If the secondary is actively reconciling (`DRSecondaryReconciling` state), promotion emits a warning but proceeds. The operator is advised to wait for reconciliation to complete before promoting to minimize data lag.
-
-4. **Secondary ingest teardown on promote:** Promotion stops the secondary ingest loop and closes the DR gRPC client connection before switching to standalone mode (`disabled` DR mode). The operator can later re-enable DR primary mode explicitly.
-
-5. **Promotion token (future work):** For environments requiring stronger guarantees, a future enhancement may require an explicit promotion token to gate secondary promotion.
-
-## Testing Expectations
-
-Core validation includes:
-
-1. DR stream replication and gap handling.
-2. Disconnect + reconcile flows.
-3. Read-only enforcement on secondary.
-4. Revoke isolation and active stream termination.
-5. Bootstrap hardening (expiry, lockout, source IP tracking).
-6. Range-path scenarios:
-   - deterministic dirty bitmap tracking
-   - sparse range checksumming
-   - batch application
-   - manual drill-down to fine-grained checksums
-   - budget-exceeded failure
-   - no index advance on partial failure
-   - multi-relationship isolation
-   - revoke during reconcile abort
-7. Leader-election journal continuity: verify new leader can serve stream catch-up from journal accumulated during follower period without reconciliation.
-8. Journal-based index warmup: verify index built from journal replay matches full-scan result.
-9. CA-scoped TLS trust pool: known cert verification, CA chain validation for unknown certs, rejection of certs not chaining to DR transport CA, TTL-based eviction, heartbeat cert refresh.
-10. Standby node redirect: verify RPCs hitting a standby return a redirect with the active leader's address.
-11. Stream resume fast-path: verify transient disconnects attempt resume before falling back to reconciliation.
-12. Monotonic checkpoint index: verify secondary rejects checkpoint_index lower than highest committed; verify resnapshot resets the high-water mark.
-13. Bootstrap AAD binding: verify wrapped root key cannot be unwrapped with mismatched cluster_id, relationship_id, or secondary cert fingerprint.
-14. Redirect rate limiting: verify excessive redirects trigger backoff and do not cause unbounded reconnection churn.
-15. Promotion safety: verify promote is rejected without `confirm_primary_unreachable=true`; verify ingest quiesce barrier waits for stable lastAppliedIndex.
-16. Resnapshot confirmation: verify resnapshot is rejected without `confirm_rollback_ok=true`; verify old HWM is surfaced in response/logs.
-17. Certificate fingerprint uniqueness: verify registration rejects a fingerprint already bound to another active relationship.
-18. Journal corruption: verify corrupted journal entries cause fail-closed behavior (abort replay, force reconciliation).
-19. Bootstrap cleanup semantics: preserve-only critical local paths, re-persist DR config, and verify stale entries are removed.
-20. DR key-transition invalidation handling: transient decrypt/audit-load failures are deferred and replayed after key resync; non-transient failures remain fatal.
-21. Transition safety bounds: queue overflow and timeout fail closed; benign leadership-setup sealed/canceled errors do not force shutdown.
-
-## Rationale and Alternatives
-
-Chosen approach:
-
-- Cross-cluster replication for true DR isolation.
-- Entry stream + checkpointed set reconciliation for correctness and efficiency.
-- Ordered hash-stream flow for better large-keyspace/hotspot behavior.
-- Dirty bitmaps to decouple reconciliation from storage size.
-
-Alternatives rejected:
-
-- **WAL shipping** -- Couples replication to storage-engine internals and leaks Raft log structure across cluster boundaries. A logical entry-level stream decouples replication from the storage engine and simplifies cross-version compatibility.
-- **IBLT (Invertible Bloom Lookup Tables)** -- In our implementation, IBLT construction required scanning large portions of the keyspace and incurred repeated full-range scans on decode failure, creating unacceptable contention with the write path. Decode failures under high divergence (common during sustained disconnection) produced cascading retries with no monotonic progress guarantee. An ordered segmentation approach reuses the storage engine's sequential-read locality and provides monotonic progress: each refinement strictly narrows the search space.
-- **Merkle-tree reconciliation** -- Imposes a hierarchical hash composition where parent digests are derived from child digests, creating a persistent tree structure that must be maintained on the write path. Our flat segmentation approach computes digests directly from items on demand, avoiding write-path overhead and patent-adjacent tree maintenance semantics.
-- **Plaintext root-key bootstrap** -- Violates security invariants; replaced with ECDH + AEAD wrapped key exchange.
-- **Insecure transport fallback** -- Fails-open on network compromise; rejected in favor of strict mTLS with no fallback path.
-
-## Operational Notes
-
-1. Range partitioning is a performance partitioning mechanism, not a security or tenancy boundary.
-2. Additive protocol evolution is used; no protocol version bump was required for current range fields.
-3. Change-stream replay intentionally includes entries at `last_applied_index` to safely recover reconnects that split same-index operation batches.
-4. Checkpoint cache is metadata-first; checkpoint-fenced `FetchEntries` values are served from immutable checkpoint artifacts (not live storage), and artifact/cache metrics expose memory/disk pressure separately.
-5. Reconciliation range planning is deterministic and derived from the checkpoint-scoped range planner; there is no legacy compatibility path retained.
-
-## Implementation Mapping
-
-### Core Replication and Reconciliation
-
-| RFC Area | Primary Implementation | Secondary/Supporting Implementation |
-|---|---|---|
-| DR primary server, subscriber model, and batched streaming | `vault/dr_replication.go` (`drReplicationPrimary`, `OnChange`, `onChangePrimaryPath`, `StreamChanges`, `sendBatch`, credit-gated batch drain) | `vault/dr_replication_secondary.go` (`drReplicationSecondary`, `runStream` batch receive + unpack, `runStreamApplyWorker`) |
-| Stream application (Transactional Batching) | N/A | `vault/dr_replication_secondary.go` (`applyStreamTxn`, `runStreamApplyWorker`) |
-| Shared journal dispatcher (all-node FSM hook) | `vault/dr_replication.go` (`drChangeStreamDispatcher`, `filterDRReplicableEntries`) | `vault/dr_replication_state.go` (`newDRRelationshipManager` dispatcher init + FSM hook registration) |
-| Stream journal append/replay/retention/warmup | `vault/dr_replication.go` (`OnChange`, `StreamChanges`, `WarmIndexFromJournal`, `WarmIndex`) | `vault/dr_stream_journal.go` (`append`, `replayRange`, `replayAll`) |
-| Checkpoint creation and cache admission | `vault/dr_replication.go` (`RequestCheckpoint`, `cacheCheckpoint`, checkpoint eviction helpers) | `vault/dr_replication_secondary.go` (`runReconciliation`) |
-| Immutable checkpoint artifact materialization and lookup | `vault/dr_checkpoint_artifact_store.go` | `vault/dr_replication.go` (`buildAndCacheCheckpoint`, `readCheckpointEntryChange`) |
-| Range manifest generation | `vault/dr_replication.go` (`RequestCheckpoint`) | `physical/replication/reconciler/range.go` (`BuildRangeChecksums`) |
-| Range-scoped Checksum exchange | `vault/dr_replication.go` (`ExchangeRangeChecksums`) | `vault/dr_replication_secondary.go` (`runRangeReconciliation`, `processRangeTask`) |
-| Range-scoped drill-down | `vault/dr_replication.go` (`ExchangeRangeDigests`) | `vault/dr_replication_secondary.go` (`runRangeDrillDown`) |
-| Range/range+bucket fetch semantics | `vault/dr_replication.go` (`FetchEntries`) | `vault/dr_replication_secondary.go` (`fetchEntriesForDiff`, `fetchAndApplyEntriesWithBudget`, `applyFetchedTxn`) |
-| Convergence telemetry and fallback triggering | `vault/dr_replication_secondary.go` (`updateConvergenceTelemetry`, `convergenceFallbackEligible`, `shouldTriggerFallback`) | `vault/dr_replication_secondary.go` (`performFallback`, `performResnapshot`) |
-| Credit-based WindowUpdate flow control | `vault/dr_replication.go` (`StreamChanges` bidi handler, `waitForCredit`, credit-reader goroutine) | `vault/dr_replication_secondary.go` (`runStream` bidi init + credit-sender goroutine, `runStreamApplyWorker` credit replenishment) |
-| Secondary controller loop (connect/start/redirect) | N/A | `vault/dr_secondary_controller.go` (`startSecondaryControllerLocked`, candidate ring rotation, redirect hint insertion, cycle backoff) |
-| Standby node rejection (active leader check) | `vault/dr_replication.go` (`requireActiveNode`, `DRRedirectDetail` gRPC status) | `vault/dr_replication_secondary.go` (`extractDRRedirect`) |
-| Stream resume fast-path | N/A | `vault/dr_replication_secondary.go` (`streamResumeAttempts`, `isReconciliationRequired`) |
-| Secondary bootstrap stale-entry purge and config re-persist | `vault/dr_replication_secondary.go` (`bootstrapKeyring`, `purgeStaleBarrierEntries`) | `vault/dr_replication_state.go` (`PersistConfigSnapshot`) |
-| DR standby key-transition queue/replay invalidation | N/A | `vault/core_cache_invalidate.go` (`beginDRKeyTransition`, deferred queue, `runDRKeyTransitionWorker`, `replayDeferredInvalidations`) |
-| DR-scoped Raft TLS keyring self-heal | `vault/raft.go` (`ensureRaftTLSKeyringForDRSecondary`, `raftForceRecreateTLSKeyring`) | `vault/dr_replication_secondary.go` (post-bootstrap self-heal trigger) |
-
-### Protocol Surface
-
-| RFC Area | Proto Definition |
-|---|---|
-| DR service + RPCs | `vault/dr_replication_service.proto` (`service DRReplication`) |
-| Stream entry + batched delivery + resume request + flow control | `vault/dr_replication_service.proto` (`EntryChange`, `EntryBatch`, `StreamChangesUpstream`, `StreamChangesRequest`, `WindowUpdate`) |
-| Checkpoint + range checksum fields | `vault/dr_replication_service.proto` (`CheckpointResponse`, `RangeChecksum`, `RangeSpan`) |
-| Range digest RPC (fine-grained drill-down) | `vault/dr_replication_service.proto` (`RangeDigestRequest`, `RangeDigestResponse`, `RangeDigest`) |
-| Dirty Bitmap exchange | `vault/dr_replication_service.proto` (`DirtyBitmapMessage`) |
-| Provenance-safe fetch and range/bucket fetch | `vault/dr_replication_service.proto` (`FetchEntriesRequest`, `FetchItem`, `EntryBatch`) |
-| Heartbeat, cert propagation, and wrapped bootstrap exchange | `vault/dr_replication_service.proto` (`DRHeartbeat*` incl. `active_cluster_cert`, `leader_cluster_addr`, `DRRedirectDetail`, `SyncKeyring*`) |
-
-### Security and Relationship Lifecycle
-
-| RFC Area | Implementation |
-|---|---|
-| Activation token schema and manager config | `vault/dr_replication_state.go` (`DRActivationToken`, `DRConfig`) |
-| Relationship schema/state model | `vault/dr_replication_state.go` (`DRRelationship`, `DRRelationshipState`) |
-| Token generation and expiry fields | `vault/dr_bootstrap_registration.go` (`GenerateActivationToken`) |
-| Bootstrap validation, lockout, source IP | `vault/dr_bootstrap_registration.go` (`ValidateBootstrapAndStoreCertWithSourceIP`) |
-| Relationship authorization checks | `vault/dr_relationship_authz.go` (`ValidateRelationshipAccess`) and `vault/dr_replication.go` (`authorizeRelationship`) |
-| Revocation semantics | `vault/dr_relationship_authz.go` (`RevokeRelationship`) and `vault/dr_replication.go` (`RevokeRelationship`) |
-| Heartbeat last-seen throttling | `vault/dr_relationship_authz.go` (`MarkRelationshipSeen`) |
-| DR transport CA generation and storage | `vault/dr_transport_ca.go` (`generateDRTransportCA`, `signDRTransportLeafCert`, `loadDRTransportCA`) |
-| Cluster cert trust and fingerprint propagation | `vault/dr_cluster.go` (`drReplicationClusterClient`, `trustedPrimaryCert`, `VerifyPeerCertificate`, `addTrustedCert`, `pruneTrustedCerts`, `initTrustedPool`, `verifyCertChainToCA`) and `vault/dr_replication.go` (`peerCertFingerprintFromContext`) |
-| CA-scoped TLS trust pool (secondary) | `vault/dr_replication_secondary.go` (`trustedPrimaryCerts` pool, `Connect` pool init, `runHeartbeatLoop` cert CA-verify/add/prune) |
-| Cluster.Client TLS verification callback | `vault/cluster/cluster.go` (`VerifyPeerCertificate` interface method, `GetContextDialerFunc` callback wiring) |
-| Monotonic checkpoint index enforcement | `vault/dr_reconcile_session.go` (`beginReconcileSession` monotonicity check, `highestCommittedCheckpointIndex` persist/load) |
-| Promotion safety controls | `vault/dr_failover.go` (`DRFailover` quiesce barrier, `confirm_primary_unreachable` check) |
-
-### API and Operational Wiring
-
-| RFC Area | Implementation |
-|---|---|
-| System DR routes and handlers | `vault/logical_system_dr.go` |
-| Auth/unauth path registration | `vault/logical_system.go` |
-| Status handler fields | `vault/logical_system_dr.go` (`handleDRStatus`) |
-| DR tuning/status wiring for artifact + backpressure knobs | `vault/logical_system_dr.go` (`handleDRTuningRead`, `handleDRTuningWrite`) |
-| Core manager wiring/load on unseal | `vault/core.go` (`NewCore`, `postUnseal`) |
-| Leadership setup benign/fatal classification | `vault/ha.go` (`isBenignLeadershipSetupError`, `waitForLeadership`) |
-| Secondary write enforcement exceptions | `vault/request_handling.go` + `vault/dr_replication_state.go` (`isDRSecondaryAllowedPath`) |
-| Primary write ingress backpressure gate | `vault/request_handling.go` (`switchedLockHandleRequest`) + `vault/dr_replication.go` (`allowWriteRequest`) |
-| Failover/promotion path | `vault/dr_failover.go` and `vault/dr_replication_state.go` (`PromoteSecondary`) |
-
-### Storage/Hook Plumbing
-
-| RFC Area | Implementation |
-|---|---|
-| Public change-stream interface | `sdk/physical/physical.go` (`ChangeStreamEntry`, `ChangeStreamBackend`) |
-| Raft backend hook registration + journal dir | `physical/raft/raft.go` (`HookChangeStream`, `JournalDir`) |
-| Ordered FSM batch hook emission | `physical/raft/fsm.go` (`hookChangeStream`, `ApplyBatch`) |
-| Seal-wrap propagation in transaction log ops | `physical/raft/raft.go` (`Put`) and `physical/raft/transaction.go` (`Put`, `Commit`) |
-| Strict scanner semantics + ciphertext domain | `physical/replication/reconciler/reconciler.go` (`Scan`, `ScanPhysical`, `ComputeKID`, `ComputeVID`, `beginScanSnapshot`, `beginScanSnapshotPhysical`) |
-
-### Budgets and Defaults
-
-| RFC Area | Implementation |
-|---|---|
-| Bootstrap policy defaults | `vault/dr_replication_state.go` (bootstrap constants block) |
-| Last-seen persistence throttle | `vault/dr_replication_state.go` (`drLastSeenPersistInterval`) |
-| Checkpoint cache budgets, cardinality, TTL | `vault/dr_replication.go` (constants + `NewDRReplicationPrimary`) |
-| Range reconcile limits and timeouts | `vault/dr_replication_secondary.go` (range budget constants, `drDefaultReconcileTimeout`, `drDefaultCheckpointRPCTimeout`) |
-| Stream resume and apply yield defaults | `vault/dr_replication_secondary.go` (`drMaxStreamResumeAttempts`, `drDefaultApplyYieldDuration`) |
-| Reconcile retry caps/cooldowns | `vault/dr_reconcile_session.go` (`shouldRetryReconcile`, `reconcileRetryCap`, `retryCapCooldown`) |
-| Deterministic range planner defaults | `physical/replication/reconciler/range.go` (`DefaultRangePlanConfig`) |
-| Epoch-based GC intervals | `vault/dr_gc.go` (`DefaultGCInterval`, `MaxTombstoneAge`) |
-
-### Test Coverage Map
-
-| RFC Area | Tests |
-|---|---|
-| Range manifest determinism | `TestDRIntegration_RangeManifestDeterminism` (`vault/dr_replication_integration_test.go`) |
-| Per-range Checksum success | `TestDRIntegration_RangeChecksumSuccess` (`vault/dr_replication_integration_test.go`) |
-| Dirty Bitmap tracking | `TestDRIntegration_DirtyBitmapUpdates` (`vault/dr_replication_integration_test.go`) |
-| Fine-grained drill down | `TestDRIntegration_RangeDrillDown` (`vault/dr_replication_integration_test.go`) |
-| Budget-exceeded fail-closed behavior | `TestDRIntegration_ReconcileFailsOnBudgetExceeded` (`vault/dr_replication_integration_test.go`) |
-| No index advance on partial range failure | `TestDRIntegration_NoIndexAdvanceOnPartialRangeFailure` (`vault/dr_replication_integration_test.go`) |
-| Multi-relationship isolation | `TestDRIntegration_MultiRelationshipRangeIsolation` (`vault/dr_replication_integration_test.go`) |
-| Revoke-during-reconcile abort | `TestDRIntegration_RevokeDuringRangeReconcileAborts` (`vault/dr_replication_integration_test.go`) |
-| Stream same-index replay behavior | `TestDRIntegration_StreamAppliesSameRaftIndexBatchEntries`, `TestDRIntegration_PrimaryStreamReplayIncludesLastAppliedIndex` (`vault/dr_replication_integration_test.go`) |
-| Scanner fail-closed + transactional enforcement | `physical/replication/reconciler/reconciler_test.go` (`TestScannerFailsClosedOnGetError`, `TestScannerFailsClosedOnListPageError`, `TestScannerRequiresTransactionalSnapshotWhenConfigured`, `TestScannerUsesTransactionHandleForGet`) |
-| Checkpoint cache budget and eviction | `vault/dr_replication_test.go` checkpoint cache tests |
-| Revoke stream termination isolation | `TestDRRelationshipManager_PrimaryRevokeTerminatesOnlyMatchingStreams` (`vault/dr_replication_test.go`) |
-| Bootstrap expiry/lockout/source-IP/throttle | `TestDRRelationshipManager_BootstrapTokenExpires`, `TestDRRelationshipManager_BootstrapTokenAttemptLockout`, `TestDRRelationshipManager_BootstrapTokenSourceIPBinding`, `TestDRRelationshipManager_HeartbeatLastSeenWriteThrottle` (`vault/dr_replication_test.go`) |
-| Artifact fetch correctness vs live drift | `TestDRPrimary_ReadCheckpointEntryChange_UsesArtifactNotLiveStorage`, `TestDRPrimary_ReadCheckpointEntryChange_ExpectedVIDMismatch` (`vault/dr_replication_test.go`) |
-| Artifact store budget/eviction behavior | `TestDRCheckpointArtifactStore_EvictsByGlobalBudget`, `TestDRCheckpointArtifactStore_RejectsOversizedArtifact` (`vault/dr_replication_test.go`) |
-| Dirty bitmap post-restart safety | `TestDRPrimary_ExchangeDirtyBitmap_PostRestartReturnsAllDirty`, `TestDRPrimary_ExchangeDirtyBitmap_InitializedBitmapUsesActual` (`vault/dr_replication_test.go`) |
-| Dirty bitmap persistence and reload | `TestDRPrimary_DirtyBitmapPersistenceAndReload` (`vault/dr_replication_test.go`) |
-| Tombstone GC watermark computation | `TestDRTombstoneGC_ComputesWatermarkFromSecondaryPressure`, `TestDRTombstoneGC_DisconnectedPeersExcludedFromWatermark`, `TestDRTombstoneGC_NoActivePeersUsesLocalIndex` (`vault/dr_replication_test.go`) |
-| Credit-based WindowUpdate flow control | `TestStreamChanges_InitialWindowRespected`, `TestStreamChanges_CreditFlowControl`, `TestStreamChanges_CreditTimeout` (`vault/dr_replication_test.go`) |
-| EntryBatch stream batching | `TestStreamChanges_BatchSizeRespected` (`vault/dr_replication_test.go`) |
-| CA-scoped TLS trust pool (known cert, CA chain verify, rejection, eviction) | `TestDRClusterClient_VerifyKnownCert`, `TestDRClusterClient_VerifyCAChain`, `TestDRClusterClient_RejectNonCACert`, `TestDRClusterClient_VerifyEmptyCerts`, `TestDRTrustPool_TTLEviction`, `TestHeartbeatResponse_ActiveClusterCert`, `TestInitTrustedPool`, `TestDRCertFingerprint` (`vault/dr_replication_test.go`) |
-| DR transport CA generation and leaf signing | `TestDRTransportCA_Generate`, `TestDRTransportCA_SignLeaf`, `TestDRTransportCA_LoadFromStorage` (`vault/dr_transport_ca_test.go`) |
-| Shared journal dispatcher (all-node journal, primary delegation, leader transition) | `TestDispatcher_JournalAlwaysWritten`, `TestDispatcher_DelegatesToPrimary`, `TestDispatcher_LeaderTransitionJournalContinuity`, `TestDispatcher_SetClearPrimary`, `TestFilterDRReplicableEntries` (`vault/dr_replication_test.go`) |
-| Journal-based index warmup | `TestWarmIndexFromJournal`, `TestWarmIndexFromJournal_EmptyJournal`, `TestWarmIndexFromJournal_NilJournal` (`vault/dr_replication_test.go`) |
-| Monotonic checkpoint index | `TestReconcileSession_MonotonicCheckpointIndex`, `TestReconcileSession_ResnapshotResetsHighWaterMark` (`vault/dr_replication_test.go`) |
-| Bootstrap AAD binding | `TestBootstrapAAD_ClusterIDBinding`, `TestBootstrapAAD_SecondaryFPBinding`, `TestBootstrapAAD_PrimaryIdentityBinding` (`vault/dr_replication_crypto_test.go`) |
-| Promotion safety | `TestDRFailover_RequiresConfirmation`, `TestDRFailover_QuiesceBarrier` (`vault/dr_failover_test.go`) |
-| Redirect rate limiting | `TestSecondaryController_RedirectRateLimit`, `TestSecondaryController_RedirectBackoff` (`vault/dr_secondary_controller_test.go`) |
-| Bootstrap purge preservation + DR config re-persist helpers | `TestDRBootstrapPhysicalRecursiveDelete_PreservesCriticalPaths`, `TestDRManagerPersistConfigSnapshot` (`vault/dr_secondary_seal_recovery_test.go`) |
-| DR runtime-mode and raft TLS self-heal predicates | `TestCoreIsDRSecondaryRuntimeMode`, `TestShouldRecreateRaftTLSKeyringForDRSecondary` (`vault/dr_secondary_seal_recovery_test.go`) |
-| DR key-transition invalidation defer/replay/overflow behavior | `TestInvalidation_DRDecryptFailure_DefersDuringTransition`, `TestInvalidation_DRAuditLoadError_DefersWhileTransitionActive`, `TestInvalidation_DRTransitionQueueOverflow_IsFatal`, `TestInvalidation_DRConfigInvalidation_RefreshesRuntimeMode` (`vault/core_cache_invalidate_test.go`) |
-| Leadership setup benign sealed/canceled classification | `TestIsBenignLeadershipSetupError` (`vault/dr_secondary_seal_recovery_test.go`) |
-
-## Demo (CLI)
-
-### Primary
-
-```bash
-bao write sys/replication/dr/primary/enable
-bao write -format=json sys/replication/dr/primary/secondary-token > dr-token.json
-bao read sys/replication/dr/primary/relationships
-bao read sys/replication/dr/status
-```
-
-### Secondary
-
-```bash
-bao write sys/replication/dr/secondary/enable token="$(jq -r '.data.token' dr-token.json)"
-bao read sys/replication/dr/status
-```
-
-### Revoke relationship
-
-```bash
-bao write sys/replication/dr/primary/relationships/<relationship-id>/revoke
-```
-
-### Promote secondary
-
-```bash
-bao write sys/replication/dr/secondary/promote confirm_primary_unreachable=true
-```
+### Why mandatory drill-down
+
+This is a greenfield feature. There is no compatibility requirement to support
+older primaries that lack `ExchangeRangeDigests`. Mandatory drill-down removes
+an unsafe fallback path and makes proof validation uniform.
+
+### Alternatives rejected
+
+Full snapshot on every disconnect:
+Simple, but too expensive for large installations and unnecessary for small
+stream gaps.
+
+Merkle tree persistence:
+Useful, but adds persistent index maintenance and failure modes. The current
+proposal starts with checkpoint-built range descriptors and can evolve toward
+persistent structures later.
+
+WAL shipping:
+Efficient for storage engines with a native WAL contract, but it couples DR to
+backend internals and does not naturally support OpenBao relationship authz or
+local path exclusions.
+
+Trusting dirty bitmaps as authority:
+Too risky. A bitmap false negative can silently skip divergence. Dirty bitmaps
+should optimize scheduling, not define correctness.
+
+## Downsides
+
+This design adds a substantial protocol surface and correctness burden.
+Checkpoint artifacts, range descriptors, stream journals, and proof validation
+all require careful resource management.
+
+Mandatory drill-down means older or partially implemented primaries cannot be
+used for reconciliation. That is acceptable for a greenfield feature but makes
+rolling upgrades a future design topic.
+
+Proof validation adds CPU cost during reconciliation. This is the cost of
+making delete inference safe.
+
+The current PoC still needs range selection completeness before it can be
+considered robust under adversarial or stress-test conditions.
+
+## Security implications
+
+The design improves security by avoiding plaintext root-key transfer, requiring
+mTLS, binding every RPC to a relationship, and failing closed on revoked
+relationships or checkpoint mismatches.
+
+The main security-sensitive areas are:
+
+- bootstrap token lifetime and single-use enforcement
+- mTLS certificate validation
+- relationship revocation
+- checkpoint artifact integrity
+- local-only path exclusions
+- delete inference
+- promotion boundaries
+
+The most important reconciliation security property is that a secondary must
+not delete local data based on incomplete or unproven primary output.
+
+## User/developer experience
+
+Operators get a first-class DR workflow instead of composing external backup
+and restore steps. Normal workloads continue to write only to the primary.
+Secondaries expose read-only replicated state and clear DR status.
+
+Developers get a protocol with explicit phases and failure classes. Tests can
+target each invariant independently: authz, checkpoint tuple binding, digest
+coverage, fetch proof validation, delete safety, stream replay, and promotion.
+
+## Unresolved questions
+
+1. What exact range selection completeness mechanism should be used before
+   checkpoint advancement?
+2. Should top-level full-range verification happen every reconciliation, on a
+   cadence, or only after dirty bitmap uncertainty?
+3. What are the final retention defaults for checkpoint artifacts and stream
+   journal segments?
+4. How should DR transport CA rotation work without relationship
+   re-bootstrap?
+5. What rolling-upgrade guarantees, if any, should DR support?
+6. Should secondaries ever serve replicated reads while lagging, or should
+   secondary mode remain operationally read-only/standby?
+7. What promotion guardrails should prevent accidental split-brain?
+
+## Related issues
+
+This RFC is currently local to the PoC branch. Before upstream submission it
+should reference any OpenBao issue or discussion used to track native DR
+replication.
+
+## Proof of concept
+
+The PoC currently includes:
+
+- relationship manager and DR mode state
+- activation token flow
+- DR mTLS transport setup
+- primary change stream
+- secondary stream apply
+- checkpoint request and artifact-backed fetch
+- range checksum and digest RPCs
+- mandatory digest drill-down for mismatched ranges
+- fetch completeness validation
+- inferred local-only deletes
+- secondary read-only enforcement
+- relationship revocation handling
+- promotion API wiring
+- status and metrics fields
+
+The PoC is still under correctness hardening. The next required correctness
+target is range selection completeness: dirty bitmaps must not allow a
+checkpoint to advance while unverified ranges may still diverge.
+
+## Test plan
+
+Tests should cover the following groups:
+
+- bootstrap token expiry, single use, and relationship binding
+- strict TLS and certificate trust behavior
+- stream apply ordering and `lastAppliedIndex` advancement
+- stream reconnect and replay horizon behavior
+- checkpoint tuple mismatch failures
+- checkpoint artifact fetch instead of live storage fetch
+- digest response coverage failures
+- fetch output proof failures
+- local-only delete inference
+- delete safety when stream boundaries move
+- revocation during stream and reconciliation
+- fallback/resnapshot behavior
+- promotion safety
+- dirty bitmap false-negative behavior
+- stress convergence under sustained writes
+
+The local test matrix is tracked in `DR_TEST_MATRIX.md`.
