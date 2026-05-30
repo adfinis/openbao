@@ -6,7 +6,8 @@ description: |-
 
 # Native cross-cluster DR replication
 
-**Status**: draft, proof-of-concept under active correctness validation.
+**Status**: draft, proof-of-concept under active security, correctness, and HA
+validation.
 
 ## Summary
 
@@ -65,7 +66,11 @@ secondary-local entries that are absent from the proven primary set, and then
 advances its checkpoint.
 
 If the primary is permanently unavailable, an operator can promote a secondary.
-After promotion, the cluster becomes standalone and accepts local writes.
+Promotion is a one-way safety boundary: the secondary becomes a standalone
+authority for future writes, the previous relationship is terminated, and the
+old primary cannot automatically rejoin or merge. If the secondary is not known
+to be fully caught up, promotion must require an explicit data-loss
+acknowledgement.
 
 ## Goals
 
@@ -80,6 +85,8 @@ After promotion, the cluster becomes standalone and accepts local writes.
 8. Preserve local-only cluster state such as seal configuration and DR
    relationship configuration.
 9. Provide explicit promotion semantics for disaster recovery failover.
+10. Provide failover guardrails that make split-brain and data-loss risks
+    explicit to operators.
 
 ## Non-goals
 
@@ -90,6 +97,10 @@ After promotion, the cluster becomes standalone and accepts local writes.
 5. Merkle tree persistence as the primary reconciliation strategy.
 6. A guarantee that secondaries can serve stale reads while still in secondary
    mode.
+7. Automatic merge or conflict resolution after both the old primary and a
+   promoted secondary accept writes.
+8. Automatic failback to the former primary. Failback is modeled as a new DR
+   relationship or rebuild from the promoted authority.
 
 ## Technical description
 
@@ -133,11 +144,17 @@ The relationship lifecycle is:
 
 1. Operator enables DR primary mode.
 2. Primary generates or loads DR transport CA state.
-3. Operator creates a secondary activation token.
-4. Secondary enables DR using that activation token.
-5. Secondary connects to the primary over mTLS.
-6. Primary authorizes every DR RPC against the relationship record.
-7. Operator can revoke the relationship, which denies further RPCs and
+3. Operator creates a secondary activation token, which creates a pending
+   relationship on the primary.
+4. Secondary enables DR using that activation token and generates stable DR
+   client certificate material.
+5. Secondary registers its certificate with the primary HTTP API using the
+   activation token's single-use bootstrap token.
+6. Secondary connects to the primary over DR mTLS and performs keyring
+   bootstrap through `SyncKeyring`.
+7. Primary authorizes every DR RPC against the relationship record and the
+   mTLS peer certificate.
+8. Operator can revoke the relationship, which denies further RPCs and
    terminates matching streams.
 
 ### Bootstrap
@@ -147,19 +164,41 @@ Bootstrap establishes trust and transfers only wrapped key material.
 The activation token carries:
 
 - `relationship_id`
-- primary cluster identity
+- primary DR cluster identity
+- primary DR gRPC addresses
+- primary HTTP API address for certificate registration
 - DR transport CA certificate
-- bootstrap endpoint information
-- wrapped bootstrap material
-- expiry and single-use semantics
+- optional primary API CA certificate and server name
+- replication salt for KID derivation
+- single-use bootstrap token for secondary certificate registration
 
-The root key is not sent in plaintext. Bootstrap wrapping binds the exchange to
-the primary identity, secondary identity, relationship ID, cluster ID, and
-protocol version. This prevents cross-cluster replay and unknown-key-share
-attacks.
+The bootstrap token is accepted only while the relationship is pending and
+unexpired. The primary stores only a relationship-bound verifier hash for the
+bootstrap token; the bearer token itself exists only in the activation token.
+Successful registration clears the verifier and records the certificate
+fingerprint. Expiry is terminal for the pending relationship, and repeated
+failed attempts revoke the relationship and clear remaining bootstrap material.
+Replay against a registered or revoked relationship must be rejected without
+mutating the relationship. Certificate fingerprint uniqueness is enforced across
+all relationship lineages, including revoked records, so stale secondary
+credential material cannot be reused to create or revive a relationship.
 
-After bootstrap, the secondary removes or preserves local-only state according
-to the replication exclusion rules below.
+The activation token does not directly carry the primary root key. After the
+secondary registers its certificate, it establishes DR mTLS and calls
+`SyncKeyring` with an ephemeral public key and nonce. The primary reads the
+encrypted keyring and root-key entries, wraps the plaintext root key to the
+secondary's ephemeral key, and returns the wrapped root key together with the
+encrypted storage entries.
+
+Root-key wrapping is bound to the primary DR identity, secondary certificate
+fingerprint, relationship ID, DR cluster ID, client nonce, server nonce, and
+protocol AAD version. This prevents cross-cluster replay and
+unknown-key-share attacks.
+
+After bootstrap, the secondary installs the primary keyring, persists the
+primary root key under the secondary's seal, and removes or preserves
+local-only state according to the replication exclusion rules below. Operators
+continue to use the secondary cluster's local unseal mechanism.
 
 ### Transport trust model
 
@@ -168,12 +207,49 @@ nodes present leaf certificates signed by this CA. The secondary pins the DR
 transport CA from the activation token and rejects primary certificates that do
 not chain to it.
 
+Each secondary persists its DR client certificate and private key in local DR
+configuration. The primary accepts that certificate only after successful
+single-use bootstrap registration and binds subsequent RPC authorization to the
+registered certificate fingerprint.
+
 Heartbeat responses can propagate active primary leaf certificates, but those
 certificates are only accepted if they chain to the pinned DR transport CA. This
 avoids trust-on-first-use behavior.
 
 The protocol has no insecure fallback. If trusted certificate context is
 missing or invalid, DR connection establishment fails.
+
+### Certificate lifecycle
+
+The primary-side DR transport CA is a long-lived trust anchor stored in barrier
+storage. Active primary nodes mint short-lived DR transport leaf certificates
+from this CA using the node's current cluster key. Leaf certificates are
+renewed in the background before expiry and are advertised to secondaries in
+heartbeat responses. A secondary may accept a newly seen primary leaf only if it
+chains to the pinned DR transport CA from the activation token.
+
+The secondary-side DR client certificate is the relationship credential. It is
+generated when secondary mode is enabled, persisted in local DR configuration,
+registered once with the primary through the bootstrap endpoint, and then used
+for mTLS on every DR RPC. The primary binds authorization to the registered
+certificate fingerprint and the relationship record.
+
+This PoC does not silently renew secondary relationship credentials. Healthy
+relationships can use a first-class two-phase rotation protocol: stage a new
+secondary certificate with a request signed by the current relationship
+credential, trust both current and pending certificates while the rotation is
+pending, then finalize with a request signed by the pending credential. Final
+confirmation promotes the pending certificate, records the previous fingerprint,
+clears pending state, and terminates active streams so the secondary reconnects
+with the new credential. Pending rotation state is time-bounded; if
+confirmation does not arrive before expiry, the pending credential is rejected
+and trust returns to the current credential only.
+
+Operator-driven relationship replacement remains the recovery path when the
+current secondary credential is expired, lost, suspected compromised, revoked,
+or stale after promotion. Replacement creates a new activation token from the
+current authority, re-enables or rebuilds the secondary, and retires the old
+relationship. The original bootstrap token is never reused for rotation.
 
 ### Replication domain
 
@@ -324,8 +400,6 @@ auditable. Delete application is fail-closed and checkpoint-bound.
 
 ### Range selection completeness
 
-This is the main remaining correctness target.
-
 Dirty bitmaps are useful for reducing work, but they must not be treated as
 authority. A checkpoint cannot be marked applied unless the secondary has
 verified every relevant range or has a tuple-bound proof that skipped ranges
@@ -336,15 +410,16 @@ The required invariant is:
 > `lastAppliedIndex` must not advance for a checkpoint unless range selection
 > is complete for that checkpoint.
 
-Acceptable designs include:
+The current PoC implements the conservative design: every checkpoint
+reconciliation verifies the complete top-level range partition before it can
+advance. Dirty bitmaps are accepted only as ordering hints. Bitmap-marked
+ranges are checked first, then every unmarked top-level range is checked in a
+deterministic order.
 
-- always verifying all top-level ranges before checkpoint advancement
-- using dirty bitmaps only as priority hints
-- adding a checkpoint-bound coverage proof for skipped ranges
-- periodically forcing full top-level verification
-
-The PoC should not be considered correctness-complete until this invariant has
-an implementation and regression coverage.
+This costs one checksum pass over all top-level ranges per checkpoint
+reconciliation, but it removes the false-negative bitmap failure mode. A future
+optimization can skip ranges only if the primary supplies a checkpoint-bound
+coverage proof for the skipped ranges.
 
 ### Apply and commit rule
 
@@ -369,9 +444,12 @@ Fallback is a recovery mechanism, not a way to bypass reconciliation proofs.
 It should be triggered by explicit operator action or by configured convergence
 policy after repeated bounded failures.
 
-### Promotion
+### Failover and promotion
 
-Promotion converts a DR secondary into a standalone cluster.
+Promotion converts a DR secondary into a standalone authority for the
+replicated dataset. It is not a reversible replication mode transition. It is
+the point where operators choose the secondary as the new write authority and
+accept that the previous primary relationship is severed.
 
 Promotion must:
 
@@ -379,8 +457,98 @@ Promotion must:
 - clear secondary read-only enforcement
 - prevent use of stale primary relationship state
 - leave the promoted cluster with local ownership of future writes
+- persist a promotion lineage record
+- invalidate old relationship credentials for future DR use
 
-Promotion does not preserve an active relationship to the old primary.
+Promotion does not preserve an active relationship to the old primary. If the
+old primary later becomes reachable, it is a separate cluster that may have
+diverged. The old primary must not automatically reconnect, resume streaming,
+or merge with the promoted cluster.
+
+This is a protocol boundary, not a complete operational fence. If the old
+primary is restarted or remains reachable to clients, it can still serve its
+own timeline until operators decommission, isolate, or rebuild it. The protocol
+must prevent automatic merge or stale relationship reuse, and operational
+runbooks must prevent clients from writing to both authorities after failover.
+
+The design supports two promotion classes:
+
+1. Clean promotion: the secondary is streaming, has lag 0, is not reconciling,
+   and its last applied index remains stable across a short quiesce window.
+2. Forced promotion: the operator has confirmed that the primary is
+   unavailable, but the secondary is lagging, reconciling, or cannot prove that
+   it is fully caught up.
+
+Clean promotion can proceed with primary-unreachable confirmation only when the
+secondary still has a stable streaming proof across the promotion quiesce
+window: it must be in streaming state before and after the quiesce window, have
+lag 0, and keep `lastAppliedIndex` stable. If primary loss causes the secondary
+to disconnect, reconnect, or enter reconciliation before or during the quiesce
+window, promotion is forced even if the estimated missing-entry count is zero.
+Forced promotion requires a second explicit acknowledgement such as
+`accept_data_loss=true`. Estimated data loss is an observed
+primary-index/last-applied-index gap; a zero estimate is not a clean-promotion
+proof by itself. The promotion response must report:
+
+- `promotion_class`
+- `clean_promotion_eligible`
+- `clean_promotion_proof_available`
+- `forced_promotion_requires_acknowledgement`
+- `forced_promotion_reason_codes`
+- `forced_promotion_reason_details`
+- `data_loss_accepted`
+- `last_applied_index`
+- `last_known_primary_index`
+- `estimated_data_loss_entries`
+- `estimated_data_loss_entries_basis`
+
+After promotion, failback is not automatic. Returning service to the old site
+requires a rebuild, restore, or a new DR relationship from the promoted
+authority. The protocol does not attempt bidirectional reconciliation or
+conflict resolution.
+
+If multiple secondaries exist, promotion of one secondary does not transfer the
+other secondary relationships. Non-promoted secondaries remain tied to the old
+relationship lineage and must be re-enabled against the promoted cluster with
+new relationship state.
+
+When the promoted cluster should become the new DR authority, operators enable
+DR primary mode on the promoted cluster and explicitly reseed or re-enable
+other secondaries from fresh activation tokens generated by that promoted
+authority. Old-primary-only data must not merge into the promoted timeline as
+part of this flow.
+
+Re-enabling a non-promoted secondary from a fresh promoted-authority activation
+token is a new lineage, not a resume of the old relationship. The secondary
+must clear local replication cursor state from the old lineage, including
+checkpoint high-water marks, before reconciling from the promoted authority.
+
+The promoted cluster must reject stale activation tokens that reference the old
+primary cluster ID or old relationship ID recorded in its promotion lineage. It
+must also reject the old secondary certificate fingerprint if that credential is
+presented during a later bootstrap registration. The promotion lineage record
+must survive restart and repeated promotion/reseed cycles so this stale-lineage
+fence continues to apply after promoted-cluster recovery, HA active handoff, and
+later failover events.
+
+The promotion lineage record should include:
+
+- promotion ID
+- promotion timestamp
+- old primary cluster ID
+- old relationship ID
+- old secondary certificate fingerprint
+- inherited stale primary cluster IDs from earlier promotions
+- inherited stale relationship IDs from earlier promotions
+- inherited stale secondary certificate fingerprints from earlier promotions
+- local cluster ID at promotion time
+- last applied index
+- last known primary index
+- clean or forced promotion class
+- estimated data-loss entries
+- data-loss estimate basis
+- whether data-loss acknowledgement was accepted
+- forced-promotion reason codes and operator-facing details, if any
 
 ### API surface
 
@@ -389,11 +557,105 @@ The expected HTTP API shape is:
 - `sys/replication/dr/primary/enable`
 - `sys/replication/dr/primary/disable`
 - `sys/replication/dr/primary/secondary-token`
-- `sys/replication/dr/primary/revoke-secondary`
+- `sys/replication/dr/primary/register-secondary`
+- `sys/replication/dr/primary/rotate-secondary-certificate`
+- `sys/replication/dr/primary/confirm-secondary-certificate`
+- `sys/replication/dr/primary/relationships`
+- `sys/replication/dr/primary/relationships/:id/status`
+- `sys/replication/dr/primary/relationships/:id/revoke`
 - `sys/replication/dr/secondary/enable`
 - `sys/replication/dr/secondary/disable`
+- `sys/replication/dr/secondary/rotate-certificate`
 - `sys/replication/dr/secondary/promote`
+- `sys/replication/dr/secondary/resnapshot`
+- `sys/replication/dr/tuning`
 - `sys/replication/dr/status`
+
+`sys/replication/dr/secondary/promote` must require
+`confirm_primary_unreachable=true`. If the secondary cannot prove clean
+promotion conditions, the request must also require an explicit data-loss
+acknowledgement. The response must include enough lineage and index information
+for operators to audit the failover decision, including clean-promotion
+eligibility, proof availability, forced-promotion acknowledgement state,
+machine-readable forced reason codes, operator-facing forced reason details,
+the last applied index, the last known primary index, the estimated missing
+entry count, and the estimate basis.
+
+`sys/replication/dr/primary/register-secondary` is a bootstrap-only endpoint.
+It accepts the pending relationship ID, the single-use bootstrap token, and the
+secondary certificate material. It is the handoff point between activation-token
+bootstrap and normal DR mTLS authorization.
+
+All administrative DR HTTP endpoints must require root or sudo capability:
+primary enable/disable, activation-token generation, relationship listing and
+revocation, secondary enable/disable, secondary local credential rotation,
+promotion, resnapshot, and tuning.
+
+`sys/replication/dr/primary/register-secondary` is intentionally
+unauthenticated at the ACL layer because the bootstrap token is its credential.
+The endpoint must bound request sizes before expensive decode or parse work,
+must authenticate only pending unexpired bootstrap material, and must clear
+bootstrap verifier material after terminal success or failure. Pending
+relationship records must not persist plaintext bootstrap tokens. Request
+fields that carry bootstrap credentials or certificate material must remain
+HMAC-redacted in audits and must not be logged.
+
+`sys/replication/dr/primary/rotate-secondary-certificate` and
+`sys/replication/dr/primary/confirm-secondary-certificate` are intentionally
+unauthenticated at the ACL layer because the current or pending relationship
+certificate signs each request. Rotation must require an active relationship,
+fresh request timestamp, client-generated operation ID, bounded certificate and
+signature sizes, fingerprint uniqueness across current, pending, previous, and
+revoked relationship records, bounded pending-rotation lifetime, and rejection
+of stale promotion lineage.
+
+Bootstrap registration and credential-rotation failure responses must not act
+as unauthenticated relationship-state or fingerprint oracles. Field-shape
+failures such as missing fields, invalid base64, or bounded-size violations may
+remain specific, but failures from relationship lookup, token validation,
+signature validation, relationship state, duplicate fingerprint checks, stale
+lineage checks, lockout, or pending-rotation state must return generic public
+errors. Detailed reasons belong in server logs, persisted relationship audit
+metadata, and root-protected relationship status.
+
+The complete unauthenticated DR HTTP surface is limited to:
+`sys/replication/dr/status`,
+`sys/replication/dr/primary/register-secondary`,
+`sys/replication/dr/primary/rotate-secondary-certificate`, and
+`sys/replication/dr/primary/confirm-secondary-certificate`. No other DR path
+should be added to the unauthenticated special-path list. Schema metadata for
+activation-token responses, secondary enable tokens, bootstrap tokens,
+secondary CA material, and rotation signatures must mark those fields
+sensitive, and default audit output must HMAC the raw values.
+
+`sys/replication/dr/secondary/rotate-certificate` is the local operator wrapper
+for healthy secondary credential rotation. It generates new local certificate
+material, stages it on the primary using the current credential, persists the
+new material as local pending rotation state, confirms the rotation on the
+primary using the pending credential, then promotes the pending material to the
+active local credential and reconnects. If confirmation is interrupted, the
+local pending state allows a later retry before the pending-rotation TTL
+expires.
+
+`sys/replication/dr/status` may remain unauthenticated for health checks and
+operator visibility. It must not expose activation tokens, bootstrap tokens,
+certificate material, old relationship IDs, old primary IDs, or certificate
+fingerprints from promotion lineage. Root-protected promotion and relationship
+APIs may return lineage details needed to audit an operator action.
+
+Relationship list and relationship status responses are root-protected operator
+surfaces. They may expose relationship IDs, state, current certificate
+fingerprints, failed-attempt counters, lockout timestamps, and registration
+source metadata needed for audit and troubleshooting. They must not serialize
+stored relationship records directly and must not return plaintext bootstrap
+tokens, bootstrap verifier hashes, certificate DER/PEM material, pending or
+previous certificate fingerprints, pending rotation operation IDs, or private
+key material.
+
+`sys/replication/dr/secondary/resnapshot` is an operator-triggered fallback. It
+must require explicit acknowledgement because it resets the secondary's
+checkpoint high-water mark and allows the secondary to accept an older
+checkpoint as the new full-copy base.
 
 The expected gRPC protocol includes:
 
@@ -407,6 +669,13 @@ The expected gRPC protocol includes:
 - `SyncKeyring`
 
 All DR gRPC calls require mTLS and relationship authorization.
+`StreamChanges`, `Heartbeat`, `RequestCheckpoint`, `ExchangeDirtyBitmap`, and
+`SyncKeyring` authorize against the request relationship ID only after deriving
+the caller identity from the mTLS peer certificate. Checkpoint-scoped RPCs
+(`ExchangeRangeChecksums`, `ExchangeRangeDigests`, and `FetchEntries`) also
+carry `relationship_id`; the primary authorizes that relationship against the
+mTLS peer fingerprint before checkpoint lookup, then requires the checkpoint's
+persisted relationship ID to match the authorized relationship.
 
 ### Resource controls
 
@@ -423,6 +692,11 @@ The protocol needs bounded resource use:
 - batch sizes for fetched puts and deletes
 - bounded stream apply queues
 - primary-side backpressure when secondaries cannot converge
+- unauthenticated bootstrap and credential-rotation endpoints perform only
+  request-shape parsing, base64 decoding, and fixed-size hashing before
+  relationship state gates; attacker-supplied certificate parsing and
+  proof-of-possession verification are deferred until the relationship and
+  pending operation state allow the request
 
 Budget exhaustion is a reconciliation failure unless an operator explicitly
 chooses a fallback path.
@@ -432,7 +706,7 @@ chooses a fallback path.
 The status API should expose:
 
 - DR mode and secondary state
-- relationship ID
+- non-sensitive promotion summary fields, if the cluster has ever been promoted
 - primary index
 - last applied index
 - active checkpoint tuple
@@ -444,6 +718,12 @@ The status API should expose:
 - budget usage
 - journal replay health
 - backpressure state
+- primary relationship counts by state
+
+Root-protected relationship APIs expose relationship IDs and per-relationship
+audit state. The broad status endpoint must not expose relationship IDs,
+certificate fingerprints, primary API addresses, bootstrap material, or stale
+promotion-lineage identifiers.
 
 Metrics should make it possible to distinguish:
 
@@ -485,6 +765,85 @@ This is a greenfield feature. There is no compatibility requirement to support
 older primaries that lack `ExchangeRangeDigests`. Mandatory drill-down removes
 an unsafe fallback path and makes proof validation uniform.
 
+### Prior art and design-space positioning
+
+DR replication for stateful systems is a well-established problem. This design
+is intentionally assembled from long-published, general-purpose techniques
+rather than novel mechanisms. Positioning it against that prior art clarifies
+which parts are conventional and which single part is a deliberate
+OpenBao-specific tradeoff.
+
+Steady-state change streaming follows the ordered log-shipping pattern that
+mainstream databases have used for decades: PostgreSQL streaming replication
+(write-ahead log and log sequence numbers), MySQL binary-log replication,
+MongoDB oplog tailing, and Raft log replication as used by etcd and Consul. In
+all of these a primary emits an ordered operation log, a follower applies it in
+order, a monotonic position watermark (LSN, GTID, offset, or log index) tracks
+progress, and a retained log window bounds how far a disconnected follower can
+resume before it needs a fuller resync. OpenBao's `lastAppliedIndex`, ordered
+apply batches, and bounded stream journal occupy the same point in this space.
+
+Gap recovery follows the anti-entropy / range-hash reconciliation pattern
+popularized by Amazon's Dynamo (2007) and used by Cassandra, Riak, and
+ScyllaDB, in which replicas compare hashes over key ranges and exchange only the
+entries in mismatched ranges. The narrower problem of efficiently reconciling
+two large sets that mostly agree is itself a studied area, including
+Minsky-Trachtenberg-Zippel set reconciliation and invertible Bloom lookup
+tables. OpenBao uses range checksums and XOR-of-SHA-256 set digests with
+recursive drill-down, which is a standard instance of this family.
+
+Snapshot and base-copy fallback, monotonic fencing across failover (analogous to
+Raft terms, ZooKeeper epochs, and fencing tokens), and asynchronous
+single-primary warm-standby DR are likewise standard, widely-implemented
+patterns.
+
+The one deliberate divergence from the most common implementations is that
+OpenBao builds range descriptors on demand, fenced to an immutable checkpoint,
+rather than maintaining a persistent Merkle or diff index between
+reconciliations. This trades persistent index state and its maintenance failure
+modes for a bounded full-range verification pass per checkpoint reconciliation,
+and it is the reason the protocol must prove fetch completeness before inferring
+deletes (see "Why digest proof before deletes"). It is an engineering tradeoff
+over how to schedule and bound comparison work, not a new reconciliation
+algorithm.
+
+These techniques are general prior art that predates and is independent of any
+specific vendor's replication product. This subsection describes the technical
+design lineage only. As stated under "Differentiation from Vault Enterprise
+replication," it is not a patent or license-clearance opinion, and any such
+clearance must be performed separately.
+
+### Differentiation from Vault Enterprise replication
+
+OpenBao can support the same operator-facing feature category as Vault
+Enterprise without implementing Vault Enterprise's replication protocol or
+recovery machinery. This is similar to other OpenBao feature areas where the
+project provides a familiar capability through an OpenBao-owned design.
+
+This design is not wire-compatible with Vault Enterprise DR replication and
+does not attempt to interoperate with Vault Enterprise primaries, secondaries,
+activation tokens, operation tokens, WAL streams, Merkle indexes, or
+replication state.
+
+The key technical differences are:
+
+- normal mode streams ordered physical entry changes rather than shipping
+  Vault Enterprise WAL records
+- reconnect uses a bounded entry buffer and stream journal rather than a
+  Merkle-root-guarded log shipper
+- recovery uses checkpoint-fenced range checksums, range digests, KID/VID
+  proofs, and checkpoint artifact fetches rather than a persisted Merkle index
+  diff/sync state machine
+- range selection is complete for each checkpoint before `lastAppliedIndex`
+  advances; dirty bitmaps are only scheduling hints
+- deletes require fetch-completeness proof over the relevant checkpoint spans
+  before absence can be used as authority
+- failback is modeled as explicit rebuild or reseed from the promoted
+  authority, not as automatic relationship update or merge
+
+This section is a technical design boundary, not a patent or license clearance
+opinion. Any external legal clearance must happen separately from this RFC.
+
 ### Alternatives rejected
 
 Full snapshot on every disconnect:
@@ -518,8 +877,14 @@ rolling upgrades a future design topic.
 Proof validation adds CPU cost during reconciliation. This is the cost of
 making delete inference safe.
 
-The current PoC still needs range selection completeness before it can be
-considered robust under adversarial or stress-test conditions.
+The current conservative range-selection strategy verifies the complete
+top-level range partition for each checkpoint reconciliation. That is simpler
+and safer than trusting dirty bitmaps, but it adds predictable checksum-scan
+cost during reconnect and stress recovery.
+
+Failover semantics deliberately avoid automatic merge or failback. This makes
+the protocol safer, but it shifts old-primary fencing, traffic routing, and
+site-rebuild decisions into operational runbooks.
 
 ## Security implications
 
@@ -527,18 +892,199 @@ The design improves security by avoiding plaintext root-key transfer, requiring
 mTLS, binding every RPC to a relationship, and failing closed on revoked
 relationships or checkpoint mismatches.
 
+### Trust model
+
+The DR primary is trusted as the data authority for its active relationships.
+A DR secondary trusts the primary for replicated ciphertext entries, checkpoint
+artifacts, range digests, and promotion status while it remains in secondary
+mode.
+
+The network is untrusted. A network attacker may observe, replay, delay,
+drop, reorder, or inject packets, but must not be able to authenticate as a
+relationship peer without the required certificate material and relationship
+state.
+
+The activation token is highly privileged bearer material. Possession of a
+valid unused activation token is enough to attempt secondary certificate
+registration and then bootstrap a DR relationship. Token lifetime, single-use
+semantics, failed-attempt handling, audit logging, and stale-lineage rejection
+are therefore security controls.
+
+A bootstrapped secondary holds enough material to become a usable copy of the
+replicated cluster. Compromise of a secondary after bootstrap is a serious
+cluster-data compromise, not merely a replication-channel compromise.
+
+After promotion, the promoted secondary is a new authority. The old primary, if
+it remains reachable, is a separate possible authority on an old timeline. The
+protocol must prevent automatic reconnect, merge, or stale relationship reuse;
+operators must still fence client traffic and decommission or rebuild the old
+site.
+
+### Protected assets
+
+The most sensitive assets are:
+
+- primary root key and keyring material
+- activation tokens and bootstrap tokens
+- secondary DR client private keys
+- DR transport CA private keys and trust anchors
+- relationship records, certificate fingerprints, and revocation state
+- checkpoint artifacts and provenance metadata
+- local-only storage paths, including seal state, root-key wrapping state,
+  cluster identity, DR configuration, and HA coordination state
+- promotion lineage records
+
 The main security-sensitive areas are:
 
 - bootstrap token lifetime and single-use enforcement
+- endpoint authorization boundaries and audit redaction
 - mTLS certificate validation
+- secondary certificate registration and persistence
 - relationship revocation
+- stale activation token replay after promotion
 - checkpoint artifact integrity
 - local-only path exclusions
 - delete inference
 - promotion boundaries
+- split-brain risk after forced promotion
 
-The most important reconciliation security property is that a secondary must
-not delete local data based on incomplete or unproven primary output.
+### P0 security invariants
+
+Bootstrap must not expose the primary root key in plaintext outside the
+established cryptographic exchange. `SyncKeyring` wrapping must be bound to the
+relationship ID, DR cluster ID, primary identity, secondary certificate
+fingerprint, protocol AAD version, and fresh nonces. `SyncKeyring` is a
+single-shot transition for a registered relationship: malformed requests must
+not activate the relationship, successful wrapping marks it active, and replayed
+or repeated keyring-sync requests after activation must be denied.
+
+Every DR RPC must derive authorization from the mTLS peer certificate and the
+persisted relationship record. Request-supplied relationship IDs are only
+selectors; they are not authority. For checkpoint-scoped RPCs, the checkpoint
+ID selects an immutable cached checkpoint tuple only after the request
+relationship has been authorized, and the checkpoint's persisted relationship ID
+must match that authorized relationship. Revocation must fail closed and
+terminate or deny matching active streams. RPCs that can perform substantial
+work or return sensitive material must re-check relationship authorization
+before returning or continuing: checkpoint creation/reuse, dirty bitmap
+exchange, range checksum/digest exchange, fetched-entry streaming, heartbeat
+leader hints/cert material, and keyring sync. `SyncKeyring` treats successful
+relationship activation as the linearization point; if revocation wins after
+the initial authorization but before activation, the wrapped root key is not
+returned. Revocation also removes cached current and pending relationship
+certificate trust so in-progress credential rotation cannot keep a stale
+authorization path alive.
+
+Every DR administrative HTTP endpoint must require root or sudo capability
+except `sys/replication/dr/status`,
+`sys/replication/dr/primary/register-secondary`,
+`sys/replication/dr/primary/rotate-secondary-certificate`, and
+`sys/replication/dr/primary/confirm-secondary-certificate`.
+Bootstrap registration must treat the single-use bootstrap token as a
+credential and reject oversized, stale, expired, replayed, or malformed
+material before it can create or revive a relationship. Credential rotation
+must treat the current or pending relationship certificate signature as the
+credential and must not be usable for revoked, stale, or inactive
+relationships. Because bootstrap and rotation are intentionally
+unauthenticated, they must also bound work before authentication: perform cheap
+shape, size, and timestamp checks first, require the persisted relationship
+state and pending rotation operation to match before parsing attacker-supplied
+certificates or performing proof-of-possession signature validation, and prefer
+stored current or pending certificate material for verification whenever it is
+already known.
+
+The unauthenticated status endpoint must expose only operational state and
+non-sensitive promotion summary fields. Endpoint metadata tests must lock the
+exact unauthenticated set so future DR endpoints do not bypass normal ACL
+enforcement by accident.
+
+Unauthenticated bootstrap and credential-rotation endpoints must not expose
+relationship existence, current state, lockout timestamps, duplicate
+fingerprint binding, stale promotion lineage, pending-rotation operation IDs,
+or pending fingerprint mismatches through public failure messages. These
+endpoints may return specific request-shape errors before the request reaches
+relationship state, but all manager/authz/state failures must be generic to the
+caller and detailed only in logs or root-protected status.
+
+Broad status responses and root-protected relationship responses must be built
+from explicit allowlists, not by converting persisted DR structs to API
+responses. Status must not expose local DR config material, primary API
+addresses, relationship IDs, transport CA material, secondary client
+credentials, or stale promotion lineage identifiers. Relationship list/status
+responses must not expose bootstrap verifier material, certificate bytes,
+pending or previous certificate fingerprints, or pending rotation operation
+IDs.
+
+Bootstrap registration must be a narrow, auditable transition from pending
+relationship to registered relationship. Relationship IDs and bootstrap tokens
+must be well-formed, tokens must be single-use and expiry-bound, pending
+relationship storage must contain only verifier hashes, failed attempts must be
+persisted with audit metadata, terminal bootstrap failures must clear remaining
+verifier material, and replayed bootstrap material must not mutate registered
+or revoked relationships. Certificate fingerprints must remain bound to their
+original relationship lineage even after revocation.
+
+Audit output and logs must not disclose activation tokens, bootstrap tokens,
+secondary certificate material, root-key wrapping material, or stale promotion
+credential lineage. Registration failures, relationship revocation, promotion,
+resnapshot, and tuning changes should leave enough audit or server-log metadata
+to diagnose the state transition without logging bearer material. Bootstrap and
+credential-rotation request schemas must mark token, certificate, and signature
+fields sensitive; audit regression tests must verify the raw values are HMACed
+by the default audit formatter.
+
+The secondary must reject malformed, out-of-range, duplicate,
+checkpoint-mismatched, or incomplete reconciliation data. A secondary must not
+delete local data based on incomplete or unproven primary output.
+
+Local-only paths must be excluded consistently from stream apply, fetched entry
+apply, and inferred deletes. Replication must not overwrite or delete local
+seal state, local root-key wrapping state, DR relationship configuration,
+cluster identity, or HA coordination state.
+
+Promotion must be a security boundary. A promoted cluster must not accept
+activation tokens, certificates, or relationship state from the pre-promotion
+primary lineage. Reconnecting another secondary to the promoted authority must
+require an explicit new relationship created by the promoted cluster. The
+promoted authority must preserve enough lineage metadata, including the old
+secondary certificate fingerprint and inherited stale lineage identifiers from
+earlier promotion cycles, to reject stale pre-promotion credential material even
+after restart.
+
+Promotion must not imply safe mergeability. If the old primary and promoted
+secondary both accept writes, they are divergent authorities. The protocol must
+make that state operator-visible and must not silently reconnect the old
+relationship.
+
+Resource budgets are security controls. A valid but compromised secondary must
+not be able to exhaust primary memory, disk, CPU, or goroutines through
+unbounded checkpoint creation, digest drill-down, range fetches, stream window
+updates, or resnapshot requests. Unauthenticated callers must not be able to
+force unbounded certificate parsing or signature verification by replaying
+stale bootstrap or rotation material.
+
+Certificate lifecycle must fail closed. Primary leaf renewal must preserve the
+DR transport CA trust root. Secondary certificates registered through bootstrap
+must be currently valid, self-signed relationship trust anchors, and suitable
+for client authentication. First-class secondary credential rotation must be
+two-phase and proof-of-possession based: the current credential may stage a
+pending credential, and only the pending credential may finalize it. The
+primary must retain previous fingerprints to prevent stale credential reuse.
+The secondary must not fall back to unrelated local cluster certificates for DR
+client authentication.
+
+### Security non-goals
+
+DR replication does not protect against a fully compromised primary. A malicious
+primary can send malicious but well-formed replicated state to its secondaries.
+
+DR replication does not protect secrets from a fully compromised bootstrapped
+secondary. A secondary is a disaster recovery copy of the replicated dataset by
+design.
+
+DR replication does not automatically solve split-brain traffic routing after
+promotion. The protocol prevents automatic merge and stale lineage reuse, but
+operators must still fence the old primary from clients.
 
 ## User/developer experience
 
@@ -546,24 +1092,31 @@ Operators get a first-class DR workflow instead of composing external backup
 and restore steps. Normal workloads continue to write only to the primary.
 Secondaries expose read-only replicated state and clear DR status.
 
+During failover, operators get explicit promotion responses that distinguish
+clean promotion from forced promotion and show the last applied and last known
+primary indexes. Forced promotions also return stable reason codes, readable
+details, whether `accept_data_loss=true` was required and accepted, and the
+data-loss estimate basis. This makes the safety proof and data-loss tradeoff
+visible at the time the cluster becomes writable.
+
 Developers get a protocol with explicit phases and failure classes. Tests can
 target each invariant independently: authz, checkpoint tuple binding, digest
 coverage, fetch proof validation, delete safety, stream replay, and promotion.
 
 ## Unresolved questions
 
-1. What exact range selection completeness mechanism should be used before
-   checkpoint advancement?
-2. Should top-level full-range verification happen every reconciliation, on a
-   cadence, or only after dirty bitmap uncertainty?
-3. What are the final retention defaults for checkpoint artifacts and stream
+1. What are the final retention defaults for checkpoint artifacts and stream
    journal segments?
-4. How should DR transport CA rotation work without relationship
-   re-bootstrap?
-5. What rolling-upgrade guarantees, if any, should DR support?
-6. Should secondaries ever serve replicated reads while lagging, or should
+2. How should DR transport CA rotation work without relationship re-bootstrap,
+   and should the final design use an explicit CA-roll protocol or require
+   relationship replacement?
+3. What rolling-upgrade guarantees, if any, should DR support?
+4. Should secondaries ever serve replicated reads while lagging, or should
    secondary mode remain operationally read-only/standby?
-7. What promotion guardrails should prevent accidental split-brain?
+5. What final UI presentation should be used for forced-promotion reason codes,
+   data-loss acknowledgement, and estimate-basis wording?
+6. What availability guarantees should the feature target during HA active
+   handoff while a primary is under sustained DR backlog pressure?
 
 ## Related issues
 
@@ -577,7 +1130,11 @@ The PoC currently includes:
 
 - relationship manager and DR mode state
 - activation token flow
+- secondary certificate registration with a single-use bootstrap token whose
+  pending primary-side state stores only a verifier hash
+- stable secondary DR client certificate persistence
 - DR mTLS transport setup
+- `SyncKeyring` bootstrap with wrapped root-key exchange
 - primary change stream
 - secondary stream apply
 - checkpoint request and artifact-backed fetch
@@ -588,17 +1145,40 @@ The PoC currently includes:
 - secondary read-only enforcement
 - relationship revocation handling
 - promotion API wiring
+- primary-unreachable confirmation for promotion
+- forced-promotion data-loss acknowledgement
+- forced-promotion reason codes/details and estimate-basis reporting
+- persisted promotion lineage records
+- stale pre-promotion activation token rejection
 - status and metrics fields
+- durable checkpoint high-water finalization
+- operator-triggered resnapshot API
+- resnapshot fetch proof validation
+- active checkpoint artifact pinning during fetch
+- stop/promotion cancellation of reconcile contexts
+- repo-local single-node and HA Docker test topology
+- explicit promoted-authority reseed flow for non-promoted secondaries
 
-The PoC is still under correctness hardening. The next required correctness
-target is range selection completeness: dirty bitmaps must not allow a
-checkpoint to advance while unverified ranges may still diverge.
+The PoC is still under hardening, but recent validation produced a strong
+data-correctness signal across sustained writes, stream buffer pressure,
+reconciliation, active handoff, failover under load, promotion durability, and
+explicit secondary reseed. A repo-local HA lifecycle rerun on 2026-05-30 passed
+against a rebuilt image: `reset --build`, forced failover smoke, promoted-cluster
+restart and active-handoff durability smoke, and explicit secondary reseed from
+the promoted authority. The main known gap is availability during primary HA
+active handoff under sustained write and DR backlog pressure; stress runs
+observed transient client-visible errors even when final replicated data
+converged.
 
 ## Test plan
 
 Tests should cover the following groups:
 
 - bootstrap token expiry, single use, and relationship binding
+- DR gRPC data-plane authorization by mTLS fingerprint and persisted
+  relationship state
+- `SyncKeyring` AAD binding, fresh envelope generation, malformed envelope
+  rejection, one-shot activation, and replay denial
 - strict TLS and certificate trust behavior
 - stream apply ordering and `lastAppliedIndex` advancement
 - stream reconnect and replay horizon behavior
@@ -610,8 +1190,16 @@ Tests should cover the following groups:
 - delete safety when stream boundaries move
 - revocation during stream and reconciliation
 - fallback/resnapshot behavior
-- promotion safety
+- clean promotion with lag 0 and stable last applied index
+- forced promotion while lagging or reconciling
+- promotion lineage persistence
+- old primary reconnect rejection after promotion
+- non-promoted secondary behavior after another secondary is promoted
+- promotion durability across promoted-cluster restart
+- stale old-primary activation token rejection after promoted-cluster restart
+- explicit secondary reseed from the promoted authority
 - dirty bitmap false-negative behavior
 - stress convergence under sustained writes
 
-The local test matrix is tracked in `DR_TEST_MATRIX.md`.
+The local test matrix is tracked in `DR_TEST_MATRIX.md`. Current validation
+results are summarized in `DR_VALIDATION_RESULTS.md`.

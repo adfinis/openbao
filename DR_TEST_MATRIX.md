@@ -11,13 +11,13 @@ This matrix defines manual and automated validation for DR replication in this r
 ## Environment Assumptions
 
 - OpenBao repo root: `/Users/roelc/projects/secretz/openbao`
-- DR environment repo path is exported as `DR_ENV_DIR`.
 - Tools available: `docker`, `jq`, `bao`, `rg`.
-- DR endpoints and tokens are exported (for example via `.envrc`):
+- Local compose topology: `docker-compose.dr-test.yml`
+- Local HA compose topology: `docker-compose.dr-ha-test.yml`
+- DR endpoints and tokens are exported by `scripts/dr_local_test.sh bootstrap` into `.dr-test.env`:
   - `DR_PRIMARY_ADDR`, `DR_PRIMARY_TOKEN`
   - `DR_SECONDARY1_ADDR`, `DR_SECONDARY1_TOKEN`
   - `DR_SECONDARY2_ADDR`, `DR_SECONDARY2_TOKEN`
-  - `DR_CA_CERT`
 
 ---
 
@@ -30,13 +30,24 @@ This matrix defines manual and automated validation for DR replication in this r
 | A3 | DR race subset | `go test -race ./vault -run 'TestDRIntegration_(StreamReplication|DisconnectAndReconcile|ReadOnlyEnforcement|GapDetection|BufferOverflowDetection)' -count=1` | Pass, no races |
 | A4 | DR range reconciliation | `go test ./vault -run 'TestDRIntegration_(RangeManifestDeterminism|RangeIBLTDecodeSuccess|RangeIBLTDecodeAdaptiveSplit|RangeRefinementPrefixFallback|ReconcileFailsOnBudgetExceeded|NoIndexAdvanceOnPartialRangeFailure|MultiRelationshipRangeIsolation|RevokeDuringRangeReconcileAborts)' -count=1` | Pass |
 | A5 | DR stream cursor/replay correctness | `go test ./vault -run 'TestDRIntegration_(StreamAppliesSameRaftIndexBatchEntries|PrimaryStreamReplayIncludesLastAppliedIndex)' -count=1` | Pass |
-| A6 | DR bootstrap/authz hardening | `go test ./vault -run 'TestDR(RelationshipManager_BootstrapTokenExpires|RelationshipManager_BootstrapTokenAttemptLockout|RelationshipManager_BootstrapTokenSourceIPBinding|RelationshipManager_HeartbeatLastSeenWriteThrottle|Primary_RevokeRelationshipTerminatesOnlyMatchingStreams)' -count=1` | Pass |
+| A6 | DR bootstrap/authz hardening | `go test ./vault -run 'TestDR(RelationshipManager_ActivationToken|RelationshipManager_LegacyPlaintextBootstrapTokenMigratesToVerifier|RelationshipManager_BootstrapTokenExpires|RelationshipManager_BootstrapTokenAttemptLockout|RelationshipManager_BootstrapTokenSourceIPBinding|RelationshipManager_BootstrapReplayDoesNotMutateRegisteredRelationship|RelationshipManager_HeartbeatLastSeenWriteThrottle|Primary_RevokeRelationshipTerminatesOnlyMatchingStreams)' -count=1` | Pass |
 | A7 | DR manager persistence rollback | `go test ./vault -run 'TestDRRelationshipManager_(EnablePrimary_SaveConfigFailureRollsBackState|EnableSecondary_SaveConfigFailureRollsBackState|UpdateTuningAppliesSecondaryRuntime)' -count=1` | Pass |
 | A8 | Sketch package | `go test ./physical/replication/sketch -count=1` | Pass |
 | A9 | Reconciler package | `go test ./physical/replication/reconciler -count=1` | Pass |
 | A10 | Raft stream hooks | `go test ./physical/raft -run 'Test.*ChangeStream|Test.*HookChangeStream|Test.*ApplyBatch' -count=1` | Pass |
 | A11 | Artifact fetch + budget semantics | `go test ./vault -run 'TestDRPrimary_ReadCheckpointEntryChange_(ExpectedVIDMismatch|UsesArtifactNotLiveStorage)|TestDRCheckpointArtifactStore_(EvictsByGlobalBudget|RejectsOversizedArtifact)' -count=1` | Pass |
 | A12 | Reconcile failure taxonomy | `go test ./vault -run 'TestClassifyReconcileFailure_(Stalled|CheckpointClasses)' -count=1` | Pass |
+| A13 | DR correctness hardening | `go test ./vault -run 'TestDRIntegration_(RangeReconciliationFinalizeFailureIsRetryable|ResnapshotRejectsSilentFetchOmission|CheckpointHighWaterLoadSeedsLastAppliedIndex|RootKeyReplicationFailsClosed)|TestDRCheckpointArtifactStore_DoesNotEvictRetainedArtifact|TestDRSecondary_Start_HeartbeatPermissionDeniedCancelsStream' -count=1` | Pass |
+| A14 | DR endpoint/audit boundary | `go test ./vault -run 'TestSystemBackend_DRSpecialPaths|TestSystemBackend_DRSensitiveFields|TestSystemBackend_DRAuditHMACsBootstrapAndRotationMaterial|TestSystemBackend_RootPaths' -count=1` | Pass |
+| A15 | DR response disclosure boundary | `go test ./vault -run 'TestDRSystemBackend_StatusDoesNotExposePromotionSecrets|TestDRSystemBackend_RelationshipResponsesDoNotExposeStoredSecrets' -count=1` | Pass |
+| A16 | DR unauthenticated error-oracle hardening | `go test ./vault -run 'TestDRSystemBackend_BootstrapRegistrationFailureResponseIsGeneric|TestDRSystemBackend_CredentialRotationFailureResponseIsGeneric' -count=1` | Pass |
+| A17 | DR gRPC data-plane authz | `go test ./vault -run 'TestDRPrimary_(StreamChangesRequiresRelationshipAuthorization|RequestCheckpointRequiresRelationshipAuthorization|HeartbeatRequiresRelationshipAuthorization|CheckpointRPCsRequireRelationshipAuthorization|ExchangeDirtyBitmap_RequiresRelationshipAuthorization|SyncKeyringRequiresRelationshipAuthorization)|TestDRIntegration_(MultiRelationshipRangeIsolation|RevokeDuringRangeReconcileAborts)' -count=1` | Pass |
+| A18 | DR SyncKeyring crypto binding | `go test ./vault -run 'TestDRPrimary_SyncKeyringRequiresRelationshipAuthorization|TestDRRootKey(WrapAADBindingRejectsMismatches|WrapRequiresCompleteInputs|WrapProducesFreshEnvelopeForRepeatedClientNonce|UnwrapRejectsMalformedEnvelope)|TestDRIntegration_RootKeyReplicationFailsClosed' -count=1` | Pass |
+| A19 | DR unauthenticated resource-exhaustion hardening | `go test ./vault -run 'TestDRRelationshipManager_SecondaryCredentialRotation(RejectsRegisteredBeforeParsingCertificate|ConfirmRejectsMissingPendingBeforeParsingCertificate|TwoPhase)|TestDRSystemBackend_CredentialRotationFailureResponseIsGeneric' -count=1` | Pass |
+| A20 | DR revocation fail-closed semantics | `go test ./vault -run 'TestDRPrimary_(StreamChangesRequiresRelationshipAuthorization|RequestCheckpointRequiresRelationshipAuthorization|HeartbeatRequiresRelationshipAuthorization|CheckpointRPCsRequireRelationshipAuthorization|ExchangeDirtyBitmap_RequiresRelationshipAuthorization|SyncKeyringRequiresRelationshipAuthorization|SyncKeyringRevocationDuringWrapFailsClosed)|TestFetchEntries_RechecksRelationshipRevocationDuringStream|TestDRRelationshipManager_RevokeClearsPendingCredentialRotationTrust|TestDRIntegration_RevokeDuringRangeReconcileAborts' -count=1` | Pass |
+| A21 | DR promotion lineage inheritance | `go test ./vault -run 'TestDRRelationshipManager_(EnableSecondaryRejectsStalePromotionLineage|RepeatedPromotionPreservesStaleLineage|BootstrapRejectsPrePromotionSecondaryFingerprint|LoadConfigSkipsStalePromotionRelationshipCerts)|TestDRSystemBackend_StatusDoesNotExposePromotionSecrets|TestDRFailoverToPrimary' -count=1` | Pass |
+| A22 | DR promotion UX and safety contract | `go test ./vault -run 'TestDRFailover_(FromSecondary|ForcedRequiresAcceptDataLoss|ForcedWithAcceptDataLoss|ForcedWithZeroEstimatedLossExplainsCleanProofUnavailable|ToPrimary)|TestDRFailoverToPrimary|TestDRSystemBackend_PromoteResponseExplainsForcedPromotion|TestDRSystemBackend_StatusDoesNotExposePromotionSecrets' -count=1` | Pass |
+| A23 | DR promoted-authority reseed cursor reset | `go test ./vault -run 'TestDRRelationshipManager_EnableSecondaryClearsStaleCheckpointCursor' -count=1` | Pass |
 
 Recommended compile pre-step:
 
@@ -52,24 +63,58 @@ Set shell environment:
 
 ```bash
 OPENBAO_REPO_DIR="/Users/roelc/projects/secretz/openbao"
-DR_ENV_DIR="/path/to/dr-env"
 DR_RESULTS_DIR="$OPENBAO_REPO_DIR/dr-stress-results"
 cd "$OPENBAO_REPO_DIR"
 ```
 
-Build OpenBao image and refresh test clusters:
+Build OpenBao image and refresh local test clusters:
 
 ```bash
 make docker-dev
-cd "$DR_ENV_DIR"
-make fresh-bao
+scripts/dr_local_test.sh reset
 ```
 
-Configure DR relationships (from DR env repo):
+The reset command starts `docker-compose.dr-test.yml`, initializes and unseals the
+three single-node Raft clusters, enables DR primary mode, enables both
+secondaries, waits for `secondary_state=streaming` and `lag_entries=0`, and writes
+tokens to `.dr-test.env`.
+
+For full-feature local validation, use the HA topology:
 
 ```bash
-cd "$DR_ENV_DIR"
-./dr-configuration.sh
+make docker-dev
+scripts/dr_local_test.sh --topology ha reset
+scripts/dr_local_test.sh --topology ha smoke --duration 900 --concurrency 48 --stepdown-interval 300
+scripts/dr_local_test.sh --topology ha verify --sample 0
+scripts/dr_local_test.sh --topology ha failover-smoke
+scripts/dr_local_test.sh --topology ha promoted-durability-smoke
+scripts/dr_local_test.sh --topology ha reseed-secondary-smoke
+scripts/dr_local_test.sh --topology ha failover-load-lifecycle
+```
+
+The HA topology runs nine containers: three Raft nodes for the primary cluster,
+three for secondary #1, and three for secondary #2. This is the local topology
+for active stepdown, standby forwarding, Raft peer behavior, DR stream recovery,
+promotion tests, promoted-cluster durability checks, and explicit secondary
+reseed validation. Run the promoted durability and reseed smokes after
+`failover-smoke` without resetting; they intentionally consume the promoted
+state created by the failover smoke.
+
+Useful local shortcuts:
+
+```bash
+make dr-test-status
+make dr-test-smoke
+make dr-test-verify
+make dr-test-down
+make dr-test-ha-reset
+make dr-test-ha-smoke
+make dr-test-ha-verify
+make dr-test-ha-failover-smoke
+make dr-test-ha-promoted-durability-smoke
+make dr-test-ha-reseed-secondary-smoke
+make dr-test-ha-failover-load-lifecycle
+make dr-test-ha-down
 ```
 
 ### E2E Scenarios
@@ -83,39 +128,44 @@ cd "$DR_ENV_DIR"
 | E5 | Re-enable after revoke | Disable revoked secondary, issue new token, re-enable. | Secondary returns to `streaming`; new writes replicate. |
 | E6 | Disconnect + reconcile | Disrupt primary connectivity, continue writes, restore connectivity. | Secondary transitions through reconcile and converges. |
 | E7 | Secondary read-only gate | Attempt data write on secondary and DR control operation. | Data write denied; allowed control operation accepted. |
-| E8 | Failover path | Promote secondary with `sys/replication/dr/secondary/promote`. | DR mode disabled on promoted cluster; writes accepted locally. |
+| E8 | Failover path | Hard-stop old primary, promote secondary #1 with `accept_data_loss=true`, restart old primary, and compare key visibility. Use `scripts/dr_local_test.sh --topology ha failover-smoke`. | Forced promotion requires explicit acknowledgement; promoted cluster keeps its own post-promotion writes; resurrected old primary and non-promoted secondary form a separate timeline with no automatic merge. |
+| E9 | Promotion lineage fence | `go test ./vault -run 'TestDRRelationshipManager_EnableSecondaryRejectsStalePromotionLineage' -count=1`; also asserted by `scripts/dr_local_test.sh --topology ha failover-smoke`. | After promotion, stale activation tokens from the old primary cluster or old relationship cannot re-enable the promoted cluster as a secondary. Fresh lineage remains possible for explicit rebuild/reconfiguration flows. |
+| E10 | Promotion durability | Run after E8: `scripts/dr_local_test.sh --topology ha promoted-durability-smoke`. | Promoted HA cluster remains `mode=disabled` with the same promotion record, keeps all raft voters unsealed, preserves writes across full promoted-cluster restart, rejects stale old-primary tokens after restart, and accepts writes after HA active handoff. |
+| E11 | Explicit secondary reseed | Run after E8/E10: `scripts/dr_local_test.sh --topology ha reseed-secondary-smoke`. | Promoted cluster can be explicitly enabled as the new DR primary; secondary2 can be disabled from the old lineage and re-enabled from a fresh promoted-authority token; promoted-only keys replicate, old-primary-only keys are removed, and old primary remains separate. |
+| E12 | Failover-under-load lifecycle | Run `scripts/dr_local_test.sh --topology ha failover-load-lifecycle` or `make dr-test-ha-failover-load-lifecycle`. The command resets the HA topology, runs the `scripts/dr-stress` mixed KV workload against the old primary, hard-stops all old-primary nodes mid-run, promotes secondary1 with explicit `accept_data_loss=true`, exhaustively verifies the promoted secondary1 truth log, then runs E10 and E11 without resetting. | No-ack promotion fails closed; accepted promotion reports clean/forced semantics, reason codes/details, acknowledgement state, and data-loss estimate basis; promoted secondary1 has no confirmed missing keys or mismatches; promoted durability passes; secondary2 can be re-seeded from the promoted authority and reaches `streaming` with `lag_entries=0`. |
 
 ### Command Snippets (address-based, no container-name dependency)
 
 Enable DR primary and seed baseline key:
 
 ```bash
-BAO_ADDR="$DR_PRIMARY_ADDR" BAO_TOKEN="$DR_PRIMARY_TOKEN" BAO_CACERT="$DR_CA_CERT" bao write -f sys/replication/dr/primary/enable
-BAO_ADDR="$DR_PRIMARY_ADDR" BAO_TOKEN="$DR_PRIMARY_TOKEN" BAO_CACERT="$DR_CA_CERT" bao secrets enable -path=kv kv-v2 || true
-BAO_ADDR="$DR_PRIMARY_ADDR" BAO_TOKEN="$DR_PRIMARY_TOKEN" BAO_CACERT="$DR_CA_CERT" bao kv put kv/dr-baseline msg=hello ts="$(date +%s)"
+source .dr-test.env
+BAO_ADDR="$DR_PRIMARY_ADDR" BAO_TOKEN="$DR_PRIMARY_TOKEN" bao write -f sys/replication/dr/primary/enable
+BAO_ADDR="$DR_PRIMARY_ADDR" BAO_TOKEN="$DR_PRIMARY_TOKEN" bao secrets enable -path=kv kv-v2 || true
+BAO_ADDR="$DR_PRIMARY_ADDR" BAO_TOKEN="$DR_PRIMARY_TOKEN" bao kv put kv/dr-baseline msg=hello ts="$(date +%s)"
 ```
 
 Enable secondary #1:
 
 ```bash
-ACT1=$(BAO_ADDR="$DR_PRIMARY_ADDR" BAO_TOKEN="$DR_PRIMARY_TOKEN" BAO_CACERT="$DR_CA_CERT" bao write -f -format=json sys/replication/dr/primary/secondary-token | jq -r '.data.token')
-BAO_ADDR="$DR_SECONDARY1_ADDR" BAO_TOKEN="$DR_SECONDARY1_TOKEN" BAO_CACERT="$DR_CA_CERT" bao write sys/replication/dr/secondary/enable token="$ACT1"
+ACT1=$(BAO_ADDR="$DR_PRIMARY_ADDR" BAO_TOKEN="$DR_PRIMARY_TOKEN" bao write -f -format=json sys/replication/dr/primary/secondary-token | jq -r '.data.token')
+BAO_ADDR="$DR_SECONDARY1_ADDR" BAO_TOKEN="$DR_SECONDARY1_TOKEN" bao write sys/replication/dr/secondary/enable token="$ACT1"
 ```
 
 Enable secondary #2:
 
 ```bash
-ACT2=$(BAO_ADDR="$DR_PRIMARY_ADDR" BAO_TOKEN="$DR_PRIMARY_TOKEN" BAO_CACERT="$DR_CA_CERT" bao write -f -format=json sys/replication/dr/primary/secondary-token | jq -r '.data.token')
-BAO_ADDR="$DR_SECONDARY2_ADDR" BAO_TOKEN="$DR_SECONDARY2_TOKEN" BAO_CACERT="$DR_CA_CERT" bao write sys/replication/dr/secondary/enable token="$ACT2"
+ACT2=$(BAO_ADDR="$DR_PRIMARY_ADDR" BAO_TOKEN="$DR_PRIMARY_TOKEN" bao write -f -format=json sys/replication/dr/primary/secondary-token | jq -r '.data.token')
+BAO_ADDR="$DR_SECONDARY2_ADDR" BAO_TOKEN="$DR_SECONDARY2_TOKEN" bao write sys/replication/dr/secondary/enable token="$ACT2"
 ```
 
 Live stream check:
 
 ```bash
-BAO_ADDR="$DR_PRIMARY_ADDR" BAO_TOKEN="$DR_PRIMARY_TOKEN" BAO_CACERT="$DR_CA_CERT" bao kv put kv/dr-live ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)" src=primary
+BAO_ADDR="$DR_PRIMARY_ADDR" BAO_TOKEN="$DR_PRIMARY_TOKEN" bao kv put kv/dr-live ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)" src=primary
 sleep 2
-BAO_ADDR="$DR_SECONDARY1_ADDR" BAO_TOKEN="$DR_SECONDARY1_TOKEN" BAO_CACERT="$DR_CA_CERT" bao read kv/data/dr-live
-BAO_ADDR="$DR_SECONDARY2_ADDR" BAO_TOKEN="$DR_SECONDARY2_TOKEN" BAO_CACERT="$DR_CA_CERT" bao read kv/data/dr-live
+BAO_ADDR="$DR_SECONDARY1_ADDR" BAO_TOKEN="$DR_PRIMARY_TOKEN" bao read kv/data/dr-live
+BAO_ADDR="$DR_SECONDARY2_ADDR" BAO_TOKEN="$DR_PRIMARY_TOKEN" bao read kv/data/dr-live
 ```
 
 ---
@@ -154,7 +204,8 @@ docker logs --since=10m bao-primary-1 | rg 'dr-replication|checkpoint|change str
 
 ## 5. Stress Test Matrix
 
-Use scripts in `/Users/roelc/projects/secretz/openbao/scripts`.
+Use `scripts/dr_local_test.sh` for local compose runs. Lower-level stress
+scripts remain available under `/Users/roelc/projects/secretz/openbao/scripts`.
 
 | ID | Profile | Command Flags | Goal | Pass Criteria |
 |---|---|---|---|---|
@@ -170,6 +221,13 @@ Use scripts in `/Users/roelc/projects/secretz/openbao/scripts`.
 
 ### Stress Run Examples
 
+Local compose smoke:
+
+```bash
+scripts/dr_local_test.sh smoke --duration 120 --concurrency 24
+scripts/dr_local_test.sh verify --sample 0
+```
+
 Single secondary:
 
 ```bash
@@ -177,9 +235,7 @@ bash /Users/roelc/projects/secretz/openbao/scripts/dr_stress_test.sh run \
   --primary-addr "$DR_PRIMARY_ADDR" \
   --primary-token "$DR_PRIMARY_TOKEN" \
   --secondary-addr "$DR_SECONDARY1_ADDR" \
-  --secondary-token "$DR_SECONDARY1_TOKEN" \
-  --primary-cacert "$DR_CA_CERT" \
-  --secondary-cacert "$DR_CA_CERT" \
+  --secondary-token "$DR_PRIMARY_TOKEN" \
   --write-count 10000 \
   --concurrency 24 \
   --payload-bytes 1024 \
@@ -193,12 +249,9 @@ bash /Users/roelc/projects/secretz/openbao/scripts/dr_stress_dual_secondary.sh r
   --primary-addr "$DR_PRIMARY_ADDR" \
   --primary-token "$DR_PRIMARY_TOKEN" \
   --secondary1-addr "$DR_SECONDARY1_ADDR" \
-  --secondary1-token "$DR_SECONDARY1_TOKEN" \
+  --secondary1-token "$DR_PRIMARY_TOKEN" \
   --secondary2-addr "$DR_SECONDARY2_ADDR" \
-  --secondary2-token "$DR_SECONDARY2_TOKEN" \
-  --primary-cacert "$DR_CA_CERT" \
-  --secondary1-cacert "$DR_CA_CERT" \
-  --secondary2-cacert "$DR_CA_CERT" \
+  --secondary2-token "$DR_PRIMARY_TOKEN" \
   --secondary1-name secondary-a \
   --secondary2-name secondary-b \
   --write-count 100000 \
@@ -219,7 +272,7 @@ bash /Users/roelc/projects/secretz/openbao/scripts/dr_stress_mixed_workload.sh a
 Quick convergence signal check:
 
 ```bash
-BAO_ADDR="$DR_SECONDARY1_ADDR" BAO_TOKEN="$DR_SECONDARY1_TOKEN" BAO_CACERT="$DR_CA_CERT" bao read -format=json sys/replication/dr/status | \
+BAO_ADDR="$DR_SECONDARY1_ADDR" BAO_TOKEN="$DR_PRIMARY_TOKEN" bao read -format=json sys/replication/dr/status | \
   jq '.data | {secondary_state, last_applied_index, primary_index, secondary_apply_rate_eps, primary_write_rate_eps, lag_entries, lag_slope_eps, fallback_count, fallback_last_reason, checkpoint_conflicts_storage_drift_total, dr_backpressure_state, dr_backpressure_rejections_total}'
 ```
 
@@ -230,12 +283,9 @@ bash /Users/roelc/projects/secretz/openbao/scripts/dr_stress_mixed_workload.sh r
   --primary-addr "$DR_PRIMARY_ADDR" \
   --primary-token "$DR_PRIMARY_TOKEN" \
   --secondary1-addr "$DR_SECONDARY1_ADDR" \
-  --secondary1-token "$DR_SECONDARY1_TOKEN" \
+  --secondary1-token "$DR_PRIMARY_TOKEN" \
   --secondary2-addr "$DR_SECONDARY2_ADDR" \
-  --secondary2-token "$DR_SECONDARY2_TOKEN" \
-  --primary-cacert "$DR_CA_CERT" \
-  --secondary1-cacert "$DR_CA_CERT" \
-  --secondary2-cacert "$DR_CA_CERT" \
+  --secondary2-token "$DR_PRIMARY_TOKEN" \
   --duration-seconds 1800 \
   --concurrency 24 \
   --put-percent 55 \
