@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/openbao/openbao/helper/locking"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -84,6 +85,86 @@ func TestGrabLockOrStop(t *testing.T) {
 		}()
 	}
 	workerWg.Wait()
+}
+
+func TestRunStandbyGrabStateLockTimeout(t *testing.T) {
+	previousDuration := DefaultMaxRequestDuration
+	DefaultMaxRequestDuration = 10 * time.Millisecond
+	defer func() {
+		DefaultMaxRequestDuration = previousDuration
+	}()
+
+	c := &Core{
+		stateLock: &locking.SyncRWMutex{},
+	}
+	c.stateLock.Lock()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- c.runStandbyGrabStateLock(make(chan struct{}))
+	}()
+
+	select {
+	case err := <-done:
+		require.Error(t, err)
+	case <-time.After(time.Second):
+		c.stateLock.Unlock()
+		t.Fatal("timed out waiting for standby state-lock acquisition to stop")
+	}
+
+	c.stateLock.Unlock()
+
+	released := make(chan struct{})
+	go func() {
+		c.stateLock.Lock()
+		c.stateLock.Unlock()
+		close(released)
+	}()
+
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for abandoned state-lock acquisition to release")
+	}
+}
+
+func TestGrabStateLockOrStopDoesNotQueueWriter(t *testing.T) {
+	c := &Core{
+		stateLock: &locking.SyncRWMutex{},
+	}
+	c.stateLock.Lock()
+
+	stopCh := make(chan struct{})
+	done := make(chan bool, 1)
+	go func() {
+		done <- c.grabStateLockOrStop(stopCh, nil)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	close(stopCh)
+
+	select {
+	case stopped := <-done:
+		require.True(t, stopped)
+	case <-time.After(time.Second):
+		c.stateLock.Unlock()
+		t.Fatal("timed out waiting for state-lock acquisition to stop")
+	}
+
+	c.stateLock.Unlock()
+
+	released := make(chan struct{})
+	go func() {
+		c.stateLock.Lock()
+		c.stateLock.Unlock()
+		close(released)
+	}()
+
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for abandoned state-lock acquisition to release")
+	}
 }
 
 func TestCoreRestart(t *testing.T) {

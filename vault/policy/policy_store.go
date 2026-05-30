@@ -751,6 +751,38 @@ func (ps *Store) LoadDefaultPolicies(ctx context.Context) error {
 	return nil
 }
 
+// LoadDefaultPoliciesAllowReadOnly is used by read-only standby unseal. Active
+// nodes must create or update these immutable policies, but a standby cannot
+// write through the read-only barrier. If both policies already exist, a
+// read-only persistence failure can be tolerated until the active node updates
+// storage and invalidates the standby caches.
+func (ps *Store) LoadDefaultPoliciesAllowReadOnly(ctx context.Context) error {
+	err := ps.LoadDefaultPolicies(ctx)
+	if err == nil || !errors.Is(err, logical.ErrReadOnly) {
+		return err
+	}
+
+	if verifyErr := ps.verifyDefaultPoliciesExist(ctx); verifyErr != nil {
+		return fmt.Errorf("%w; unable to verify existing default policies: %v", err, verifyErr)
+	}
+
+	return nil
+}
+
+func (ps *Store) verifyDefaultPoliciesExist(ctx context.Context) error {
+	for _, policyName := range []string{defaultPolicyName, ResponseWrappingPolicyName} {
+		pol, err := ps.GetPolicy(ctx, policyName, TypeACL)
+		if err != nil {
+			return fmt.Errorf("failed to fetch %q policy: %w", policyName, err)
+		}
+		if pol == nil {
+			return fmt.Errorf("%q policy is missing", policyName)
+		}
+	}
+
+	return nil
+}
+
 func (ps *Store) PurgeCache() {
 	ps.tokenPoliciesLRU.Purge()
 }

@@ -21,6 +21,7 @@ type RWMutex interface {
 	RLock()
 	RLocker() sync.Locker
 	RUnlock()
+	TryLock() bool
 	Unlock()
 }
 

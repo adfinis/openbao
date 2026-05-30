@@ -271,15 +271,14 @@ func (c *Core) initializeInternal(ctx context.Context, initParams *InitParams) (
 			return nil, fmt.Errorf("failed to create initialization lock: %w", err)
 		}
 
+		// Add a timeout for lock acquisition: if multiple nodes race to
+		// acquire this lock, we wish to stop the losing nodes rather than
+		// hang indefinitely. One initialization is sufficient in this case.
 		stopCh := make(chan struct{})
-		go func() {
-			// Add a timeout for lock acquisition: if multiple nodes race to
-			// acquire this lock, we wish to stop the losing nodes rather than
-			// hang indefinitely. One initialization is sufficient in this
-			// case.
-			time.Sleep(5 * time.Second)
-			stopCh <- struct{}{}
-		}()
+		timeout := time.AfterFunc(5*time.Second, func() {
+			close(stopCh)
+		})
+		defer timeout.Stop()
 
 		// This lock should not be held long enough to trigger a loss of
 		// leadership so ignore the loss channel.

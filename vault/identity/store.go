@@ -803,8 +803,12 @@ func mfaPaths(i *IdentityStore) []*framework.Path {
 
 func (i *IdentityStore) initialize(ctx context.Context, req *logical.InitializationRequest) error {
 	if err := i.StoreOIDCDefaultResources(ctx, req.Storage); err != nil {
-		i.logger.Error("failed to write OIDC default resources to storage", "error", err)
-		return err
+		if errors.Is(err, logical.ErrReadOnly) {
+			i.logger.Warn("skipping OIDC default resource writes on read-only identity mount", "error", err)
+		} else {
+			i.logger.Error("failed to write OIDC default resources to storage", "error", err)
+			return err
+		}
 	}
 
 	// if the storage entry for caseSensitivityKey exists, remove it

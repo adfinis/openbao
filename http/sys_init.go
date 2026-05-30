@@ -106,9 +106,14 @@ func handleSysInitPut(core *vault.Core, w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	if err := core.UnsealWithStoredKeys(ctx); err != nil {
-		respondError(w, http.StatusInternalServerError, err)
-		return
+	// Auto-seal cores either unseal during Core.Initialize or via the normal
+	// stored-key unseal loop. Avoid a redundant synchronous unseal here because
+	// it can race HA standby setup during init.
+	if !core.SealAccess().RecoveryKeySupported() && core.Sealed() {
+		if err := core.UnsealWithStoredKeys(ctx); err != nil {
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
 	}
 
 	respondOk(w, resp)

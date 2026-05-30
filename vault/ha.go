@@ -424,55 +424,33 @@ func (c *Core) drainPendingRestarts() {
 }
 
 func (c *Core) runStandbyGrabStateLock(stopCh <-chan struct{}) error {
-	acquiredCh := make(chan struct{})
-	quitCh := make(chan struct{})
+	timeout := time.NewTimer(DefaultMaxRequestDuration)
+	defer timeout.Stop()
 
-	// We want to quit lock acquisition on two conditions:
-	//
-	// 1. Timeout.
-	// 2. If we're told to stop.
-	//
-	// While technically unnecessary, we only quit lock acquisition
-	// if we've not been canceled.
-	go func() {
-		timeout := time.NewTimer(DefaultMaxRequestDuration)
-
-		canceled := false
-		select {
-		case <-timeout.C:
-			canceled = true
-		case <-stopCh:
-			canceled = true
-		case <-acquiredCh:
-		}
-
-		if !timeout.Stop() {
-			<-timeout.C
-		}
-
-		if canceled {
-			select {
-			case quitCh <- struct{}{}:
-			default:
-			}
-		}
-
-		close(quitCh)
-	}()
-
-	// Grab lock.
-	l := newLockGrabber(c.stateLock.Lock, c.stateLock.Unlock, quitCh)
-	go l.grab()
-
-	// Check if we got the lock successfully.
-	stopped := l.lockOrStop()
-	if stopped {
+	if stopped := c.grabStateLockOrStop(stopCh, timeout.C); stopped {
 		return fmt.Errorf("failed to acquire state lock")
 	}
 
-	close(acquiredCh)
-
 	return nil
+}
+
+func (c *Core) grabStateLockOrStop(stopCh <-chan struct{}, timeoutCh <-chan time.Time) (stopped bool) {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if c.stateLock.TryLock() {
+			return false
+		}
+
+		select {
+		case <-stopCh:
+			return true
+		case <-timeoutCh:
+			return true
+		case <-ticker.C:
+		}
+	}
 }
 
 // runStandby is a long running process that manages a number of the HA
@@ -674,10 +652,8 @@ func (c *Core) waitForLeadership(manualStepDownCh, stopCh <-chan struct{}) {
 		// detect flapping
 		activeTime := time.Now()
 
-		// Grab the statelock or stop
-		l := newLockGrabber(c.stateLock.Lock, c.stateLock.Unlock, stopCh)
-		go l.grab()
-		if stopped := l.lockOrStop(); stopped {
+		// Grab the statelock or stop.
+		if stopped := c.grabStateLockOrStop(stopCh, nil); stopped {
 			lock.Unlock()
 			metrics.MeasureSince([]string{"core", "leadership_setup_failed"}, activeTime)
 			return
@@ -828,10 +804,8 @@ func (c *Core) waitForLeadership(manualStepDownCh, stopCh <-chan struct{}) {
 				}
 			}()
 
-			// Grab lock if we are not stopped
-			l := newLockGrabber(c.stateLock.Lock, c.stateLock.Unlock, stopCh)
-			go l.grab()
-			stopped := l.lockOrStop()
+			// Grab lock if we are not stopped.
+			stopped := c.grabStateLockOrStop(stopCh, nil)
 
 			// Cancel the context incase the above go routine hasn't done it
 			// yet
