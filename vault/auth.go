@@ -1072,6 +1072,11 @@ func (c *Core) setupCredentials(ctx context.Context) error {
 	defer c.authLock.Unlock()
 
 	for _, entry := range c.auth.SortEntriesByPathDepth().Entries {
+		if shouldSkipDRSecondaryProtectedRouterEntry(ctx, c, entry, true) {
+			c.logger.Info("skipping existing protected DR secondary auth route", "path", entry.Path, "type", entry.Type, "namespace", entry.Namespace)
+			continue
+		}
+
 		postUnsealFunc, err := c.setupCredential(ctx, entry)
 		if err != nil {
 			return err
@@ -1095,6 +1100,10 @@ func (c *Core) setupCredentialsForNamespace(ctx context.Context, ns *namespace.N
 	for _, entry := range c.auth.SortEntriesByPath().Entries {
 		// Only process entries with matching namespace ID
 		if entry.NamespaceID != ns.ID {
+			continue
+		}
+		if shouldSkipDRSecondaryProtectedRouterEntry(ctx, c, entry, true) {
+			c.logger.Info("skipping existing protected DR secondary namespace auth route", "path", entry.Path, "type", entry.Type, "namespace", entry.Namespace)
 			continue
 		}
 

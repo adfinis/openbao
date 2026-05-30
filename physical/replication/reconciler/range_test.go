@@ -83,6 +83,35 @@ func TestSplitRange(t *testing.T) {
 	}
 }
 
+func TestBuildRangeDigestFromIndexPreservesRequestedSpan(t *testing.T) {
+	span := RangeSpan{
+		StartKID:   testKID(10),
+		EndKID:     testKID(100),
+		SplitDepth: 3,
+	}
+	kid := testKID(50)
+	vid := sha256.Sum256([]byte("value"))
+	index := NewRangeMapIndex(map[[32]byte][32]byte{kid: vid}, nil)
+
+	desc := BuildRangeDigestFromIndex(index, span)
+	if desc.Span != span {
+		t.Fatalf("expected requested span to be preserved, got %#v want %#v", desc.Span, span)
+	}
+
+	emptySpan := RangeSpan{
+		StartKID:   testKID(60),
+		EndKID:     testKID(70),
+		SplitDepth: 4,
+	}
+	emptyDesc := BuildRangeDigestFromIndex(index, emptySpan)
+	if emptyDesc.Count != 0 {
+		t.Fatalf("expected empty digest count, got %d", emptyDesc.Count)
+	}
+	if emptyDesc.Span != emptySpan {
+		t.Fatalf("expected empty requested span to be preserved, got %#v want %#v", emptyDesc.Span, emptySpan)
+	}
+}
+
 func TestBuildRangeManifest_NoSingleRangeCollapseForDistributedKIDs(t *testing.T) {
 	rs := &ReconciliationSet{
 		KIDToVID: make(map[[32]byte][32]byte),

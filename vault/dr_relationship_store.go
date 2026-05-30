@@ -42,21 +42,50 @@ func (m *drRelationshipManager) restoreRelationshipCerts(ctx context.Context) er
 			continue
 		}
 
-		if rel.State == DRRelationshipStateRevoked || len(rel.SecondaryCACert) == 0 {
+		if rel.State == DRRelationshipStateRevoked || (len(rel.SecondaryCACert) == 0 && len(rel.PendingSecondaryCACert) == 0) {
+			continue
+		}
+		if isStalePostPromotionLineage(m.config.Promotion, "", rel.RelationshipID) {
+			m.logger.Warn("skipping stale pre-promotion relationship cert",
+				"relationship_id", rel.RelationshipID)
 			continue
 		}
 
-		cert, err := x509.ParseCertificate(rel.SecondaryCACert)
-		if err != nil {
-			m.logger.Warn("failed to parse relationship cert", "relationship_id", rel.RelationshipID, "error", err)
-			continue
+		m.restoreRelationshipCertLocked(&rel, rel.SecondaryCACert, rel.SecondaryCertFingerprint, "current")
+		if !pendingCredentialRotationExpired(&rel, time.Now().UTC()) {
+			m.restoreRelationshipCertLocked(&rel, rel.PendingSecondaryCACert, rel.PendingSecondaryCertFingerprint, "pending")
 		}
-
-		m.handler.AddTrustedCert(rel.RelationshipID, cert)
-		m.logger.Info("restored trusted relationship cert", "relationship_id", rel.RelationshipID)
 	}
 
 	return nil
+}
+
+func (m *drRelationshipManager) restoreRelationshipCertLocked(rel *DRRelationship, certDER []byte, fingerprint string, label string) {
+	if len(certDER) == 0 {
+		return
+	}
+	cert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		m.logger.Warn("failed to parse relationship cert", "relationship_id", rel.RelationshipID, "rotation_state", label, "error", err)
+		return
+	}
+	if err := validateDRSecondaryClientCert(cert, time.Now().UTC()); err != nil {
+		m.logger.Warn("skipping invalid relationship cert", "relationship_id", rel.RelationshipID, "rotation_state", label, "error", err)
+		return
+	}
+	if fingerprint == "" {
+		fingerprint = certFingerprintSHA256(cert)
+	}
+	if isStalePostPromotionFingerprint(m.config.Promotion, fingerprint) {
+		m.logger.Warn("skipping stale pre-promotion relationship cert",
+			"relationship_id", rel.RelationshipID,
+			"rotation_state", label,
+			"fingerprint", fingerprint)
+		return
+	}
+
+	m.handler.AddTrustedCert(rel.RelationshipID, cert)
+	m.logger.Info("restored trusted relationship cert", "relationship_id", rel.RelationshipID, "rotation_state", label)
 }
 
 func (m *drRelationshipManager) relationshipKey(id string) string {
@@ -77,6 +106,19 @@ func (m *drRelationshipManager) normalizeRelationshipLocked(rel *DRRelationship)
 		rel.State = DRRelationshipStatePending
 		changed = true
 		warnings = append(warnings, "missing state")
+	}
+
+	if rel.State == DRRelationshipStatePending && rel.BootstrapToken != "" && rel.BootstrapTokenHash == "" {
+		rel.BootstrapTokenHash = hashDRBootstrapToken(rel.RelationshipID, rel.BootstrapToken)
+		rel.BootstrapToken = ""
+		changed = true
+		warnings = append(warnings, "legacy plaintext bootstrap token")
+	}
+	if rel.State != DRRelationshipStatePending && (rel.BootstrapToken != "" || rel.BootstrapTokenHash != "") {
+		rel.BootstrapToken = ""
+		rel.BootstrapTokenHash = ""
+		changed = true
+		warnings = append(warnings, "non-pending bootstrap verifier")
 	}
 
 	if rel.CreatedAt == 0 {
@@ -103,6 +145,13 @@ func (m *drRelationshipManager) normalizeRelationshipLocked(rel *DRRelationship)
 
 	if rel.State == DRRelationshipStateRevoked && rel.RevokedAt == 0 {
 		rel.RevokedAt = now
+		changed = true
+	}
+
+	if (rel.State == DRRelationshipStateRegistered || rel.State == DRRelationshipStateActive) &&
+		rel.SecondaryCertFingerprint != "" &&
+		rel.CredentialGeneration == 0 {
+		rel.CredentialGeneration = 1
 		changed = true
 	}
 
@@ -228,10 +277,12 @@ func (m *drRelationshipManager) ListRelationships(ctx context.Context) ([]*DRRel
 	return relationships, nil
 }
 
-// findActiveRelationshipByFingerprint scans all relationships for one that
-// has a matching secondary_cert_fingerprint and is not revoked. Returns nil
-// if no match is found. Caller must hold m.mu.
-func (m *drRelationshipManager) findActiveRelationshipByFingerprint(ctx context.Context, fingerprint string) (*DRRelationship, error) {
+// findRelationshipByFingerprint scans all relationships for one that has a
+// matching current, pending, or previous secondary certificate fingerprint,
+// including revoked records. Revoked and previous matches matter because stale
+// secondary credentials must not be revived under a new relationship. Returns
+// nil if no match is found. Caller must hold m.mu.
+func (m *drRelationshipManager) findRelationshipByFingerprint(ctx context.Context, fingerprint string) (*DRRelationship, error) {
 	keys, err := m.core.barrier.List(ctx, drRelationshipsPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list relationships: %w", err)
@@ -241,10 +292,9 @@ func (m *drRelationshipManager) findActiveRelationshipByFingerprint(ctx context.
 		if err != nil {
 			continue
 		}
-		if rel.State == DRRelationshipStateRevoked {
-			continue
-		}
-		if strings.EqualFold(rel.SecondaryCertFingerprint, fingerprint) {
+		if strings.EqualFold(rel.SecondaryCertFingerprint, fingerprint) ||
+			strings.EqualFold(rel.PendingSecondaryCertFingerprint, fingerprint) ||
+			strings.EqualFold(rel.PreviousSecondaryCertFingerprint, fingerprint) {
 			return rel, nil
 		}
 	}

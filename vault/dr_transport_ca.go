@@ -8,6 +8,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
@@ -31,6 +32,14 @@ const (
 	// drTransportLeafValidity is the validity period for per-node DR
 	// transport leaf certificates signed by the CA.
 	drTransportLeafValidity = 72 * time.Hour
+
+	// drSecondaryClientCertValidityYears is the validity period for the
+	// secondary's self-signed relationship credential. It is intentionally
+	// long-lived; rotation is modeled as a new DR relationship or an explicit
+	// future certificate-rotation API, not silent bootstrap-token reuse.
+	drSecondaryClientCertValidityYears = 10
+
+	drCertClockSkew = 5 * time.Minute
 )
 
 // drTransportCABundle is the serialized form of the DR transport CA stored
@@ -170,6 +179,122 @@ func loadDRTransportCA(core *Core) (*drTransportCA, error) {
 	}
 
 	return &drTransportCA{cert: cert, certDER: bundle.CertDER, key: key}, nil
+}
+
+func generateDRSecondaryClientCert() ([]byte, []byte, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to generate DR secondary client key: %w", err)
+	}
+
+	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to generate DR secondary client serial number: %w", err)
+	}
+
+	now := time.Now().UTC()
+	template := &x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			CommonName:   "openbao-dr-secondary-client",
+			Organization: []string{"OpenBao DR"},
+		},
+		NotBefore: now.Add(-5 * time.Minute),
+		NotAfter:  now.AddDate(drSecondaryClientCertValidityYears, 0, 0),
+		KeyUsage:  x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		ExtKeyUsage: []x509.ExtKeyUsage{
+			x509.ExtKeyUsageClientAuth,
+		},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		MaxPathLen:            0,
+		MaxPathLenZero:        true,
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create DR secondary client certificate: %w", err)
+	}
+
+	keyBytes, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to marshal DR secondary client key: %w", err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes})
+	return certDER, keyPEM, nil
+}
+
+func validateDRSecondaryClientCert(cert *x509.Certificate, now time.Time) error {
+	if cert == nil {
+		return fmt.Errorf("missing DR secondary client certificate")
+	}
+	now = now.UTC()
+	if now.Add(drCertClockSkew).Before(cert.NotBefore) {
+		return fmt.Errorf("DR secondary client certificate is not valid before %s", cert.NotBefore.UTC())
+	}
+	if !now.Before(cert.NotAfter) {
+		return fmt.Errorf("DR secondary client certificate expired at %s", cert.NotAfter.UTC())
+	}
+	if !cert.BasicConstraintsValid || !cert.IsCA {
+		return fmt.Errorf("DR secondary client certificate must be a self-signed CA trust anchor")
+	}
+	if cert.KeyUsage&x509.KeyUsageDigitalSignature == 0 {
+		return fmt.Errorf("DR secondary client certificate must allow digital signatures")
+	}
+	if cert.KeyUsage&x509.KeyUsageCertSign == 0 {
+		return fmt.Errorf("DR secondary client certificate must allow certificate signing")
+	}
+	if len(cert.ExtKeyUsage) > 0 {
+		allowed := false
+		for _, usage := range cert.ExtKeyUsage {
+			if usage == x509.ExtKeyUsageClientAuth || usage == x509.ExtKeyUsageAny {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return fmt.Errorf("DR secondary client certificate must allow client authentication")
+		}
+	}
+	if err := cert.CheckSignatureFrom(cert); err != nil {
+		return fmt.Errorf("DR secondary client certificate must be self-signed: %w", err)
+	}
+	return nil
+}
+
+func parseDRSecondaryClientCert(certDER, keyPEM []byte) (*tls.Certificate, error) {
+	if len(certDER) == 0 {
+		return nil, fmt.Errorf("missing DR secondary client certificate")
+	}
+	if len(keyPEM) == 0 {
+		return nil, fmt.Errorf("missing DR secondary client key")
+	}
+
+	block, _ := pem.Decode(keyPEM)
+	if block == nil {
+		return nil, fmt.Errorf("failed to decode DR secondary client key PEM")
+	}
+	key, err := x509.ParseECPrivateKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse DR secondary client key: %w", err)
+	}
+
+	cert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse DR secondary client certificate: %w", err)
+	}
+	if err := validateDRSecondaryClientCert(cert, time.Now().UTC()); err != nil {
+		return nil, err
+	}
+	if !key.PublicKey.Equal(cert.PublicKey) {
+		return nil, fmt.Errorf("DR secondary client certificate public key does not match private key")
+	}
+
+	return &tls.Certificate{
+		Certificate: [][]byte{certDER},
+		PrivateKey:  key,
+		Leaf:        cert,
+	}, nil
 }
 
 // signDRTransportLeafCert creates a short-lived leaf certificate signed by

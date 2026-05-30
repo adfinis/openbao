@@ -76,6 +76,42 @@ func newLeafSignedByTestCA(t *testing.T, caCert *x509.Certificate, caKey *ecdsa.
 	return leafDER
 }
 
+func newValidationSecondaryClientCert(t *testing.T, mutate func(*x509.Certificate)) *x509.Certificate {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate secondary key: %v", err)
+	}
+
+	now := time.Now().UTC()
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(now.UnixNano()),
+		Subject:               pkix.Name{CommonName: "openbao-dr-secondary-client"},
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		MaxPathLen:            0,
+		MaxPathLenZero:        true,
+	}
+	if mutate != nil {
+		mutate(template)
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("failed to create secondary certificate: %v", err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("failed to parse secondary certificate: %v", err)
+	}
+	return cert
+}
+
 func TestVerifyCertChainToCA_AcceptsCurrentlyValidLeaf(t *testing.T) {
 	caCert, caKey := newTestDRTransportCACert(t)
 	now := time.Now().UTC()
@@ -103,5 +139,57 @@ func TestVerifyCertChainToCA_RejectsNotYetValidLeaf(t *testing.T) {
 
 	if err := verifyCertChainToCA(leafDER, caCert); err == nil {
 		t.Fatal("expected not-yet-valid leaf verification to fail")
+	}
+}
+
+func TestValidateDRSecondaryClientCertAcceptsGeneratedCertificate(t *testing.T) {
+	certDER, keyPEM, err := generateDRSecondaryClientCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateDRSecondaryClientCert(cert, time.Now().UTC()); err != nil {
+		t.Fatalf("expected generated secondary client cert to validate: %v", err)
+	}
+	if _, err := parseDRSecondaryClientCert(certDER, keyPEM); err != nil {
+		t.Fatalf("expected generated secondary client cert/key pair to parse: %v", err)
+	}
+}
+
+func TestValidateDRSecondaryClientCertRejectsInvalidLifecycle(t *testing.T) {
+	now := time.Now().UTC()
+
+	tests := map[string]func(*x509.Certificate){
+		"expired": func(tpl *x509.Certificate) {
+			tpl.NotBefore = now.Add(-2 * time.Hour)
+			tpl.NotAfter = now.Add(-time.Hour)
+		},
+		"not-yet-valid": func(tpl *x509.Certificate) {
+			tpl.NotBefore = now.Add(time.Hour)
+			tpl.NotAfter = now.Add(2 * time.Hour)
+		},
+		"non-ca": func(tpl *x509.Certificate) {
+			tpl.IsCA = false
+			tpl.MaxPathLenZero = false
+			tpl.KeyUsage = x509.KeyUsageDigitalSignature
+		},
+		"missing-digital-signature": func(tpl *x509.Certificate) {
+			tpl.KeyUsage = x509.KeyUsageCertSign
+		},
+		"server-auth-only": func(tpl *x509.Certificate) {
+			tpl.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+		},
+	}
+
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			cert := newValidationSecondaryClientCert(t, mutate)
+			if err := validateDRSecondaryClientCert(cert, now); err == nil {
+				t.Fatal("expected invalid secondary client certificate to be rejected")
+			}
+		})
 	}
 }

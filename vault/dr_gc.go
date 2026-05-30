@@ -107,7 +107,8 @@ func (gc *drTombstoneGC) runOnce() {
 		gc.pruneStreamJournal(watermark, now)
 	}
 
-	gc.logger.Debug("GC cycle complete",
+	gc.logger.Debug(
+		"GC cycle complete",
 		"watermark", watermark,
 		"disconnected_peers", disconnected,
 		"gc_runs", gc.gcRuns.Load(),

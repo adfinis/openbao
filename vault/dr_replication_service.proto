@@ -163,6 +163,7 @@ message RangeChecksum {
 
 // RangeChecksumRequest requests checksums for specific ranges.
 message RangeChecksumRequest {
+    string relationship_id = 4;
     string checkpoint_id = 1;
     uint64 checkpoint_index = 2;
     repeated uint64 range_ids = 3;
@@ -184,6 +185,7 @@ message RangeDigest {
 
 // RangeDigestRequest asks the primary for fine-grained sub-range digests.
 message RangeDigestRequest {
+    string relationship_id = 4;
     string checkpoint_id = 1;
     uint64 checkpoint_index = 2;
     // parent_span is the mismatched range to drill into.
@@ -206,6 +208,8 @@ message FetchItem {
 
 // FetchEntriesRequest asks the primary for specific entries by KID.
 message FetchEntriesRequest {
+    string relationship_id = 9;
+
     string checkpoint_id = 1;
 
     // kids is the list of KID hashes to fetch entries for.

@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 	"github.com/openbao/openbao/physical/replication/reconciler"
 	"github.com/openbao/openbao/sdk/v2/logical"
 	"github.com/openbao/openbao/sdk/v2/physical"
+	"github.com/openbao/openbao/vault/routing"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
@@ -136,6 +138,12 @@ func TestDRIntegration_StreamReplication(t *testing.T) {
 	// Simulate change stream: collect entries from primary and apply to secondary.
 	var changes []physical.ChangeStreamEntry
 	err := logical.ScanView(ctx, primary.barrier, func(path string) {
+		// This test exercises ordinary stream entry application. Barrier-key
+		// replacement is covered by dedicated keyring/root-key tests because it
+		// requires the DR bootstrap sequence, not direct fetched entry replay.
+		if path == "core/keyring" || path == "core/root-key" {
+			return
+		}
 		entry, err := primary.barrier.Get(ctx, path)
 		if err != nil || entry == nil {
 			return
@@ -402,6 +410,227 @@ func TestDRIntegration_ReadOnlyEnforcement(t *testing.T) {
 	}
 }
 
+func TestDRIntegration_RuntimeStateRefreshMountsReplicatedMount(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := namespace.RootContext(t.Context())
+
+	sec := newDRReplicationSecondary(core, make([]byte, 32), "rel-runtime-refresh", core.logger)
+	mount := &routing.MountEntry{
+		Table: routing.MountTableType,
+		Path:  "kv",
+		Type:  "kv",
+	}
+	if err := core.mount(ctx, mount); err != nil {
+		t.Fatalf("mount failed: %v", err)
+	}
+	if match := core.router.MatchingMount(ctx, "kv/foo"); match != "kv/" {
+		t.Fatalf("expected kv mount before unmount, got %q", match)
+	}
+
+	if err := core.router.Unmount(ctx, "kv/"); err != nil {
+		t.Fatalf("router unmount failed: %v", err)
+	}
+	if match := core.router.MatchingMount(ctx, "kv/foo"); match == "kv/" {
+		t.Fatalf("expected kv router entry to be absent before refresh")
+	}
+
+	if err := sec.refreshRuntimeStateAfterApply(ctx, "test", true); err != nil {
+		t.Fatalf("refresh runtime state failed: %v", err)
+	}
+	if match := core.router.MatchingMount(ctx, "kv/foo"); match != "kv/" {
+		t.Fatalf("expected kv mount after refresh, got %q", match)
+	}
+}
+
+func TestDRIntegration_RuntimeStateRefreshUnmountsRemovedMount(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := namespace.RootContext(t.Context())
+
+	sec := newDRReplicationSecondary(core, make([]byte, 32), "rel-runtime-refresh-unmount", core.logger)
+	mount := &routing.MountEntry{
+		Table: routing.MountTableType,
+		Path:  "stale-kv",
+		Type:  "kv",
+	}
+	if err := core.mount(ctx, mount); err != nil {
+		t.Fatalf("mount failed: %v", err)
+	}
+	if match := core.router.MatchingMount(ctx, "stale-kv/foo"); match != "stale-kv/" {
+		t.Fatalf("expected stale-kv mount before table removal, got %q", match)
+	}
+
+	mountsWithoutStale := core.mounts.ShallowClone()
+	removedMount, err := mountsWithoutStale.Remove(ctx, "stale-kv/")
+	if err != nil {
+		t.Fatalf("remove cloned mount table entry failed: %v", err)
+	}
+	if removedMount == nil {
+		t.Fatal("expected stale-kv entry in cloned mount table")
+	}
+	if err := core.persistMounts(ctx, core.barrier, mountsWithoutStale, &removedMount.Local, removedMount.UUID); err != nil {
+		t.Fatalf("persist mount table without stale entry failed: %v", err)
+	}
+	if match := core.router.MatchingMount(ctx, "stale-kv/foo"); match != "stale-kv/" {
+		t.Fatalf("expected stale-kv router entry to remain before refresh, got %q", match)
+	}
+
+	if err := sec.refreshRuntimeStateAfterApply(ctx, "test", true); err != nil {
+		t.Fatalf("refresh runtime state failed: %v", err)
+	}
+	if match := core.router.MatchingMount(ctx, "stale-kv/foo"); match != "" {
+		t.Fatalf("expected stale-kv router entry to be removed after refresh, got %q", match)
+	}
+}
+
+func TestDRIntegration_RuntimeStateRefreshMountsReplicatedAuth(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := namespace.RootContext(t.Context())
+
+	sec := newDRReplicationSecondary(core, make([]byte, 32), "rel-runtime-refresh-auth", core.logger)
+	auth := &routing.MountEntry{
+		Table: routing.CredentialTableType,
+		Path:  "userpass-runtime",
+		Type:  "noop",
+	}
+	if err := core.enableCredential(ctx, auth); err != nil {
+		t.Fatalf("enable credential failed: %v", err)
+	}
+	if match := core.router.MatchingMount(ctx, "auth/userpass-runtime/login"); match != "auth/userpass-runtime/" {
+		t.Fatalf("expected userpass auth mount before unmount, got %q", match)
+	}
+
+	if err := core.router.Unmount(ctx, "auth/userpass-runtime/"); err != nil {
+		t.Fatalf("router unmount failed: %v", err)
+	}
+	if match := core.router.MatchingMount(ctx, "auth/userpass-runtime/login"); match == "auth/userpass-runtime/" {
+		t.Fatalf("expected userpass router entry to be absent before refresh")
+	}
+
+	if err := sec.refreshRuntimeStateAfterApply(ctx, "test", true); err != nil {
+		t.Fatalf("refresh runtime state failed: %v", err)
+	}
+	if match := core.router.MatchingMount(ctx, "auth/userpass-runtime/login"); match != "auth/userpass-runtime/" {
+		t.Fatalf("expected userpass auth mount after refresh, got %q", match)
+	}
+}
+
+func TestDRIntegration_RuntimeStateRefreshUnmountsRemovedAuth(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := namespace.RootContext(t.Context())
+
+	sec := newDRReplicationSecondary(core, make([]byte, 32), "rel-runtime-refresh-auth-unmount", core.logger)
+	auth := &routing.MountEntry{
+		Table: routing.CredentialTableType,
+		Path:  "stale-userpass",
+		Type:  "noop",
+	}
+	if err := core.enableCredential(ctx, auth); err != nil {
+		t.Fatalf("enable credential failed: %v", err)
+	}
+	if match := core.router.MatchingMount(ctx, "auth/stale-userpass/login"); match != "auth/stale-userpass/" {
+		t.Fatalf("expected stale auth mount before table removal, got %q", match)
+	}
+
+	authWithoutStale := core.auth.ShallowClone()
+	removedAuth, err := authWithoutStale.Remove(ctx, "stale-userpass/")
+	if err != nil {
+		t.Fatalf("remove cloned auth table entry failed: %v", err)
+	}
+	if removedAuth == nil {
+		t.Fatal("expected stale-userpass entry in cloned auth table")
+	}
+	if err := core.persistAuth(ctx, core.barrier, authWithoutStale, &removedAuth.Local, removedAuth.UUID); err != nil {
+		t.Fatalf("persist auth table without stale entry failed: %v", err)
+	}
+	if match := core.router.MatchingMount(ctx, "auth/stale-userpass/login"); match != "auth/stale-userpass/" {
+		t.Fatalf("expected stale auth router entry to remain before refresh, got %q", match)
+	}
+
+	if err := sec.refreshRuntimeStateAfterApply(ctx, "test", true); err != nil {
+		t.Fatalf("refresh runtime state failed: %v", err)
+	}
+	if match := core.router.MatchingMount(ctx, "auth/stale-userpass/login"); match != "" {
+		t.Fatalf("expected stale auth router entry to be removed after refresh, got %q", match)
+	}
+}
+
+func TestDRIntegration_DRSecondarySetupSkipsExistingProtectedRoutes(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := namespace.RootContext(t.Context())
+
+	if err := core.router.Unmount(ctx, "secret/"); err != nil {
+		t.Fatalf("router unmount secret failed: %v", err)
+	}
+
+	core.drManager.mu.Lock()
+	core.drManager.config = &DRConfig{Mode: DRModeSecondary}
+	core.drManager.mu.Unlock()
+
+	var identityMount *routing.MountEntry
+	for _, entry := range core.mounts.Entries {
+		if entry.Type == routing.MountTypeIdentity {
+			identityMount = entry
+			break
+		}
+	}
+	if identityMount == nil {
+		t.Fatal("expected identity mount")
+	}
+	primaryIdentityMount := *identityMount
+	primaryIdentityMount.UUID = "primary-identity"
+	primaryIdentityMount.Accessor = "identity_primary"
+	core.mounts.Entries = append(core.mounts.Entries, &primaryIdentityMount)
+
+	if err := core.setupMounts(ctx); err != nil {
+		t.Fatalf("DR secondary mount setup should tolerate existing protected routes: %v", err)
+	}
+	if match := core.router.MatchingMount(ctx, "identity/entity/id"); match != "identity/" {
+		t.Fatalf("expected identity route to remain mounted, got %q", match)
+	}
+
+	var tokenAuth *routing.MountEntry
+	for _, entry := range core.auth.Entries {
+		if entry.Type == routing.MountTypeToken {
+			tokenAuth = entry
+			break
+		}
+	}
+	if tokenAuth == nil {
+		t.Fatal("expected token auth")
+	}
+	primaryTokenAuth := *tokenAuth
+	primaryTokenAuth.UUID = "primary-token"
+	primaryTokenAuth.Accessor = "auth_token_primary"
+	core.auth.Entries = append(core.auth.Entries, &primaryTokenAuth)
+
+	if err := core.setupCredentials(ctx); err != nil {
+		t.Fatalf("DR secondary auth setup should tolerate existing protected routes: %v", err)
+	}
+	if match := core.router.MatchingMount(ctx, "auth/token/lookup-self"); match != "auth/token/" {
+		t.Fatalf("expected token auth route to remain mounted, got %q", match)
+	}
+
+	replayedIdentityMount := *identityMount
+	replayedIdentityMount.UUID = "primary-identity-invalidation"
+	replayedIdentityMount.Accessor = "identity_primary_invalidation"
+	if err := core.reloadMountInternal(ctx, routing.MountTableType, replayedIdentityMount.UUID, &replayedIdentityMount); err != nil {
+		t.Fatalf("DR secondary mount invalidation should tolerate existing protected route: %v", err)
+	}
+	if match := core.router.MatchingMount(ctx, "identity/entity/id"); match != "identity/" {
+		t.Fatalf("expected identity route to remain mounted after invalidation, got %q", match)
+	}
+
+	replayedTokenAuth := *tokenAuth
+	replayedTokenAuth.UUID = "primary-token-invalidation"
+	replayedTokenAuth.Accessor = "auth_token_primary_invalidation"
+	if err := core.reloadMountInternal(ctx, routing.CredentialTableType, replayedTokenAuth.UUID, &replayedTokenAuth); err != nil {
+		t.Fatalf("DR secondary auth invalidation should tolerate existing protected route: %v", err)
+	}
+	if match := core.router.MatchingMount(ctx, "auth/token/lookup-self"); match != "auth/token/" {
+		t.Fatalf("expected token auth route to remain mounted after invalidation, got %q", match)
+	}
+}
+
 // --- Test: Gap detection ---
 
 func TestDRIntegration_GapDetection(t *testing.T) {
@@ -550,6 +779,49 @@ func TestDRIntegration_StreamVsFetchApply(t *testing.T) {
 	}
 }
 
+func TestDRIntegration_RootKeyReplicationFailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		apply func(*drReplicationSecondary, context.Context) error
+	}{
+		{
+			name: "stream",
+			apply: func(sec *drReplicationSecondary, ctx context.Context) error {
+				return sec.applyStreamChange(ctx, &EntryChange{
+					OpType: string(physical.PutOperation),
+					Key:    "core/root-key",
+					Value:  []byte("not-a-valid-root-key-entry"),
+				})
+			},
+		},
+		{
+			name: "fetch",
+			apply: func(sec *drReplicationSecondary, ctx context.Context) error {
+				return sec.applyFetchedChange(ctx, &EntryChange{
+					OpType: string(physical.PutOperation),
+					Key:    "core/root-key",
+					Value:  []byte("not-a-valid-root-key-entry"),
+				})
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			core, _, _ := TestCoreUnsealed(t)
+			replSalt := make([]byte, 32)
+			rand.Read(replSalt)
+			sec := newDRReplicationSecondary(core, replSalt, "rel-root-key-fail-"+tc.name, core.logger)
+
+			err := tc.apply(sec, context.Background())
+			if err == nil {
+				t.Fatal("expected invalid root-key replication to fail")
+			}
+			if !strings.Contains(err.Error(), "reload root key") {
+				t.Fatalf("expected reload root key failure, got: %v", err)
+			}
+		})
+	}
+}
+
 // --- Test: Namespace-aware path matching ---
 
 func TestDRIntegration_NamespacePathMatching(t *testing.T) {
@@ -673,6 +945,96 @@ func TestDRIntegration_LoadConfigRestoresPrimary(t *testing.T) {
 	}
 	if tlsCert.PrivateKey == nil {
 		t.Fatal("expected non-nil private key in TLS certificate")
+	}
+}
+
+func TestDRIntegration_LoadConfigMintsPrimaryLeafAfterClusterTLSRestored(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	setupTestClusterCert(t, core)
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	core.drManager = mgr
+
+	if err := mgr.EnablePrimary(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate an HA restart window where DR config is restored before this
+	// node has loaded/generated local cluster TLS material.
+	mgr.Teardown()
+	core.localClusterParsedCert.Store(nil)
+	core.localClusterCert.Store(nil)
+	core.localClusterPrivateKey.Store(nil)
+
+	mgr2 := newDRRelationshipManager(core, core.logger)
+	core.drManager = mgr2
+	if err := mgr2.LoadConfig(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := mgr2.Handler()
+	if handler == nil {
+		t.Fatal("expected handler after LoadConfig")
+	}
+	if got := handler.ActiveDRLeafCertDER(); len(got) != 0 {
+		t.Fatal("expected no DR leaf before local cluster TLS is restored")
+	}
+
+	localCert := setupTestClusterCert(t, core)
+	tlsCert, err := handler.ServerLookup(ctx, &tls.ClientHelloInfo{})
+	if err != nil {
+		t.Fatalf("ServerLookup failed after local cluster TLS restore: %v", err)
+	}
+	if tlsCert == nil || tlsCert.Leaf == nil {
+		t.Fatal("expected non-nil TLS certificate from ServerLookup")
+	}
+	if tlsCert.Leaf.Subject.CommonName != "openbao-dr-transport-leaf" {
+		t.Fatalf("expected CN 'openbao-dr-transport-leaf', got %q", tlsCert.Leaf.Subject.CommonName)
+	}
+	if tlsCert.PrivateKey == nil {
+		t.Fatal("expected non-nil private key in TLS certificate")
+	}
+	if bytes.Equal(tlsCert.Certificate[0], localCert.Raw) {
+		t.Fatal("expected CA-signed DR transport leaf, got local cluster cert fallback")
+	}
+	if got := handler.ActiveDRLeafCertDER(); len(got) == 0 {
+		t.Fatal("expected ActiveDRLeafCertDER after lazy mint")
+	}
+}
+
+func TestDRIntegration_ServerLookupFailsClosedWithoutDRTransportLeaf(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	setupTestClusterCert(t, core)
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	core.drManager = mgr
+	if err := mgr.EnablePrimary(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := mgr.Handler()
+	if handler == nil {
+		t.Fatal("expected handler after EnablePrimary")
+	}
+
+	handler.drLeafCertMu.Lock()
+	handler.drLeafCertDER = nil
+	handler.drLeafParsedCert = nil
+	handler.drLeafPrivateKey = nil
+	handler.drLeafCertMu.Unlock()
+	core.localClusterPrivateKey.Store(nil)
+
+	tlsCert, err := handler.ServerLookup(ctx, &tls.ClientHelloInfo{})
+	if err == nil {
+		t.Fatal("expected ServerLookup to fail without DR transport leaf")
+	}
+	if tlsCert != nil {
+		t.Fatal("expected no TLS certificate when DR transport leaf is unavailable")
+	}
+	if !strings.Contains(err.Error(), "DR transport leaf cert is unavailable") {
+		t.Fatalf("expected DR transport leaf error, got %v", err)
 	}
 }
 
@@ -822,6 +1184,67 @@ func TestDRIntegration_LoadConfigRestoresSecondary(t *testing.T) {
 	}
 	if mgr.Config().PrimaryAddr != "https://127.0.0.1:8201" {
 		t.Fatalf("expected primary addr https://127.0.0.1:8201, got %s", mgr.Config().PrimaryAddr)
+	}
+}
+
+func TestDRIntegration_LoadConfigRestoresSecondaryClientCert(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	core.standby.Store(true)
+
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+	clientCertDER, clientKeyPEM, err := generateDRSecondaryClientCert()
+	if err != nil {
+		t.Fatalf("failed to generate secondary client cert: %v", err)
+	}
+
+	config := &DRConfig{
+		Mode:                  DRModeSecondary,
+		ClusterID:             "restored-cluster",
+		RelationshipID:        "rel-restored",
+		ReplSalt:              replSalt,
+		PrimaryAddr:           "127.0.0.1:8201",
+		PrimaryAddrs:          []string{"127.0.0.1:8201"},
+		PrimaryCACert:         []byte("not-a-real-ca"),
+		SecondaryClientCert:   clientCertDER,
+		SecondaryClientKeyPEM: clientKeyPEM,
+	}
+	data, _ := json.Marshal(config)
+	core.barrier.Put(ctx, &logical.StorageEntry{
+		Key:   drConfigPath,
+		Value: data,
+	})
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	if err := mgr.LoadConfig(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	secondary := mgr.Secondary()
+	if secondary == nil {
+		t.Fatal("expected secondary to be created")
+	}
+	clientCert := secondary.clientCertificate()
+	if clientCert == nil || clientCert.Leaf == nil {
+		t.Fatal("expected secondary client certificate to be restored")
+	}
+	if !bytes.Equal(clientCert.Leaf.Raw, clientCertDER) {
+		t.Fatal("restored secondary client certificate does not match persisted certificate")
+	}
+
+	client := &drReplicationClusterClient{
+		core:       core,
+		clientCert: clientCert,
+	}
+	got, err := client.ClientLookup(ctx, &tls.CertificateRequestInfo{
+		AcceptableCAs: [][]byte{clientCert.Leaf.RawSubject},
+	})
+	if err != nil {
+		t.Fatalf("client lookup failed: %v", err)
+	}
+	if got == nil || got.Leaf == nil || !bytes.Equal(got.Leaf.Raw, clientCertDER) {
+		t.Fatal("expected client lookup to return restored secondary client certificate")
 	}
 }
 
@@ -1104,6 +1527,9 @@ func TestDRIntegration_HeartbeatOmitsActiveClusterCertWithoutDRLeaf(t *testing.T
 	handler.drLeafParsedCert = nil
 	handler.drLeafPrivateKey = nil
 	handler.drLeafCertMu.Unlock()
+	core.localClusterParsedCert.Store(nil)
+	core.localClusterCert.Store(nil)
+	core.localClusterPrivateKey.Store(nil)
 
 	rpcCtx := peer.NewContext(ctx, &peer.Peer{
 		AuthInfo: credentials.TLSInfo{
@@ -1152,7 +1578,7 @@ func TestDRIntegration_BootstrapTokenGeneration(t *testing.T) {
 
 	// Verify primary API address is populated.
 	// (In test mode, redirectAddr might be empty, but the field should exist.)
-	t.Logf("primary_api_addr=%q, bootstrap_token=%q", token.PrimaryAPIAddr, token.BootstrapToken)
+	t.Logf("primary_api_addr=%q, bootstrap_token_present=%t", token.PrimaryAPIAddr, token.BootstrapToken != "")
 
 	// Verify a pending relationship entry was created in storage.
 	keys, err := core.barrier.List(ctx, drRelationshipsPath)
@@ -1163,7 +1589,7 @@ func TestDRIntegration_BootstrapTokenGeneration(t *testing.T) {
 		t.Fatal("expected at least one pending relationship entry")
 	}
 
-	// Read the entry and verify it has the bootstrap token.
+	// Read the entry and verify it has only a bootstrap token verifier.
 	entry, err := core.barrier.Get(ctx, drRelationshipsPath+keys[0])
 	if err != nil {
 		t.Fatal(err)
@@ -1172,8 +1598,14 @@ func TestDRIntegration_BootstrapTokenGeneration(t *testing.T) {
 	if err := json.Unmarshal(entry.Value, &rel); err != nil {
 		t.Fatal(err)
 	}
-	if rel.BootstrapToken != token.BootstrapToken {
-		t.Fatalf("expected bootstrap token %q in storage, got %q", token.BootstrapToken, rel.BootstrapToken)
+	if rel.BootstrapToken != "" {
+		t.Fatal("expected bootstrap token plaintext not to be persisted")
+	}
+	if rel.BootstrapTokenHash == "" {
+		t.Fatal("expected bootstrap token verifier hash in storage")
+	}
+	if !bootstrapTokenMatches(&rel, token.BootstrapToken) {
+		t.Fatal("expected stored bootstrap verifier to accept activation token")
 	}
 	if rel.State != DRRelationshipStatePending {
 		t.Fatalf("expected pending state, got %q", rel.State)
@@ -1276,6 +1708,12 @@ func TestDRIntegration_CertRegistration(t *testing.T) {
 			foundRegistered = true
 			if rel.BootstrapToken != "" {
 				t.Fatal("expected bootstrap token to be cleared after use")
+			}
+			if rel.BootstrapTokenHash != "" {
+				t.Fatal("expected bootstrap token verifier to be cleared after use")
+			}
+			if rel.RegisteredAt == 0 {
+				t.Fatal("expected registered_at to be set")
 			}
 			break
 		}
@@ -1698,6 +2136,32 @@ func TestDRIntegration_PathExclusions(t *testing.T) {
 	}
 }
 
+func TestDRIntegration_RuntimeStatePaths(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{"core/mounts", true},
+		{"core/mounts/1234", true},
+		{"core/auth", true},
+		{"core/auth/1234", true},
+		{"core/audit", true},
+		{"core/audit/1234", true},
+		{"namespaces/00000000-0000-0000-0000-000000000000/core/mounts/1234", true},
+		{"core/local-mounts", false},
+		{"core/local-auth", false},
+		{"core/local-audit", false},
+		{"core/keyring", false},
+		{"logical/kv/foo", false},
+	}
+
+	for _, tt := range tests {
+		if got := isDRRuntimeStatePath(tt.path); got != tt.want {
+			t.Fatalf("isDRRuntimeStatePath(%q)=%v, want %v", tt.path, got, tt.want)
+		}
+	}
+}
+
 // --- Test: applyStreamChange skips never-replicate paths ---
 
 func TestDRIntegration_StreamChangeSkipsExcludedPaths(t *testing.T) {
@@ -1914,10 +2378,12 @@ func TestDRIntegration_RootKeyRotationHandling(t *testing.T) {
 
 type drRangeTestClient struct {
 	streamChangesFn              func(context.Context, ...grpc.CallOption) (grpc.BidiStreamingClient[StreamChangesUpstream, EntryBatch], error)
+	requestCheckpointFn          func(context.Context, *CheckpointRequest, ...grpc.CallOption) (*CheckpointResponse, error)
 	exchangeDirtyBitmapFn        func(context.Context, *DirtyBitmapMessage, ...grpc.CallOption) (*DirtyBitmapMessage, error)
 	exchangeRangeChecksumsFn     func(context.Context, *RangeChecksumRequest, ...grpc.CallOption) (*RangeChecksumResponse, error)
 	exchangeRangeDigestsFn       func(context.Context, *RangeDigestRequest, ...grpc.CallOption) (*RangeDigestResponse, error)
 	fetchEntriesFn               func(context.Context, *FetchEntriesRequest, ...grpc.CallOption) (grpc.ServerStreamingClient[EntryBatch], error)
+	heartbeatFn                  func(context.Context, *DRHeartbeatRequest, ...grpc.CallOption) (*DRHeartbeatResponse, error)
 	exchangeDirtyBitmapCallCount int
 }
 
@@ -1928,8 +2394,11 @@ func (c *drRangeTestClient) StreamChanges(ctx context.Context, opts ...grpc.Call
 	return c.streamChangesFn(ctx, opts...)
 }
 
-func (c *drRangeTestClient) RequestCheckpoint(context.Context, *CheckpointRequest, ...grpc.CallOption) (*CheckpointResponse, error) {
-	return nil, errors.New("not implemented")
+func (c *drRangeTestClient) RequestCheckpoint(ctx context.Context, in *CheckpointRequest, opts ...grpc.CallOption) (*CheckpointResponse, error) {
+	if c.requestCheckpointFn == nil {
+		return nil, errors.New("not implemented")
+	}
+	return c.requestCheckpointFn(ctx, in, opts...)
 }
 
 func (c *drRangeTestClient) ExchangeDirtyBitmap(ctx context.Context, in *DirtyBitmapMessage, opts ...grpc.CallOption) (*DirtyBitmapMessage, error) {
@@ -1961,8 +2430,11 @@ func (c *drRangeTestClient) FetchEntries(ctx context.Context, in *FetchEntriesRe
 	return c.fetchEntriesFn(ctx, in, opts...)
 }
 
-func (c *drRangeTestClient) Heartbeat(context.Context, *DRHeartbeatRequest, ...grpc.CallOption) (*DRHeartbeatResponse, error) {
-	return nil, errors.New("not implemented")
+func (c *drRangeTestClient) Heartbeat(ctx context.Context, in *DRHeartbeatRequest, opts ...grpc.CallOption) (*DRHeartbeatResponse, error) {
+	if c.heartbeatFn == nil {
+		return nil, errors.New("not implemented")
+	}
+	return c.heartbeatFn(ctx, in, opts...)
 }
 
 func (c *drRangeTestClient) SyncKeyring(context.Context, *SyncKeyringRequest, ...grpc.CallOption) (*SyncKeyringResponse, error) {
@@ -1993,6 +2465,631 @@ func (s *staticEntryBatchStream) Recv() (*EntryBatch, error) {
 	b := s.batches[s.idx]
 	s.idx++
 	return b, nil
+}
+
+func emptyDigestResponseForParent(t *testing.T, req *RangeDigestRequest) *RangeDigestResponse {
+	t.Helper()
+	parent, _, err := protoToRangeSpan(req.GetParentSpan())
+	if err != nil {
+		t.Fatalf("invalid parent span in request: %v", err)
+	}
+	left, right, ok := reconciler.SplitRange(parent)
+	if !ok {
+		return &RangeDigestResponse{Digests: []*RangeDigest{
+			rangeDescriptorToProto(reconciler.RangeDescriptor{Span: parent}),
+		}}
+	}
+	return &RangeDigestResponse{Digests: []*RangeDigest{
+		rangeDescriptorToProto(reconciler.RangeDescriptor{Span: left}),
+		rangeDescriptorToProto(reconciler.RangeDescriptor{Span: right}),
+	}}
+}
+
+func TestDRIntegration_RangeReconciliationRemovesLocalOnlyKeys(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+
+	sec := newDRReplicationSecondary(core, replSalt, "rel-range-local-only", core.logger)
+	sec.setState(DRSecondaryReconciling)
+	sec.lastAppliedIndex.Store(7)
+
+	ctx := context.Background()
+	localKey := "range/delete/local-only"
+	localEntry := &physical.Entry{Key: localKey, Value: []byte("stale")}
+	if err := core.physical.Put(ctx, localEntry); err != nil {
+		t.Fatalf("failed to seed local-only entry: %v", err)
+	}
+
+	kid, vid := sec.scanner.ComputeItemFromEntry(localEntry)
+	checkpoint := &CheckpointResponse{CheckpointId: "cp-range-local-only", CommitIndex: 88}
+
+	sec.client = &drRangeTestClient{
+		exchangeDirtyBitmapFn: func(_ context.Context, req *DirtyBitmapMessage, _ ...grpc.CallOption) (*DirtyBitmapMessage, error) {
+			return &DirtyBitmapMessage{
+				CheckpointId:    req.GetCheckpointId(),
+				CheckpointIndex: req.GetCheckpointIndex(),
+				StartIndex:      7,
+				Bitmap:          bytes.Repeat([]byte{0xff}, 128),
+			}, nil
+		},
+		exchangeRangeChecksumsFn: func(_ context.Context, req *RangeChecksumRequest, _ ...grpc.CallOption) (*RangeChecksumResponse, error) {
+			out := make([]*RangeChecksum, len(req.RangeIds))
+			for i, rid := range req.RangeIds {
+				out[i] = &RangeChecksum{RangeId: rid}
+			}
+			return &RangeChecksumResponse{Checksums: out}, nil
+		},
+		exchangeRangeDigestsFn: func(_ context.Context, req *RangeDigestRequest, _ ...grpc.CallOption) (*RangeDigestResponse, error) {
+			return emptyDigestResponseForParent(t, req), nil
+		},
+		fetchEntriesFn: func(_ context.Context, req *FetchEntriesRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[EntryBatch], error) {
+			if len(req.GetRanges()) == 0 {
+				t.Fatal("expected range fetch")
+			}
+			return &staticEntryBatchStream{}, nil
+		},
+	}
+
+	localSet := &reconciler.ReconciliationSet{
+		KIDToVID: map[[32]byte][32]byte{kid: vid},
+		KIDToKey: map[[32]byte]string{kid: localKey},
+		Entries:  map[[32]byte]*physical.Entry{kid: localEntry},
+		KeyCount: 1,
+	}
+
+	if err := sec.runRangeReconciliation(ctx, checkpoint, localSet, time.Now()); err != nil {
+		t.Fatalf("runRangeReconciliation failed: %v", err)
+	}
+	if sec.lastAppliedIndex.Load() != checkpoint.CommitIndex {
+		t.Fatalf("expected lastAppliedIndex to advance to %d, got %d", checkpoint.CommitIndex, sec.lastAppliedIndex.Load())
+	}
+	got, err := core.physical.Get(ctx, localKey)
+	if err != nil {
+		t.Fatalf("failed to read local-only key after reconcile: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("expected local-only key %q to be deleted, got %#v", localKey, got)
+	}
+}
+
+func TestDRIntegration_RangeReconciliationDirtyBitmapFalseNegativeStillChecked(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+
+	sec := newDRReplicationSecondary(core, replSalt, "rel-range-bitmap-false-negative", core.logger)
+	sec.setState(DRSecondaryReconciling)
+	sec.lastAppliedIndex.Store(7)
+
+	ctx := context.Background()
+	localKey := "range/delete/bitmap-false-negative"
+	localEntry := &physical.Entry{Key: localKey, Value: []byte("stale")}
+	if err := core.physical.Put(ctx, localEntry); err != nil {
+		t.Fatalf("failed to seed local-only entry: %v", err)
+	}
+
+	kid, vid := sec.scanner.ComputeItemFromEntry(localEntry)
+	checkpoint := &CheckpointResponse{CheckpointId: "cp-range-bitmap-false-negative", CommitIndex: 88}
+	seenChecksumRanges := make(map[uint64]struct{}, drRangeMaxTotalRanges)
+
+	sec.client = &drRangeTestClient{
+		exchangeDirtyBitmapFn: func(_ context.Context, req *DirtyBitmapMessage, _ ...grpc.CallOption) (*DirtyBitmapMessage, error) {
+			return &DirtyBitmapMessage{
+				CheckpointId:    req.GetCheckpointId(),
+				CheckpointIndex: req.GetCheckpointIndex(),
+				StartIndex:      7,
+				Bitmap:          bytes.Repeat([]byte{0x00}, 128),
+			}, nil
+		},
+		exchangeRangeChecksumsFn: func(_ context.Context, req *RangeChecksumRequest, _ ...grpc.CallOption) (*RangeChecksumResponse, error) {
+			out := make([]*RangeChecksum, len(req.RangeIds))
+			for i, rid := range req.RangeIds {
+				if rid >= uint64(drRangeMaxTotalRanges) {
+					t.Fatalf("unexpected range id %d", rid)
+				}
+				if _, ok := seenChecksumRanges[rid]; ok {
+					t.Fatalf("range id %d was checked more than once", rid)
+				}
+				seenChecksumRanges[rid] = struct{}{}
+				out[i] = &RangeChecksum{RangeId: rid}
+			}
+			return &RangeChecksumResponse{Checksums: out}, nil
+		},
+		exchangeRangeDigestsFn: func(_ context.Context, req *RangeDigestRequest, _ ...grpc.CallOption) (*RangeDigestResponse, error) {
+			return emptyDigestResponseForParent(t, req), nil
+		},
+		fetchEntriesFn: func(_ context.Context, req *FetchEntriesRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[EntryBatch], error) {
+			if len(req.GetRanges()) == 0 {
+				t.Fatal("expected range fetch")
+			}
+			return &staticEntryBatchStream{}, nil
+		},
+	}
+
+	localSet := &reconciler.ReconciliationSet{
+		KIDToVID: map[[32]byte][32]byte{kid: vid},
+		KIDToKey: map[[32]byte]string{kid: localKey},
+		Entries:  map[[32]byte]*physical.Entry{kid: localEntry},
+		KeyCount: 1,
+	}
+
+	if err := sec.runRangeReconciliation(ctx, checkpoint, localSet, time.Now()); err != nil {
+		t.Fatalf("runRangeReconciliation failed: %v", err)
+	}
+	if len(seenChecksumRanges) != drRangeMaxTotalRanges {
+		t.Fatalf("expected all %d top-level ranges to be checked, got %d", drRangeMaxTotalRanges, len(seenChecksumRanges))
+	}
+	if sec.lastAppliedIndex.Load() != checkpoint.CommitIndex {
+		t.Fatalf("expected lastAppliedIndex to advance to %d, got %d", checkpoint.CommitIndex, sec.lastAppliedIndex.Load())
+	}
+	got, err := core.physical.Get(ctx, localKey)
+	if err != nil {
+		t.Fatalf("failed to read local-only key after reconcile: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("expected local-only key %q to be deleted, got %#v", localKey, got)
+	}
+}
+
+func TestDRIntegration_RangeReconciliationFinalizeFailureIsRetryable(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+
+	sec := newDRReplicationSecondary(core, replSalt, "rel-range-finalize-retry", core.logger)
+	sec.setState(DRSecondaryReconciling)
+	sec.lastAppliedIndex.Store(7)
+
+	ctx := context.Background()
+	localKey := "range/delete/finalize-retry"
+	localEntry := &physical.Entry{Key: localKey, Value: []byte("stale")}
+	if err := core.physical.Put(ctx, localEntry); err != nil {
+		t.Fatalf("failed to seed local-only entry: %v", err)
+	}
+
+	kid, vid := sec.scanner.ComputeItemFromEntry(localEntry)
+	checkpoint := &CheckpointResponse{CheckpointId: "cp-range-finalize-retry", CommitIndex: 88}
+
+	sec.client = &drRangeTestClient{
+		exchangeDirtyBitmapFn: func(_ context.Context, req *DirtyBitmapMessage, _ ...grpc.CallOption) (*DirtyBitmapMessage, error) {
+			return &DirtyBitmapMessage{
+				CheckpointId:    req.GetCheckpointId(),
+				CheckpointIndex: req.GetCheckpointIndex(),
+				StartIndex:      7,
+				Bitmap:          bytes.Repeat([]byte{0xff}, 128),
+			}, nil
+		},
+		exchangeRangeChecksumsFn: func(_ context.Context, req *RangeChecksumRequest, _ ...grpc.CallOption) (*RangeChecksumResponse, error) {
+			out := make([]*RangeChecksum, len(req.RangeIds))
+			for i, rid := range req.RangeIds {
+				out[i] = &RangeChecksum{RangeId: rid}
+			}
+			return &RangeChecksumResponse{Checksums: out}, nil
+		},
+		exchangeRangeDigestsFn: func(_ context.Context, req *RangeDigestRequest, _ ...grpc.CallOption) (*RangeDigestResponse, error) {
+			return emptyDigestResponseForParent(t, req), nil
+		},
+		fetchEntriesFn: func(_ context.Context, req *FetchEntriesRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[EntryBatch], error) {
+			if len(req.GetRanges()) == 0 {
+				t.Fatal("expected range fetch")
+			}
+			return &staticEntryBatchStream{}, nil
+		},
+	}
+
+	localSet := &reconciler.ReconciliationSet{
+		KIDToVID: map[[32]byte][32]byte{kid: vid},
+		KIDToKey: map[[32]byte]string{kid: localKey},
+		Entries:  map[[32]byte]*physical.Entry{kid: localEntry},
+		KeyCount: 1,
+	}
+
+	persistErr := errors.New("persist failed")
+	sec.checkpointHighWaterMarkPersistHook = func(uint64) error {
+		return persistErr
+	}
+	err := sec.runRangeReconciliation(ctx, checkpoint, localSet, time.Now())
+	if err == nil {
+		t.Fatal("expected finalize failure")
+	}
+	if !strings.Contains(err.Error(), "checkpoint_high_water_persist_failed") {
+		t.Fatalf("expected high-water persist failure, got: %v", err)
+	}
+	if sec.lastAppliedIndex.Load() != 7 {
+		t.Fatalf("expected lastAppliedIndex to remain 7 after finalize failure, got %d", sec.lastAppliedIndex.Load())
+	}
+	got, err := core.physical.Get(ctx, localKey)
+	if err != nil {
+		t.Fatalf("failed to read local-only key after failed finalize: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("expected local-only key %q to have been deleted before finalize retry, got %#v", localKey, got)
+	}
+
+	sec.checkpointHighWaterMarkPersistHook = nil
+	emptyLocalSet := &reconciler.ReconciliationSet{
+		KIDToVID: make(map[[32]byte][32]byte),
+		KIDToKey: make(map[[32]byte]string),
+		Entries:  make(map[[32]byte]*physical.Entry),
+	}
+	if err := sec.runRangeReconciliation(ctx, checkpoint, emptyLocalSet, time.Now()); err != nil {
+		t.Fatalf("retry runRangeReconciliation failed: %v", err)
+	}
+	if sec.lastAppliedIndex.Load() != checkpoint.CommitIndex {
+		t.Fatalf("expected lastAppliedIndex to advance to %d after retry, got %d", checkpoint.CommitIndex, sec.lastAppliedIndex.Load())
+	}
+}
+
+func TestDRIntegration_ResnapshotRejectsSilentFetchOmission(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+
+	sec := newDRReplicationSecondary(core, replSalt, "rel-resnapshot-omission", core.logger)
+	sec.setState(DRSecondaryResnapshotting)
+	sec.lastAppliedIndex.Store(7)
+
+	ctx := context.Background()
+	localKey := "resnapshot/local"
+	if err := core.physical.Put(ctx, &physical.Entry{Key: localKey, Value: []byte("keep")}); err != nil {
+		t.Fatalf("failed to seed local entry: %v", err)
+	}
+
+	remoteKey := "resnapshot/remote"
+	remoteKID := sec.scanner.ComputeKID(remoteKey)
+	remoteVID := sec.scanner.ComputeVIDWithSealWrap([]byte("remote"), false)
+	full := reconciler.RangeSpan{}
+	for i := range full.EndKID {
+		full.EndKID[i] = 0xff
+	}
+	left, right, ok := reconciler.SplitRange(full)
+	if !ok {
+		t.Fatal("expected full span to split")
+	}
+	remoteIndex := reconciler.NewRangeMapIndex(map[[32]byte][32]byte{remoteKID: remoteVID}, nil)
+	leftDesc := reconciler.BuildRangeDigestFromIndex(remoteIndex, left)
+	rightDesc := reconciler.BuildRangeDigestFromIndex(remoteIndex, right)
+
+	checkpoint := &CheckpointResponse{CheckpointId: "cp-resnapshot-omission", CommitIndex: 88}
+	sec.client = &drRangeTestClient{
+		requestCheckpointFn: func(context.Context, *CheckpointRequest, ...grpc.CallOption) (*CheckpointResponse, error) {
+			return checkpoint, nil
+		},
+		exchangeRangeDigestsFn: func(_ context.Context, req *RangeDigestRequest, _ ...grpc.CallOption) (*RangeDigestResponse, error) {
+			if req.GetRelationshipId() != sec.relationshipID {
+				t.Fatalf("expected digest request relationship_id %q, got %q", sec.relationshipID, req.GetRelationshipId())
+			}
+			return &RangeDigestResponse{Digests: []*RangeDigest{
+				rangeDescriptorToProto(leftDesc),
+				rangeDescriptorToProto(rightDesc),
+			}}, nil
+		},
+		fetchEntriesFn: func(_ context.Context, req *FetchEntriesRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[EntryBatch], error) {
+			if req.GetRelationshipId() != sec.relationshipID {
+				t.Fatalf("expected fetch request relationship_id %q, got %q", sec.relationshipID, req.GetRelationshipId())
+			}
+			return &staticEntryBatchStream{}, nil
+		},
+	}
+
+	err := sec.performResnapshot(ctx, "test")
+	if err == nil {
+		t.Fatal("expected resnapshot to fail on silent fetch omission")
+	}
+	if !strings.Contains(err.Error(), "fetch digest proof mismatch") {
+		t.Fatalf("expected fetch proof failure, got: %v", err)
+	}
+	if sec.lastAppliedIndex.Load() != 7 {
+		t.Fatalf("expected lastAppliedIndex to remain 7, got %d", sec.lastAppliedIndex.Load())
+	}
+	got, err := core.physical.Get(ctx, localKey)
+	if err != nil {
+		t.Fatalf("failed to read local key after failed resnapshot: %v", err)
+	}
+	if got == nil {
+		t.Fatalf("expected local key %q to remain after failed resnapshot", localKey)
+	}
+}
+
+func TestDRIntegration_CheckpointHighWaterLoadSeedsLastAppliedIndex(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+
+	sec := newDRReplicationSecondary(core, replSalt, "rel-hwm-load", core.logger)
+	if err := sec.persistCheckpointHighWaterMark(123); err != nil {
+		t.Fatalf("failed to persist high-water mark: %v", err)
+	}
+
+	reloaded := newDRReplicationSecondary(core, replSalt, "rel-hwm-load", core.logger)
+	reloaded.loadCheckpointHighWaterMark()
+	if got := reloaded.lastAppliedIndex.Load(); got != 123 {
+		t.Fatalf("expected lastAppliedIndex to load from checkpoint high-water mark, got %d", got)
+	}
+}
+
+func TestDRIntegration_RangeReconciliationRejectsIncompleteFetchBatch(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		batch func(*FetchEntriesRequest) *EntryBatch
+	}{
+		{
+			name: "failed-kids",
+			batch: func(req *FetchEntriesRequest) *EntryBatch {
+				return &EntryBatch{
+					CheckpointId:    req.GetCheckpointId(),
+					CheckpointIndex: req.GetCheckpointIndex(),
+					FailedKids:      [][]byte{bytes.Repeat([]byte{0x01}, 32)},
+				}
+			},
+		},
+		{
+			name: "checkpoint-mismatch",
+			batch: func(req *FetchEntriesRequest) *EntryBatch {
+				return &EntryBatch{
+					CheckpointId:    req.GetCheckpointId() + "-other",
+					CheckpointIndex: req.GetCheckpointIndex(),
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			core, _, _ := TestCoreUnsealed(t)
+			replSalt := make([]byte, 32)
+			rand.Read(replSalt)
+
+			sec := newDRReplicationSecondary(core, replSalt, "rel-range-incomplete-"+tc.name, core.logger)
+			sec.setState(DRSecondaryReconciling)
+			sec.lastAppliedIndex.Store(7)
+
+			ctx := context.Background()
+			localKey := "range/delete/incomplete-" + tc.name
+			localEntry := &physical.Entry{Key: localKey, Value: []byte("stale")}
+			if err := core.physical.Put(ctx, localEntry); err != nil {
+				t.Fatalf("failed to seed local-only entry: %v", err)
+			}
+
+			kid, vid := sec.scanner.ComputeItemFromEntry(localEntry)
+			checkpoint := &CheckpointResponse{CheckpointId: "cp-range-incomplete-" + tc.name, CommitIndex: 88}
+
+			sec.client = &drRangeTestClient{
+				exchangeDirtyBitmapFn: func(_ context.Context, req *DirtyBitmapMessage, _ ...grpc.CallOption) (*DirtyBitmapMessage, error) {
+					return &DirtyBitmapMessage{
+						CheckpointId:    req.GetCheckpointId(),
+						CheckpointIndex: req.GetCheckpointIndex(),
+						StartIndex:      7,
+						Bitmap:          bytes.Repeat([]byte{0xff}, 128),
+					}, nil
+				},
+				exchangeRangeChecksumsFn: func(_ context.Context, req *RangeChecksumRequest, _ ...grpc.CallOption) (*RangeChecksumResponse, error) {
+					out := make([]*RangeChecksum, len(req.RangeIds))
+					for i, rid := range req.RangeIds {
+						out[i] = &RangeChecksum{RangeId: rid}
+					}
+					return &RangeChecksumResponse{Checksums: out}, nil
+				},
+				exchangeRangeDigestsFn: func(_ context.Context, req *RangeDigestRequest, _ ...grpc.CallOption) (*RangeDigestResponse, error) {
+					return emptyDigestResponseForParent(t, req), nil
+				},
+				fetchEntriesFn: func(_ context.Context, req *FetchEntriesRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[EntryBatch], error) {
+					if len(req.GetRanges()) == 0 {
+						t.Fatal("expected range fetch")
+					}
+					return &staticEntryBatchStream{batches: []*EntryBatch{tc.batch(req)}}, nil
+				},
+			}
+
+			localSet := &reconciler.ReconciliationSet{
+				KIDToVID: map[[32]byte][32]byte{kid: vid},
+				KIDToKey: map[[32]byte]string{kid: localKey},
+				Entries:  map[[32]byte]*physical.Entry{kid: localEntry},
+				KeyCount: 1,
+			}
+
+			err := sec.runRangeReconciliation(ctx, checkpoint, localSet, time.Now())
+			if err == nil {
+				t.Fatal("expected range reconciliation to fail")
+			}
+			if sec.lastAppliedIndex.Load() != 7 {
+				t.Fatalf("expected lastAppliedIndex to remain unchanged at 7, got %d", sec.lastAppliedIndex.Load())
+			}
+			got, err := core.physical.Get(ctx, localKey)
+			if err != nil {
+				t.Fatalf("failed to read local-only key after failed reconcile: %v", err)
+			}
+			if got == nil {
+				t.Fatalf("expected local-only key %q to remain after failed reconcile", localKey)
+			}
+		})
+	}
+}
+
+func TestDRIntegration_RangeReconciliationRejectsSilentFetchOmission(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+
+	sec := newDRReplicationSecondary(core, replSalt, "rel-range-silent-omission", core.logger)
+	sec.setState(DRSecondaryReconciling)
+	sec.lastAppliedIndex.Store(7)
+
+	ctx := context.Background()
+	localKey := "range/delete/silent-omission"
+	localEntry := &physical.Entry{Key: localKey, Value: []byte("stale")}
+	if err := core.physical.Put(ctx, localEntry); err != nil {
+		t.Fatalf("failed to seed local entry: %v", err)
+	}
+
+	kid, vid := sec.scanner.ComputeItemFromEntry(localEntry)
+	localSet := &reconciler.ReconciliationSet{
+		KIDToVID: map[[32]byte][32]byte{kid: vid},
+		KIDToKey: map[[32]byte]string{kid: localKey},
+		Entries:  map[[32]byte]*physical.Entry{kid: localEntry},
+		KeyCount: 1,
+	}
+	localIndex := reconciler.NewRangeMapIndex(localSet.KIDToVID, localSet.Entries)
+	rangeID := reconciler.RangeIDFromKID(kid)
+	localChecksum, localCount := reconciler.ComputeRangeChecksum(localIndex, rangeID)
+
+	checkpoint := &CheckpointResponse{CheckpointId: "cp-range-silent-omission", CommitIndex: 88}
+	sec.client = &drRangeTestClient{
+		exchangeDirtyBitmapFn: func(_ context.Context, req *DirtyBitmapMessage, _ ...grpc.CallOption) (*DirtyBitmapMessage, error) {
+			return &DirtyBitmapMessage{
+				CheckpointId:    req.GetCheckpointId(),
+				CheckpointIndex: req.GetCheckpointIndex(),
+				StartIndex:      7,
+				Bitmap:          bytes.Repeat([]byte{0xff}, 128),
+			}, nil
+		},
+		exchangeRangeChecksumsFn: func(_ context.Context, req *RangeChecksumRequest, _ ...grpc.CallOption) (*RangeChecksumResponse, error) {
+			if req.GetRelationshipId() != sec.relationshipID {
+				t.Fatalf("expected checksum request relationship_id %q, got %q", sec.relationshipID, req.GetRelationshipId())
+			}
+			out := make([]*RangeChecksum, len(req.RangeIds))
+			for i, rid := range req.RangeIds {
+				out[i] = &RangeChecksum{RangeId: rid}
+				if rid == rangeID {
+					out[i].Count = localCount
+					out[i].Checksum = localChecksum ^ 0x01
+				}
+			}
+			return &RangeChecksumResponse{Checksums: out}, nil
+		},
+		exchangeRangeDigestsFn: func(_ context.Context, req *RangeDigestRequest, _ ...grpc.CallOption) (*RangeDigestResponse, error) {
+			if req.GetRelationshipId() != sec.relationshipID {
+				t.Fatalf("expected digest request relationship_id %q, got %q", sec.relationshipID, req.GetRelationshipId())
+			}
+			parent, _, err := protoToRangeSpan(req.GetParentSpan())
+			if err != nil {
+				t.Fatalf("invalid parent span in request: %v", err)
+			}
+			left, right, ok := reconciler.SplitRange(parent)
+			if !ok {
+				desc := reconciler.BuildRangeDigestFromIndex(localIndex, parent)
+				desc.XORKeyHash[0] ^= 0x01
+				return &RangeDigestResponse{Digests: []*RangeDigest{rangeDescriptorToProto(desc)}}, nil
+			}
+			leftDesc := reconciler.BuildRangeDigestFromIndex(localIndex, left)
+			rightDesc := reconciler.BuildRangeDigestFromIndex(localIndex, right)
+			if left.Contains(kid) {
+				leftDesc.XORKeyHash[0] ^= 0x01
+			}
+			if right.Contains(kid) {
+				rightDesc.XORKeyHash[0] ^= 0x01
+			}
+			return &RangeDigestResponse{Digests: []*RangeDigest{
+				rangeDescriptorToProto(leftDesc),
+				rangeDescriptorToProto(rightDesc),
+			}}, nil
+		},
+		fetchEntriesFn: func(_ context.Context, req *FetchEntriesRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[EntryBatch], error) {
+			if req.GetRelationshipId() != sec.relationshipID {
+				t.Fatalf("expected fetch request relationship_id %q, got %q", sec.relationshipID, req.GetRelationshipId())
+			}
+			if len(req.GetRanges()) == 0 {
+				t.Fatal("expected range fetch")
+			}
+			return &staticEntryBatchStream{}, nil
+		},
+	}
+
+	err := sec.runRangeReconciliation(ctx, checkpoint, localSet, time.Now())
+	if err == nil {
+		t.Fatal("expected range reconciliation to fail on silent fetch omission")
+	}
+	if sec.lastAppliedIndex.Load() != 7 {
+		t.Fatalf("expected lastAppliedIndex to remain unchanged at 7, got %d", sec.lastAppliedIndex.Load())
+	}
+	got, err := core.physical.Get(ctx, localKey)
+	if err != nil {
+		t.Fatalf("failed to read local key after failed reconcile: %v", err)
+	}
+	if got == nil {
+		t.Fatalf("expected local key %q to remain after failed reconcile", localKey)
+	}
+}
+
+func TestDRIntegration_RangeReconciliationRejectsIncompleteDigestCoverage(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+
+	sec := newDRReplicationSecondary(core, replSalt, "rel-range-digest-gap", core.logger)
+	sec.setState(DRSecondaryReconciling)
+	sec.lastAppliedIndex.Store(7)
+
+	ctx := context.Background()
+	localKey := "range/delete/digest-gap"
+	localEntry := &physical.Entry{Key: localKey, Value: []byte("stale")}
+	if err := core.physical.Put(ctx, localEntry); err != nil {
+		t.Fatalf("failed to seed local entry: %v", err)
+	}
+
+	kid, vid := sec.scanner.ComputeItemFromEntry(localEntry)
+	localSet := &reconciler.ReconciliationSet{
+		KIDToVID: map[[32]byte][32]byte{kid: vid},
+		KIDToKey: map[[32]byte]string{kid: localKey},
+		Entries:  map[[32]byte]*physical.Entry{kid: localEntry},
+		KeyCount: 1,
+	}
+	localIndex := reconciler.NewRangeMapIndex(localSet.KIDToVID, localSet.Entries)
+	rangeID := reconciler.RangeIDFromKID(kid)
+	localChecksum, localCount := reconciler.ComputeRangeChecksum(localIndex, rangeID)
+
+	checkpoint := &CheckpointResponse{CheckpointId: "cp-range-digest-gap", CommitIndex: 88}
+	sec.client = &drRangeTestClient{
+		exchangeDirtyBitmapFn: func(_ context.Context, req *DirtyBitmapMessage, _ ...grpc.CallOption) (*DirtyBitmapMessage, error) {
+			return &DirtyBitmapMessage{
+				CheckpointId:    req.GetCheckpointId(),
+				CheckpointIndex: req.GetCheckpointIndex(),
+				StartIndex:      7,
+				Bitmap:          bytes.Repeat([]byte{0xff}, 128),
+			}, nil
+		},
+		exchangeRangeChecksumsFn: func(_ context.Context, req *RangeChecksumRequest, _ ...grpc.CallOption) (*RangeChecksumResponse, error) {
+			out := make([]*RangeChecksum, len(req.RangeIds))
+			for i, rid := range req.RangeIds {
+				out[i] = &RangeChecksum{RangeId: rid}
+				if rid == rangeID {
+					out[i].Count = localCount
+					out[i].Checksum = localChecksum ^ 0x01
+				}
+			}
+			return &RangeChecksumResponse{Checksums: out}, nil
+		},
+		exchangeRangeDigestsFn: func(_ context.Context, req *RangeDigestRequest, _ ...grpc.CallOption) (*RangeDigestResponse, error) {
+			parent, _, err := protoToRangeSpan(req.GetParentSpan())
+			if err != nil {
+				t.Fatalf("invalid parent span in request: %v", err)
+			}
+			left, _, ok := reconciler.SplitRange(parent)
+			if !ok {
+				t.Fatal("expected parent span to split")
+			}
+			leftDesc := reconciler.BuildRangeDigestFromIndex(localIndex, left)
+			return &RangeDigestResponse{Digests: []*RangeDigest{rangeDescriptorToProto(leftDesc)}}, nil
+		},
+		fetchEntriesFn: func(context.Context, *FetchEntriesRequest, ...grpc.CallOption) (grpc.ServerStreamingClient[EntryBatch], error) {
+			t.Fatal("fetch should not start after incomplete digest coverage")
+			return nil, nil
+		},
+	}
+
+	err := sec.runRangeReconciliation(ctx, checkpoint, localSet, time.Now())
+	if err == nil {
+		t.Fatal("expected range reconciliation to fail on incomplete digest coverage")
+	}
+	if sec.lastAppliedIndex.Load() != 7 {
+		t.Fatalf("expected lastAppliedIndex to remain unchanged at 7, got %d", sec.lastAppliedIndex.Load())
+	}
+	got, err := core.physical.Get(ctx, localKey)
+	if err != nil {
+		t.Fatalf("failed to read local key after failed reconcile: %v", err)
+	}
+	if got == nil {
+		t.Fatalf("expected local key %q to remain after failed reconcile", localKey)
+	}
 }
 
 type staticEntryChangeStream struct {
@@ -2070,10 +3167,11 @@ func (s *captureEntryChangeServerStream) Recv() (*StreamChangesUpstream, error) 
 		if s.initMsg != nil {
 			return s.initMsg, nil
 		}
-		// Default init: large window so tests don't block on credits.
+		// Default init: enough credits for small replay tests without
+		// exceeding the primary's bounded stream window.
 		return &StreamChangesUpstream{
 			Msg: &StreamChangesUpstream_Init{
-				Init: &StreamChangesRequest{InitialWindow: 100000},
+				Init: &StreamChangesRequest{InitialWindow: 100},
 			},
 		}, nil
 	}
@@ -2238,7 +3336,7 @@ func TestDRIntegration_PrimaryStreamReplayIncludesLastAppliedIndex(t *testing.T)
 				Init: &StreamChangesRequest{
 					RelationshipId:   token.RelationshipID,
 					LastAppliedIndex: 10,
-					InitialWindow:    100000,
+					InitialWindow:    100,
 				},
 			},
 		},
@@ -2324,6 +3422,8 @@ func TestDRIntegration_MultiRelationshipRangeIsolation(t *testing.T) {
 	if err := mgr.ValidateBootstrapAndStoreCert(ctx, tok2.RelationshipID, tok2.BootstrapToken, certDER2); err != nil {
 		t.Fatal(err)
 	}
+	markDRRelationshipActive(t, mgr, tok1.RelationshipID)
+	markDRRelationshipActive(t, mgr, tok2.RelationshipID)
 
 	rpcCtx1 := tlsPeerContext(ctx, cert1)
 	rpcCtx2 := tlsPeerContext(ctx, cert2)
@@ -2335,12 +3435,14 @@ func TestDRIntegration_MultiRelationshipRangeIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := primary.ExchangeRangeChecksums(rpcCtx2, &RangeChecksumRequest{
+		RelationshipId:  tok2.RelationshipID,
 		CheckpointId:    cp1.CheckpointId,
 		CheckpointIndex: cp1.CommitIndex,
 	}); err == nil {
 		t.Fatal("expected cross-relationship checkpoint access to be denied")
 	}
 	if _, err := primary.ExchangeRangeChecksums(rpcCtx1, &RangeChecksumRequest{
+		RelationshipId:  tok1.RelationshipID,
 		CheckpointId:    cp1.CheckpointId,
 		CheckpointIndex: cp1.CommitIndex,
 	}); err != nil {
@@ -2367,6 +3469,7 @@ func TestDRIntegration_RevokeDuringRangeReconcileAborts(t *testing.T) {
 	if err := mgr.ValidateBootstrapAndStoreCert(ctx, token.RelationshipID, token.BootstrapToken, secondaryDER); err != nil {
 		t.Fatal(err)
 	}
+	markDRRelationshipActive(t, mgr, token.RelationshipID)
 	rpcCtx := tlsPeerContext(ctx, secondaryCert)
 
 	primary := mgr.Primary()
@@ -2381,6 +3484,7 @@ func TestDRIntegration_RevokeDuringRangeReconcileAborts(t *testing.T) {
 	}
 
 	if _, err := primary.ExchangeRangeChecksums(rpcCtx, &RangeChecksumRequest{
+		RelationshipId:  token.RelationshipID,
 		CheckpointId:    cp.CheckpointId,
 		CheckpointIndex: cp.CommitIndex,
 	}); err == nil {

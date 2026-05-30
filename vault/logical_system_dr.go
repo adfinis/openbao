@@ -125,6 +125,9 @@ func (b *SystemBackend) drReplicationPaths() []*framework.Path {
 								"token": {
 									Type:     framework.TypeString,
 									Required: true,
+									DisplayAttrs: &framework.DisplayAttributes{
+										Sensitive: true,
+									},
 								},
 							},
 						}},
@@ -150,6 +153,9 @@ func (b *SystemBackend) drReplicationPaths() []*framework.Path {
 					Type:        framework.TypeString,
 					Description: "The DR activation token from the primary cluster.",
 					Required:    true,
+					DisplayAttrs: &framework.DisplayAttributes{
+						Sensitive: true,
+					},
 				},
 			},
 
@@ -196,6 +202,32 @@ func (b *SystemBackend) drReplicationPaths() []*framework.Path {
 			HelpDescription: "Stops DR replication and removes this cluster's secondary role.",
 		},
 
+		// --- Rotate Secondary Credential ---
+		{
+			Pattern: "replication/dr/secondary/rotate-certificate$",
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: "replication-dr-secondary",
+				OperationVerb:   "rotate-certificate",
+			},
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback:                  b.handleDRSecondaryRotateCertificate,
+					Summary:                   "Rotate this DR secondary's relationship certificate.",
+					ForwardPerformanceStandby: true,
+					Responses: map[int][]framework.Response{
+						http.StatusOK: {{
+							Description: "OK",
+						}},
+					},
+				},
+			},
+
+			HelpSynopsis:    "Rotate DR secondary credential",
+			HelpDescription: "Generates a new local DR secondary client certificate, stages and confirms it with the primary, persists it locally, and reconnects using the new credential.",
+		},
+
 		// --- Register Secondary (unauthenticated, bootstrap token is the auth) ---
 		{
 			Pattern: "replication/dr/primary/register-secondary$",
@@ -215,11 +247,17 @@ func (b *SystemBackend) drReplicationPaths() []*framework.Path {
 					Type:        framework.TypeString,
 					Description: "The one-time bootstrap token from the activation token.",
 					Required:    true,
+					DisplayAttrs: &framework.DisplayAttributes{
+						Sensitive: true,
+					},
 				},
 				"secondary_ca_cert": {
 					Type:        framework.TypeString,
-					Description: "The secondary's cluster CA certificate (base64-encoded DER).",
+					Description: "The secondary's DR client certificate trust anchor (base64-encoded DER).",
 					Required:    true,
+					DisplayAttrs: &framework.DisplayAttributes{
+						Sensitive: true,
+					},
 				},
 			},
 
@@ -237,7 +275,63 @@ func (b *SystemBackend) drReplicationPaths() []*framework.Path {
 			},
 
 			HelpSynopsis:    "Register a DR secondary's certificate",
-			HelpDescription: "Registers a DR secondary's cluster CA certificate so the primary can trust it for mTLS connections. Authenticated via a one-time bootstrap token.",
+			HelpDescription: "Registers a DR secondary's client certificate trust anchor so the primary can trust it for DR mTLS connections. Authenticated via a one-time bootstrap token.",
+		},
+
+		// --- Rotate Secondary Certificate (unauthenticated, signed by relationship credential) ---
+		{
+			Pattern: "replication/dr/primary/rotate-secondary-certificate$",
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: "replication-dr-primary",
+				OperationVerb:   "rotate-secondary-certificate",
+			},
+
+			Fields: drCredentialRotationFieldSchemas(),
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback:                  b.handleDRPrimaryRotateSecondaryCertificate,
+					Summary:                   "Stage a DR secondary certificate rotation.",
+					ForwardPerformanceStandby: true,
+					Responses: map[int][]framework.Response{
+						http.StatusOK: {{
+							Description: "OK",
+						}},
+					},
+				},
+			},
+
+			HelpSynopsis:    "Stage a DR secondary credential rotation",
+			HelpDescription: "Stages a new DR secondary client certificate for an active relationship. Authenticated by a signature from the current relationship credential.",
+		},
+
+		// --- Confirm Secondary Certificate Rotation (unauthenticated, signed by pending credential) ---
+		{
+			Pattern: "replication/dr/primary/confirm-secondary-certificate$",
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: "replication-dr-primary",
+				OperationVerb:   "confirm-secondary-certificate",
+			},
+
+			Fields: drCredentialRotationFieldSchemas(),
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback:                  b.handleDRPrimaryConfirmSecondaryCertificate,
+					Summary:                   "Finalize a DR secondary certificate rotation.",
+					ForwardPerformanceStandby: true,
+					Responses: map[int][]framework.Response{
+						http.StatusOK: {{
+							Description: "OK",
+						}},
+					},
+				},
+			},
+
+			HelpSynopsis:    "Finalize a DR secondary credential rotation",
+			HelpDescription: "Finalizes a staged DR secondary client certificate rotation. Authenticated by a signature from the pending relationship credential.",
 		},
 
 		// --- List Relationships ---
@@ -320,6 +414,11 @@ func (b *SystemBackend) drReplicationPaths() []*framework.Path {
 					Default:     false,
 					Description: "Operator confirmation that the primary cluster is unreachable. Required for promotion to proceed.",
 				},
+				"accept_data_loss": {
+					Type:        framework.TypeBool,
+					Default:     false,
+					Description: "Explicit acknowledgement required when promotion cannot prove the secondary is fully caught up.",
+				},
 			},
 
 			Operations: map[logical.Operation]framework.OperationHandler{
@@ -333,6 +432,42 @@ func (b *SystemBackend) drReplicationPaths() []*framework.Path {
 								"message": {
 									Type: framework.TypeString,
 								},
+								"promotion_id": {
+									Type: framework.TypeString,
+								},
+								"promotion_class": {
+									Type: framework.TypeString,
+								},
+								"clean_promotion_eligible": {
+									Type: framework.TypeBool,
+								},
+								"clean_promotion_proof_available": {
+									Type: framework.TypeBool,
+								},
+								"forced_promotion_requires_acknowledgement": {
+									Type: framework.TypeBool,
+								},
+								"forced_promotion_reason_codes": {
+									Type: framework.TypeStringSlice,
+								},
+								"forced_promotion_reason_details": {
+									Type: framework.TypeStringSlice,
+								},
+								"data_loss_accepted": {
+									Type: framework.TypeBool,
+								},
+								"last_applied_index": {
+									Type: framework.TypeInt,
+								},
+								"last_known_primary_index": {
+									Type: framework.TypeInt,
+								},
+								"estimated_data_loss_entries": {
+									Type: framework.TypeInt,
+								},
+								"estimated_data_loss_entries_basis": {
+									Type: framework.TypeString,
+								},
 							},
 						}},
 					},
@@ -340,7 +475,7 @@ func (b *SystemBackend) drReplicationPaths() []*framework.Path {
 			},
 
 			HelpSynopsis:    "Promote DR secondary",
-			HelpDescription: "Promotes this DR secondary to a standalone primary. Requires confirm_primary_unreachable=true as an operator safety check.",
+			HelpDescription: "Promotes this DR secondary to a standalone primary. Clean promotion requires confirm_primary_unreachable=true. Forced promotion also requires accept_data_loss=true when the secondary is lagging, reconciling, or otherwise cannot prove it is fully caught up.",
 		},
 
 		// --- Secondary resnapshot trigger ---
@@ -559,6 +694,26 @@ func (b *SystemBackend) handleDRStatus(ctx context.Context, req *logical.Request
 		"mode":       string(config.Mode),
 		"cluster_id": config.ClusterID,
 	}
+	if record := config.Promotion; record != nil {
+		data["last_promotion_id"] = record.PromotionID
+		data["last_promotion_class"] = string(record.PromotionClass)
+		data["last_promotion_time"] = record.PromotedAt
+		data["last_promotion_local_cluster_id"] = record.LocalClusterID
+		data["last_promotion_last_applied_index"] = record.LastAppliedIndex
+		data["last_promotion_last_known_primary_index"] = record.LastKnownPrimaryIndex
+		data["last_promotion_estimated_data_loss_entries"] = record.EstimatedDataLossEntries
+		data["last_promotion_estimated_data_loss_entries_basis"] = record.DataLossEstimateBasis
+		data["last_promotion_data_loss_accepted"] = record.DataLossAccepted
+		data["last_promotion_clean_promotion_eligible"] = record.PromotionClass == DRPromotionClean
+		data["last_promotion_clean_promotion_proof_available"] = record.PromotionClass == DRPromotionClean
+		data["last_promotion_forced_promotion_requires_acknowledgement"] = record.PromotionClass == DRPromotionForced
+		if len(record.ForcedReasonCodes) > 0 {
+			data["last_promotion_forced_reason_codes"] = append([]string(nil), record.ForcedReasonCodes...)
+		}
+		if len(record.ForcedReasonDetails) > 0 {
+			data["last_promotion_forced_reason_details"] = append([]string(nil), record.ForcedReasonDetails...)
+		}
+	}
 
 	// If secondary, include secondary-specific status.
 	if sec := mgr.Secondary(); sec != nil {
@@ -736,6 +891,9 @@ func (b *SystemBackend) handleDRSecondaryEnable(ctx context.Context, req *logica
 	if !ok || tokenStr == "" {
 		return logical.ErrorResponse("token must be a non-empty string"), nil
 	}
+	if len(tokenStr) > drActivationTokenMaxBytes {
+		return logical.ErrorResponse("activation token exceeds maximum size %d", drActivationTokenMaxBytes), nil
+	}
 
 	var token DRActivationToken
 	if err := json.Unmarshal([]byte(tokenStr), &token); err != nil {
@@ -778,12 +936,32 @@ func (b *SystemBackend) handleDRSecondaryDisable(ctx context.Context, req *logic
 	return nil, nil
 }
 
-func (b *SystemBackend) handleDRPrimaryRegisterSecondary(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+func (b *SystemBackend) handleDRSecondaryRotateCertificate(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
 	mgr := b.Core.drManager
 	if mgr == nil {
 		return logical.ErrorResponse("DR replication not initialized"), nil
 	}
+	result, err := mgr.RotateSecondaryCredential(ctx)
+	if err != nil {
+		return logical.ErrorResponse("credential rotation failed: %s", err.Error()), nil
+	}
+	b.Core.logger.Info("DR secondary credential rotated via API",
+		"relationship_id", result.RelationshipID,
+		"operation_id", result.OperationID,
+		"pending_resumed", result.PendingResumed,
+		"source_ip", sourceIPFromRequest(req))
+	return &logical.Response{Data: map[string]interface{}{
+		"relationship_id":       result.RelationshipID,
+		"operation_id":          result.OperationID,
+		"old_fingerprint":       result.OldFingerprint,
+		"new_fingerprint":       result.NewFingerprint,
+		"pending_resumed":       result.PendingResumed,
+		"rotation_started_at":   result.RotationStartedAt,
+		"rotation_completed_at": result.RotationCompletedAt,
+	}}, nil
+}
 
+func (b *SystemBackend) handleDRPrimaryRegisterSecondary(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
 	relationshipIDRaw, ok := d.GetOk("relationship_id")
 	if !ok {
 		return logical.ErrorResponse("relationship_id is required"), nil
@@ -810,6 +988,9 @@ func (b *SystemBackend) handleDRPrimaryRegisterSecondary(ctx context.Context, re
 	if !ok || certStr == "" {
 		return logical.ErrorResponse("secondary_ca_cert must be a non-empty string"), nil
 	}
+	if len(certStr) > base64.StdEncoding.EncodedLen(drBootstrapMaxCertDERBytes) {
+		return logical.ErrorResponse("secondary_ca_cert exceeds maximum DER size %d", drBootstrapMaxCertDERBytes), nil
+	}
 
 	// Decode the base64-encoded DER certificate.
 	certDER, err := base64.StdEncoding.DecodeString(certStr)
@@ -817,11 +998,205 @@ func (b *SystemBackend) handleDRPrimaryRegisterSecondary(ctx context.Context, re
 		return logical.ErrorResponse("secondary_ca_cert is not valid base64: %s", err.Error()), nil
 	}
 
+	mgr := b.Core.drManager
+	if mgr == nil {
+		return b.drBootstrapRegistrationFailure(req, relationshipID, fmt.Errorf("DR replication not initialized")), nil
+	}
+
 	if err := mgr.ValidateBootstrapAndStoreCertWithSourceIP(ctx, relationshipID, bootstrapToken, certDER, sourceIPFromRequest(req)); err != nil {
-		return logical.ErrorResponse("registration failed: %s", err.Error()), nil
+		return b.drBootstrapRegistrationFailure(req, relationshipID, err), nil
 	}
 
 	return nil, nil
+}
+
+func drCredentialRotationFieldSchemas() map[string]*framework.FieldSchema {
+	return map[string]*framework.FieldSchema{
+		"relationship_id": {
+			Type:        framework.TypeString,
+			Description: "The active DR relationship ID.",
+			Required:    true,
+		},
+		"operation_id": {
+			Type:        framework.TypeString,
+			Description: "Client-generated UUID binding the two-phase rotation attempt.",
+			Required:    true,
+		},
+		"issued_at": {
+			Type:        framework.TypeInt,
+			Description: "Unix timestamp covered by the rotation signature.",
+			Required:    true,
+		},
+		"secondary_ca_cert": {
+			Type:        framework.TypeString,
+			Description: "The new secondary DR client certificate trust anchor (base64-encoded DER).",
+			Required:    true,
+			DisplayAttrs: &framework.DisplayAttributes{
+				Sensitive: true,
+			},
+		},
+		"signature": {
+			Type:        framework.TypeString,
+			Description: "Base64-encoded ECDSA signature over the credential-rotation request.",
+			Required:    true,
+			DisplayAttrs: &framework.DisplayAttributes{
+				Sensitive: true,
+			},
+		},
+	}
+}
+
+func parseDRCredentialRotationRequest(d *framework.FieldData) (relationshipID, operationID string, issuedAt int64, certDER, signature []byte, resp *logical.Response) {
+	rawRelationshipID, ok := d.GetOk("relationship_id")
+	if !ok {
+		resp = logical.ErrorResponse("relationship_id is required")
+		return
+	}
+	relationshipID, ok = rawRelationshipID.(string)
+	if !ok || relationshipID == "" {
+		resp = logical.ErrorResponse("relationship_id must be a non-empty string")
+		return
+	}
+
+	rawOperationID, ok := d.GetOk("operation_id")
+	if !ok {
+		resp = logical.ErrorResponse("operation_id is required")
+		return
+	}
+	operationID, ok = rawOperationID.(string)
+	if !ok || operationID == "" {
+		resp = logical.ErrorResponse("operation_id must be a non-empty string")
+		return
+	}
+
+	rawIssuedAt, ok := d.GetOk("issued_at")
+	if !ok {
+		resp = logical.ErrorResponse("issued_at is required")
+		return
+	}
+	switch v := rawIssuedAt.(type) {
+	case int:
+		issuedAt = int64(v)
+	case int64:
+		issuedAt = v
+	case int32:
+		issuedAt = int64(v)
+	case uint64:
+		if v <= uint64(^uint(0)>>1) {
+			issuedAt = int64(v)
+		}
+	case float64:
+		issuedAt = int64(v)
+	}
+	if issuedAt <= 0 {
+		resp = logical.ErrorResponse("issued_at must be a positive Unix timestamp")
+		return
+	}
+
+	certRaw, ok := d.GetOk("secondary_ca_cert")
+	if !ok {
+		resp = logical.ErrorResponse("secondary_ca_cert is required")
+		return
+	}
+	certStr, ok := certRaw.(string)
+	if !ok || certStr == "" {
+		resp = logical.ErrorResponse("secondary_ca_cert must be a non-empty string")
+		return
+	}
+	if len(certStr) > base64.StdEncoding.EncodedLen(drBootstrapMaxCertDERBytes) {
+		resp = logical.ErrorResponse("secondary_ca_cert exceeds maximum DER size %d", drBootstrapMaxCertDERBytes)
+		return
+	}
+	certDER, err := base64.StdEncoding.DecodeString(certStr)
+	if err != nil {
+		resp = logical.ErrorResponse("secondary_ca_cert is not valid base64: %s", err.Error())
+		return
+	}
+
+	signatureRaw, ok := d.GetOk("signature")
+	if !ok {
+		resp = logical.ErrorResponse("signature is required")
+		return
+	}
+	signatureStr, ok := signatureRaw.(string)
+	if !ok || signatureStr == "" {
+		resp = logical.ErrorResponse("signature must be a non-empty string")
+		return
+	}
+	if len(signatureStr) > base64.StdEncoding.EncodedLen(drCredentialRotationMaxSigLen) {
+		resp = logical.ErrorResponse("signature exceeds maximum size %d", drCredentialRotationMaxSigLen)
+		return
+	}
+	signature, err = base64.StdEncoding.DecodeString(signatureStr)
+	if err != nil {
+		resp = logical.ErrorResponse("signature is not valid base64: %s", err.Error())
+		return
+	}
+	return
+}
+
+func credentialRotationResponse(rel *DRRelationship) *logical.Response {
+	return &logical.Response{Data: map[string]interface{}{
+		"relationship_id":                     rel.RelationshipID,
+		"credential_generation":               rel.CredentialGeneration,
+		"secondary_cert_fingerprint":          rel.SecondaryCertFingerprint,
+		"pending_secondary_cert_fingerprint":  rel.PendingSecondaryCertFingerprint,
+		"previous_secondary_cert_fingerprint": rel.PreviousSecondaryCertFingerprint,
+		"pending_rotation_operation_id":       rel.PendingRotationOperationID,
+		"pending_rotation_started_at":         rel.PendingRotationStartedAt,
+		"rotated_at":                          rel.RotatedAt,
+	}}
+}
+
+func (b *SystemBackend) handleDRPrimaryRotateSecondaryCertificate(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	relationshipID, operationID, issuedAt, certDER, signature, resp := parseDRCredentialRotationRequest(d)
+	if resp != nil {
+		return resp, nil
+	}
+
+	mgr := b.Core.drManager
+	if mgr == nil {
+		return b.drCredentialRotationFailure(req, relationshipID, operationID, fmt.Errorf("DR replication not initialized")), nil
+	}
+	rel, err := mgr.InitiateSecondaryCredentialRotation(ctx, relationshipID, operationID, issuedAt, certDER, signature, sourceIPFromRequest(req))
+	if err != nil {
+		return b.drCredentialRotationFailure(req, relationshipID, operationID, err), nil
+	}
+	return credentialRotationResponse(rel), nil
+}
+
+func (b *SystemBackend) handleDRPrimaryConfirmSecondaryCertificate(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	relationshipID, operationID, issuedAt, certDER, signature, resp := parseDRCredentialRotationRequest(d)
+	if resp != nil {
+		return resp, nil
+	}
+
+	mgr := b.Core.drManager
+	if mgr == nil {
+		return b.drCredentialRotationFailure(req, relationshipID, operationID, fmt.Errorf("DR replication not initialized")), nil
+	}
+	rel, err := mgr.ConfirmSecondaryCredentialRotation(ctx, relationshipID, operationID, issuedAt, certDER, signature, sourceIPFromRequest(req))
+	if err != nil {
+		return b.drCredentialRotationFailure(req, relationshipID, operationID, err), nil
+	}
+	return credentialRotationResponse(rel), nil
+}
+
+func (b *SystemBackend) drBootstrapRegistrationFailure(req *logical.Request, relationshipID string, err error) *logical.Response {
+	b.Core.logger.Warn("DR bootstrap registration rejected",
+		"relationship_id", relationshipID,
+		"source_ip", sourceIPFromRequest(req),
+		"error", err)
+	return logical.ErrorResponse("registration failed")
+}
+
+func (b *SystemBackend) drCredentialRotationFailure(req *logical.Request, relationshipID, operationID string, err error) *logical.Response {
+	b.Core.logger.Warn("DR secondary credential rotation rejected",
+		"relationship_id", relationshipID,
+		"operation_id", operationID,
+		"source_ip", sourceIPFromRequest(req),
+		"error", err)
+	return logical.ErrorResponse("credential rotation failed")
 }
 
 func sourceIPFromRequest(req *logical.Request) string {
@@ -833,6 +1208,29 @@ func sourceIPFromRequest(req *logical.Request) string {
 		return host
 	}
 	return addr
+}
+
+func drRelationshipResponseData(rel *DRRelationship) map[string]interface{} {
+	return map[string]interface{}{
+		"relationship_id":             rel.RelationshipID,
+		"state":                       string(rel.State),
+		"secondary_cert_fingerprint":  rel.SecondaryCertFingerprint,
+		"credential_generation":       rel.CredentialGeneration,
+		"rotated_at":                  rel.RotatedAt,
+		"pending_rotation":            rel.PendingSecondaryCertFingerprint != "",
+		"pending_rotation_started_at": rel.PendingRotationStartedAt,
+		"created_at":                  rel.CreatedAt,
+		"last_seen_at":                rel.LastSeenAt,
+		"expires_at":                  rel.ExpiresAt,
+		"failed_attempts":             rel.FailedAttempts,
+		"locked_until":                rel.LockedUntil,
+		"registered_from_ip":          rel.RegisteredFromIP,
+		"registered_at":               rel.RegisteredAt,
+		"last_failed_at":              rel.LastFailedAt,
+		"last_failed_from_ip":         rel.LastFailedFromIP,
+		"revoked_at":                  rel.RevokedAt,
+		"last_error":                  rel.LastError,
+	}
 }
 
 func (b *SystemBackend) handleDRPrimaryListRelationships(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
@@ -848,19 +1246,7 @@ func (b *SystemBackend) handleDRPrimaryListRelationships(ctx context.Context, re
 
 	resp := make([]map[string]interface{}, 0, len(rels))
 	for _, rel := range rels {
-		resp = append(resp, map[string]interface{}{
-			"relationship_id":            rel.RelationshipID,
-			"state":                      string(rel.State),
-			"secondary_cert_fingerprint": rel.SecondaryCertFingerprint,
-			"created_at":                 rel.CreatedAt,
-			"last_seen_at":               rel.LastSeenAt,
-			"expires_at":                 rel.ExpiresAt,
-			"failed_attempts":            rel.FailedAttempts,
-			"locked_until":               rel.LockedUntil,
-			"registered_from_ip":         rel.RegisteredFromIP,
-			"revoked_at":                 rel.RevokedAt,
-			"last_error":                 rel.LastError,
-		})
+		resp = append(resp, drRelationshipResponseData(rel))
 	}
 
 	return &logical.Response{
@@ -885,19 +1271,7 @@ func (b *SystemBackend) handleDRPrimaryRelationshipStatus(ctx context.Context, r
 	}
 
 	return &logical.Response{
-		Data: map[string]interface{}{
-			"relationship_id":            rel.RelationshipID,
-			"state":                      string(rel.State),
-			"secondary_cert_fingerprint": rel.SecondaryCertFingerprint,
-			"created_at":                 rel.CreatedAt,
-			"last_seen_at":               rel.LastSeenAt,
-			"expires_at":                 rel.ExpiresAt,
-			"failed_attempts":            rel.FailedAttempts,
-			"locked_until":               rel.LockedUntil,
-			"registered_from_ip":         rel.RegisteredFromIP,
-			"revoked_at":                 rel.RevokedAt,
-			"last_error":                 rel.LastError,
-		},
+		Data: drRelationshipResponseData(rel),
 	}, nil
 }
 
@@ -919,6 +1293,9 @@ func (b *SystemBackend) handleDRPrimaryRelationshipRevoke(ctx context.Context, r
 	if err := mgr.RevokeRelationship(ctx, id); err != nil {
 		return logical.ErrorResponse(err.Error()), nil
 	}
+	b.Core.logger.Info("DR relationship revoked via API",
+		"relationship_id", id,
+		"source_ip", sourceIPFromRequest(req))
 	return nil, nil
 }
 
@@ -932,7 +1309,8 @@ func (b *SystemBackend) handleDRSecondaryResnapshot(ctx context.Context, req *lo
 	if !confirmRollback {
 		return logical.ErrorResponse(
 			"resnapshot resets the checkpoint high-water mark, which allows the secondary to accept older checkpoint indices; " +
-				"set confirm_rollback_ok=true to proceed"), nil
+				"set confirm_rollback_ok=true to proceed",
+		), nil
 	}
 
 	// Log the HWM reset for audit trail.
@@ -946,7 +1324,7 @@ func (b *SystemBackend) handleDRSecondaryResnapshot(ctx context.Context, req *lo
 		"old_hwm", oldHWM,
 		"new_hwm", 0,
 		"reason", "manual-api",
-		"source_ip", req.Connection.RemoteAddr)
+		"source_ip", sourceIPFromRequest(req))
 
 	if err := mgr.RequestSecondaryResnapshot("manual-api"); err != nil {
 		return logical.ErrorResponse(err.Error()), nil
@@ -1134,6 +1512,7 @@ func (b *SystemBackend) handleDRTuningWrite(ctx context.Context, req *logical.Re
 	}); err != nil {
 		return logical.ErrorResponse(err.Error()), nil
 	}
+	b.Core.logger.Info("DR tuning updated via API", "source_ip", sourceIPFromRequest(req))
 	return nil, nil
 }
 
@@ -1144,38 +1523,44 @@ func (b *SystemBackend) handleDRSecondaryPromote(ctx context.Context, req *logic
 	}
 
 	confirmPrimaryUnreachable := d.Get("confirm_primary_unreachable").(bool)
+	acceptDataLoss := d.Get("accept_data_loss").(bool)
 
-	// Capture data loss metrics before promotion stops the secondary.
-	var lastAppliedIndex, lastKnownPrimaryIndex uint64
-	var estimatedDataLossEntries uint64
-	if sec := mgr.Secondary(); sec != nil {
-		lastAppliedIndex = sec.lastAppliedIndex.Load()
-		lastKnownPrimaryIndex = sec.primaryIndex.Load()
-		if lastKnownPrimaryIndex > lastAppliedIndex {
-			estimatedDataLossEntries = lastKnownPrimaryIndex - lastAppliedIndex
-		}
-	}
-
-	result, err := b.Core.DRFailover(ctx, confirmPrimaryUnreachable)
+	result, err := b.Core.DRFailover(ctx, confirmPrimaryUnreachable, acceptDataLoss)
 	if err != nil {
 		return logical.ErrorResponse(err.Error()), nil
 	}
 
 	data := map[string]interface{}{
-		"message":                     "DR secondary promoted to standalone primary",
-		"last_applied_index":          result.LastAppliedIndex,
-		"last_known_primary_index":    lastKnownPrimaryIndex,
-		"estimated_data_loss_entries": estimatedDataLossEntries,
-		"duration":                    result.Duration.String(),
+		"message":                                   "DR secondary promoted to standalone primary",
+		"promotion_id":                              result.PromotionID,
+		"promotion_class":                           string(result.PromotionClass),
+		"clean_promotion_eligible":                  result.CleanPromotionEligible,
+		"clean_promotion_proof_available":           result.CleanPromotionEligible,
+		"forced_promotion_requires_acknowledgement": result.ForcedPromotionRequiresAcknowledgement,
+		"forced_promotion_reason_codes":             append([]string(nil), result.ForcedPromotionReasonCodes...),
+		"forced_promotion_reason_details":           append([]string(nil), result.ForcedPromotionReasonDetails...),
+		"data_loss_accepted":                        result.DataLossAccepted,
+		"last_applied_index":                        result.LastAppliedIndex,
+		"last_known_primary_index":                  result.LastKnownPrimaryIndex,
+		"estimated_data_loss_entries":               result.EstimatedDataLossEntries,
+		"estimated_data_loss_entries_basis":         result.DataLossEstimateBasis,
+		"duration":                                  result.Duration.String(),
+	}
+	if record := result.PromotionRecord; record != nil {
+		data["promoted_at"] = record.PromotedAt
+		data["local_cluster_id"] = record.LocalClusterID
+		data["old_primary_cluster_id"] = record.OldPrimaryClusterID
+		data["old_relationship_id"] = record.OldRelationshipID
+		data["old_secondary_cert_fingerprint"] = record.OldSecondaryCertFingerprint
 	}
 	if result.Warning != "" {
 		data["warning"] = result.Warning
-	} else if estimatedDataLossEntries > 0 {
-		data["warning"] = fmt.Sprintf(
-			"approximately %d entries may not have been replicated before promotion",
-			estimatedDataLossEntries,
-		)
 	}
+	b.Core.logger.Info("DR secondary promoted via API",
+		"promotion_id", result.PromotionID,
+		"promotion_class", result.PromotionClass,
+		"data_loss_accepted", result.DataLossAccepted,
+		"source_ip", sourceIPFromRequest(req))
 
 	return &logical.Response{Data: data}, nil
 }

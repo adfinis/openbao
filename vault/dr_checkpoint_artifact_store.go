@@ -61,6 +61,7 @@ type drCheckpointArtifactStore struct {
 	perRelBudget    uint64
 	segmentBytes    uint64
 	artifacts       map[string]*drCheckpointArtifact
+	activeRefs      map[string]int
 	totalBytes      uint64
 	storageDriftHit atomic.Uint64
 	evictions       atomic.Uint64
@@ -83,6 +84,7 @@ func newDRCheckpointArtifactStore(logger log.Logger, dir string) *drCheckpointAr
 		perRelBudget: drCheckpointArtifactDefaultPerRelBudget,
 		segmentBytes: drCheckpointArtifactDefaultSegmentBytes,
 		artifacts:    make(map[string]*drCheckpointArtifact),
+		activeRefs:   make(map[string]int),
 	}
 }
 
@@ -125,7 +127,7 @@ func (s *drCheckpointArtifactStore) getRecord(checkpointID string, kid [32]byte)
 	if !ok {
 		return drCheckpointArtifactRecord{}, false, fmt.Errorf("checkpoint artifact missing")
 	}
-	if s.ttl > 0 && time.Since(art.CreatedAt) > s.ttl {
+	if s.ttl > 0 && s.activeRefs[checkpointID] == 0 && time.Since(art.CreatedAt) > s.ttl {
 		s.evictLocked(checkpointID)
 		return drCheckpointArtifactRecord{}, false, fmt.Errorf("checkpoint artifact expired")
 	}
@@ -149,6 +151,26 @@ func (s *drCheckpointArtifactStore) readValue(checkpointID, valueRef string) ([]
 		return nil, fmt.Errorf("read checkpoint artifact value: %w", err)
 	}
 	return value, nil
+}
+
+func (s *drCheckpointArtifactStore) retain(checkpointID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.artifacts[checkpointID]; !ok {
+		return false
+	}
+	s.activeRefs[checkpointID]++
+	return true
+}
+
+func (s *drCheckpointArtifactStore) release(checkpointID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if refs := s.activeRefs[checkpointID]; refs <= 1 {
+		delete(s.activeRefs, checkpointID)
+	} else {
+		s.activeRefs[checkpointID] = refs - 1
+	}
 }
 
 func (s *drCheckpointArtifactStore) delete(checkpointID string) {
@@ -177,6 +199,9 @@ func (s *drCheckpointArtifactStore) relationshipBytesLocked(relationshipID strin
 func (s *drCheckpointArtifactStore) evictOldestGlobalLocked() bool {
 	var oldest *drCheckpointArtifact
 	for _, art := range s.artifacts {
+		if s.activeRefs[art.CheckpointID] > 0 {
+			continue
+		}
 		if oldest == nil || art.CreatedAt.Before(oldest.CreatedAt) {
 			oldest = art
 		}
@@ -194,6 +219,9 @@ func (s *drCheckpointArtifactStore) evictOldestRelationshipLocked(relationshipID
 		if art.RelationshipID != relationshipID {
 			continue
 		}
+		if s.activeRefs[art.CheckpointID] > 0 {
+			continue
+		}
 		if oldest == nil || art.CreatedAt.Before(oldest.CreatedAt) {
 			oldest = art
 		}
@@ -206,6 +234,9 @@ func (s *drCheckpointArtifactStore) evictOldestRelationshipLocked(relationshipID
 }
 
 func (s *drCheckpointArtifactStore) evictLocked(checkpointID string) {
+	if s.activeRefs[checkpointID] > 0 {
+		return
+	}
 	art, ok := s.artifacts[checkpointID]
 	if !ok {
 		return

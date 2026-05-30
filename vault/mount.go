@@ -1454,6 +1454,11 @@ func (c *Core) setupMounts(ctx context.Context) error {
 	defer c.mountsLock.Unlock()
 
 	for _, entry := range c.mounts.SortEntriesByPathDepth().Entries {
+		if shouldSkipDRSecondaryProtectedRouterEntry(ctx, c, entry, false) {
+			c.logger.Info("skipping existing protected DR secondary mount route", "path", entry.Path, "type", entry.Type, "namespace", entry.Namespace)
+			continue
+		}
+
 		postUnsealFunc, err := c.setupMount(ctx, entry)
 		if err != nil {
 			return err
@@ -1477,6 +1482,10 @@ func (c *Core) setupMountsForNamespace(ctx context.Context, ns *namespace.Namesp
 	for _, entry := range c.mounts.SortEntriesByPath().Entries {
 		// Only process entries with matching namespace ID
 		if entry.NamespaceID != ns.ID {
+			continue
+		}
+		if shouldSkipDRSecondaryProtectedRouterEntry(ctx, c, entry, false) {
+			c.logger.Info("skipping existing protected DR secondary namespace mount route", "path", entry.Path, "type", entry.Type, "namespace", entry.Namespace)
 			continue
 		}
 
@@ -2131,6 +2140,15 @@ func (c *Core) reloadMountInternalWithLock(ctx context.Context, table, uuid stri
 	ns, err := namespace.FromContext(ctx)
 	if err != nil {
 		return err
+	}
+	credential := table == routing.CredentialTableType
+	if desiredMountEntry != nil && shouldSkipDRSecondaryProtectedRouterEntry(ctx, c, desiredMountEntry, credential) {
+		c.logger.Info("skipping protected DR secondary mount invalidation", "path", desiredMountEntry.Path, "type", desiredMountEntry.Type, "uuid", uuid, "table", table, "namespace", ns)
+		return nil
+	}
+	if desiredMountEntry == nil && actualMountEntry != nil && shouldSkipDRSecondaryProtectedRouterEntry(ctx, c, actualMountEntry, credential) {
+		c.logger.Info("skipping protected DR secondary mount deletion invalidation", "path", actualMountEntry.Path, "type", actualMountEntry.Type, "uuid", uuid, "table", table, "namespace", ns)
+		return nil
 	}
 
 	switch {

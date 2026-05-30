@@ -35,6 +35,8 @@ type drPeerFingerprintContextKey struct{}
 // remote address for RPC authz fallback when gRPC AuthInfo is unavailable.
 var drPeerFingerprintByRemoteAddr sync.Map
 
+var errDRTransportLeafKeyUnavailable = errors.New("no local cluster private key available")
+
 // --- DR Replication Cluster Handler (primary side) ---
 
 // drReplicationClusterHandler implements the cluster.Handler interface for
@@ -48,6 +50,7 @@ type drReplicationClusterHandler struct {
 
 	// drLeafCertMu protects drLeafCertDER / drLeafParsedCert / drLeafPrivateKey.
 	drLeafCertMu     sync.RWMutex
+	drTransportCA    *drTransportCA
 	drLeafCertDER    []byte // DER-encoded leaf cert signed by DR transport CA
 	drLeafParsedCert *x509.Certificate
 	drLeafPrivateKey *ecdsa.PrivateKey // snapshot of the key used when minting the leaf
@@ -92,9 +95,17 @@ func newDRReplicationClusterHandler(core *Core, drServer *drReplicationPrimary, 
 // to secondaries in the TLS handshake so they can verify it chains to
 // the CA from the activation token.
 func (h *drReplicationClusterHandler) SetTransportCA(ca *drTransportCA) error {
+	if ca == nil {
+		return errors.New("no DR transport CA available")
+	}
+
+	h.drLeafCertMu.Lock()
+	h.drTransportCA = ca
+	h.drLeafCertMu.Unlock()
+
 	privKey := h.core.localClusterPrivateKey.Load()
 	if privKey == nil {
-		return errors.New("no local cluster private key available")
+		return errDRTransportLeafKeyUnavailable
 	}
 
 	clusterAddr := h.core.ClusterAddr()
@@ -123,12 +134,35 @@ func (h *drReplicationClusterHandler) SetTransportCA(ca *drTransportCA) error {
 	return nil
 }
 
+func (h *drReplicationClusterHandler) hasDRLeafCert() bool {
+	h.drLeafCertMu.RLock()
+	defer h.drLeafCertMu.RUnlock()
+	return len(h.drLeafCertDER) != 0 && h.drLeafParsedCert != nil && h.drLeafPrivateKey != nil
+}
+
+func (h *drReplicationClusterHandler) ensureDRLeafCert() error {
+	h.drLeafCertMu.RLock()
+	hasLeaf := len(h.drLeafCertDER) != 0 && h.drLeafParsedCert != nil && h.drLeafPrivateKey != nil
+	ca := h.drTransportCA
+	h.drLeafCertMu.RUnlock()
+
+	if hasLeaf {
+		return nil
+	}
+	if ca == nil {
+		return errors.New("no DR transport CA available")
+	}
+	return h.SetTransportCA(ca)
+}
+
 // ActiveDRLeafCertDER returns a copy of the currently minted DR transport
 // leaf certificate DER bytes. Returns nil when no DR leaf is available.
 func (h *drReplicationClusterHandler) ActiveDRLeafCertDER() []byte {
 	if h == nil {
 		return nil
 	}
+
+	_ = h.ensureDRLeafCert()
 
 	h.drLeafCertMu.RLock()
 	defer h.drLeafCertMu.RUnlock()
@@ -142,15 +176,24 @@ func (h *drReplicationClusterHandler) ActiveDRLeafCertDER() []byte {
 }
 
 // ServerLookup returns the DR transport leaf certificate for incoming
-// connections. If a CA-signed leaf has been minted, it is presented
-// together with the transport CA cert as the chain. Falls back to the
-// node's self-signed cluster cert only if no DR leaf has been minted yet.
+// connections. DR transport identity is always rooted in the DR transport CA;
+// if a leaf is unavailable, fail closed instead of serving the node's
+// self-signed cluster cert.
 func (h *drReplicationClusterHandler) ServerLookup(ctx context.Context, clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	h.drLeafCertMu.RLock()
 	leafDER := h.drLeafCertDER
 	leafParsed := h.drLeafParsedCert
 	leafKey := h.drLeafPrivateKey
 	h.drLeafCertMu.RUnlock()
+
+	if leafDER == nil || leafParsed == nil || leafKey == nil {
+		_ = h.ensureDRLeafCert()
+		h.drLeafCertMu.RLock()
+		leafDER = h.drLeafCertDER
+		leafParsed = h.drLeafParsedCert
+		leafKey = h.drLeafPrivateKey
+		h.drLeafCertMu.RUnlock()
+	}
 
 	if leafDER != nil && leafParsed != nil && leafKey != nil {
 		return &tls.Certificate{
@@ -160,38 +203,33 @@ func (h *drReplicationClusterHandler) ServerLookup(ctx context.Context, clientHe
 		}, nil
 	}
 
-	// Fallback: no DR leaf cert minted yet, use self-signed cluster cert.
-	h.logger.Warn("no DR transport leaf cert available, falling back to cluster cert")
-	currCert := h.core.localClusterCert.Load()
-	if currCert == nil {
-		return nil, errors.New("dr replication connection but no local cert")
-	}
-	certBytes := *currCert
-	if len(certBytes) == 0 {
-		return nil, errors.New("dr replication connection but empty local cert")
-	}
-
-	localCert := make([]byte, len(certBytes))
-	copy(localCert, certBytes)
-
-	return &tls.Certificate{
-		Certificate: [][]byte{localCert},
-		PrivateKey:  h.core.localClusterPrivateKey.Load(),
-		Leaf:        h.core.localClusterParsedCert.Load(),
-	}, nil
+	return nil, errors.New("dr replication connection but DR transport leaf cert is unavailable")
 }
 
 // startLeafRenewal launches a background goroutine that re-mints the DR
 // leaf certificate at half the leaf validity interval. The goroutine
 // stops when the handler's stopCh is closed.
 func (h *drReplicationClusterHandler) startLeafRenewal(ca *drTransportCA) {
+	h.drLeafCertMu.Lock()
+	h.drTransportCA = ca
+	h.drLeafCertMu.Unlock()
+
 	renewInterval := drTransportLeafValidity / 2
+	retryTicker := time.NewTicker(time.Second)
 	go func() {
-		ticker := time.NewTicker(renewInterval)
-		defer ticker.Stop()
+		renewTicker := time.NewTicker(renewInterval)
+		defer retryTicker.Stop()
+		defer renewTicker.Stop()
 		for {
 			select {
-			case <-ticker.C:
+			case <-retryTicker.C:
+				if h.hasDRLeafCert() {
+					continue
+				}
+				if err := h.SetTransportCA(ca); err != nil {
+					h.logger.Debug("DR transport leaf cert not available yet", "error", err)
+				}
+			case <-renewTicker.C:
 				if err := h.SetTransportCA(ca); err != nil {
 					h.logger.Error("failed to renew DR transport leaf cert", "error", err)
 				} else {
@@ -360,52 +398,24 @@ type drReplicationClusterClient struct {
 	trustedCertsMu *sync.RWMutex
 	trustedCerts   map[string]*trustedPrimaryCert
 
+	clientCert *tls.Certificate
+
 	clientCertMu sync.RWMutex
 	clientCertFP string
 }
 
 // ClientLookup returns the client TLS certificate for outgoing connections.
 func (c *drReplicationClusterClient) ClientLookup(ctx context.Context, requestInfo *tls.CertificateRequestInfo) (*tls.Certificate, error) {
-	parsedCert := c.core.localClusterParsedCert.Load()
-	if parsedCert == nil {
+	if c.clientCert == nil || c.clientCert.Leaf == nil {
 		return nil, nil
 	}
-	currCert := c.core.localClusterCert.Load()
-	if currCert == nil {
-		return nil, nil
-	}
-	certBytes := *currCert
-	if len(certBytes) == 0 {
-		return nil, nil
-	}
-
-	localCert := make([]byte, len(certBytes))
-	copy(localCert, certBytes)
-
 	for _, subj := range requestInfo.AcceptableCAs {
-		// Match against the primary's CA certificate RawSubject for
-		// cross-cluster mTLS. The primary's cert is the CA from the
-		// activation token, so we compare the server's acceptable CA
-		// with the primary's raw subject.
-		if c.primaryCACert != nil && bytes.Equal(subj, c.primaryCACert.RawSubject) {
-			c.setLastClientCertFingerprint(certFingerprintSHA256(parsedCert))
-			return &tls.Certificate{
-				Certificate: [][]byte{localCert},
-				PrivateKey:  c.core.localClusterPrivateKey.Load(),
-				Leaf:        c.core.localClusterParsedCert.Load(),
-			}, nil
-		}
-		// Also match against the local cert's issuer (same-cluster case).
-		if bytes.Equal(subj, parsedCert.RawIssuer) {
-			c.setLastClientCertFingerprint(certFingerprintSHA256(parsedCert))
-			return &tls.Certificate{
-				Certificate: [][]byte{localCert},
-				PrivateKey:  c.core.localClusterPrivateKey.Load(),
-				Leaf:        c.core.localClusterParsedCert.Load(),
-			}, nil
+		if bytes.Equal(subj, c.clientCert.Leaf.RawSubject) || bytes.Equal(subj, c.clientCert.Leaf.RawIssuer) {
+			c.setLastClientCertFingerprint(certFingerprintSHA256(c.clientCert.Leaf))
+			cert := *c.clientCert
+			return &cert, nil
 		}
 	}
-
 	return nil, nil
 }
 

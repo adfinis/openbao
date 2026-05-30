@@ -6,12 +6,16 @@ package vault
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -29,7 +33,149 @@ const (
 	drRegistrationTLSHandshakeTimeout   = 5 * time.Second
 	drRegistrationResponseHeaderTimeout = 10 * time.Second
 	drRegistrationRequestTimeout        = 15 * time.Second
+	drBootstrapTokenHashDomain          = "openbao-dr-bootstrap-token-v1"
 )
+
+type drPrimaryAPIClientConfig struct {
+	APIAddr    string
+	CACert     []byte
+	ServerName string
+}
+
+func drPrimaryAPIClientConfigFromActivationToken(token *DRActivationToken) drPrimaryAPIClientConfig {
+	if token == nil {
+		return drPrimaryAPIClientConfig{}
+	}
+	caBytes := token.PrimaryAPICACert
+	if len(caBytes) == 0 {
+		caBytes = token.DRTransportCACert
+	}
+	serverName := token.PrimaryAPIServerName
+	if serverName == "" {
+		serverName = deriveServerName(token.PrimaryAPIAddr)
+	}
+	return drPrimaryAPIClientConfig{
+		APIAddr:    normalizePrimaryAPIAddr(token.PrimaryAPIAddr),
+		CACert:     caBytes,
+		ServerName: serverName,
+	}
+}
+
+func drPrimaryAPIClientConfigFromDRConfig(config DRConfig) drPrimaryAPIClientConfig {
+	serverName := config.PrimaryAPIServerName
+	if serverName == "" {
+		serverName = deriveServerName(config.PrimaryAPIAddr)
+	}
+	return drPrimaryAPIClientConfig{
+		APIAddr:    normalizePrimaryAPIAddr(config.PrimaryAPIAddr),
+		CACert:     config.PrimaryAPICACert,
+		ServerName: serverName,
+	}
+}
+
+func primaryAPIAddrRequiresTLS(apiAddr string) bool {
+	apiAddr = normalizePrimaryAPIAddr(apiAddr)
+	if apiAddr == "" {
+		return false
+	}
+	u, err := url.Parse(apiAddr)
+	if err != nil {
+		return true
+	}
+	return strings.EqualFold(u.Scheme, "https")
+}
+
+func newDRPrimaryAPIHTTPClient(config drPrimaryAPIClientConfig) (*http.Client, error) {
+	config.APIAddr = normalizePrimaryAPIAddr(config.APIAddr)
+	if config.APIAddr == "" {
+		return nil, fmt.Errorf("missing primary API address")
+	}
+
+	u, err := url.Parse(config.APIAddr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid primary API address: %w", err)
+	}
+
+	var tlsConfig *tls.Config
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+	case "https":
+		if len(config.CACert) == 0 {
+			return nil, fmt.Errorf("missing primary API CA certificate")
+		}
+		primaryCert, err := x509.ParseCertificate(config.CACert)
+		if err != nil {
+			return nil, fmt.Errorf("invalid primary API CA certificate: %w", err)
+		}
+		pool := x509.NewCertPool()
+		pool.AddCert(primaryCert)
+
+		serverName := config.ServerName
+		if serverName == "" {
+			serverName = deriveServerName(config.APIAddr)
+		}
+		if serverName == "" {
+			return nil, fmt.Errorf("failed to determine primary API TLS server name")
+		}
+
+		tlsConfig = &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			RootCAs:    pool,
+			ServerName: serverName,
+		}
+	default:
+		return nil, fmt.Errorf("unsupported primary API scheme %q", u.Scheme)
+	}
+
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout: drRegistrationDialTimeout,
+			}).DialContext,
+			TLSClientConfig:       tlsConfig,
+			TLSHandshakeTimeout:   drRegistrationTLSHandshakeTimeout,
+			ResponseHeaderTimeout: drRegistrationResponseHeaderTimeout,
+			ExpectContinueTimeout: 1 * time.Second,
+			IdleConnTimeout:       30 * time.Second,
+		},
+		Timeout: drRegistrationRequestTimeout,
+	}, nil
+}
+
+func postDRPrimaryAPIJSON(ctx context.Context, config drPrimaryAPIClientConfig, path string, body map[string]interface{}) error {
+	config.APIAddr = normalizePrimaryAPIAddr(config.APIAddr)
+	client, err := newDRPrimaryAPIHTTPClient(config)
+	if err != nil {
+		return err
+	}
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("failed to marshal primary API request: %w", err)
+	}
+
+	url := fmt.Sprintf("%s/v1/sys/%s", strings.TrimRight(config.APIAddr, "/"), strings.TrimPrefix(path, "/"))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return fmt.Errorf("failed to create primary API request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("primary API request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		msg := strings.TrimSpace(string(body))
+		if msg != "" {
+			return fmt.Errorf("primary API request returned status %d: %s", resp.StatusCode, msg)
+		}
+		return fmt.Errorf("primary API request returned status %d", resp.StatusCode)
+	}
+	return nil
+}
 
 // GenerateActivationToken creates a token that a secondary uses to
 // establish the DR relationship. Each token includes a single-use
@@ -56,11 +202,11 @@ func (m *drRelationshipManager) GenerateActivationToken(ctx context.Context) (*D
 
 	now := time.Now().UTC()
 	relationship := &DRRelationship{
-		RelationshipID: relationshipID,
-		State:          DRRelationshipStatePending,
-		BootstrapToken: bootstrapToken,
-		CreatedAt:      now.Unix(),
-		ExpiresAt:      now.Add(drBootstrapTokenTTL).Unix(),
+		RelationshipID:     relationshipID,
+		State:              DRRelationshipStatePending,
+		BootstrapTokenHash: hashDRBootstrapToken(relationshipID, bootstrapToken),
+		CreatedAt:          now.Unix(),
+		ExpiresAt:          now.Add(drBootstrapTokenTTL).Unix(),
 	}
 	relBytes, err := json.Marshal(relationship)
 	if err != nil {
@@ -186,15 +332,67 @@ func (m *drRelationshipManager) primaryAPICACertFromConfig() []byte {
 	return nil
 }
 
-func (m *drRelationshipManager) recordBootstrapFailureLocked(ctx context.Context, rel *DRRelationship, reason string, now time.Time) {
+func validateDRBootstrapRegistrationInput(relationshipID, bootstrapToken string, secondaryCACert []byte) error {
+	if relationshipID == "" {
+		return fmt.Errorf("relationship_id is required")
+	}
+	if _, err := uuid.ParseUUID(relationshipID); err != nil {
+		return fmt.Errorf("relationship_id must be a valid UUID")
+	}
+	if bootstrapToken == "" {
+		return fmt.Errorf("bootstrap_token is required")
+	}
+	if _, err := uuid.ParseUUID(bootstrapToken); err != nil {
+		return fmt.Errorf("bootstrap_token must be a valid UUID")
+	}
+	if len(secondaryCACert) == 0 {
+		return fmt.Errorf("secondary_ca_cert is required")
+	}
+	if len(secondaryCACert) > drBootstrapMaxCertDERBytes {
+		return fmt.Errorf("secondary_ca_cert exceeds maximum DER size %d", drBootstrapMaxCertDERBytes)
+	}
+	return nil
+}
+
+func hashDRBootstrapToken(relationshipID, bootstrapToken string) string {
+	sum := sha256.Sum256([]byte(drBootstrapTokenHashDomain + "\x00" + relationshipID + "\x00" + bootstrapToken))
+	return hex.EncodeToString(sum[:])
+}
+
+func bootstrapTokenMatches(rel *DRRelationship, bootstrapToken string) bool {
+	if rel == nil {
+		return false
+	}
+	if rel.BootstrapTokenHash != "" {
+		got := hashDRBootstrapToken(rel.RelationshipID, bootstrapToken)
+		return subtle.ConstantTimeCompare([]byte(got), []byte(rel.BootstrapTokenHash)) == 1
+	}
+	if rel.BootstrapToken != "" {
+		return subtle.ConstantTimeCompare([]byte(rel.BootstrapToken), []byte(bootstrapToken)) == 1
+	}
+	return false
+}
+
+func (m *drRelationshipManager) recordBootstrapFailureLocked(ctx context.Context, rel *DRRelationship, reason string, now time.Time, sourceIP string, terminal bool) {
+	if rel == nil {
+		return
+	}
 	rel.FailedAttempts++
 	rel.LastError = reason
-	if rel.FailedAttempts >= drBootstrapMaxFailedAttempts {
+	rel.LastFailedAt = now.Unix()
+	rel.LastFailedFromIP = sourceIP
+	if rel.State == DRRelationshipStatePending && (terminal || rel.FailedAttempts >= drBootstrapMaxFailedAttempts) {
+		rel.State = DRRelationshipStateRevoked
+		rel.BootstrapToken = ""
+		rel.BootstrapTokenHash = ""
+		rel.ExpiresAt = 0
+		rel.RevokedAt = now.Unix()
 		rel.LockedUntil = now.Add(drBootstrapLockoutDuration).Unix()
-		m.logger.Warn("DR bootstrap registration locked due to repeated failures",
+		m.logger.Warn("DR bootstrap registration reached terminal failure",
 			"relationship_id", rel.RelationshipID,
 			"failed_attempts", rel.FailedAttempts,
-			"locked_until", rel.LockedUntil)
+			"locked_until", rel.LockedUntil,
+			"terminal", true)
 	}
 	if err := m.saveRelationship(ctx, rel); err != nil {
 		m.logger.Warn("failed to persist DR bootstrap failure",
@@ -204,12 +402,13 @@ func (m *drRelationshipManager) recordBootstrapFailureLocked(ctx context.Context
 	m.logger.Warn("DR bootstrap registration failed",
 		"relationship_id", rel.RelationshipID,
 		"failed_attempts", rel.FailedAttempts,
-		"reason", reason)
+		"reason", reason,
+		"source_ip", sourceIP)
 }
 
 // ValidateBootstrapAndStoreCert validates a bootstrap token and stores the
-// secondary's CA certificate. Returns an error if the token is invalid or
-// already consumed.
+// secondary's DR client certificate trust anchor. Returns an error if the token
+// is invalid or already consumed.
 func (m *drRelationshipManager) ValidateBootstrapAndStoreCert(ctx context.Context, relationshipID string, bootstrapToken string, secondaryCACert []byte) error {
 	return m.ValidateBootstrapAndStoreCertWithSourceIP(ctx, relationshipID, bootstrapToken, secondaryCACert, "")
 }
@@ -217,6 +416,10 @@ func (m *drRelationshipManager) ValidateBootstrapAndStoreCert(ctx context.Contex
 // ValidateBootstrapAndStoreCertWithSourceIP validates bootstrap registration
 // and records the source IP of successful registration.
 func (m *drRelationshipManager) ValidateBootstrapAndStoreCertWithSourceIP(ctx context.Context, relationshipID string, bootstrapToken string, secondaryCACert []byte, sourceIP string) error {
+	if err := validateDRBootstrapRegistrationInput(relationshipID, bootstrapToken, secondaryCACert); err != nil {
+		return err
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -236,12 +439,15 @@ func (m *drRelationshipManager) ValidateBootstrapAndStoreCertWithSourceIP(ctx co
 	nowUnix := now.Unix()
 
 	if matchedRel.State != DRRelationshipStatePending {
-		m.recordBootstrapFailureLocked(ctx, matchedRel, "relationship is not pending", now)
+		m.logger.Warn("DR bootstrap registration rejected for non-pending relationship",
+			"relationship_id", matchedRel.RelationshipID,
+			"state", matchedRel.State,
+			"source_ip", sourceIP)
 		return fmt.Errorf("invalid or already-used bootstrap token")
 	}
 
 	if matchedRel.ExpiresAt > 0 && matchedRel.ExpiresAt <= nowUnix {
-		m.recordBootstrapFailureLocked(ctx, matchedRel, "bootstrap token expired", now)
+		m.recordBootstrapFailureLocked(ctx, matchedRel, "bootstrap token expired", now, sourceIP, true)
 		return fmt.Errorf("bootstrap token expired")
 	}
 
@@ -250,50 +456,68 @@ func (m *drRelationshipManager) ValidateBootstrapAndStoreCertWithSourceIP(ctx co
 	}
 
 	if matchedRel.RegisteredFromIP != "" && sourceIP != "" && matchedRel.RegisteredFromIP != sourceIP {
-		m.recordBootstrapFailureLocked(ctx, matchedRel, "source IP mismatch", now)
+		m.recordBootstrapFailureLocked(ctx, matchedRel, "source IP mismatch", now, sourceIP, false)
 		return fmt.Errorf("registration source IP mismatch")
 	}
 
-	if matchedRel.BootstrapToken != bootstrapToken {
-		m.recordBootstrapFailureLocked(ctx, matchedRel, "bootstrap token mismatch", now)
+	if !bootstrapTokenMatches(matchedRel, bootstrapToken) {
+		m.recordBootstrapFailureLocked(ctx, matchedRel, "bootstrap token mismatch", now, sourceIP, false)
 		return fmt.Errorf("invalid or already-used bootstrap token")
 	}
 
-	// Parse and validate the secondary's CA cert.
+	// Parse and validate the secondary's DR client certificate trust anchor.
 	cert, err := x509.ParseCertificate(secondaryCACert)
 	if err != nil {
-		m.recordBootstrapFailureLocked(ctx, matchedRel, "invalid secondary certificate", now)
+		m.recordBootstrapFailureLocked(ctx, matchedRel, "invalid secondary certificate", now, sourceIP, false)
+		return fmt.Errorf("invalid secondary CA certificate: %w", err)
+	}
+	if err := validateDRSecondaryClientCert(cert, now); err != nil {
+		m.recordBootstrapFailureLocked(ctx, matchedRel, "invalid secondary certificate", now, sourceIP, false)
 		return fmt.Errorf("invalid secondary CA certificate: %w", err)
 	}
 
-	// Enforce fingerprint uniqueness: a secondary cert fingerprint can
-	// be bound to at most one active (non-revoked) relationship.
+	// Enforce fingerprint uniqueness: a secondary cert fingerprint can be
+	// bound to at most one relationship lineage. Reusing a revoked
+	// relationship credential with a fresh bootstrap token would revive stale
+	// credential material, so revoked relationships are included in the scan.
 	newFP := certFingerprintSHA256(cert)
-	if existingRel, fpErr := m.findActiveRelationshipByFingerprint(ctx, newFP); fpErr == nil && existingRel != nil {
+	if isStalePostPromotionFingerprint(m.config.Promotion, newFP) {
+		m.recordBootstrapFailureLocked(ctx, matchedRel, "stale pre-promotion certificate fingerprint", now, sourceIP, true)
+		return fmt.Errorf("certificate fingerprint belongs to stale pre-promotion DR lineage")
+	}
+	if existingRel, fpErr := m.findRelationshipByFingerprint(ctx, newFP); fpErr == nil && existingRel != nil {
 		if existingRel.RelationshipID != matchedRel.RelationshipID {
-			m.recordBootstrapFailureLocked(ctx, matchedRel, "duplicate fingerprint", now)
-			return fmt.Errorf("certificate fingerprint already bound to active relationship %q", existingRel.RelationshipID)
+			m.recordBootstrapFailureLocked(ctx, matchedRel, "duplicate fingerprint", now, sourceIP, false)
+			return fmt.Errorf("certificate fingerprint already bound to relationship %q", existingRel.RelationshipID)
 		}
 	}
 
-	// Add the cert to the handler's trusted pool.
-	m.handler.AddTrustedCert(matchedRel.RelationshipID, cert)
-
 	// Update relationship: store cert, clear bootstrap token, and mark registered.
 	matchedRel.SecondaryCACert = secondaryCACert
-	matchedRel.SecondaryCertFingerprint = certFingerprintSHA256(cert)
+	matchedRel.SecondaryCertFingerprint = newFP
+	matchedRel.CredentialGeneration = 1
 	matchedRel.BootstrapToken = ""
+	matchedRel.BootstrapTokenHash = ""
 	matchedRel.State = DRRelationshipStateRegistered
 	matchedRel.LastSeenAt = nowUnix
+	matchedRel.RegisteredAt = nowUnix
 	matchedRel.FailedAttempts = 0
 	matchedRel.LockedUntil = 0
 	matchedRel.ExpiresAt = 0
 	matchedRel.LastError = ""
+	matchedRel.LastFailedAt = 0
+	matchedRel.LastFailedFromIP = ""
 	matchedRel.RegisteredFromIP = sourceIP
 
 	if err := m.saveRelationship(ctx, matchedRel); err != nil {
 		return fmt.Errorf("failed to persist relationship certificate: %w", err)
 	}
+
+	// Add the cert to the handler's trusted pool only after the relationship
+	// record is durably updated. Otherwise a failed write could leave an
+	// in-memory trust entry without matching persisted authorization state.
+	m.handler.AddTrustedCert(matchedRel.RelationshipID, cert)
+
 	m.latestSeenAt[matchedRel.RelationshipID] = nowUnix
 	m.lastSeenWriteAt[matchedRel.RelationshipID] = now
 
@@ -322,83 +546,20 @@ func (m *drRelationshipManager) registerWithPrimary(ctx context.Context, token *
 		return nil
 	}
 
-	// Get the secondary's own cluster CA cert (DER).
-	localCert := m.core.localClusterParsedCert.Load()
-	if localCert == nil {
-		return fmt.Errorf("no local cluster certificate available for registration")
+	if m.config == nil || len(m.config.SecondaryClientCert) == 0 {
+		return fmt.Errorf("missing DR secondary client certificate for registration")
 	}
+	secondaryCertDER := m.config.SecondaryClientCert
 
 	// Build the request body. The cert is base64-encoded DER as expected
 	// by the registration endpoint.
 	body := map[string]interface{}{
 		"relationship_id":   token.RelationshipID,
 		"bootstrap_token":   token.BootstrapToken,
-		"secondary_ca_cert": base64.StdEncoding.EncodeToString(localCert.Raw),
+		"secondary_ca_cert": base64.StdEncoding.EncodeToString(secondaryCertDER),
 	}
-	bodyBytes, err := json.Marshal(body)
-	if err != nil {
-		return fmt.Errorf("failed to marshal registration request: %w", err)
-	}
-
-	// Build TLS config for the registration HTTP call. Prefer the
-	// API-specific CA if present; otherwise fall back to cluster CA.
-	caBytes := token.PrimaryAPICACert
-	if len(caBytes) == 0 {
-		caBytes = token.DRTransportCACert
-	}
-	if len(caBytes) == 0 {
-		return fmt.Errorf("missing primary API CA certificate in activation token")
-	}
-	primaryCert, err := x509.ParseCertificate(caBytes)
-	if err != nil {
-		return fmt.Errorf("invalid primary API CA certificate in activation token: %w", err)
-	}
-	pool := x509.NewCertPool()
-	pool.AddCert(primaryCert)
-
-	serverName := token.PrimaryAPIServerName
-	if serverName == "" {
-		serverName = deriveServerName(apiAddr)
-	}
-	if serverName == "" {
-		return fmt.Errorf("failed to determine primary API TLS server name from activation token")
-	}
-
-	tlsConfig := &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		RootCAs:    pool,
-		ServerName: serverName,
-	}
-
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: (&net.Dialer{
-				Timeout: drRegistrationDialTimeout,
-			}).DialContext,
-			TLSClientConfig:       tlsConfig,
-			TLSHandshakeTimeout:   drRegistrationTLSHandshakeTimeout,
-			ResponseHeaderTimeout: drRegistrationResponseHeaderTimeout,
-			ExpectContinueTimeout: 1 * time.Second,
-			IdleConnTimeout:       30 * time.Second,
-		},
-		Timeout: drRegistrationRequestTimeout,
-	}
-
-	url := fmt.Sprintf("%s/v1/sys/replication/dr/primary/register-secondary", apiAddr)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return fmt.Errorf("failed to create registration request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
+	if err := postDRPrimaryAPIJSON(ctx, drPrimaryAPIClientConfigFromActivationToken(token), "replication/dr/primary/register-secondary", body); err != nil {
 		return fmt.Errorf("registration request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("registration request returned status %d", resp.StatusCode)
 	}
 
 	m.logger.Info("successfully registered with primary")

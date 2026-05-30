@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -32,10 +33,15 @@ const (
 	drReplSaltLen = 32
 
 	// Bootstrap token policy defaults.
-	drBootstrapTokenTTL           = 15 * time.Minute
-	drBootstrapMaxFailedAttempts  = 5
-	drBootstrapLockoutDuration    = 30 * time.Minute
-	drRelationshipCleanupInterval = 24 * time.Hour
+	drBootstrapTokenTTL            = 15 * time.Minute
+	drBootstrapMaxFailedAttempts   = 5
+	drBootstrapLockoutDuration     = 30 * time.Minute
+	drBootstrapMaxCertDERBytes     = 64 * 1024
+	drActivationTokenMaxBytes      = 256 * 1024
+	drCredentialRotationMaxSkew    = 5 * time.Minute
+	drCredentialRotationPendingTTL = 30 * time.Minute
+	drCredentialRotationMaxSigLen  = 8 * 1024
+	drRelationshipCleanupInterval  = 24 * time.Hour
 
 	// Persist relationship heartbeat writes at most once per interval.
 	drLastSeenPersistInterval = 30 * time.Second
@@ -49,6 +55,37 @@ const (
 	DRModePrimary   DRMode = "primary"
 	DRModeSecondary DRMode = "secondary"
 )
+
+// DRPromotionClass records whether a DR promotion was fully caught up or
+// required an explicit data-loss acknowledgement.
+type DRPromotionClass string
+
+const (
+	DRPromotionClean  DRPromotionClass = "clean"
+	DRPromotionForced DRPromotionClass = "forced"
+)
+
+// DRPromotionRecord is persisted after a secondary is promoted so stale
+// upstream relationship state cannot be mistaken for a resumable stream.
+type DRPromotionRecord struct {
+	PromotionID                 string           `json:"promotion_id"`
+	PromotedAt                  int64            `json:"promoted_at"`
+	OldPrimaryClusterID         string           `json:"old_primary_cluster_id,omitempty"`
+	OldRelationshipID           string           `json:"old_relationship_id,omitempty"`
+	OldSecondaryCertFingerprint string           `json:"old_secondary_cert_fingerprint,omitempty"`
+	StalePrimaryClusterIDs      []string         `json:"stale_primary_cluster_ids,omitempty"`
+	StaleRelationshipIDs        []string         `json:"stale_relationship_ids,omitempty"`
+	StaleSecondaryFingerprints  []string         `json:"stale_secondary_fingerprints,omitempty"`
+	LocalClusterID              string           `json:"local_cluster_id,omitempty"`
+	LastAppliedIndex            uint64           `json:"last_applied_index"`
+	LastKnownPrimaryIndex       uint64           `json:"last_known_primary_index"`
+	PromotionClass              DRPromotionClass `json:"promotion_class"`
+	EstimatedDataLossEntries    uint64           `json:"estimated_data_loss_entries,omitempty"`
+	DataLossEstimateBasis       string           `json:"data_loss_estimate_basis,omitempty"`
+	DataLossAccepted            bool             `json:"data_loss_accepted,omitempty"`
+	ForcedReasonCodes           []string         `json:"forced_reason_codes,omitempty"`
+	ForcedReasonDetails         []string         `json:"forced_reason_details,omitempty"`
+}
 
 // DRConfig is the persistent DR replication configuration.
 type DRConfig struct {
@@ -75,6 +112,31 @@ type DRConfig struct {
 	// Persisted so the secondary can re-establish mTLS after a restart.
 	// This is the sole trust anchor for verifying primary identity.
 	PrimaryCACert []byte `json:"primary_ca_cert,omitempty"`
+
+	// PrimaryAPIAddr, PrimaryAPICACert, and PrimaryAPIServerName describe the
+	// primary HTTP API endpoint used for bootstrap registration and later
+	// first-class secondary credential rotation.
+	PrimaryAPIAddr       string `json:"primary_api_addr,omitempty"`
+	PrimaryAPICACert     []byte `json:"primary_api_ca_cert,omitempty"`
+	PrimaryAPIServerName string `json:"primary_api_server_name,omitempty"`
+
+	// SecondaryClientCert and SecondaryClientKeyPEM are the secondary's stable
+	// DR client certificate material. The certificate is registered with the
+	// primary and the private key remains barrier-encrypted in local DR config.
+	SecondaryClientCert   []byte `json:"secondary_client_cert,omitempty"`
+	SecondaryClientKeyPEM []byte `json:"secondary_client_key_pem,omitempty"`
+
+	// PendingSecondaryClientCert and PendingSecondaryClientKeyPEM are local
+	// durable state for an in-progress first-class secondary credential rotation.
+	// The current credential remains active until the primary confirms the
+	// pending credential.
+	PendingSecondaryClientCert        []byte `json:"pending_secondary_client_cert,omitempty"`
+	PendingSecondaryClientKeyPEM      []byte `json:"pending_secondary_client_key_pem,omitempty"`
+	PendingSecondaryRotationOperation string `json:"pending_secondary_rotation_operation,omitempty"`
+	PendingSecondaryRotationStartedAt int64  `json:"pending_secondary_rotation_started_at,omitempty"`
+
+	// Promotion records the most recent secondary promotion lineage.
+	Promotion *DRPromotionRecord `json:"promotion,omitempty"`
 
 	// ReconcileIntegrityMode controls Phase A match behavior.
 	// "performance" (default): Phase A match skips to next range.
@@ -188,6 +250,17 @@ func normalizePrimaryAddr(addr string) string {
 	return addr
 }
 
+func normalizePrimaryAPIAddr(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return ""
+	}
+	if strings.HasPrefix(addr, "http://") || strings.HasPrefix(addr, "https://") {
+		return addr
+	}
+	return "https://" + addr
+}
+
 func normalizePrimaryAddrs(primaryAddrs []string) []string {
 	out := make([]string, 0, len(primaryAddrs))
 	seen := make(map[string]struct{}, len(primaryAddrs))
@@ -209,6 +282,96 @@ func normalizePrimaryAddrs(primaryAddrs []string) []string {
 	return out
 }
 
+func isStalePostPromotionActivationToken(promotion *DRPromotionRecord, token *DRActivationToken) bool {
+	if promotion == nil || token == nil {
+		return false
+	}
+	return isStalePostPromotionLineage(promotion, token.ClusterID, token.RelationshipID)
+}
+
+func isStalePostPromotionLineage(promotion *DRPromotionRecord, clusterID, relationshipID string) bool {
+	if promotion == nil {
+		return false
+	}
+	if promotion.OldPrimaryClusterID != "" && clusterID == promotion.OldPrimaryClusterID {
+		return true
+	}
+	for _, staleClusterID := range promotion.StalePrimaryClusterIDs {
+		if staleClusterID != "" && clusterID == staleClusterID {
+			return true
+		}
+	}
+	if promotion.OldRelationshipID != "" && relationshipID == promotion.OldRelationshipID {
+		return true
+	}
+	for _, staleRelationshipID := range promotion.StaleRelationshipIDs {
+		if staleRelationshipID != "" && relationshipID == staleRelationshipID {
+			return true
+		}
+	}
+	return false
+}
+
+func isStalePostPromotionFingerprint(promotion *DRPromotionRecord, fingerprint string) bool {
+	if promotion == nil || fingerprint == "" {
+		return false
+	}
+	if promotion.OldSecondaryCertFingerprint != "" && strings.EqualFold(fingerprint, promotion.OldSecondaryCertFingerprint) {
+		return true
+	}
+	for _, staleFingerprint := range promotion.StaleSecondaryFingerprints {
+		if staleFingerprint != "" && strings.EqualFold(fingerprint, staleFingerprint) {
+			return true
+		}
+	}
+	return false
+}
+
+func appendUniquePromotionStrings(dst []string, values ...string) []string {
+	seen := make(map[string]struct{}, len(dst)+len(values))
+	out := make([]string, 0, len(dst)+len(values))
+	for _, value := range dst {
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
+func inheritPromotionLineage(dst *DRPromotionRecord, previous *DRPromotionRecord) {
+	if dst == nil || previous == nil {
+		return
+	}
+	dst.StalePrimaryClusterIDs = appendUniquePromotionStrings(dst.StalePrimaryClusterIDs, previous.OldPrimaryClusterID)
+	dst.StalePrimaryClusterIDs = appendUniquePromotionStrings(dst.StalePrimaryClusterIDs, previous.StalePrimaryClusterIDs...)
+	dst.StaleRelationshipIDs = appendUniquePromotionStrings(dst.StaleRelationshipIDs, previous.OldRelationshipID)
+	dst.StaleRelationshipIDs = appendUniquePromotionStrings(dst.StaleRelationshipIDs, previous.StaleRelationshipIDs...)
+	dst.StaleSecondaryFingerprints = appendUniquePromotionStrings(dst.StaleSecondaryFingerprints, previous.OldSecondaryCertFingerprint)
+	dst.StaleSecondaryFingerprints = appendUniquePromotionStrings(dst.StaleSecondaryFingerprints, previous.StaleSecondaryFingerprints...)
+}
+
+func disabledConfigPreservingPromotion(promotion *DRPromotionRecord) *DRConfig {
+	return &DRConfig{
+		Mode:      DRModeDisabled,
+		Promotion: promotion,
+	}
+}
+
 type DRRelationship struct {
 	RelationshipID string              `json:"relationship_id"`
 	State          DRRelationshipState `json:"state"`
@@ -219,8 +382,32 @@ type DRRelationship struct {
 	// SecondaryCACert is the secondary cluster CA/leaf cert bytes used for mTLS trust.
 	SecondaryCACert []byte `json:"secondary_ca_cert,omitempty"`
 
-	// BootstrapToken is one-time secret used for cert registration.
+	// PreviousSecondaryCertFingerprint is retained after first-class credential
+	// rotation so stale credentials cannot be reused in another relationship.
+	PreviousSecondaryCertFingerprint string `json:"previous_secondary_cert_fingerprint,omitempty"`
+
+	// PendingSecondaryCertFingerprint and PendingSecondaryCACert represent a
+	// staged first-class credential rotation. While pending, both the current and
+	// pending certs are trusted so the secondary can switch certificates and
+	// confirm with the new credential.
+	PendingSecondaryCertFingerprint string `json:"pending_secondary_cert_fingerprint,omitempty"`
+	PendingSecondaryCACert          []byte `json:"pending_secondary_ca_cert,omitempty"`
+	PendingRotationOperationID      string `json:"pending_rotation_operation_id,omitempty"`
+	PendingRotationStartedAt        int64  `json:"pending_rotation_started_at,omitempty"`
+
+	// CredentialGeneration starts at 1 after bootstrap registration and
+	// increments after each finalized first-class rotation.
+	CredentialGeneration uint64 `json:"credential_generation,omitempty"`
+	RotatedAt            int64  `json:"rotated_at,omitempty"`
+
+	// BootstrapToken is retained only to decode legacy pending records that
+	// stored the one-time secret directly. New records store BootstrapTokenHash.
 	BootstrapToken string `json:"bootstrap_token,omitempty"`
+
+	// BootstrapTokenHash is a verifier for the one-time cert-registration token.
+	// The bearer token itself is returned only in the activation token and is
+	// not persisted in relationship state.
+	BootstrapTokenHash string `json:"bootstrap_token_hash,omitempty"`
 
 	CreatedAt  int64 `json:"created_at"`
 	LastSeenAt int64 `json:"last_seen_at"`
@@ -236,6 +423,14 @@ type DRRelationship struct {
 
 	// RegisteredFromIP is the source IP that successfully registered the cert.
 	RegisteredFromIP string `json:"registered_from_ip,omitempty"`
+
+	// RegisteredAt records the successful bootstrap registration timestamp.
+	RegisteredAt int64 `json:"registered_at,omitempty"`
+
+	// LastFailedAt and LastFailedFromIP record the latest failed bootstrap
+	// registration attempt for audit/status surfaces.
+	LastFailedAt     int64  `json:"last_failed_at,omitempty"`
+	LastFailedFromIP string `json:"last_failed_from_ip,omitempty"`
 
 	// RevokedAt is the revoke timestamp, if revoked.
 	RevokedAt int64 `json:"revoked_at,omitempty"`
@@ -373,6 +568,15 @@ func applyDRConfigDefaults(cfg *DRConfig) {
 		cfg.StreamJournalSegmentBytes == drDefaultStreamJournalSegmentBytes {
 		cfg.StreamJournalEnabled = true
 	}
+	if cfg.PrimaryAPIAddr != "" {
+		cfg.PrimaryAPIAddr = normalizePrimaryAPIAddr(cfg.PrimaryAPIAddr)
+		if len(cfg.PrimaryAPICACert) == 0 {
+			cfg.PrimaryAPICACert = cfg.PrimaryCACert
+		}
+		if cfg.PrimaryAPIServerName == "" {
+			cfg.PrimaryAPIServerName = deriveServerName(cfg.PrimaryAPIAddr)
+		}
+	}
 	if cfg.ReconcileApplyWorkers <= 0 {
 		cfg.ReconcileApplyWorkers = drDefaultReconcileApplyWorkers
 	}
@@ -443,6 +647,18 @@ func (m *drRelationshipManager) LoadConfig(ctx context.Context) error {
 		return fmt.Errorf("failed to unmarshal DR config: %w", err)
 	}
 	applyDRConfigDefaults(&config)
+	if config.Mode == DRModeSecondary && isStalePostPromotionLineage(config.Promotion, config.ClusterID, config.RelationshipID) {
+		m.logger.Warn("rejecting stale post-promotion DR secondary config during restore",
+			"cluster_id", config.ClusterID,
+			"relationship_id", config.RelationshipID)
+		m.config = disabledConfigPreservingPromotion(config.Promotion)
+		m.stopSecondaryRuntimeLocked()
+		m.core.replicationState.Store(uint32(consts.ReplicationDRDisabled))
+		if err := m.saveConfig(ctx); err != nil {
+			return fmt.Errorf("failed to disable stale post-promotion DR secondary config: %w", err)
+		}
+		return nil
+	}
 	m.config = &config
 
 	// Restore replication state based on persisted config.
@@ -452,8 +668,7 @@ func (m *drRelationshipManager) LoadConfig(ctx context.Context) error {
 
 		// Load the DR transport CA from barrier storage so the handler can
 		// mint a CA-signed leaf cert. Without this, new leaders after a
-		// stepdown would fall back to the self-signed cluster cert and
-		// secondaries would reject the connection.
+		// stepdown cannot present a valid DR transport identity.
 		transportCA, err := loadDRTransportCA(m.core)
 		if err != nil {
 			m.logger.Error("failed to load DR transport CA during config restore", "error", err)
@@ -493,7 +708,11 @@ func (m *drRelationshipManager) LoadConfig(ctx context.Context) error {
 		m.handler = newDRReplicationClusterHandler(m.core, m.primary, m.logger)
 		if m.transportCA != nil {
 			if err := m.handler.SetTransportCA(m.transportCA); err != nil {
-				m.logger.Error("failed to mint DR transport leaf cert on restore", "error", err)
+				if errors.Is(err, errDRTransportLeafKeyUnavailable) {
+					m.logger.Debug("deferring DR transport leaf cert mint until local cluster key is available")
+				} else {
+					m.logger.Error("failed to mint DR transport leaf cert on restore", "error", err)
+				}
 			}
 			m.handler.startLeafRenewal(m.transportCA)
 		}
@@ -534,6 +753,11 @@ func (m *drRelationshipManager) LoadConfig(ctx context.Context) error {
 		// Restore the primary's CA cert so mTLS works after restart.
 		if len(config.PrimaryCACert) > 0 {
 			m.secondary.primaryCACert = config.PrimaryCACert
+		}
+		if len(config.SecondaryClientCert) > 0 || len(config.SecondaryClientKeyPEM) > 0 {
+			if err := m.secondary.setClientCertificate(config.SecondaryClientCert, config.SecondaryClientKeyPEM); err != nil {
+				return fmt.Errorf("invalid DR secondary client certificate: %w", err)
+			}
 		}
 
 		m.core.replicationState.Store(uint32(consts.ReplicationDRSecondary))
@@ -639,6 +863,18 @@ func (m *drRelationshipManager) RefreshConfigFromStorage(ctx context.Context) (D
 		return m.config.Mode, fmt.Errorf("failed to unmarshal DR config: %w", err)
 	}
 	applyDRConfigDefaults(&config)
+	if config.Mode == DRModeSecondary && isStalePostPromotionLineage(config.Promotion, config.ClusterID, config.RelationshipID) {
+		m.logger.Warn("rejecting stale post-promotion DR secondary config during refresh",
+			"cluster_id", config.ClusterID,
+			"relationship_id", config.RelationshipID)
+		m.config = disabledConfigPreservingPromotion(config.Promotion)
+		m.stopSecondaryRuntimeLocked()
+		m.core.replicationState.Store(uint32(consts.ReplicationDRDisabled))
+		if err := m.saveConfig(ctx); err != nil {
+			return m.config.Mode, fmt.Errorf("failed to disable stale post-promotion DR secondary config: %w", err)
+		}
+		return DRModeDisabled, nil
+	}
 
 	if config.Mode == DRModeSecondary {
 		normalized := normalizePrimaryAddrs(config.PrimaryAddrs)
@@ -681,6 +917,7 @@ func (m *drRelationshipManager) EnablePrimary(ctx context.Context) error {
 		Mode:      DRModePrimary,
 		ClusterID: clusterID,
 		ReplSalt:  replSalt,
+		Promotion: oldConfig.Promotion,
 
 		FallbackEnabled:                     drDefaultFallbackEnabled,
 		FallbackStallSeconds:                int64(drDefaultFallbackStall / time.Second),
@@ -747,9 +984,13 @@ func (m *drRelationshipManager) EnablePrimary(ctx context.Context) error {
 	// Register the DR handler on the cluster listener for mTLS-secured gRPC.
 	m.handler = newDRReplicationClusterHandler(m.core, m.primary, m.logger)
 	if err := m.handler.SetTransportCA(m.transportCA); err != nil {
-		m.logger.Error("failed to mint DR transport leaf cert", "error", err)
-		// Non-fatal: handler will fall back to self-signed cluster cert
-		// but secondaries will reject the connection. Log loudly.
+		if errors.Is(err, errDRTransportLeafKeyUnavailable) {
+			m.logger.Warn("deferring DR transport leaf cert mint until local cluster key is available")
+		} else {
+			m.logger.Error("failed to mint DR transport leaf cert", "error", err)
+		}
+		// Non-fatal: the handler will retry and will not serve the
+		// self-signed fallback cert while a DR transport CA is configured.
 	}
 	registerDRHandler(m.core, m.handler)
 
@@ -772,7 +1013,7 @@ func (m *drRelationshipManager) DisablePrimary(ctx context.Context) error {
 	}
 
 	oldConfig := m.config
-	m.config = &DRConfig{Mode: DRModeDisabled}
+	m.config = disabledConfigPreservingPromotion(oldConfig.Promotion)
 	if err := m.saveConfig(ctx); err != nil {
 		m.config = oldConfig
 		return err
@@ -808,8 +1049,17 @@ func (m *drRelationshipManager) EnableSecondary(ctx context.Context, token *DRAc
 	if m.config.Mode != DRModeDisabled {
 		return fmt.Errorf("DR replication already enabled as %s", m.config.Mode)
 	}
+	if token == nil {
+		return fmt.Errorf("activation token is required")
+	}
+	if token.ClusterID == "" {
+		return fmt.Errorf("activation token missing cluster_id")
+	}
 	if token.RelationshipID == "" {
 		return fmt.Errorf("activation token missing relationship_id")
+	}
+	if isStalePostPromotionActivationToken(m.config.Promotion, token) {
+		return fmt.Errorf("activation token references a stale pre-promotion DR lineage; create a new relationship from the promoted authority")
 	}
 	normalizedPrimaryAddrs := normalizePrimaryAddrs(token.PrimaryAddrs)
 	if len(normalizedPrimaryAddrs) == 0 {
@@ -817,15 +1067,26 @@ func (m *drRelationshipManager) EnableSecondary(ctx context.Context, token *DRAc
 	}
 	primaryAddr := normalizedPrimaryAddrs[0]
 
+	secondaryClientCert, secondaryClientKeyPEM, err := generateDRSecondaryClientCert()
+	if err != nil {
+		return fmt.Errorf("failed to generate DR secondary client certificate: %w", err)
+	}
+
 	oldConfig := m.config
 	m.config = &DRConfig{
-		Mode:           DRModeSecondary,
-		ClusterID:      token.ClusterID,
-		RelationshipID: token.RelationshipID,
-		ReplSalt:       token.ReplSalt,
-		PrimaryAddr:    primaryAddr,
-		PrimaryAddrs:   normalizedPrimaryAddrs,
-		PrimaryCACert:  token.DRTransportCACert,
+		Mode:                  DRModeSecondary,
+		ClusterID:             token.ClusterID,
+		RelationshipID:        token.RelationshipID,
+		ReplSalt:              token.ReplSalt,
+		PrimaryAddr:           primaryAddr,
+		PrimaryAddrs:          normalizedPrimaryAddrs,
+		PrimaryCACert:         token.DRTransportCACert,
+		PrimaryAPIAddr:        normalizePrimaryAPIAddr(token.PrimaryAPIAddr),
+		PrimaryAPICACert:      token.PrimaryAPICACert,
+		PrimaryAPIServerName:  token.PrimaryAPIServerName,
+		SecondaryClientCert:   secondaryClientCert,
+		SecondaryClientKeyPEM: secondaryClientKeyPEM,
+		Promotion:             oldConfig.Promotion,
 
 		FallbackEnabled:          drDefaultFallbackEnabled,
 		FallbackStallSeconds:     int64(drDefaultFallbackStall / time.Second),
@@ -833,9 +1094,20 @@ func (m *drRelationshipManager) EnableSecondary(ctx context.Context, token *DRAc
 		FallbackCooldownSeconds:  int64(drDefaultFallbackCooldown / time.Second),
 		FallbackMaxPerHour:       drDefaultFallbackMaxPerHour,
 	}
+	if len(m.config.PrimaryAPICACert) == 0 {
+		m.config.PrimaryAPICACert = token.DRTransportCACert
+	}
+	if m.config.PrimaryAPIServerName == "" {
+		m.config.PrimaryAPIServerName = deriveServerName(m.config.PrimaryAPIAddr)
+	}
 
 	if err := m.saveConfig(ctx); err != nil {
 		m.config = oldConfig
+		return err
+	}
+	if err := m.clearSecondaryCheckpointCursor(ctx); err != nil {
+		m.config = oldConfig
+		_ = m.saveConfig(ctx)
 		return err
 	}
 
@@ -848,6 +1120,10 @@ func (m *drRelationshipManager) EnableSecondary(ctx context.Context, token *DRAc
 	)
 	m.applySecondaryTunablesLocked()
 	m.secondary.primaryCACert = token.DRTransportCACert
+	if err := m.secondary.setClientCertificate(secondaryClientCert, secondaryClientKeyPEM); err != nil {
+		m.config = oldConfig
+		return fmt.Errorf("failed to configure DR secondary client certificate: %w", err)
+	}
 
 	m.core.replicationState.Store(uint32(consts.ReplicationDRSecondary))
 
@@ -883,20 +1159,18 @@ func (m *drRelationshipManager) DisableSecondary(ctx context.Context) error {
 	}
 
 	oldConfig := m.config
-	m.config = &DRConfig{Mode: DRModeDisabled}
+	m.config = disabledConfigPreservingPromotion(oldConfig.Promotion)
 	if err := m.saveConfig(ctx); err != nil {
 		m.config = oldConfig
 		return err
 	}
-
-	if m.secondary != nil {
-		if m.secondaryLoopCancel != nil {
-			m.secondaryLoopCancel()
-			m.secondaryLoopCancel = nil
-		}
-		m.secondary.Stop()
-		m.secondary = nil
+	if err := m.clearSecondaryCheckpointCursor(ctx); err != nil {
+		m.config = oldConfig
+		_ = m.saveConfig(ctx)
+		return err
 	}
+
+	m.stopSecondaryRuntimeLocked()
 
 	m.core.replicationState.Store(uint32(consts.ReplicationDRDisabled))
 
@@ -904,14 +1178,72 @@ func (m *drRelationshipManager) DisableSecondary(ctx context.Context) error {
 	return nil
 }
 
-// PromoteSecondary promotes this DR secondary to standalone primary.
+func (m *drRelationshipManager) clearSecondaryCheckpointCursor(ctx context.Context) error {
+	if m == nil || m.core == nil || m.core.barrier == nil {
+		return nil
+	}
+	if err := m.core.barrier.Delete(ctx, drCheckpointHWMPath); err != nil {
+		return fmt.Errorf("failed to clear DR secondary checkpoint cursor: %w", err)
+	}
+	return nil
+}
+
+// PromoteSecondary promotes this DR secondary to standalone mode.
 func (m *drRelationshipManager) PromoteSecondary(ctx context.Context) error {
+	return m.promoteSecondary(ctx, nil)
+}
+
+// PromoteSecondaryWithRecord promotes this DR secondary to standalone mode and
+// persists the promotion lineage record.
+func (m *drRelationshipManager) PromoteSecondaryWithRecord(ctx context.Context, promotion *DRPromotionRecord) error {
+	return m.promoteSecondary(ctx, promotion)
+}
+
+func (m *drRelationshipManager) promoteSecondary(ctx context.Context, promotion *DRPromotionRecord) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if m.config.Mode != DRModeSecondary {
 		return fmt.Errorf("not in DR secondary mode")
 	}
+
+	now := time.Now().UTC()
+	if promotion == nil {
+		promotionID, err := uuid.GenerateUUID()
+		if err != nil {
+			return fmt.Errorf("failed to generate promotion ID: %w", err)
+		}
+		promotion = &DRPromotionRecord{
+			PromotionID:    promotionID,
+			PromotedAt:     now.Unix(),
+			PromotionClass: DRPromotionForced,
+		}
+	}
+	promotionCopy := *promotion
+	if promotionCopy.PromotionID == "" {
+		promotionID, err := uuid.GenerateUUID()
+		if err != nil {
+			return fmt.Errorf("failed to generate promotion ID: %w", err)
+		}
+		promotionCopy.PromotionID = promotionID
+	}
+	if promotionCopy.PromotedAt == 0 {
+		promotionCopy.PromotedAt = now.Unix()
+	}
+	if promotionCopy.PromotionClass == "" {
+		promotionCopy.PromotionClass = DRPromotionForced
+	}
+	if promotionCopy.OldPrimaryClusterID == "" {
+		promotionCopy.OldPrimaryClusterID = m.config.ClusterID
+	}
+	if promotionCopy.OldRelationshipID == "" {
+		promotionCopy.OldRelationshipID = m.config.RelationshipID
+	}
+	if promotionCopy.OldSecondaryCertFingerprint == "" {
+		promotionCopy.OldSecondaryCertFingerprint = certFingerprintSHA256DER(m.config.SecondaryClientCert)
+	}
+	inheritPromotionLineage(&promotionCopy, m.config.Promotion)
+	promotion = &promotionCopy
 
 	if m.secondary != nil {
 		if m.secondaryLoopCancel != nil {
@@ -924,9 +1256,13 @@ func (m *drRelationshipManager) PromoteSecondary(ctx context.Context) error {
 		m.secondary = nil
 	}
 
-	// Transition to disabled (standalone) mode. The operator can
-	// re-enable as a primary if they want to accept new secondaries.
-	m.config.Mode = DRModeDisabled
+	// Transition to disabled (standalone) mode and clear stale upstream
+	// relationship material. A promoted cluster must not resume or merge with
+	// the old primary relationship after this safety boundary.
+	m.config = &DRConfig{
+		Mode:      DRModeDisabled,
+		Promotion: promotion,
+	}
 	if err := m.saveConfig(ctx); err != nil {
 		return err
 	}
@@ -937,12 +1273,25 @@ func (m *drRelationshipManager) PromoteSecondary(ctx context.Context) error {
 	return nil
 }
 
+func (m *drRelationshipManager) stopSecondaryRuntimeLocked() {
+	if m.secondary == nil {
+		return
+	}
+	if m.secondaryLoopCancel != nil {
+		m.secondaryLoopCancel()
+		m.secondaryLoopCancel = nil
+	}
+	m.secondary.Stop()
+	m.secondary = nil
+}
+
 // drSecondaryAllowedPaths are the API paths that can perform writes
 // even when the cluster is a DR secondary. All other write operations
 // are rejected with a read-only error.
 var drSecondaryAllowedPaths = []string{
 	"sys/replication/dr/secondary/promote",
 	"sys/replication/dr/secondary/disable",
+	"sys/replication/dr/secondary/rotate-certificate",
 	"sys/replication/dr/secondary/resnapshot",
 	"sys/replication/dr/tuning",
 	"sys/replication/dr/status",

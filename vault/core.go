@@ -2236,7 +2236,7 @@ func (readonlyUnsealStrategy) unsealShared(ctx context.Context, c *Core, standby
 	if err := c.setupMounts(ctx); err != nil {
 		return err
 	}
-	if err := c.setupPolicyStore(ctx); err != nil {
+	if err := c.setupPolicyStore(ctx, standby); err != nil {
 		return err
 	}
 	if err := c.loadCORSConfig(ctx); err != nil {
@@ -2328,6 +2328,16 @@ func (c *Core) postUnseal(ctx context.Context, ctxCancelFunc context.CancelFunc,
 	// previous state.
 	if err := c.loadVersionHistory(ctx); err != nil {
 		return err
+	}
+
+	// Load persisted DR role metadata before subsystem setup. A DR secondary
+	// may have replicated primary mount/auth tables in storage while still
+	// needing local singleton runtime routes during unseal. The full DR
+	// runtime is restored after post-unseal setup below.
+	if c.drManager != nil {
+		if _, err := c.drManager.RefreshConfigFromStorage(ctx); err != nil {
+			c.logger.Warn("failed to load DR replication config before post-unseal setup", "error", err)
+		}
 	}
 
 	if err := unsealer.unseal(ctx, c.logger, c); err != nil {
@@ -4033,7 +4043,7 @@ func (c *Core) performPolicyChecks(ctx context.Context, acl *policy.ACL, te *log
 
 // setupPolicyStore is used to initialize the policy store
 // when the vault is being unsealed.
-func (c *Core) setupPolicyStore(ctx context.Context) error {
+func (c *Core) setupPolicyStore(ctx context.Context, standby bool) error {
 	// Create the policy store
 	var err error
 	sysView := &dynamicSystemView{core: c}
@@ -4045,6 +4055,9 @@ func (c *Core) setupPolicyStore(ctx context.Context) error {
 	}
 
 	// Ensure that the default policy exists, and if not, create it
+	if standby {
+		return c.policyStore.LoadDefaultPoliciesAllowReadOnly(ctx)
+	}
 	return c.policyStore.LoadDefaultPolicies(ctx)
 }
 

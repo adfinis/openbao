@@ -251,7 +251,9 @@ func BuildRangeDigestFromIndex(index *RangeMapIndex, span RangeSpan) RangeDescri
 		return empty
 	}
 	keys := index.RangeKeys(span)
-	return buildRangeDescriptor(keys, index.kidToVID, index.entries, span.SplitDepth)
+	desc := buildRangeDescriptor(keys, index.kidToVID, index.entries, span.SplitDepth)
+	desc.Span = span
+	return desc
 }
 
 // ComputeRangeDigestFromItems computes a range digest from compact

@@ -28,6 +28,7 @@ func (m *drRelationshipManager) RevokeRelationship(ctx context.Context, relation
 
 	rel.State = DRRelationshipStateRevoked
 	rel.BootstrapToken = ""
+	rel.BootstrapTokenHash = ""
 	rel.LastSeenAt = time.Now().UTC().Unix()
 	rel.RevokedAt = rel.LastSeenAt
 	rel.LastError = ""
@@ -48,6 +49,14 @@ func (m *drRelationshipManager) RevokeRelationship(ctx context.Context, relation
 }
 
 func (m *drRelationshipManager) ValidateRelationshipAccess(relationshipID, fingerprint string, allowedStates ...DRRelationshipState) (*DRRelationship, error) {
+	return m.validateRelationshipAccess(relationshipID, fingerprint, true, allowedStates...)
+}
+
+func (m *drRelationshipManager) ValidateRelationshipAccessNoActivate(relationshipID, fingerprint string, allowedStates ...DRRelationshipState) (*DRRelationship, error) {
+	return m.validateRelationshipAccess(relationshipID, fingerprint, false, allowedStates...)
+}
+
+func (m *drRelationshipManager) validateRelationshipAccess(relationshipID, fingerprint string, activateRegistered bool, allowedStates ...DRRelationshipState) (*DRRelationship, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -81,11 +90,14 @@ func (m *drRelationshipManager) ValidateRelationshipAccess(relationshipID, finge
 	if rel.SecondaryCertFingerprint == "" {
 		return nil, fmt.Errorf("relationship %q has no registered certificate", relationshipID)
 	}
-	if !strings.EqualFold(rel.SecondaryCertFingerprint, fingerprint) {
+	nowTime := time.Now().UTC()
+	pendingAllowed := strings.EqualFold(rel.PendingSecondaryCertFingerprint, fingerprint) &&
+		!pendingCredentialRotationExpired(rel, nowTime)
+	if !strings.EqualFold(rel.SecondaryCertFingerprint, fingerprint) &&
+		!pendingAllowed {
 		return nil, fmt.Errorf("certificate fingerprint mismatch for relationship %q", relationshipID)
 	}
 
-	nowTime := time.Now().UTC()
 	now := nowTime.Unix()
 	updated := false
 	m.latestSeenAt[relationshipID] = now
@@ -94,7 +106,7 @@ func (m *drRelationshipManager) ValidateRelationshipAccess(relationshipID, finge
 		m.lastSeenWriteAt[relationshipID] = nowTime
 		updated = true
 	}
-	if rel.State == DRRelationshipStateRegistered {
+	if activateRegistered && rel.State == DRRelationshipStateRegistered {
 		rel.State = DRRelationshipStateActive
 		updated = true
 	}
@@ -113,17 +125,20 @@ func (m *drRelationshipManager) MarkRelationshipSeen(relationshipID string) {
 
 	now := time.Now().UTC()
 	nowUnix := now.Unix()
+	ctx := context.Background()
+	rel, err := m.loadRelationship(ctx, relationshipID)
+	if err != nil {
+		return
+	}
+	if rel.State == DRRelationshipStateRevoked {
+		return
+	}
 	m.latestSeenAt[relationshipID] = nowUnix
 	lastWrite := m.lastSeenWriteAt[relationshipID]
 	if !lastWrite.IsZero() && now.Sub(lastWrite) < drLastSeenPersistInterval {
 		return
 	}
 
-	ctx := context.Background()
-	rel, err := m.loadRelationship(ctx, relationshipID)
-	if err != nil {
-		return
-	}
 	rel.LastSeenAt = nowUnix
 	if err := m.saveRelationship(ctx, rel); err != nil {
 		m.logger.Warn("failed to persist relationship last_seen", "relationship_id", relationshipID, "error", err)
@@ -132,27 +147,37 @@ func (m *drRelationshipManager) MarkRelationshipSeen(relationshipID string) {
 	m.lastSeenWriteAt[relationshipID] = now
 }
 
-func (m *drRelationshipManager) MarkRelationshipActive(relationshipID string) {
+func (m *drRelationshipManager) MarkRelationshipActive(relationshipID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if m.config.Mode != DRModePrimary {
+		return fmt.Errorf("not in DR primary mode")
+	}
+
 	now := time.Now().UTC()
 	nowUnix := now.Unix()
-	m.latestSeenAt[relationshipID] = nowUnix
 
 	ctx := context.Background()
 	rel, err := m.loadRelationship(ctx, relationshipID)
 	if err != nil {
-		return
+		return err
+	}
+	if rel.State == DRRelationshipStateRevoked {
+		return fmt.Errorf("relationship %q is revoked", relationshipID)
 	}
 	if rel.State == DRRelationshipStateRegistered {
 		rel.State = DRRelationshipStateActive
+	} else if rel.State != DRRelationshipStateActive {
+		return fmt.Errorf("relationship %q is in state %q", relationshipID, rel.State)
 	}
+	m.latestSeenAt[relationshipID] = nowUnix
 	rel.LastSeenAt = nowUnix
 	rel.LastError = ""
 	if err := m.saveRelationship(ctx, rel); err != nil {
 		m.logger.Warn("failed to persist relationship state", "relationship_id", relationshipID, "error", err)
-		return
+		return err
 	}
 	m.lastSeenWriteAt[relationshipID] = now
+	return nil
 }

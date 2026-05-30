@@ -59,23 +59,21 @@ func (s *drReplicationSecondary) beginReconcileSession(checkpointID string, chec
 	return nil
 }
 
-// commitCheckpointIndex advances the monotonic checkpoint high-water mark
-// and persists it to barrier storage. Called on successful reconciliation.
-func (s *drReplicationSecondary) commitCheckpointIndex(checkpointIndex uint64) {
+// commitCheckpointIndex durably advances the monotonic checkpoint high-water
+// mark. It must succeed before lastAppliedIndex is advanced for a checkpoint.
+func (s *drReplicationSecondary) commitCheckpointIndex(checkpointIndex uint64) error {
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
 
-	if checkpointIndex > s.highestCommittedCheckpointIndex {
-		s.highestCommittedCheckpointIndex = checkpointIndex
-		s.highestCommittedCheckpointIndexSet = true
-
-		// Best-effort persist; failure is logged but does not block reconciliation.
-		if err := s.persistCheckpointHighWaterMark(checkpointIndex); err != nil {
-			s.logger.Warn("failed to persist checkpoint high-water mark",
-				"checkpoint_index", checkpointIndex,
-				"error", err)
-		}
+	if checkpointIndex <= s.highestCommittedCheckpointIndex {
+		return nil
 	}
+	if err := s.persistCheckpointHighWaterMark(checkpointIndex); err != nil {
+		return err
+	}
+	s.highestCommittedCheckpointIndex = checkpointIndex
+	s.highestCommittedCheckpointIndexSet = true
+	return nil
 }
 
 // resetCheckpointHighWaterMark clears the monotonic checkpoint constraint.
@@ -93,6 +91,9 @@ func (s *drReplicationSecondary) resetCheckpointHighWaterMark() {
 const drCheckpointHWMPath = "core/dr-replication/checkpoint-hwm"
 
 func (s *drReplicationSecondary) persistCheckpointHighWaterMark(index uint64) error {
+	if s.checkpointHighWaterMarkPersistHook != nil {
+		return s.checkpointHighWaterMarkPersistHook(index)
+	}
 	data := fmt.Sprintf("%d", index)
 	entry := &logical.StorageEntry{
 		Key:   drCheckpointHWMPath,
@@ -112,8 +113,22 @@ func (s *drReplicationSecondary) loadCheckpointHighWaterMark() {
 		s.highestCommittedCheckpointIndex = hwm
 		s.highestCommittedCheckpointIndexSet = true
 		s.sessionMu.Unlock()
+		if s.lastAppliedIndex.Load() < hwm {
+			s.setLastAppliedIndex(hwm)
+		}
 		s.logger.Info("loaded checkpoint high-water mark", "checkpoint_index", hwm)
 	}
+}
+
+func (s *drReplicationSecondary) finalizeReconcileCheckpoint(checkpointID string, checkpointIndex uint64) error {
+	if err := s.assertActiveCheckpoint(checkpointID, checkpointIndex); err != nil {
+		return err
+	}
+	if err := s.commitCheckpointIndex(checkpointIndex); err != nil {
+		return fmt.Errorf("checkpoint_high_water_persist_failed: %w", err)
+	}
+	s.setLastAppliedIndex(checkpointIndex)
+	return nil
 }
 
 func (s *drReplicationSecondary) endReconcileSession() {

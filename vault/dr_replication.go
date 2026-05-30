@@ -51,6 +51,7 @@ const (
 
 	drStreamSendBatchMaxEntries = 64      // max entries per EntryBatch on the stream
 	drStreamSendBatchMaxBytes   = 1 << 20 // 1 MiB max payload per stream batch
+	drFetchRequestMaxSelectors  = 16384   // max point selectors (kids + items) per FetchEntries request
 
 	drBackpressureDefaultEnabled        = true
 	drBackpressureDefaultDegradedRatio  = 0.80
@@ -172,6 +173,10 @@ type drReplicationPrimary struct {
 	mu          sync.RWMutex
 	subscribers map[string]*changeStreamSubscriber
 
+	// syncKeyringMu keeps bootstrap keyring sync single-shot per registered
+	// relationship by serializing authorize-wrap-activate.
+	syncKeyringMu sync.Mutex
+
 	// changeBuffer is a ring buffer of recent changes for stream
 	// catch-up. Protected by bufMu.
 	bufMu        sync.RWMutex
@@ -212,6 +217,7 @@ type drReplicationPrimary struct {
 	// for the same relationship.
 	checkpointBuildInFlight        map[string]*drCheckpointBuildResult
 	latestCheckpointByRelationship map[string]string
+	activeCheckpointRefs           map[string]int
 	// checkpointLastForcedBuildByRelationship prevents permanent reconcile
 	// starvation under sustained stream pressure by allowing occasional builds.
 	checkpointLastForcedBuildByRelationship map[string]time.Time
@@ -356,6 +362,7 @@ func NewDRReplicationPrimary(core *Core, replSalt []byte, logger log.Logger, jou
 		rangePlanConfig:                         reconciler.DefaultRangePlanConfig(),
 		checkpointBuildInFlight:                 make(map[string]*drCheckpointBuildResult),
 		latestCheckpointByRelationship:          make(map[string]string),
+		activeCheckpointRefs:                    make(map[string]int),
 		checkpointLastForcedBuildByRelationship: make(map[string]time.Time),
 		indexKIDToVID:                           make(map[[32]byte][32]byte),
 		indexKIDToKey:                           make(map[[32]byte]string),
@@ -614,9 +621,15 @@ func (s *drReplicationPrimary) StreamChanges(stream grpc.BidiStreamingServer[Str
 		return status.Error(codes.InvalidArgument, "first StreamChangesUpstream message must be init")
 	}
 
-	if err := s.authorizeRelationship(stream.Context(), req.RelationshipId, DRRelationshipStateRegistered, DRRelationshipStateActive); err != nil {
+	if err := s.authorizeRelationship(stream.Context(), req.RelationshipId, DRRelationshipStateActive); err != nil {
 		return err
 	}
+
+	initialWindow, err := s.validateInitialStreamWindow(req.InitialWindow)
+	if err != nil {
+		return err
+	}
+	maxWindowCredits := s.maxStreamWindowCredits()
 
 	subID, err := uuid.GenerateUUID()
 	if err != nil {
@@ -642,11 +655,6 @@ func (s *drReplicationPrimary) StreamChanges(stream grpc.BidiStreamingServer[Str
 			cancel()
 		}
 	}()
-
-	initialWindow := int64(req.InitialWindow)
-	if initialWindow <= 0 {
-		initialWindow = drDefaultInitialWindow
-	}
 
 	sub := &changeStreamSubscriber{
 		id:             subID,
@@ -676,6 +684,7 @@ func (s *drReplicationPrimary) StreamChanges(stream grpc.BidiStreamingServer[Str
 	// --- Credit-reader goroutine ---
 	// Reads subsequent upstream messages (WindowUpdate) and replenishes
 	// the subscriber's credit counter.
+	var creditErr atomic.Value
 	go func() {
 		for {
 			upstream, err := stream.Recv()
@@ -686,7 +695,11 @@ func (s *drReplicationPrimary) StreamChanges(stream grpc.BidiStreamingServer[Str
 				return
 			}
 			if wu := upstream.GetWindowUpdate(); wu != nil && wu.Credits > 0 {
-				sub.credits.Add(int64(wu.Credits))
+				if err := addStreamWindowCredits(sub, wu.Credits, maxWindowCredits); err != nil {
+					creditErr.Store(err)
+					cancel()
+					return
+				}
 				// Non-blocking signal to wake up a waiting sender.
 				select {
 				case sub.creditCh <- struct{}{}:
@@ -814,9 +827,12 @@ func (s *drReplicationPrimary) StreamChanges(stream grpc.BidiStreamingServer[Str
 	for {
 		select {
 		case <-ctx.Done():
+			if err, ok := loadStreamCreditError(&creditErr); ok {
+				return err
+			}
 			return ctx.Err()
 		case <-authTicker.C:
-			if err := s.authorizeRelationship(ctx, req.RelationshipId, DRRelationshipStateRegistered, DRRelationshipStateActive); err != nil {
+			if err := s.authorizeRelationship(ctx, req.RelationshipId, DRRelationshipStateActive); err != nil {
 				return err
 			}
 		case entry := <-sub.ch:
@@ -848,6 +864,98 @@ func (s *drReplicationPrimary) StreamChanges(stream grpc.BidiStreamingServer[Str
 			}
 		}
 	}
+}
+
+func (s *drReplicationPrimary) maxStreamWindowCredits() int64 {
+	max := s.bufMaxSize
+	if max <= 0 {
+		max = drStreamBufferMaxEntries
+	}
+	return int64(max)
+}
+
+func (s *drReplicationPrimary) validateInitialStreamWindow(requested uint64) (int64, error) {
+	max := s.maxStreamWindowCredits()
+	if requested == 0 {
+		if drDefaultInitialWindow > max {
+			return max, nil
+		}
+		return drDefaultInitialWindow, nil
+	}
+	if requested > uint64(max) {
+		return 0, status.Errorf(codes.ResourceExhausted, "initial_window %d exceeds maximum %d", requested, max)
+	}
+	return int64(requested), nil
+}
+
+func addStreamWindowCredits(sub *changeStreamSubscriber, credits uint64, max int64) error {
+	if credits == 0 {
+		return nil
+	}
+	if max <= 0 {
+		return status.Error(codes.FailedPrecondition, "stream window maximum is not configured")
+	}
+	if credits > uint64(max) {
+		return status.Errorf(codes.ResourceExhausted, "window_update credits %d exceeds maximum %d", credits, max)
+	}
+	add := int64(credits)
+	for {
+		current := sub.credits.Load()
+		if current > max {
+			return status.Errorf(codes.ResourceExhausted, "stream credits %d exceed maximum %d", current, max)
+		}
+		if add > max-current {
+			return status.Errorf(codes.ResourceExhausted, "stream credits would exceed maximum %d", max)
+		}
+		if sub.credits.CompareAndSwap(current, current+add) {
+			return nil
+		}
+	}
+}
+
+func loadStreamCreditError(v *atomic.Value) (error, bool) {
+	if v == nil {
+		return nil, false
+	}
+	raw := v.Load()
+	if raw == nil {
+		return nil, false
+	}
+	err, ok := raw.(error)
+	return err, ok
+}
+
+func validateRangeChecksumRequest(req *RangeChecksumRequest) error {
+	rangeCount := len(req.GetRangeIds())
+	if rangeCount > drRangeMaxTotalRanges {
+		return status.Errorf(codes.ResourceExhausted,
+			"range checksum request has %d ranges; maximum is %d",
+			rangeCount, drRangeMaxTotalRanges)
+	}
+	for _, rangeID := range req.GetRangeIds() {
+		if rangeID >= uint64(drRangeMaxTotalRanges) {
+			return status.Errorf(codes.InvalidArgument,
+				"range_id %d exceeds maximum %d",
+				rangeID, drRangeMaxTotalRanges-1)
+		}
+	}
+	return nil
+}
+
+func validateFetchEntriesRequest(req *FetchEntriesRequest) error {
+	selectorCount := len(req.GetKids()) + len(req.GetItems())
+	if selectorCount > drFetchRequestMaxSelectors {
+		return status.Errorf(codes.ResourceExhausted,
+			"fetch request has %d point selectors; maximum is %d",
+			selectorCount, drFetchRequestMaxSelectors)
+	}
+	rangeCount := len(req.GetRanges())
+	if rangeCount > drRangeMaxTotalRanges {
+		return status.Errorf(codes.ResourceExhausted,
+			"fetch request has %d ranges; maximum is %d",
+			rangeCount, drRangeMaxTotalRanges)
+	}
+	return nil
 }
 
 // waitForCredit blocks until the subscriber has at least one credit
@@ -898,7 +1006,7 @@ func (s *drReplicationPrimary) RequestCheckpoint(ctx context.Context, req *Check
 	if err := s.requireActiveNode(); err != nil {
 		return nil, err
 	}
-	if err := s.authorizeRelationship(ctx, req.RelationshipId, DRRelationshipStateRegistered, DRRelationshipStateActive); err != nil {
+	if err := s.authorizeRelationship(ctx, req.RelationshipId, DRRelationshipStateActive); err != nil {
 		return nil, err
 	}
 
@@ -910,6 +1018,9 @@ func (s *drReplicationPrimary) RequestCheckpoint(ctx context.Context, req *Check
 
 	for {
 		if resp, ok := s.reuseCheckpointResponse(req.RelationshipId, commitIndex); ok {
+			if err := s.authorizeRelationship(ctx, req.RelationshipId, DRRelationshipStateActive); err != nil {
+				return nil, err
+			}
 			return resp, nil
 		}
 		if throttle, reason := s.shouldThrottleCheckpointBuild(); throttle {
@@ -945,7 +1056,13 @@ func (s *drReplicationPrimary) RequestCheckpoint(ctx context.Context, req *Check
 
 		resp, err := s.buildAndCacheCheckpoint(ctx, req.RelationshipId, commitIndex)
 		s.finishCheckpointBuild(req.RelationshipId, wait, resp, err)
-		return resp, err
+		if err != nil {
+			return nil, err
+		}
+		if err := s.authorizeRelationship(ctx, req.RelationshipId, DRRelationshipStateActive); err != nil {
+			return nil, err
+		}
+		return resp, nil
 	}
 }
 
@@ -954,7 +1071,7 @@ func (s *drReplicationPrimary) ExchangeDirtyBitmap(ctx context.Context, req *Dir
 	if err := s.requireActiveNode(); err != nil {
 		return nil, err
 	}
-	if err := s.authorizeRelationship(ctx, req.RelationshipId, DRRelationshipStateRegistered, DRRelationshipStateActive); err != nil {
+	if err := s.authorizeRelationship(ctx, req.RelationshipId, DRRelationshipStateActive); err != nil {
 		return nil, err
 	}
 	s.dirtyMapMu.RLock()
@@ -976,13 +1093,17 @@ func (s *drReplicationPrimary) ExchangeDirtyBitmap(ctx context.Context, req *Dir
 		copy(bitmap, s.dirtyMap)
 	}
 
-	return &DirtyBitmapMessage{
+	resp := &DirtyBitmapMessage{
 		RelationshipId:  req.RelationshipId,
 		CheckpointId:    req.CheckpointId,
 		CheckpointIndex: req.CheckpointIndex,
 		StartIndex:      s.dirtyMapStart,
 		Bitmap:          bitmap,
-	}, nil
+	}
+	if err := s.authorizeRelationship(ctx, req.RelationshipId, DRRelationshipStateActive); err != nil {
+		return nil, err
+	}
+	return resp, nil
 }
 
 // loadDirtyBitmap restores the dirty bitmap from physical storage after
@@ -1096,15 +1217,24 @@ func (s *drReplicationPrimary) ExchangeRangeChecksums(ctx context.Context, req *
 	if err := s.requireActiveNode(); err != nil {
 		return nil, err
 	}
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "range checksum request is required")
+	}
+	if err := s.authorizeRelationship(ctx, req.RelationshipId, DRRelationshipStateActive); err != nil {
+		return nil, err
+	}
+	if err := validateRangeChecksumRequest(req); err != nil {
+		return nil, err
+	}
 	cp, err := s.getCheckpoint(req.CheckpointId)
 	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "checkpoint not found: %v", err)
 	}
+	if err := validateCheckpointRelationship(req.RelationshipId, cp); err != nil {
+		return nil, err
+	}
 	if err := validateCheckpointTuple(req.CheckpointId, req.GetCheckpointIndex(), cp); err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "invalid checkpoint tuple: %v", err)
-	}
-	if err := s.authorizeCheckpoint(ctx, cp); err != nil {
-		return nil, err
 	}
 
 	// Calculate checksums for requested ranges.
@@ -1149,6 +1279,9 @@ func (s *drReplicationPrimary) ExchangeRangeChecksums(ctx context.Context, req *
 		resp.Checksums = append(resp.Checksums, rc)
 	}
 
+	if err := s.authorizeRelationship(ctx, req.RelationshipId, DRRelationshipStateActive); err != nil {
+		return nil, err
+	}
 	return resp, nil
 }
 
@@ -1159,20 +1292,29 @@ func (s *drReplicationPrimary) ExchangeRangeDigests(ctx context.Context, req *Ra
 	if err := s.requireActiveNode(); err != nil {
 		return nil, err
 	}
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "range digest request is required")
+	}
+	if err := s.authorizeRelationship(ctx, req.RelationshipId, DRRelationshipStateActive); err != nil {
+		return nil, err
+	}
 	cp, err := s.getCheckpoint(req.CheckpointId)
 	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "checkpoint not found: %v", err)
 	}
+	if err := validateCheckpointRelationship(req.RelationshipId, cp); err != nil {
+		return nil, err
+	}
 	if err := validateCheckpointTuple(req.CheckpointId, req.GetCheckpointIndex(), cp); err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "invalid checkpoint tuple: %v", err)
-	}
-	if err := s.authorizeCheckpoint(ctx, cp); err != nil {
-		return nil, err
 	}
 
 	parentSpan := req.GetParentSpan()
 	if parentSpan == nil || len(parentSpan.StartKid) != 32 || len(parentSpan.EndKid) != 32 {
 		return nil, status.Errorf(codes.InvalidArgument, "parent_span must have valid 32-byte KID boundaries")
+	}
+	if parentSpan.SplitDepth > uint32(drRangeMaxSplitDepth) {
+		return nil, status.Errorf(codes.InvalidArgument, "parent_span split depth %d exceeds maximum %d", parentSpan.SplitDepth, drRangeMaxSplitDepth)
 	}
 
 	var start, end [32]byte
@@ -1183,6 +1325,9 @@ func (s *drReplicationPrimary) ExchangeRangeDigests(ctx context.Context, req *Ra
 		EndKID:     end,
 		SplitDepth: parentSpan.SplitDepth,
 	}
+	if !parent.Valid() {
+		return nil, status.Error(codes.InvalidArgument, "parent_span start must be <= end")
+	}
 
 	// Split the parent range into two children.
 	left, right, ok := reconciler.SplitRange(parent)
@@ -1190,21 +1335,29 @@ func (s *drReplicationPrimary) ExchangeRangeDigests(ctx context.Context, req *Ra
 		// Cannot split further -- return a single digest for the parent.
 		idx := reconciler.NewRangeMapIndex(cp.kidToVID, nil)
 		desc := reconciler.BuildRangeDigestFromIndex(idx, parent)
-		return &RangeDigestResponse{
+		resp := &RangeDigestResponse{
 			Digests: []*RangeDigest{rangeDescriptorToProto(desc)},
-		}, nil
+		}
+		if err := s.authorizeRelationship(ctx, req.RelationshipId, DRRelationshipStateActive); err != nil {
+			return nil, err
+		}
+		return resp, nil
 	}
 
 	idx := reconciler.NewRangeMapIndex(cp.kidToVID, nil)
 	leftDesc := reconciler.BuildRangeDigestFromIndex(idx, left)
 	rightDesc := reconciler.BuildRangeDigestFromIndex(idx, right)
 
-	return &RangeDigestResponse{
+	resp := &RangeDigestResponse{
 		Digests: []*RangeDigest{
 			rangeDescriptorToProto(leftDesc),
 			rangeDescriptorToProto(rightDesc),
 		},
-	}, nil
+	}
+	if err := s.authorizeRelationship(ctx, req.RelationshipId, DRRelationshipStateActive); err != nil {
+		return nil, err
+	}
+	return resp, nil
 }
 
 // rangeDescriptorToProto converts a reconciler.RangeDescriptor to the proto RangeDigest.
@@ -1229,6 +1382,15 @@ func (s *drReplicationPrimary) FetchEntries(req *FetchEntriesRequest, stream grp
 	if err := s.requireActiveNode(); err != nil {
 		return err
 	}
+	if req == nil {
+		return status.Error(codes.InvalidArgument, "fetch request is required")
+	}
+	if err := s.authorizeRelationship(stream.Context(), req.RelationshipId, DRRelationshipStateActive); err != nil {
+		return err
+	}
+	if err := validateFetchEntriesRequest(req); err != nil {
+		return err
+	}
 
 	// Derive a context from both the gRPC stream and the core's active
 	// context. The stream must terminate when either:
@@ -1248,15 +1410,19 @@ func (s *drReplicationPrimary) FetchEntries(req *FetchEntriesRequest, stream grp
 		}
 	}()
 
-	cp, err := s.getCheckpoint(req.CheckpointId)
+	cp, releaseCheckpoint, err := s.getCheckpointLease(req.CheckpointId)
 	if err != nil {
 		return status.Errorf(codes.NotFound, "checkpoint not found: %v", err)
+	}
+	defer releaseCheckpoint()
+	if err := validateCheckpointRelationship(req.RelationshipId, cp); err != nil {
+		return err
 	}
 	if err := validateCheckpointTuple(req.CheckpointId, req.GetCheckpointIndex(), cp); err != nil {
 		return status.Errorf(codes.FailedPrecondition, "invalid checkpoint tuple: %v", err)
 	}
-	if err := s.authorizeCheckpoint(ctx, cp); err != nil {
-		return err
+	authorizeFetchContinuation := func() error {
+		return s.authorizeRelationship(ctx, req.RelationshipId, DRRelationshipStateActive)
 	}
 
 	s.logger.Info("fetching entries",
@@ -1308,6 +1474,9 @@ func (s *drReplicationPrimary) FetchEntries(req *FetchEntriesRequest, stream grp
 		}
 		batch.Entries = append(batch.Entries, change)
 		if len(batch.Entries) >= 100 {
+			if err := authorizeFetchContinuation(); err != nil {
+				return err
+			}
 			if err := stream.Send(&batch); err != nil {
 				return err
 			}
@@ -1385,6 +1554,9 @@ func (s *drReplicationPrimary) FetchEntries(req *FetchEntriesRequest, stream grp
 				}
 				batch.Entries = append(batch.Entries, res.change)
 				if len(batch.Entries) >= 100 {
+					if err := authorizeFetchContinuation(); err != nil {
+						return err
+					}
 					if err := stream.Send(&batch); err != nil {
 						return err
 					}
@@ -1433,6 +1605,9 @@ func (s *drReplicationPrimary) FetchEntries(req *FetchEntriesRequest, stream grp
 
 	// Send remaining entries.
 	if len(batch.Entries) > 0 || len(batch.FailedKids) > 0 {
+		if err := authorizeFetchContinuation(); err != nil {
+			return err
+		}
 		if err := stream.Send(&batch); err != nil {
 			return err
 		}
@@ -1446,7 +1621,7 @@ func (s *drReplicationPrimary) Heartbeat(ctx context.Context, req *DRHeartbeatRe
 	if err := s.requireActiveNode(); err != nil {
 		return nil, err
 	}
-	if err := s.authorizeRelationship(ctx, req.RelationshipId, DRRelationshipStateRegistered, DRRelationshipStateActive); err != nil {
+	if err := s.authorizeRelationshipNoActivate(ctx, req.RelationshipId, DRRelationshipStateRegistered, DRRelationshipStateActive); err != nil {
 		return nil, err
 	}
 	if mgr := s.core.drManager; mgr != nil {
@@ -1497,6 +1672,9 @@ func (s *drReplicationPrimary) Heartbeat(ctx context.Context, req *DRHeartbeatRe
 		s.heartbeatMissingDRLeafWarned.Store(false)
 	}
 
+	if err := s.authorizeRelationshipNoActivate(ctx, req.RelationshipId, DRRelationshipStateRegistered, DRRelationshipStateActive); err != nil {
+		return nil, err
+	}
 	return &DRHeartbeatResponse{
 		PrimaryIndex:      reportedIndex,
 		PrimaryTerm:       primaryTerm,
@@ -1525,14 +1703,21 @@ func (s *drReplicationPrimary) SyncKeyring(ctx context.Context, req *SyncKeyring
 	if err := s.requireActiveNode(); err != nil {
 		return nil, err
 	}
-	if err := s.authorizeRelationship(ctx, req.RelationshipId, DRRelationshipStateRegistered, DRRelationshipStateActive); err != nil {
-		return nil, err
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "sync keyring request is required")
 	}
-	if len(req.ClientEphemeralPubkey) == 0 {
-		return nil, status.Error(codes.InvalidArgument, "client_ephemeral_pubkey is required")
+	if len(req.ClientEphemeralPubkey) != 32 {
+		return nil, status.Error(codes.InvalidArgument, "client_ephemeral_pubkey must be a 32-byte X25519 public key")
 	}
 	if len(req.ClientNonce) != drBootstrapNonceSize {
 		return nil, status.Errorf(codes.InvalidArgument, "client_nonce must be %d bytes", drBootstrapNonceSize)
+	}
+
+	s.syncKeyringMu.Lock()
+	defer s.syncKeyringMu.Unlock()
+
+	if err := s.authorizeRelationshipNoActivate(ctx, req.RelationshipId, DRRelationshipStateRegistered); err != nil {
+		return nil, err
 	}
 
 	s.logger.Info("syncing keyring to secondary", "relationship_id", req.RelationshipId)
@@ -1580,7 +1765,7 @@ func (s *drReplicationPrimary) SyncKeyring(ctx context.Context, req *SyncKeyring
 		return nil, status.Errorf(codes.PermissionDenied, "failed to derive secondary certificate fingerprint: %v", err)
 	}
 
-	wrappedRootKey, serverPub, srvNonce, gcmIV, aadVersion, err := wrapRootKeyForSecondary(
+	wrappedRootKey, serverPub, srvNonce, gcmIV, aadVersion, err := wrapRootKeyForDRSync(
 		keyring.RootKey(),
 		req.RelationshipId,
 		wrapClusterID,
@@ -1590,6 +1775,10 @@ func (s *drReplicationPrimary) SyncKeyring(ctx context.Context, req *SyncKeyring
 		req.ClientNonce,
 	)
 	if err != nil {
+		if strings.Contains(err.Error(), "invalid client ephemeral public key") ||
+			strings.Contains(err.Error(), "failed to derive shared secret") {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid client_ephemeral_pubkey: %v", err)
+		}
 		return nil, status.Errorf(codes.Internal, "failed to wrap root key: %v", err)
 	}
 
@@ -1608,7 +1797,9 @@ func (s *drReplicationPrimary) SyncKeyring(ctx context.Context, req *SyncKeyring
 	}
 
 	if mgr := s.core.drManager; mgr != nil {
-		mgr.MarkRelationshipActive(req.RelationshipId)
+		if err := mgr.MarkRelationshipActive(req.RelationshipId); err != nil {
+			return nil, status.Errorf(codes.PermissionDenied, "relationship activation failed: %v", err)
+		}
 	}
 
 	s.logger.Info("keyring synced to secondary")
@@ -2023,10 +2214,13 @@ func (s *drReplicationPrimary) updateIndexFromChanges(entries []physical.ChangeS
 
 func parseRangeSpan(span *RangeSpan) (reconciler.RangeSpan, bool, error) {
 	if span == nil {
-		return reconciler.RangeSpan{}, false, nil
+		return reconciler.RangeSpan{}, false, fmt.Errorf("nil range span")
 	}
 	if len(span.StartKid) != 32 || len(span.EndKid) != 32 {
 		return reconciler.RangeSpan{}, true, fmt.Errorf("start_kid/end_kid must be 32 bytes")
+	}
+	if span.SplitDepth > uint32(drRangeMaxSplitDepth) {
+		return reconciler.RangeSpan{}, true, fmt.Errorf("range split depth %d exceeds maximum %d", span.SplitDepth, drRangeMaxSplitDepth)
 	}
 	var rs reconciler.RangeSpan
 	copy(rs.StartKID[:], span.StartKid)
@@ -2044,9 +2238,12 @@ func parseRangeSpans(spans []*RangeSpan) ([]reconciler.RangeSpan, error) {
 	}
 	out := make([]reconciler.RangeSpan, 0, len(spans))
 	for _, s := range spans {
-		rs, _, err := parseRangeSpan(s)
+		rs, ok, err := parseRangeSpan(s)
 		if err != nil {
 			return nil, err
+		}
+		if !ok {
+			return nil, fmt.Errorf("nil range span")
 		}
 		out = append(out, rs)
 	}
@@ -2087,10 +2284,13 @@ func (s *drReplicationPrimary) setCheckpointCacheGaugesLocked() {
 	metrics.SetGauge([]string{"replication", "dr", "checkpoint", "cache_items"}, float32(len(s.checkpoints)))
 }
 
-func (s *drReplicationPrimary) evictCheckpointLocked(id string) {
+func (s *drReplicationPrimary) evictCheckpointLocked(id string) bool {
+	if s.activeCheckpointRefs[id] > 0 {
+		return false
+	}
 	cp, ok := s.checkpoints[id]
 	if !ok {
-		return
+		return false
 	}
 	if s.checkpointArtifacts != nil {
 		s.checkpointArtifacts.delete(id)
@@ -2119,6 +2319,7 @@ func (s *drReplicationPrimary) evictCheckpointLocked(id string) {
 			delete(s.latestCheckpointByRelationship, cp.relationshipID)
 		}
 	}
+	return true
 }
 
 func (s *drReplicationPrimary) relationshipBytesLocked(relationshipID string) uint64 {
@@ -2148,6 +2349,9 @@ func (s *drReplicationPrimary) evictOldestInRelationshipLocked(relationshipID st
 		if cp.relationshipID != relationshipID {
 			continue
 		}
+		if s.activeCheckpointRefs[id] > 0 {
+			continue
+		}
 		if oldestID == "" || cp.createdAt.Before(oldestTime) {
 			oldestID = id
 			oldestTime = cp.createdAt
@@ -2156,14 +2360,16 @@ func (s *drReplicationPrimary) evictOldestInRelationshipLocked(relationshipID st
 	if oldestID == "" {
 		return false
 	}
-	s.evictCheckpointLocked(oldestID)
-	return true
+	return s.evictCheckpointLocked(oldestID)
 }
 
 func (s *drReplicationPrimary) evictOldestGlobalLocked() bool {
 	var oldestID string
 	var oldestTime time.Time
 	for id, cp := range s.checkpoints {
+		if s.activeCheckpointRefs[id] > 0 {
+			continue
+		}
 		if oldestID == "" || cp.createdAt.Before(oldestTime) {
 			oldestID = id
 			oldestTime = cp.createdAt
@@ -2172,8 +2378,7 @@ func (s *drReplicationPrimary) evictOldestGlobalLocked() bool {
 	if oldestID == "" {
 		return false
 	}
-	s.evictCheckpointLocked(oldestID)
-	return true
+	return s.evictCheckpointLocked(oldestID)
 }
 
 func (s *drReplicationPrimary) cacheCheckpoint(entry *drCheckpointCacheEntry) error {
@@ -2265,16 +2470,56 @@ func (s *drReplicationPrimary) getCheckpoint(id string) (*drCheckpointCacheEntry
 		return nil, fmt.Errorf("unknown checkpoint id %q", id)
 	}
 	if now.Sub(entry.createdAt) > s.checkpointTTL {
-		s.evictCheckpointLocked(id)
+		_ = s.evictCheckpointLocked(id)
 		return nil, fmt.Errorf("checkpoint %q expired", id)
 	}
 	return entry, nil
 }
 
+func (s *drReplicationPrimary) getCheckpointLease(id string) (*drCheckpointCacheEntry, func(), error) {
+	s.checkpointMu.Lock()
+	now := time.Now().UTC()
+	s.pruneCheckpointsLocked(now)
+
+	entry, ok := s.checkpoints[id]
+	if !ok {
+		s.checkpointMu.Unlock()
+		return nil, nil, fmt.Errorf("unknown checkpoint id %q", id)
+	}
+	if now.Sub(entry.createdAt) > s.checkpointTTL {
+		_ = s.evictCheckpointLocked(id)
+		s.checkpointMu.Unlock()
+		return nil, nil, fmt.Errorf("checkpoint %q expired", id)
+	}
+	s.activeCheckpointRefs[id]++
+	retainedArtifact := false
+	if s.checkpointArtifacts != nil {
+		retainedArtifact = s.checkpointArtifacts.retain(id)
+	}
+	s.checkpointMu.Unlock()
+
+	release := func() {
+		if retainedArtifact && s.checkpointArtifacts != nil {
+			s.checkpointArtifacts.release(id)
+		}
+		s.checkpointMu.Lock()
+		if refs := s.activeCheckpointRefs[id]; refs <= 1 {
+			delete(s.activeCheckpointRefs, id)
+		} else {
+			s.activeCheckpointRefs[id] = refs - 1
+		}
+		s.checkpointMu.Unlock()
+	}
+	return entry, release, nil
+}
+
 func (s *drReplicationPrimary) pruneCheckpointsLocked(now time.Time) {
 	for id, cp := range s.checkpoints {
+		if s.activeCheckpointRefs[id] > 0 {
+			continue
+		}
 		if now.Sub(cp.createdAt) > s.checkpointTTL {
-			s.evictCheckpointLocked(id)
+			_ = s.evictCheckpointLocked(id)
 		}
 	}
 	s.setCheckpointCacheGaugesLocked()
@@ -2592,6 +2837,14 @@ func isDRBackpressureExemptPath(path string) bool {
 }
 
 func (s *drReplicationPrimary) RevokeRelationship(relationshipID string) {
+	s.terminateRelationshipStreams(relationshipID, true)
+}
+
+func (s *drReplicationPrimary) TerminateRelationshipStreams(relationshipID string) {
+	s.terminateRelationshipStreams(relationshipID, false)
+}
+
+func (s *drReplicationPrimary) terminateRelationshipStreams(relationshipID string, revoked bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -2605,8 +2858,12 @@ func (s *drReplicationPrimary) RevokeRelationship(relationshipID string) {
 		terminated++
 	}
 	if terminated > 0 {
-		s.revokedStreamsTerminated.Add(terminated)
-		metrics.IncrCounter([]string{"replication", "dr", "stream", "revoked_streams_terminated"}, float32(terminated))
+		if revoked {
+			s.revokedStreamsTerminated.Add(terminated)
+			metrics.IncrCounter([]string{"replication", "dr", "stream", "revoked_streams_terminated"}, float32(terminated))
+		} else {
+			metrics.IncrCounter([]string{"replication", "dr", "stream", "credential_rotation_streams_terminated"}, float32(terminated))
+		}
 	}
 }
 
@@ -2615,6 +2872,14 @@ func (s *drReplicationPrimary) revokedStreamsTerminatedCount() uint64 {
 }
 
 func (s *drReplicationPrimary) authorizeRelationship(ctx context.Context, relationshipID string, states ...DRRelationshipState) error {
+	return s.authorizeRelationshipWithActivation(ctx, relationshipID, true, states...)
+}
+
+func (s *drReplicationPrimary) authorizeRelationshipNoActivate(ctx context.Context, relationshipID string, states ...DRRelationshipState) error {
+	return s.authorizeRelationshipWithActivation(ctx, relationshipID, false, states...)
+}
+
+func (s *drReplicationPrimary) authorizeRelationshipWithActivation(ctx context.Context, relationshipID string, activateRegistered bool, states ...DRRelationshipState) error {
 	if relationshipID == "" {
 		return status.Error(codes.InvalidArgument, "relationship_id is required")
 	}
@@ -2629,14 +2894,16 @@ func (s *drReplicationPrimary) authorizeRelationship(ctx context.Context, relati
 		return status.Errorf(codes.PermissionDenied, "failed to verify peer identity: %v", err)
 	}
 
-	if _, err := mgr.ValidateRelationshipAccess(relationshipID, fingerprint, states...); err != nil {
-		return status.Errorf(codes.PermissionDenied, "relationship authorization failed: %v", err)
+	var validateErr error
+	if activateRegistered {
+		_, validateErr = mgr.ValidateRelationshipAccess(relationshipID, fingerprint, states...)
+	} else {
+		_, validateErr = mgr.ValidateRelationshipAccessNoActivate(relationshipID, fingerprint, states...)
+	}
+	if validateErr != nil {
+		return status.Errorf(codes.PermissionDenied, "relationship authorization failed: %v", validateErr)
 	}
 	return nil
-}
-
-func (s *drReplicationPrimary) authorizeCheckpoint(ctx context.Context, cp *drCheckpointCacheEntry) error {
-	return s.authorizeRelationship(ctx, cp.relationshipID, DRRelationshipStateRegistered, DRRelationshipStateActive)
 }
 
 func peerCertFingerprintFromContext(ctx context.Context) (string, error) {
@@ -2666,6 +2933,16 @@ func peerCertFingerprintFromContext(ctx context.Context) (string, error) {
 	}
 
 	return "", errors.New("peer is not using TLS")
+}
+
+func validateCheckpointRelationship(relationshipID string, cp *drCheckpointCacheEntry) error {
+	if cp == nil {
+		return status.Error(codes.NotFound, "checkpoint not found")
+	}
+	if cp.relationshipID == "" || cp.relationshipID != relationshipID {
+		return status.Error(codes.PermissionDenied, "checkpoint relationship authorization failed")
+	}
+	return nil
 }
 
 func validateCheckpointTuple(checkpointID string, checkpointIndex uint64, cp *drCheckpointCacheEntry) error {

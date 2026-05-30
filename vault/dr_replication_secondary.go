@@ -10,6 +10,7 @@ import (
 	"crypto/ecdh"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"errors"
@@ -26,6 +27,7 @@ import (
 	log "github.com/hashicorp/go-hclog"
 	metrics "github.com/hashicorp/go-metrics/compat"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	_ "google.golang.org/grpc/encoding/gzip" // Register gzip compressor for DR streams
 	"google.golang.org/grpc/status"
@@ -35,6 +37,7 @@ import (
 	"github.com/openbao/openbao/sdk/v2/helper/consts"
 	"github.com/openbao/openbao/sdk/v2/logical"
 	"github.com/openbao/openbao/sdk/v2/physical"
+	"github.com/openbao/openbao/vault/routing"
 )
 
 // errDRRedirect is returned when a DR gRPC call is redirected to the
@@ -318,6 +321,9 @@ type drReplicationSecondary struct {
 	streamMu     sync.Mutex
 	streamCancel context.CancelFunc
 
+	runtimeStateReloadMu       sync.Mutex
+	runtimeStateRefreshPending atomic.Bool
+
 	// state tracks the secondary's replication state.
 	state atomic.Int32
 
@@ -346,6 +352,9 @@ type drReplicationSecondary struct {
 	// cluster listener. Kept so the heartbeat loop can call
 	// addTrustedCert / pruneTrustedCerts directly.
 	drClusterClient *drReplicationClusterClient
+
+	clientCertMu sync.RWMutex
+	clientCert   *tls.Certificate
 
 	// lastKnownLeaderAddr caches the active leader's cluster address,
 	// updated on each heartbeat. Used for redirect-based reconnection
@@ -389,6 +398,7 @@ type drReplicationSecondary struct {
 	lastReconcileFailReason            string
 	lastRangeManifestCount             int
 	lastReconcileFailureByType         map[string]uint64
+	checkpointHighWaterMarkPersistHook func(uint64) error
 
 	// Additional heavy-load observability counters.
 	scanFailures            atomic.Uint64
@@ -519,6 +529,41 @@ func newDRReplicationSecondary(core *Core, replSalt []byte, relationshipID strin
 	return sec
 }
 
+func (s *drReplicationSecondary) setClientCertificate(certDER, keyPEM []byte) error {
+	cert, err := parseDRSecondaryClientCert(certDER, keyPEM)
+	if err != nil {
+		return err
+	}
+	s.clientCertMu.Lock()
+	s.clientCert = cert
+	s.clientCertMu.Unlock()
+	return nil
+}
+
+func (s *drReplicationSecondary) clientCertificate() *tls.Certificate {
+	s.clientCertMu.RLock()
+	defer s.clientCertMu.RUnlock()
+	if s.clientCert == nil {
+		return nil
+	}
+	cert := *s.clientCert
+	return &cert
+}
+
+func (s *drReplicationSecondary) ReconnectWithClientCertificate(certDER, keyPEM []byte) error {
+	if err := s.setClientCertificate(certDER, keyPEM); err != nil {
+		return err
+	}
+	s.cancelActiveStream()
+	if s.conn != nil {
+		_ = s.conn.Close()
+	}
+	if cl := s.core.getClusterListener(); cl != nil {
+		cl.RemoveClient(consts.DRReplicationALPN)
+	}
+	return nil
+}
+
 // Connect establishes the gRPC connection to the primary.
 // The connection is strictly mTLS-only via DRReplicationALPN and fails
 // closed if transport credentials cannot be established.
@@ -563,6 +608,7 @@ func (s *drReplicationSecondary) Connect(ctx context.Context, primaryAddr string
 		logger:         s.logger,
 		trustedCertsMu: &s.trustedPrimaryCertsMu,
 		trustedCerts:   s.trustedPrimaryCerts,
+		clientCert:     s.clientCertificate(),
 	}
 	s.drClusterClient = client
 
@@ -664,12 +710,6 @@ func (s *drReplicationSecondary) Start(ctx context.Context) error {
 				continue
 			}
 			s.markReconcileSuccess()
-			s.sessionMu.RLock()
-			commitIdx := s.activeCheckpointIndex
-			s.sessionMu.RUnlock()
-			if commitIdx > 0 {
-				s.commitCheckpointIndex(commitIdx)
-			}
 
 			// After initial reconciliation, the storage contains the
 			// primary's data (including token salt, mount table, etc.)
@@ -704,10 +744,6 @@ func (s *drReplicationSecondary) Start(ctx context.Context) error {
 				// controller reconnect loop, not by local resume/reconcile
 				// retries inside this Start() invocation.
 				if isDRTransportReconnectError(err) {
-					if hint := s.lastKnownLeaderAddr.Load(); hint != nil && *hint != "" {
-						s.logger.Info("stream transport error; reconnecting via leader hint", "addr", *hint)
-						return &errDRRedirect{LeaderAddr: *hint}
-					}
 					return fmt.Errorf("stream transport failure, reconnecting: %w", err)
 				}
 
@@ -764,10 +800,6 @@ func (s *drReplicationSecondary) Start(ctx context.Context) error {
 				// controller reconnect loop; retrying reconciliation in
 				// place can cause a tight reconciling loop after stepdown.
 				if isDRTransportReconnectError(err) {
-					if hint := s.lastKnownLeaderAddr.Load(); hint != nil && *hint != "" {
-						s.logger.Info("reconciliation transport error; reconnecting via leader hint", "addr", *hint)
-						return &errDRRedirect{LeaderAddr: *hint}
-					}
 					return fmt.Errorf("reconciliation transport failure, reconnecting: %w", err)
 				}
 
@@ -808,12 +840,6 @@ func (s *drReplicationSecondary) Start(ctx context.Context) error {
 				continue
 			}
 			s.markReconcileSuccess()
-			s.sessionMu.RLock()
-			reconcileCommitIdx := s.activeCheckpointIndex
-			s.sessionMu.RUnlock()
-			if reconcileCommitIdx > 0 {
-				s.commitCheckpointIndex(reconcileCommitIdx)
-			}
 			s.streamResumeAttempts = 0
 			s.setState(DRSecondaryStreaming)
 
@@ -827,10 +853,6 @@ func (s *drReplicationSecondary) Start(ctx context.Context) error {
 				s.logger.Error("resnapshot fallback failed", "error", err)
 
 				if isDRTransportReconnectError(err) {
-					if hint := s.lastKnownLeaderAddr.Load(); hint != nil && *hint != "" {
-						s.logger.Info("resnapshot transport error; reconnecting via leader hint", "addr", *hint)
-						return &errDRRedirect{LeaderAddr: *hint}
-					}
 					return fmt.Errorf("resnapshot transport failure, reconnecting: %w", err)
 				}
 
@@ -851,12 +873,6 @@ func (s *drReplicationSecondary) Start(ctx context.Context) error {
 				continue
 			}
 			s.markReconcileSuccess()
-			s.sessionMu.RLock()
-			resnapshotCommitIdx := s.activeCheckpointIndex
-			s.sessionMu.RUnlock()
-			if resnapshotCommitIdx > 0 {
-				s.commitCheckpointIndex(resnapshotCommitIdx)
-			}
 			s.streamResumeAttempts = 0
 			s.setState(DRSecondaryStreaming)
 
@@ -995,16 +1011,12 @@ func (s *drReplicationSecondary) Promote() error {
 	return nil
 }
 
-// reloadCoreState reloads the critical in-memory subsystems from
-// storage. This is necessary after DR promotion because the storage
-// now contains the primary's data but the in-memory caches still
-// reflect the secondary's original initialization.
-//
-// We cannot do a full unload/reload cycle because that would destroy
-// the running system backend, token store, and other critical
-// singleton mounts. Instead we take a targeted approach: load the
-// primary's mount table and mount any NEW entries that don't already
-// exist in the router.
+// reloadCoreState reloads the critical in-memory subsystems from storage.
+// The storage now contains the primary's replicated mount/auth tables, but
+// the live router may still reflect an older secondary view. Avoid a full
+// router reset because singleton mounts such as sys/, identity/, cubbyhole/,
+// and token/ are process-local runtime state. Instead, reconcile non-singleton
+// secret and auth routes against the replicated tables.
 func (s *drReplicationSecondary) reloadCoreState(ctx context.Context) error {
 	// Purge physical cache first to ensure all reads go to storage.
 	if s.core.physicalCache != nil {
@@ -1016,11 +1028,17 @@ func (s *drReplicationSecondary) reloadCoreState(ctx context.Context) error {
 		s.core.tokenStore.Invalidate(ctx, "token/salt")
 	}
 
+	oldMounts := cloneDRMountTable(s.core.mounts)
+	oldAuth := cloneDRMountTable(s.core.auth)
+
 	// Load the primary's mount table from storage. This replaces the
 	// in-memory mount table but doesn't touch the router or backends.
 	s.logger.Info("reloading mount table from storage")
 	if err := s.core.loadMounts(ctx, false); err != nil {
 		return fmt.Errorf("failed to reload mounts: %w", err)
+	}
+	if err := s.unmountStaleRouterEntries(ctx, oldMounts, s.core.mounts, false); err != nil {
+		return fmt.Errorf("failed to unmount stale mounts: %w", err)
 	}
 
 	// Mount any new entries from the primary that aren't already
@@ -1035,8 +1053,161 @@ func (s *drReplicationSecondary) reloadCoreState(ctx context.Context) error {
 	if err := s.core.loadCredentials(ctx, false); err != nil {
 		return fmt.Errorf("failed to reload credentials: %w", err)
 	}
+	if err := s.unmountStaleRouterEntries(ctx, oldAuth, s.core.auth, true); err != nil {
+		return fmt.Errorf("failed to unmount stale auth backends: %w", err)
+	}
+	if err := s.mountNewCredentialEntries(ctx); err != nil {
+		return fmt.Errorf("failed to mount new auth backends: %w", err)
+	}
 
 	s.logger.Info("core state reloaded from storage")
+	return nil
+}
+
+func (s *drReplicationSecondary) refreshRuntimeStateAfterApply(ctx context.Context, source string, strict bool) error {
+	s.runtimeStateReloadMu.Lock()
+	defer s.runtimeStateReloadMu.Unlock()
+
+	s.logger.Info("replicated runtime state changed; refreshing core state", "source", source)
+	if err := s.reloadCoreState(ctx); err != nil {
+		s.runtimeStateRefreshPending.Store(true)
+		err = fmt.Errorf("failed to refresh replicated runtime state after %s: %w", source, err)
+		if strict {
+			return err
+		}
+		s.logger.Warn("replicated runtime state refresh deferred", "source", source, "error", err)
+		return nil
+	}
+	s.runtimeStateRefreshPending.Store(false)
+	return nil
+}
+
+func isDRRuntimeStatePath(path string) bool {
+	normalized := strings.Trim(path, "/")
+	if normalized == "" {
+		return false
+	}
+
+	candidates := []string{normalized}
+	if keySuffix, ok := strings.CutPrefix(normalized, namespaceBarrierPrefix); ok {
+		if namespaceUUID, namespacedKey, found := strings.Cut(keySuffix, "/"); found && namespaceUUID != "" && namespacedKey != "" {
+			candidates = append(candidates, namespacedKey)
+		}
+	}
+
+	for _, candidate := range candidates {
+		switch {
+		case candidate == coreMountConfigPath || strings.HasPrefix(candidate, coreMountConfigPath+"/"):
+			return true
+		case candidate == coreAuthConfigPath || strings.HasPrefix(candidate, coreAuthConfigPath+"/"):
+			return true
+		case candidate == coreAuditConfigPath || strings.HasPrefix(candidate, coreAuditConfigPath+"/"):
+			return true
+		}
+	}
+	return false
+}
+
+func cloneDRMountTable(table *routing.MountTable) *routing.MountTable {
+	if table == nil {
+		return nil
+	}
+	return table.ShallowClone()
+}
+
+func drMountEntryContext(ctx context.Context, entry *routing.MountEntry) context.Context {
+	if entry != nil && entry.Namespace != nil {
+		return namespace.ContextWithNamespace(ctx, entry.Namespace)
+	}
+	return namespace.RootContext(ctx)
+}
+
+func isDRRuntimeRouterProtectedEntry(entry *routing.MountEntry) bool {
+	if entry == nil || entry.Local {
+		return true
+	}
+	if isSingletonMountType(entry.Type) {
+		return true
+	}
+	for _, protected := range protectedMounts {
+		if strings.HasPrefix(entry.Path, protected) {
+			return true
+		}
+	}
+	return false
+}
+
+func isSingletonMountType(mountType string) bool {
+	for _, singleton := range singletonMounts {
+		if mountType == singleton {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldSkipDRSecondaryProtectedRouterEntry(ctx context.Context, core *Core, entry *routing.MountEntry, credential bool) bool {
+	if core == nil || core.drManager == nil || core.drManager.Mode() != DRModeSecondary {
+		return false
+	}
+	if !isDRRuntimeRouterProtectedEntry(entry) {
+		return false
+	}
+
+	path := entry.Path
+	if credential {
+		path = routing.CredentialRoutePrefix + path
+	}
+	if !strings.HasSuffix(path, "/") {
+		path += "/"
+	}
+	return core.router.MatchingMount(drMountEntryContext(ctx, entry), path) != ""
+}
+
+func drMountAccessors(table *routing.MountTable) map[string]struct{} {
+	accessors := make(map[string]struct{})
+	if table == nil {
+		return accessors
+	}
+	for _, entry := range table.Entries {
+		if entry == nil || entry.Accessor == "" {
+			continue
+		}
+		accessors[entry.Accessor] = struct{}{}
+	}
+	return accessors
+}
+
+func (s *drReplicationSecondary) unmountStaleRouterEntries(ctx context.Context, oldTable, newTable *routing.MountTable, credential bool) error {
+	if oldTable == nil {
+		return nil
+	}
+	current := drMountAccessors(newTable)
+	for _, entry := range oldTable.Entries {
+		if isDRRuntimeRouterProtectedEntry(entry) {
+			continue
+		}
+		if _, ok := current[entry.Accessor]; ok {
+			continue
+		}
+
+		nsCtx := drMountEntryContext(ctx, entry)
+		path := entry.Path
+		if credential {
+			path = routing.CredentialRoutePrefix + path
+		}
+		if !strings.HasSuffix(path, "/") {
+			path += "/"
+		}
+		if s.core.router.MatchingMount(nsCtx, path) == "" {
+			continue
+		}
+
+		s.logger.Info("unmounting stale replicated router entry", "path", path, "type", entry.Type, "credential", credential)
+		if err := s.core.router.Unmount(nsCtx, path); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -1049,8 +1220,11 @@ func (s *drReplicationSecondary) mountNewEntries(ctx context.Context) error {
 	}
 
 	for _, entry := range s.core.mounts.Entries {
+		if isDRRuntimeRouterProtectedEntry(entry) {
+			continue
+		}
 		// Check if this mount is already in the router.
-		nsCtx := namespace.ContextWithNamespace(ctx, entry.Namespace)
+		nsCtx := drMountEntryContext(ctx, entry)
 		if s.core.router.MatchingMount(nsCtx, entry.Path) != "" {
 			continue
 		}
@@ -1084,6 +1258,48 @@ func (s *drReplicationSecondary) mountNewEntries(ctx context.Context) error {
 		}
 	}
 
+	return nil
+}
+
+// mountNewCredentialEntries initializes auth backends from the loaded auth
+// table when their router entries are not present yet.
+func (s *drReplicationSecondary) mountNewCredentialEntries(ctx context.Context) error {
+	if s.core.auth == nil {
+		return nil
+	}
+
+	var postUnsealFuncs []func()
+
+	s.core.authLock.Lock()
+	for _, entry := range s.core.auth.SortEntriesByPathDepth().Entries {
+		if isDRRuntimeRouterProtectedEntry(entry) {
+			continue
+		}
+
+		nsCtx := drMountEntryContext(ctx, entry)
+		path := routing.CredentialRoutePrefix + entry.Path
+		if !strings.HasSuffix(path, "/") {
+			path += "/"
+		}
+		if s.core.router.MatchingMount(nsCtx, path) != "" {
+			continue
+		}
+
+		s.logger.Info("mounting new auth entry from primary", "path", entry.Path, "type", entry.Type)
+		postUnsealFunc, err := s.core.setupCredential(nsCtx, entry)
+		if err != nil {
+			s.core.authLock.Unlock()
+			return err
+		}
+		if postUnsealFunc != nil {
+			postUnsealFuncs = append(postUnsealFuncs, postUnsealFunc)
+		}
+	}
+	s.core.authLock.Unlock()
+
+	if len(postUnsealFuncs) > 0 {
+		s.core.runPostUnsealFuncs(postUnsealFuncs)
+	}
 	return nil
 }
 
@@ -1363,6 +1579,18 @@ func (s *drReplicationSecondary) rpcContext(ctx context.Context) (context.Contex
 	return context.WithTimeout(ctx, deadline)
 }
 
+func (s *drReplicationSecondary) stopAwareContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	child, cancel := context.WithCancel(ctx)
+	go func() {
+		select {
+		case <-s.stopCh:
+			cancel()
+		case <-child.Done():
+		}
+	}()
+	return child, cancel
+}
+
 func (s *drReplicationSecondary) runHeartbeatLoop(ctx context.Context, errCh chan<- error) {
 	ticker := time.NewTicker(drHeartbeatInterval)
 	defer ticker.Stop()
@@ -1390,6 +1618,16 @@ func (s *drReplicationSecondary) runHeartbeatLoop(ctx context.Context, errCh cha
 			if err != nil {
 				if addr, ok := extractDRRedirect(err); ok {
 					s.lastKnownLeaderAddr.Store(&addr)
+				}
+				if status.Code(err) == codes.PermissionDenied {
+					s.cancelActiveStream()
+					if errCh != nil {
+						select {
+						case errCh <- fmt.Errorf("heartbeat authorization failed: %w", err):
+						default:
+						}
+					}
+					return
 				}
 			}
 			continue
@@ -1690,6 +1928,10 @@ func (s *drReplicationSecondary) noteFallbackTriggered(reason string) {
 }
 
 func (s *drReplicationSecondary) performResnapshot(ctx context.Context, reason string) error {
+	stopCtx, stopCancel := s.stopAwareContext(ctx)
+	defer stopCancel()
+	ctx = stopCtx
+
 	if reason == "" {
 		reason = "manual"
 	}
@@ -1719,6 +1961,12 @@ func (s *drReplicationSecondary) performResnapshot(ctx context.Context, reason s
 	for i := range full.EndKID {
 		full.EndKID[i] = 0xff
 	}
+	fetchSpans, err := s.fetchRemoteDigestSpans(ctx, checkpoint, full)
+	if err != nil {
+		return fmt.Errorf("resnapshot digest proof failed: %w", err)
+	}
+	accumulators := make([]drFetchedRangeAccumulator, len(fetchSpans))
+	seenRemoteKIDs := make(map[[32]byte]struct{})
 
 	fetchTimeout := s.reconcileMaxWallTime
 	if fetchTimeout <= 0 {
@@ -1772,6 +2020,7 @@ func (s *drReplicationSecondary) performResnapshot(ctx context.Context, reason s
 	}()
 
 	stream, err := s.client.FetchEntries(fetchCtx, &FetchEntriesRequest{
+		RelationshipId:  s.relationshipID,
 		CheckpointId:    checkpoint.CheckpointId,
 		CheckpointIndex: checkpoint.CommitIndex,
 		Ranges:          []*RangeSpan{rangeSpanToProto(full)},
@@ -1808,6 +2057,9 @@ func (s *drReplicationSecondary) performResnapshot(ctx context.Context, reason s
 			}
 			return fmt.Errorf("resnapshot fetch stream failed: %w", recvErr)
 		}
+		if batch == nil {
+			return fmt.Errorf("resnapshot fetch returned nil batch")
+		}
 		markProgress()
 		if err := s.assertActiveCheckpoint(batch.GetCheckpointId(), batch.GetCheckpointIndex()); err != nil {
 			return fmt.Errorf("checkpoint conflict: %w", err)
@@ -1819,6 +2071,19 @@ func (s *drReplicationSecondary) performResnapshot(ctx context.Context, reason s
 			s.reconcileRPCBytesUsed.Add(uint64(len(batch.GetEntries())) * 128)
 			entries := make([]*EntryChange, 0, len(batch.GetEntries()))
 			for _, e := range batch.GetEntries() {
+				kid, vid, err := s.kidVIDFromFetchedChange(e)
+				if err != nil {
+					return fmt.Errorf("resnapshot fetch proof failed: %w", err)
+				}
+				if _, ok := seenRemoteKIDs[kid]; ok {
+					return fmt.Errorf("resnapshot fetch returned duplicate kid %x", kid)
+				}
+				spanIndex, err := fetchSpanIndex(fetchSpans, kid)
+				if err != nil {
+					return fmt.Errorf("resnapshot fetch proof failed: %w", err)
+				}
+				accumulators[spanIndex].add(kid, vid)
+				seenRemoteKIDs[kid] = struct{}{}
 				entries = append(entries, cloneEntryChange(e))
 			}
 			if err := applyPipeline.submit(entries); err != nil {
@@ -1845,6 +2110,9 @@ func (s *drReplicationSecondary) performResnapshot(ctx context.Context, reason s
 	}
 	pipelineClosed = true
 	markProgress()
+	if err := validateFetchedRangeProofs(fetchSpans, accumulators); err != nil {
+		return fmt.Errorf("resnapshot fetch proof failed: %w", err)
+	}
 
 	localCheckpoint := reconciler.Checkpoint{
 		ID:          checkpoint.CheckpointId,
@@ -1885,7 +2153,9 @@ func (s *drReplicationSecondary) performResnapshot(ctx context.Context, reason s
 	}
 
 	s.setReconcilePhase(drReconcilePhaseFinalize)
-	s.setLastAppliedIndex(checkpoint.CommitIndex)
+	if err := s.finalizeReconcileCheckpoint(checkpoint.CheckpointId, checkpoint.CommitIndex); err != nil {
+		return fmt.Errorf("resnapshot finalize failed: %w", err)
+	}
 	s.entriesApplied.Add(uint64(applied))
 	s.reconcileCount.Add(1)
 	s.lastReconcileAt.Store(time.Now().Unix())
@@ -2066,6 +2336,12 @@ func (s *drReplicationSecondary) bootstrapKeyring(ctx context.Context) error {
 	if err := s.purgeStaleBarrierEntries(ctx); err != nil {
 		return fmt.Errorf("failed to purge stale entries: %w", err)
 	}
+	if s.core.physicalCache != nil {
+		s.core.physicalCache.Purge(ctx)
+	}
+	if err := s.core.setupCluster(ctx); err != nil {
+		return fmt.Errorf("failed to recreate local cluster info after bootstrap purge: %w", err)
+	}
 	if mgr := s.core.drManager; mgr != nil {
 		if err := mgr.PersistConfigSnapshot(ctx); err != nil {
 			return fmt.Errorf("failed to repersist DR config after bootstrap purge: %w", err)
@@ -2097,7 +2373,6 @@ var drBootstrapPreservePaths = map[string]bool{
 	"core/seal-config":             true, // unencrypted local seal config
 	"core/recovery-config":         true, // local auto-unseal recovery config
 	"core/recovery-key":            true, // local auto-unseal recovery key material
-	"core/cluster/local/info":      true, // local cluster metadata for status APIs
 }
 
 // purgeStaleBarrierEntries removes all entries from physical storage
@@ -2522,7 +2797,9 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 	current := s.lastAppliedIndex.Load()
 	affected := 0
 	var lastIndex uint64
-	var keyRotationDetected bool
+	var keyringTouched bool
+	var rootKeyTouched bool
+	var runtimeStateTouched bool
 
 	for _, change := range batch {
 		if change.RaftIndex < current {
@@ -2549,6 +2826,9 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 			if err := txn.Delete(ctx, change.Key); err != nil {
 				return err
 			}
+			if isDRRuntimeStatePath(change.Key) {
+				runtimeStateTouched = true
+			}
 		case physical.PutOperation:
 			entry := &physical.Entry{
 				Key:      change.Key,
@@ -2559,9 +2839,14 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 				return err
 			}
 
-			// Check for special keys that trigger post-commit actions
-			if change.Key == "core/keyring" || change.Key == "core/root-key" {
-				keyRotationDetected = true
+			switch change.Key {
+			case "core/keyring":
+				keyringTouched = true
+			case "core/root-key":
+				rootKeyTouched = true
+			}
+			if isDRRuntimeStatePath(change.Key) {
+				runtimeStateTouched = true
 			}
 		default:
 			// Ignore unknown operations
@@ -2587,36 +2872,25 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 		return err
 	}
 
-	// Update state
+	if rootKeyTouched {
+		if err := s.handleReplicatedKeyringUpdate(ctx, "transaction batch", "core/root-key", true); err != nil {
+			return err
+		}
+	} else if keyringTouched {
+		if err := s.handleReplicatedKeyringUpdate(ctx, "transaction batch", "core/keyring", false); err != nil {
+			return err
+		}
+	}
+	if runtimeStateTouched {
+		if err := s.refreshRuntimeStateAfterApply(ctx, "stream transaction batch", false); err != nil {
+			return err
+		}
+	}
+
 	s.setLastAppliedIndex(lastIndex)
 	s.entriesApplied.Add(uint64(affected))
 	metrics.IncrCounter([]string{"replication", "dr", "secondary", "entries_applied"}, float32(affected))
 	metrics.SetGauge([]string{"replication", "dr", "secondary", "last_applied_index"}, float32(lastIndex))
-
-	// Handle side effects (key rotation) AFTER commit
-	if keyRotationDetected {
-		// We call applyStreamChange for the specific keys again?
-		// No, we should just invoke the reload logic directly.
-		// Since the data is now COMMITTED, re-reading it from storage in Reload logic works.
-
-		// Logic copied from applyStreamChange:
-		s.logger.Info("keyring/root-key update detected via transaction batch")
-
-		if err := s.core.barrier.ReloadRootKey(ctx); err != nil {
-			s.logger.Warn("failed to reload root key after batch update", "error", err)
-		}
-		if err := s.core.barrier.ReloadKeyring(ctx); err != nil {
-			// We don't have the specific key easily here without re-iterating, but logging generic is fine
-			s.logger.Warn("failed to reload keyring after batch update", "error", err)
-		}
-
-		// Persist updated root key under secondary's seal for restart survival.
-		if keyring, err := s.core.barrier.Keyring(); err == nil {
-			if err := s.core.seal.SetStoredKeys(ctx, [][]byte{keyring.RootKey()}); err != nil {
-				s.logger.Error("failed to persist rotated root key in seal", "error", err)
-			}
-		}
-	}
 
 	return nil
 }
@@ -2666,33 +2940,73 @@ func (s *drReplicationSecondary) applyStreamChange(ctx context.Context, change *
 		// the Raft log), step 2 may fail temporarily. When core/root-key
 		// arrives next, both steps succeed. Failures are non-fatal.
 		if change.Key == "core/keyring" || change.Key == "core/root-key" {
-			s.logger.Info("keyring/root-key update detected via stream", "key", change.Key)
-
-			if err := s.core.barrier.ReloadRootKey(ctx); err != nil {
-				s.logger.Warn("failed to reload root key after stream update", "error", err)
+			if err := s.handleReplicatedKeyringUpdate(ctx, "stream", change.Key, change.Key == "core/root-key"); err != nil {
+				return err
 			}
-			if err := s.core.barrier.ReloadKeyring(ctx); err != nil {
-				s.logger.Warn("failed to reload keyring after stream update",
-					"key", change.Key, "error", err)
-			}
-
-			// Persist updated root key under secondary's seal for restart survival.
-			if keyring, err := s.core.barrier.Keyring(); err == nil {
-				if err := s.core.seal.SetStoredKeys(ctx, [][]byte{keyring.RootKey()}); err != nil {
-					s.logger.Error("failed to persist rotated root key in seal", "error", err)
-				}
+		}
+		if isDRRuntimeStatePath(change.Key) {
+			if err := s.refreshRuntimeStateAfterApply(ctx, "stream", false); err != nil {
+				return err
 			}
 		}
 		return nil
 
 	case physical.DeleteOperation:
-		return s.core.physical.Delete(ctx, change.Key)
+		if err := s.core.physical.Delete(ctx, change.Key); err != nil {
+			return err
+		}
+		if isDRRuntimeStatePath(change.Key) {
+			if err := s.refreshRuntimeStateAfterApply(ctx, "stream", false); err != nil {
+				return err
+			}
+		}
+		return nil
 
 	default:
 		s.logger.Warn("unknown operation type in change stream",
 			"op_type", change.OpType, "key", change.Key)
 		return nil
 	}
+}
+
+func (s *drReplicationSecondary) handleReplicatedKeyringUpdate(ctx context.Context, source, key string, strict bool) error {
+	s.logger.Info("keyring/root-key update detected via "+source, "key", key)
+
+	if err := s.core.barrier.ReloadRootKey(ctx); err != nil {
+		if strict {
+			return fmt.Errorf("reload root key after %s update: %w", source, err)
+		}
+		s.logger.Warn("failed to reload root key after "+source+" update", "key", key, "error", err)
+		return nil
+	}
+	if err := s.core.barrier.ReloadKeyring(ctx); err != nil {
+		if strict {
+			return fmt.Errorf("reload keyring after %s update: %w", source, err)
+		}
+		s.logger.Warn("failed to reload keyring after "+source+" update", "key", key, "error", err)
+		return nil
+	}
+
+	keyring, err := s.core.barrier.Keyring()
+	if err != nil {
+		if strict {
+			return fmt.Errorf("read keyring after %s update: %w", source, err)
+		}
+		s.logger.Warn("failed to read keyring after "+source+" update", "key", key, "error", err)
+		return nil
+	}
+	if err := s.core.seal.SetStoredKeys(ctx, [][]byte{keyring.RootKey()}); err != nil {
+		if strict {
+			return fmt.Errorf("persist rotated root key after %s update: %w", source, err)
+		}
+		s.logger.Error("failed to persist rotated root key in seal", "key", key, "error", err)
+	}
+	if s.runtimeStateRefreshPending.Load() {
+		if err := s.refreshRuntimeStateAfterApply(ctx, source+" keyring retry", false); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // applyFetchedChange applies a single entry change received via
@@ -2733,28 +3047,28 @@ func (s *drReplicationSecondary) applyFetchedChangeWithKIDMap(ctx context.Contex
 		// Same rotation-safe ordering as applyStreamChange: reload
 		// root key first, then keyring, then persist to seal.
 		if change.Key == "core/keyring" || change.Key == "core/root-key" {
-			s.logger.Info("keyring/root-key update detected via fetch", "key", change.Key)
-
-			if err := s.core.barrier.ReloadRootKey(ctx); err != nil {
-				s.logger.Warn("failed to reload root key after fetch update", "error", err)
+			if err := s.handleReplicatedKeyringUpdate(ctx, "fetch", change.Key, change.Key == "core/root-key"); err != nil {
+				return err
 			}
-			if err := s.core.barrier.ReloadKeyring(ctx); err != nil {
-				s.logger.Warn("failed to reload keyring after fetch update",
-					"key", change.Key, "error", err)
-			}
-
-			// Persist updated root key under secondary's seal.
-			if keyring, err := s.core.barrier.Keyring(); err == nil {
-				if err := s.core.seal.SetStoredKeys(ctx, [][]byte{keyring.RootKey()}); err != nil {
-					s.logger.Error("failed to persist rotated root key in seal", "error", err)
-				}
+		}
+		if isDRRuntimeStatePath(change.Key) {
+			if err := s.refreshRuntimeStateAfterApply(ctx, "fetch", false); err != nil {
+				return err
 			}
 		}
 		return nil
 
 	case physical.DeleteOperation:
 		if change.Key != "" {
-			return s.core.physical.Delete(ctx, change.Key)
+			if err := s.core.physical.Delete(ctx, change.Key); err != nil {
+				return err
+			}
+			if isDRRuntimeStatePath(change.Key) {
+				if err := s.refreshRuntimeStateAfterApply(ctx, "fetch", false); err != nil {
+					return err
+				}
+			}
+			return nil
 		}
 		// If Key is empty but KID is present, resolve via local KID map.
 		if len(change.Kid) == 32 && kidToKey != nil {
@@ -2764,7 +3078,15 @@ func (s *drReplicationSecondary) applyFetchedChangeWithKIDMap(ctx context.Contex
 				if isDRNeverReplicatePath(key) {
 					return nil
 				}
-				return s.core.physical.Delete(ctx, key)
+				if err := s.core.physical.Delete(ctx, key); err != nil {
+					return err
+				}
+				if isDRRuntimeStatePath(key) {
+					if err := s.refreshRuntimeStateAfterApply(ctx, "fetch", false); err != nil {
+						return err
+					}
+				}
+				return nil
 			}
 			s.logger.Warn("delete with KID but key not found in local map",
 				"kid_prefix", fmt.Sprintf("%x", change.Kid[:8]))
@@ -2784,10 +3106,13 @@ func (s *drReplicationSecondary) runReconciliation(ctx context.Context) error {
 	s.logger.Info("starting reconciliation")
 	startTime := time.Now()
 
+	stopCtx, stopCancel := s.stopAwareContext(ctx)
+	defer stopCancel()
+
 	// Bound the total time a single reconciliation attempt may run so
 	// that a slow scan, checkpoint build, or stalled FetchEntries RPC
 	// cannot hang the secondary indefinitely.
-	reconcileCtx, reconcileCancel := context.WithTimeout(ctx, drDefaultReconcileTimeout)
+	reconcileCtx, reconcileCancel := context.WithTimeout(stopCtx, drDefaultReconcileTimeout)
 	defer reconcileCancel()
 
 	s.setReconcilePhase(drReconcilePhaseRangeTasks)
@@ -2842,6 +3167,25 @@ func (s *drReplicationSecondary) runReconciliation(ctx context.Context) error {
 type drRangeTask struct {
 	span    reconciler.RangeSpan
 	rangeID uint64
+}
+
+type drRangeFetchProof struct {
+	hasDigest bool
+
+	count        uint64
+	xorKeyHash   [32]byte
+	xorValueHash [32]byte
+}
+
+type drFetchSpan struct {
+	span  reconciler.RangeSpan
+	proof drRangeFetchProof
+}
+
+type drFetchedRangeAccumulator struct {
+	count        uint64
+	xorKeyHash   [32]byte
+	xorValueHash [32]byte
 }
 
 type drQueuedRangeTask struct {
@@ -3082,6 +3426,7 @@ func (p *drPutApplyPipeline) applyBatchTxn(entries []*EntryChange) error {
 	// entries need the special reload path in applyFetchedChange.
 	var keyringEntries []*EntryChange
 	normalEntries := make([]*EntryChange, 0, len(entries))
+	var runtimeStateTouched bool
 
 	for _, change := range entries {
 		if change == nil {
@@ -3094,6 +3439,9 @@ func (p *drPutApplyPipeline) applyBatchTxn(entries []*EntryChange) error {
 			keyringEntries = append(keyringEntries, change)
 		} else {
 			normalEntries = append(normalEntries, change)
+			if isDRRuntimeStatePath(change.Key) {
+				runtimeStateTouched = true
+			}
 		}
 	}
 
@@ -3143,6 +3491,11 @@ func (p *drPutApplyPipeline) applyBatchTxn(entries []*EntryChange) error {
 
 		if err := tx.Commit(p.ctx); err != nil {
 			return fmt.Errorf("commit batch txn (%d entries): %w", len(normalEntries), err)
+		}
+		if runtimeStateTouched {
+			if err := p.secondary.refreshRuntimeStateAfterApply(p.ctx, "fetch transaction batch", false); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -3282,8 +3635,10 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 		nextTaskID++
 	}
 
-	// 1. Exchange Dirty Bitmap
-	var dirtyRanges []uint64
+	// 1. Exchange Dirty Bitmap. The bitmap is a priority hint only; range
+	// selection remains complete for every checkpoint reconciliation.
+	dirtyHints := make([]bool, drRangeMaxTotalRanges)
+	dirtyHintCount := 0
 	rpcCtx, cancel := s.rpcContext(ctx)
 	bitmapResp, err := s.client.ExchangeDirtyBitmap(rpcCtx, &DirtyBitmapMessage{
 		RelationshipId:  s.relationshipID,
@@ -3292,22 +3647,22 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 	})
 	cancel()
 
-	useBitmap := false
+	useBitmapHints := false
 	if err == nil {
-		// Verify if bitmap is usable (covers all missing changes)
-		lastApplied := s.lastAppliedIndex.Load()
-		if bitmapResp.StartIndex <= lastApplied {
-			useBitmap = true
-			s.logger.Info("using dirty bitmap optimization", "start_index", bitmapResp.StartIndex, "last_applied", lastApplied)
+		if bitmapResp == nil {
+			s.logger.Warn("dirty bitmap response was nil; using natural range order")
+		} else if lastApplied := s.lastAppliedIndex.Load(); bitmapResp.StartIndex <= lastApplied {
+			useBitmapHints = true
+			s.logger.Info("using dirty bitmap priority hints", "start_index", bitmapResp.StartIndex, "last_applied", lastApplied)
 
-			// Parse bitmap
 			for i := 0; i < len(bitmapResp.Bitmap); i++ {
 				b := bitmapResp.Bitmap[i]
 				for j := 0; j < 8; j++ {
 					if (b & (1 << j)) != 0 {
-						rangeID := uint64(i*8 + j)
-						if rangeID < uint64(drRangeMaxTotalRanges) {
-							dirtyRanges = append(dirtyRanges, rangeID)
+						rangeID := i*8 + j
+						if rangeID < drRangeMaxTotalRanges && !dirtyHints[rangeID] {
+							dirtyHints[rangeID] = true
+							dirtyHintCount++
 						}
 					}
 				}
@@ -3319,27 +3674,25 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 		s.logger.Warn("failed to exchange dirty bitmap", "error", err)
 	}
 
-	if !useBitmap {
-		// Fallback: check all ranges
-		dirtyRanges = make([]uint64, drRangeMaxTotalRanges)
-		for i := 0; i < drRangeMaxTotalRanges; i++ {
-			dirtyRanges[i] = uint64(i)
-		}
-	}
+	rangesToVerify := buildCompleteRangeVerificationOrder(dirtyHints)
 
-	s.logger.Info("ranges to verify", "count", len(dirtyRanges), "using_bitmap", useBitmap)
+	s.logger.Info("ranges to verify",
+		"count", len(rangesToVerify),
+		"dirty_hint_count", dirtyHintCount,
+		"using_bitmap_hints", useBitmapHints)
 
 	// 2. Exchange Range Checksums (Batched)
 	batchSize := 100
-	for i := 0; i < len(dirtyRanges); i += batchSize {
+	for i := 0; i < len(rangesToVerify); i += batchSize {
 		end := i + batchSize
-		if end > len(dirtyRanges) {
-			end = len(dirtyRanges)
+		if end > len(rangesToVerify) {
+			end = len(rangesToVerify)
 		}
-		batchIDs := dirtyRanges[i:end]
+		batchIDs := rangesToVerify[i:end]
 
 		rpcCtx, cancel := s.rpcContext(ctx)
 		csumResp, err := s.client.ExchangeRangeChecksums(rpcCtx, &RangeChecksumRequest{
+			RelationshipId:  s.relationshipID,
 			CheckpointId:    checkpoint.CheckpointId,
 			CheckpointIndex: checkpoint.CommitIndex,
 			RangeIds:        batchIDs,
@@ -3347,6 +3700,9 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 		cancel()
 		if err != nil {
 			return fmt.Errorf("reconcile failure [rpc_failed]: exchange range checksums: %w", err)
+		}
+		if csumResp == nil {
+			return fmt.Errorf("reconcile failure [rpc_failed]: exchange range checksums returned nil response")
 		}
 		if err := budget.addRPC(uint64(len(batchIDs) * 24)); err != nil { // Approximate size
 			return err
@@ -3364,9 +3720,12 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 		// A mismatch always enters Phase B, where the authoritative
 		// RangeDescriptor (256-bit SHA256-XOR pair + count) narrows the
 		// diff to the smallest mismatched sub-ranges.
-		remoteChecksums := make(map[uint64]*RangeChecksum, len(csumResp.Checksums))
-		for _, rc := range csumResp.Checksums {
-			remoteChecksums[rc.RangeId] = rc
+		remoteChecksums := make(map[uint64]*RangeChecksum, len(csumResp.GetChecksums()))
+		for _, rc := range csumResp.GetChecksums() {
+			if rc == nil {
+				continue
+			}
+			remoteChecksums[rc.GetRangeId()] = rc
 		}
 
 		for _, rangeID := range batchIDs {
@@ -3380,7 +3739,7 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 					mismatch = true
 				}
 			} else {
-				if remoteRC.Checksum != localSum || remoteRC.Count != localCount {
+				if remoteRC.GetChecksum() != localSum || remoteRC.GetCount() != localCount {
 					mismatch = true
 				}
 			}
@@ -3397,14 +3756,18 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 	metrics.SetGauge([]string{"replication", "dr", "reconcile", "ranges_mismatched"}, float32(queue.Len()))
 
 	if queue.Len() == 0 {
-		// All dirty ranges matched at the CRC64-XOR level (Phase A).
+		// All top-level ranges matched at the CRC64-XOR level (Phase A).
 		// No Phase B drill-down or Phase C fetch required.
+		s.setReconcilePhase(drReconcilePhaseFinalize)
+		if err := s.finalizeReconcileCheckpoint(checkpoint.CheckpointId, checkpoint.CommitIndex); err != nil {
+			return fmt.Errorf("range reconciliation finalize failed: %w", err)
+		}
 		s.reconcileBudgetRemainingByte.Store(int64(s.reconcileMaxRPCBytes))
-		s.setLastAppliedIndex(checkpoint.CommitIndex)
 		s.reconcileCount.Add(1)
 		s.lastReconcileAt.Store(time.Now().Unix())
 		s.logger.Info("range reconciliation: all ranges converged at Phase A checksum",
-			"dirty_ranges_checked", len(dirtyRanges))
+			"ranges_checked", len(rangesToVerify),
+			"dirty_hint_count", dirtyHintCount)
 		return nil
 	}
 
@@ -3433,7 +3796,7 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 					if !ok {
 						return
 					}
-					res := s.processRangeTask(workerCtx, checkpoint, localIndex, queued)
+					res := s.processRangeTask(workerCtx, checkpoint, localIndex, localSet.KIDToKey, queued)
 					select {
 					case resultCh <- res:
 					case <-workerCtx.Done():
@@ -3505,17 +3868,8 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 				return wrapReconcileFailure(drReconcileFailureApplyFailed, "queue fetched entries for apply", err)
 			}
 		}
-		// Removed keys handling?
-		// FetchEntries response (EntryBatch) can contain indications of removal if we compare?
-		// Actually, FetchEntries with `ranges` streams ALL entries in range.
-		// So simple logic:
-		// 1. Get all remote entries for range.
-		// 2. Local entries in range that are NOT in remote list are DELETES.
-		// 3. Remote entries are PUTS.
-		// Wait, `processRangeTask` needs to determine DELETES too!
-		// `FetchEntries` only gives me what exists on Primary.
-		// I need to difference with Local.
-		// I will update `processRangeTask` to do this diff.
+		// Range fetch streams primary-present entries; the worker also
+		// reports local-only keys so deletes are applied after puts settle.
 		if len(res.removedKeys) > 0 {
 			for _, key := range res.removedKeys {
 				pendingDeletes[key] = struct{}{}
@@ -3542,7 +3896,9 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 	}
 	s.setReconcilePhase(drReconcilePhaseFinalize)
 
-	s.setLastAppliedIndex(checkpoint.CommitIndex)
+	if err := s.finalizeReconcileCheckpoint(checkpoint.CheckpointId, checkpoint.CommitIndex); err != nil {
+		return fmt.Errorf("range reconciliation finalize failed: %w", err)
+	}
 	s.reconcileCount.Add(1)
 	s.lastReconcileAt.Store(time.Now().Unix())
 	s.logger.Info("range-first reconciliation complete",
@@ -3552,7 +3908,22 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 	return nil
 }
 
-func (s *drReplicationSecondary) processRangeTask(ctx context.Context, checkpoint *CheckpointResponse, localIndex *reconciler.RangeMapIndex, queued drQueuedRangeTask) drRangeTaskResult {
+func buildCompleteRangeVerificationOrder(dirtyHints []bool) []uint64 {
+	ranges := make([]uint64, 0, drRangeMaxTotalRanges)
+	for i := 0; i < drRangeMaxTotalRanges; i++ {
+		if i < len(dirtyHints) && dirtyHints[i] {
+			ranges = append(ranges, uint64(i))
+		}
+	}
+	for i := 0; i < drRangeMaxTotalRanges; i++ {
+		if i >= len(dirtyHints) || !dirtyHints[i] {
+			ranges = append(ranges, uint64(i))
+		}
+	}
+	return ranges
+}
+
+func (s *drReplicationSecondary) processRangeTask(ctx context.Context, checkpoint *CheckpointResponse, localIndex *reconciler.RangeMapIndex, kidToKey map[[32]byte]string, queued drQueuedRangeTask) drRangeTaskResult {
 	task := queued.task
 	result := drRangeTaskResult{
 		id:   queued.id,
@@ -3560,19 +3931,27 @@ func (s *drReplicationSecondary) processRangeTask(ctx context.Context, checkpoin
 	}
 
 	// Attempt fine-grained drill-down to narrow the diff.
-	fetchSpans := s.runRangeDrillDown(ctx, checkpoint, localIndex, task.span)
+	fetchSpans, err := s.runRangeDrillDown(ctx, checkpoint, localIndex, task.span)
+	if err != nil {
+		result.err = err
+		return result
+	}
 	if fetchSpans == nil {
-		// Drill-down failed or unsupported -- fall back to full range.
-		fetchSpans = []reconciler.RangeSpan{task.span}
+		result.err = fmt.Errorf("drill-down did not return a fetch plan")
+		return result
+	}
+	if len(fetchSpans) == 0 {
+		return result
 	}
 
 	// Convert narrowed spans to proto and fetch entries.
 	protoSpans := make([]*RangeSpan, len(fetchSpans))
 	for i, sp := range fetchSpans {
-		protoSpans[i] = rangeSpanToProto(sp)
+		protoSpans[i] = rangeSpanToProto(sp.span)
 	}
 
 	stream, err := s.client.FetchEntries(ctx, &FetchEntriesRequest{
+		RelationshipId:  s.relationshipID,
 		CheckpointId:    checkpoint.CheckpointId,
 		CheckpointIndex: checkpoint.CommitIndex,
 		Ranges:          protoSpans,
@@ -3584,6 +3963,9 @@ func (s *drReplicationSecondary) processRangeTask(ctx context.Context, checkpoin
 	}
 
 	var rpcBytes uint64
+	remoteKIDs := make(map[[32]byte]struct{})
+	seenRemoteKIDs := make(map[[32]byte]struct{})
+	accumulators := make([]drFetchedRangeAccumulator, len(fetchSpans))
 
 	for {
 		batch, err := stream.Recv()
@@ -3594,14 +3976,185 @@ func (s *drReplicationSecondary) processRangeTask(ctx context.Context, checkpoin
 			result.err = fmt.Errorf("fetch stream recv error: %w", err)
 			return result
 		}
+		if batch == nil {
+			result.err = fmt.Errorf("fetch stream returned nil batch")
+			return result
+		}
+		if err := s.assertActiveCheckpoint(batch.GetCheckpointId(), batch.GetCheckpointIndex()); err != nil {
+			result.err = fmt.Errorf("checkpoint conflict: %w", err)
+			return result
+		}
+		if len(batch.GetFailedKids()) > 0 {
+			result.err = fmt.Errorf("fetch stream returned failed_kids: %d", len(batch.GetFailedKids()))
+			return result
+		}
 		rpcBytes += uint64(len(batch.Entries) * 128) // Estimate
 		for _, e := range batch.Entries {
+			kid, vid, err := s.kidVIDFromFetchedChange(e)
+			if err != nil {
+				result.err = err
+				return result
+			}
+			if _, ok := seenRemoteKIDs[kid]; ok {
+				result.err = fmt.Errorf("fetch stream returned duplicate kid %x", kid)
+				return result
+			}
+			spanIndex, err := fetchSpanIndex(fetchSpans, kid)
+			if err != nil {
+				result.err = err
+				return result
+			}
+			accumulators[spanIndex].add(kid, vid)
+			remoteKIDs[kid] = struct{}{}
+			seenRemoteKIDs[kid] = struct{}{}
 			result.fetchedEntries = append(result.fetchedEntries, cloneEntryChange(e))
 		}
 	}
 	result.rpcBytes = rpcBytes
 
+	if err := validateFetchedRangeProofs(fetchSpans, accumulators); err != nil {
+		result.err = err
+		return result
+	}
+
+	removedKeys, err := localOnlyKeysForSpans(localIndex, kidToKey, rangeSpansFromFetchSpans(fetchSpans), remoteKIDs)
+	if err != nil {
+		result.err = err
+		return result
+	}
+	result.removedKeys = removedKeys
+
 	return result
+}
+
+func (s *drReplicationSecondary) kidFromEntryChange(change *EntryChange) ([32]byte, bool) {
+	var kid [32]byte
+	if change == nil {
+		return kid, false
+	}
+	if len(change.Kid) == 32 {
+		copy(kid[:], change.Kid)
+		return kid, true
+	}
+	if change.Key != "" {
+		return s.scanner.ComputeKID(change.Key), true
+	}
+	return kid, false
+}
+
+func (s *drReplicationSecondary) kidVIDFromFetchedChange(change *EntryChange) ([32]byte, [32]byte, error) {
+	var vid [32]byte
+	kid, ok := s.kidFromEntryChange(change)
+	if !ok {
+		return kid, vid, fmt.Errorf("fetch stream returned entry without resolvable kid")
+	}
+	switch physical.Operation(change.OpType) {
+	case physical.PutOperation:
+		vid = s.scanner.ComputeVIDWithSealWrap(change.Value, change.SealWrap)
+		return kid, vid, nil
+	case physical.DeleteOperation:
+		if change.Key == "" {
+			return kid, vid, fmt.Errorf("fetch stream returned kid-only delete that cannot be range-proofed: kid=%x", kid)
+		}
+		_, vid = s.scanner.ComputeItemFromEntry(&physical.Entry{Key: change.Key})
+		return kid, vid, nil
+	default:
+		return kid, vid, fmt.Errorf("unknown operation type in fetched change: op_type=%s key=%s", change.OpType, change.Key)
+	}
+}
+
+func (a *drFetchedRangeAccumulator) add(kid, vid [32]byte) {
+	a.count++
+
+	kidHash := sha256.Sum256(kid[:])
+	xorHash32(&a.xorKeyHash, kidHash)
+
+	h := sha256.New()
+	h.Write(kid[:])
+	h.Write(vid[:])
+	var elem [32]byte
+	copy(elem[:], h.Sum(nil))
+	xorHash32(&a.xorValueHash, elem)
+}
+
+func validateFetchedRangeProofs(fetchSpans []drFetchSpan, accumulators []drFetchedRangeAccumulator) error {
+	if len(fetchSpans) != len(accumulators) {
+		return fmt.Errorf("fetch proof validation invariant failed: spans=%d accumulators=%d", len(fetchSpans), len(accumulators))
+	}
+	for i, fetchSpan := range fetchSpans {
+		acc := accumulators[i]
+		proof := fetchSpan.proof
+		if proof.hasDigest {
+			if acc.count != proof.count || acc.xorKeyHash != proof.xorKeyHash || acc.xorValueHash != proof.xorValueHash {
+				return fmt.Errorf("fetch digest proof mismatch: span_depth=%d fetched_count=%d expected_count=%d", fetchSpan.span.SplitDepth, acc.count, proof.count)
+			}
+			continue
+		}
+		return fmt.Errorf("missing fetch completeness proof for span depth=%d", fetchSpan.span.SplitDepth)
+	}
+	return nil
+}
+
+func fetchSpanIndex(fetchSpans []drFetchSpan, kid [32]byte) (int, error) {
+	found := -1
+	for i, fetchSpan := range fetchSpans {
+		if !fetchSpan.span.Contains(kid) {
+			continue
+		}
+		if found >= 0 {
+			return -1, fmt.Errorf("fetch stream returned kid %x matching multiple spans", kid)
+		}
+		found = i
+	}
+	if found < 0 {
+		return -1, fmt.Errorf("fetch stream returned kid %x outside requested spans", kid)
+	}
+	return found, nil
+}
+
+func rangeSpansFromFetchSpans(fetchSpans []drFetchSpan) []reconciler.RangeSpan {
+	spans := make([]reconciler.RangeSpan, len(fetchSpans))
+	for i, fetchSpan := range fetchSpans {
+		spans[i] = fetchSpan.span
+	}
+	return spans
+}
+
+func xorHash32(dst *[32]byte, src [32]byte) {
+	for i := 0; i < 32; i++ {
+		dst[i] ^= src[i]
+	}
+}
+
+func localOnlyKeysForSpans(localIndex *reconciler.RangeMapIndex, kidToKey map[[32]byte]string, spans []reconciler.RangeSpan, remoteKIDs map[[32]byte]struct{}) ([]string, error) {
+	if localIndex == nil || len(spans) == 0 {
+		return nil, nil
+	}
+	seen := make(map[string]struct{})
+	for _, span := range spans {
+		for _, kid := range localIndex.RangeKeys(span) {
+			if _, ok := remoteKIDs[kid]; ok {
+				continue
+			}
+			key, ok := kidToKey[kid]
+			if !ok || key == "" {
+				return nil, fmt.Errorf("local-only kid %x in reconcile span has no key mapping", kid)
+			}
+			if isDRNeverReplicatePath(key) {
+				continue
+			}
+			seen[key] = struct{}{}
+		}
+	}
+	if len(seen) == 0 {
+		return nil, nil
+	}
+	keys := make([]string, 0, len(seen))
+	for key := range seen {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys, nil
 }
 
 func wrapReconcileFailure(defaultClass drReconcileFailureClass, op string, err error) error {
@@ -3757,35 +4310,58 @@ func rangeSpanToProto(span reconciler.RangeSpan) *RangeSpan {
 	}
 }
 
+func (s *drReplicationSecondary) fetchRemoteDigestSpans(ctx context.Context, checkpoint *CheckpointResponse, parentSpan reconciler.RangeSpan) ([]drFetchSpan, error) {
+	rpcCtx, cancel := s.rpcContext(ctx)
+	resp, err := s.client.ExchangeRangeDigests(rpcCtx, &RangeDigestRequest{
+		RelationshipId:  s.relationshipID,
+		CheckpointId:    checkpoint.CheckpointId,
+		CheckpointIndex: checkpoint.CommitIndex,
+		ParentSpan:      rangeSpanToProto(parentSpan),
+	})
+	cancel()
+	if err != nil {
+		return nil, fmt.Errorf("digest RPC failed for span depth=%d: %w", parentSpan.SplitDepth, err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("invalid digest response: nil response for span depth=%d", parentSpan.SplitDepth)
+	}
+	if len(resp.GetDigests()) == 0 {
+		return nil, fmt.Errorf("invalid digest response: no digests for span depth=%d", parentSpan.SplitDepth)
+	}
+	return fetchSpansFromDigestResponse(parentSpan, resp.GetDigests())
+}
+
 // runRangeDrillDown performs fine-grained drill-down on a mismatched
 // range by recursively splitting it via ExchangeRangeDigests until the
 // diff is narrowed to the smallest mismatched sub-ranges. Returns the
-// list of sub-range spans that need fetching. If drill-down fails or
-// the RPC is unimplemented, it returns nil to signal the caller should
-// fall back to fetching the entire range.
+// list of sub-range spans that need fetching. Drill-down is mandatory for
+// mismatched ranges: transport failures and malformed digest content both
+// return an error because they cannot safely narrow the fetch scope.
 func (s *drReplicationSecondary) runRangeDrillDown(
 	ctx context.Context,
 	checkpoint *CheckpointResponse,
 	localIndex *reconciler.RangeMapIndex,
 	parentSpan reconciler.RangeSpan,
-) []reconciler.RangeSpan {
+) ([]drFetchSpan, error) {
 	// Work queue of spans to drill into.
-	pending := []reconciler.RangeSpan{parentSpan}
-	var mismatched []reconciler.RangeSpan
+	pending := []drFetchSpan{{span: parentSpan}}
+	var mismatched []drFetchSpan
 	splits := 0
 
 	for len(pending) > 0 && splits < drRangeMaxSessionSplits {
-		span := pending[0]
+		item := pending[0]
+		span := item.span
 		pending = pending[1:]
 
 		// Check depth limit.
 		if span.SplitDepth >= uint32(drRangeMaxSplitDepth) {
-			mismatched = append(mismatched, span)
+			mismatched = append(mismatched, item)
 			continue
 		}
 
 		rpcCtx, cancel := s.rpcContext(ctx)
 		resp, err := s.client.ExchangeRangeDigests(rpcCtx, &RangeDigestRequest{
+			RelationshipId:  s.relationshipID,
 			CheckpointId:    checkpoint.CheckpointId,
 			CheckpointIndex: checkpoint.CommitIndex,
 			ParentSpan:      rangeSpanToProto(span),
@@ -3793,39 +4369,40 @@ func (s *drReplicationSecondary) runRangeDrillDown(
 		cancel()
 
 		if err != nil {
-			// If the primary doesn't support drill-down (old version)
-			// or any RPC failure, fall back to full-range fetch.
-			s.logger.Warn("drill-down RPC failed, falling back to full range fetch",
-				"error", err, "split_depth", span.SplitDepth)
-			return nil
+			return nil, fmt.Errorf("drill-down RPC failed for span depth=%d: %w", span.SplitDepth, err)
+		}
+		if resp == nil {
+			return nil, fmt.Errorf("invalid drill-down response: nil response for span depth=%d", span.SplitDepth)
+		}
+		if len(resp.GetDigests()) == 0 {
+			return nil, fmt.Errorf("invalid drill-down response: no digests for span depth=%d", span.SplitDepth)
 		}
 
-		for _, digest := range resp.Digests {
-			remoteSpan, _, err := protoToRangeSpan(digest.Span)
-			if err != nil {
-				s.logger.Warn("invalid drill-down span from primary", "error", err)
-				return nil
-			}
+		children, err := fetchSpansFromDigestResponse(span, resp.GetDigests())
+		if err != nil {
+			return nil, fmt.Errorf("invalid drill-down response: %w", err)
+		}
 
+		for _, child := range children {
 			// Compute local RangeDescriptor for this sub-range.
-			localDesc := reconciler.BuildRangeDigestFromIndex(localIndex, remoteSpan)
+			localDesc := reconciler.BuildRangeDigestFromIndex(localIndex, child.span)
 
 			// Phase B authoritative equality: compare (count, XORKeyHash,
 			// XORValueHash). These are 256-bit SHA256-XOR accumulators,
 			// making false-equality cryptographically negligible (~2^-256).
-			if localDesc.Count == digest.Count &&
-				localDesc.XORKeyHash == bytesToHash32(digest.XorKeyHash) &&
-				localDesc.XORValueHash == bytesToHash32(digest.XorValueHash) {
+			if localDesc.Count == child.proof.count &&
+				localDesc.XORKeyHash == child.proof.xorKeyHash &&
+				localDesc.XORValueHash == child.proof.xorValueHash {
 				// Sub-range matches at RangeDescriptor level -- skip.
 				continue
 			}
 
 			splits++
 			// Sub-range mismatched -- drill deeper or mark for fetch.
-			if remoteSpan.SplitDepth < uint32(drRangeMaxSplitDepth) && digest.Count > 1 {
-				pending = append(pending, remoteSpan)
+			if child.span.SplitDepth < uint32(drRangeMaxSplitDepth) && child.proof.count > 1 {
+				pending = append(pending, child)
 			} else {
-				mismatched = append(mismatched, remoteSpan)
+				mismatched = append(mismatched, child)
 			}
 		}
 	}
@@ -3834,14 +4411,112 @@ func (s *drReplicationSecondary) runRangeDrillDown(
 	mismatched = append(mismatched, pending...)
 
 	if len(mismatched) == 0 {
-		return mismatched // Empty -- ranges converged during drill-down.
+		return mismatched, nil // Empty -- ranges converged during drill-down.
 	}
 
 	s.logger.Info("drill-down complete",
 		"original_span_depth", parentSpan.SplitDepth,
 		"mismatched_sub_ranges", len(mismatched),
 		"total_splits", splits)
-	return mismatched
+	return mismatched, nil
+}
+
+func fetchSpansFromDigestResponse(parent reconciler.RangeSpan, digests []*RangeDigest) ([]drFetchSpan, error) {
+	if !parent.Valid() {
+		return nil, fmt.Errorf("invalid parent span")
+	}
+	fetchSpans := make([]drFetchSpan, 0, len(digests))
+	for _, digest := range digests {
+		remoteSpan, _, err := protoToRangeSpan(digest.GetSpan())
+		if err != nil {
+			return nil, err
+		}
+		if !remoteSpan.Valid() {
+			return nil, fmt.Errorf("invalid span bounds")
+		}
+		if bytes.Compare(remoteSpan.StartKID[:], parent.StartKID[:]) < 0 ||
+			bytes.Compare(remoteSpan.EndKID[:], parent.EndKID[:]) > 0 {
+			return nil, fmt.Errorf("digest span is outside parent span")
+		}
+		proof, err := rangeFetchProofFromDigest(digest)
+		if err != nil {
+			return nil, err
+		}
+		fetchSpans = append(fetchSpans, drFetchSpan{span: remoteSpan, proof: proof})
+	}
+	if len(fetchSpans) == 0 {
+		return nil, fmt.Errorf("no digests")
+	}
+
+	sort.Slice(fetchSpans, func(i, j int) bool {
+		if cmp := bytes.Compare(fetchSpans[i].span.StartKID[:], fetchSpans[j].span.StartKID[:]); cmp != 0 {
+			return cmp < 0
+		}
+		return bytes.Compare(fetchSpans[i].span.EndKID[:], fetchSpans[j].span.EndKID[:]) < 0
+	})
+
+	if !bytes.Equal(fetchSpans[0].span.StartKID[:], parent.StartKID[:]) {
+		return nil, fmt.Errorf("digest coverage gap at parent start")
+	}
+
+	_, _, parentCanSplit := reconciler.SplitRange(parent)
+	for i, fetchSpan := range fetchSpans {
+		if fetchSpan.span == parent && fetchSpan.span.SplitDepth == parent.SplitDepth {
+			if parentCanSplit {
+				return nil, fmt.Errorf("digest span did not split splittable parent")
+			}
+		} else if fetchSpan.span.SplitDepth <= parent.SplitDepth {
+			return nil, fmt.Errorf("digest span did not advance split depth")
+		}
+
+		if i == 0 {
+			continue
+		}
+		expectedStart, carry := nextKID(fetchSpans[i-1].span.EndKID)
+		if carry {
+			return nil, fmt.Errorf("digest coverage overlaps after terminal kid")
+		}
+		if !bytes.Equal(expectedStart[:], fetchSpan.span.StartKID[:]) {
+			return nil, fmt.Errorf("digest coverage gap or overlap")
+		}
+	}
+
+	last := fetchSpans[len(fetchSpans)-1].span
+	if !bytes.Equal(last.EndKID[:], parent.EndKID[:]) {
+		return nil, fmt.Errorf("digest coverage gap at parent end")
+	}
+	return fetchSpans, nil
+}
+
+func rangeFetchProofFromDigest(digest *RangeDigest) (drRangeFetchProof, error) {
+	var proof drRangeFetchProof
+	if digest == nil {
+		return proof, fmt.Errorf("nil digest")
+	}
+	keyHash := digest.GetXorKeyHash()
+	valueHash := digest.GetXorValueHash()
+	if len(keyHash) != 32 {
+		return proof, fmt.Errorf("invalid xor_key_hash length %d", len(keyHash))
+	}
+	if len(valueHash) != 32 {
+		return proof, fmt.Errorf("invalid xor_value_hash length %d", len(valueHash))
+	}
+	proof.hasDigest = true
+	proof.count = digest.GetCount()
+	copy(proof.xorKeyHash[:], keyHash)
+	copy(proof.xorValueHash[:], valueHash)
+	return proof, nil
+}
+
+func nextKID(kid [32]byte) ([32]byte, bool) {
+	out := kid
+	for i := len(out) - 1; i >= 0; i-- {
+		out[i]++
+		if out[i] != 0 {
+			return out, false
+		}
+	}
+	return out, true
 }
 
 // protoToRangeSpan converts a proto RangeSpan to a reconciler.RangeSpan.
@@ -3857,13 +4532,4 @@ func protoToRangeSpan(span *RangeSpan) (reconciler.RangeSpan, bool, error) {
 	copy(s.EndKID[:], span.EndKid)
 	s.SplitDepth = span.SplitDepth
 	return s, true, nil
-}
-
-// bytesToHash32 converts a byte slice to a [32]byte array.
-func bytesToHash32(b []byte) [32]byte {
-	var h [32]byte
-	if len(b) == 32 {
-		copy(h[:], b)
-	}
-	return h
 }

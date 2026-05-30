@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -77,6 +78,7 @@ func TestSystemBackend_RootPaths(t *testing.T) {
 		"replication/dr/primary/relationships/*",
 		"replication/dr/secondary/enable",
 		"replication/dr/secondary/disable",
+		"replication/dr/secondary/rotate-certificate",
 		"replication/dr/secondary/promote",
 		"replication/dr/secondary/resnapshot",
 		"replication/dr/tuning",
@@ -87,6 +89,178 @@ func TestSystemBackend_RootPaths(t *testing.T) {
 	if !reflect.DeepEqual(actual, expected) {
 		t.Fatalf("bad: mismatch\nexpected:\n%#v\ngot:\n%#v", expected, actual)
 	}
+}
+
+func TestSystemBackend_DRSpecialPaths(t *testing.T) {
+	b := testSystemBackend(t)
+
+	rootPaths := b.SpecialPaths().Root
+	for _, path := range []string{
+		"replication/dr/primary/enable",
+		"replication/dr/primary/disable",
+		"replication/dr/primary/secondary-token",
+		"replication/dr/primary/relationships",
+		"replication/dr/primary/relationships/*",
+		"replication/dr/secondary/enable",
+		"replication/dr/secondary/disable",
+		"replication/dr/secondary/rotate-certificate",
+		"replication/dr/secondary/promote",
+		"replication/dr/secondary/resnapshot",
+		"replication/dr/tuning",
+	} {
+		if !strListContains(rootPaths, path) {
+			t.Fatalf("expected DR admin path %q to require root", path)
+		}
+	}
+	if strListContains(rootPaths, "replication/dr/primary/register-secondary") {
+		t.Fatal("bootstrap registration endpoint must not require root because bootstrap token is its credential")
+	}
+	for _, path := range []string{
+		"replication/dr/primary/rotate-secondary-certificate",
+		"replication/dr/primary/confirm-secondary-certificate",
+	} {
+		if strListContains(rootPaths, path) {
+			t.Fatalf("credential rotation endpoint %q must not require root because relationship signatures are its credential", path)
+		}
+	}
+
+	unauthPaths := b.SpecialPaths().Unauthenticated
+	expectedDRUnauthPaths := []string{
+		"replication/dr/status",
+		"replication/dr/primary/register-secondary",
+		"replication/dr/primary/rotate-secondary-certificate",
+		"replication/dr/primary/confirm-secondary-certificate",
+	}
+	for _, path := range expectedDRUnauthPaths {
+		if !strListContains(unauthPaths, path) {
+			t.Fatalf("expected DR path %q to be unauthenticated", path)
+		}
+	}
+	for _, path := range unauthPaths {
+		if strings.HasPrefix(path, "replication/dr/") && !strListContains(expectedDRUnauthPaths, path) {
+			t.Fatalf("unexpected DR unauthenticated path %q", path)
+		}
+	}
+}
+
+func TestSystemBackend_DRSensitiveFields(t *testing.T) {
+	b := testSystemBackend(t).(*SystemBackend)
+
+	requireSensitiveDRField := func(pattern, field string) {
+		t.Helper()
+		p := findDRPathForTest(t, b, pattern)
+		schema, ok := p.Fields[field]
+		if !ok {
+			t.Fatalf("path %q missing field %q", pattern, field)
+		}
+		if schema.DisplayAttrs == nil || !schema.DisplayAttrs.Sensitive {
+			t.Fatalf("path %q field %q must be marked sensitive", pattern, field)
+		}
+	}
+	requireSensitiveDRResponseField := func(pattern string, op logical.Operation, status int, field string) {
+		t.Helper()
+		p := findDRPathForTest(t, b, pattern)
+		handler, ok := p.Operations[op].(*framework.PathOperation)
+		if !ok {
+			t.Fatalf("path %q operation %q is not a PathOperation", pattern, op)
+		}
+		responses := handler.Responses[status]
+		if len(responses) == 0 {
+			t.Fatalf("path %q operation %q missing response status %d", pattern, op, status)
+		}
+		schema, ok := responses[0].Fields[field]
+		if !ok {
+			t.Fatalf("path %q response missing field %q", pattern, field)
+		}
+		if schema.DisplayAttrs == nil || !schema.DisplayAttrs.Sensitive {
+			t.Fatalf("path %q response field %q must be marked sensitive", pattern, field)
+		}
+	}
+
+	requireSensitiveDRResponseField("replication/dr/primary/secondary-token$", logical.UpdateOperation, http.StatusOK, "token")
+	requireSensitiveDRField("replication/dr/secondary/enable$", "token")
+	requireSensitiveDRField("replication/dr/primary/register-secondary$", "bootstrap_token")
+	requireSensitiveDRField("replication/dr/primary/register-secondary$", "secondary_ca_cert")
+	for _, pattern := range []string{
+		"replication/dr/primary/rotate-secondary-certificate$",
+		"replication/dr/primary/confirm-secondary-certificate$",
+	} {
+		requireSensitiveDRField(pattern, "secondary_ca_cert")
+		requireSensitiveDRField(pattern, "signature")
+	}
+}
+
+func TestSystemBackend_DRAuditHMACsBootstrapAndRotationMaterial(t *testing.T) {
+	noop := corehelpers.TestNoopAudit(t, nil)
+
+	requests := []*logical.Request{
+		{
+			Operation: logical.UpdateOperation,
+			Path:      "sys/replication/dr/primary/register-secondary",
+			Data: map[string]interface{}{
+				"relationship_id":   "11111111-1111-1111-1111-111111111111",
+				"bootstrap_token":   "bootstrap-token-raw-value-that-must-not-appear",
+				"secondary_ca_cert": "registration-cert-raw-value-that-must-not-appear",
+			},
+		},
+		{
+			Operation: logical.UpdateOperation,
+			Path:      "sys/replication/dr/primary/rotate-secondary-certificate",
+			Data: map[string]interface{}{
+				"relationship_id":   "22222222-2222-2222-2222-222222222222",
+				"generation":        2,
+				"secondary_ca_cert": "rotation-cert-raw-value-that-must-not-appear",
+				"signature":         "rotation-signature-raw-value-that-must-not-appear",
+			},
+		},
+	}
+
+	for _, req := range requests {
+		if err := noop.LogRequest(namespace.RootContext(t.Context()), &logical.LogInput{Request: req}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var records []interface{}
+	for i := range requests {
+		record, err := noop.GetDecodedRecord(i)
+		if err != nil {
+			t.Fatal(err)
+		}
+		records = append(records, record)
+	}
+	body, err := json.Marshal(records)
+	require.NoError(t, err)
+	for _, raw := range []string{
+		"bootstrap-token-raw-value-that-must-not-appear",
+		"registration-cert-raw-value-that-must-not-appear",
+		"rotation-cert-raw-value-that-must-not-appear",
+		"rotation-signature-raw-value-that-must-not-appear",
+	} {
+		if strings.Contains(string(body), raw) {
+			t.Fatalf("audit record exposed raw DR secret material %q: %s", raw, string(body))
+		}
+	}
+}
+
+func findDRPathForTest(t *testing.T, b *SystemBackend, pattern string) *framework.Path {
+	t.Helper()
+	for _, p := range b.drReplicationPaths() {
+		if p.Pattern == pattern {
+			return p
+		}
+	}
+	t.Fatalf("DR path pattern %q not found", pattern)
+	return nil
+}
+
+func strListContains(list []string, value string) bool {
+	for _, item := range list {
+		if item == value {
+			return true
+		}
+	}
+	return false
 }
 
 func TestSystemConfigCORS(t *testing.T) {

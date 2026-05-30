@@ -55,6 +55,22 @@ type drWrapAAD struct {
 // parameters are required to produce a valid AAD that binds the wrapped
 // material to the specific cluster, relationship, and peer identities.
 func buildDRWrapAAD(relationshipID, clusterID, secondaryCertFP, primaryIdentity string, clientNonce []byte) ([]byte, error) {
+	if relationshipID == "" {
+		return nil, fmt.Errorf("relationship_id is required")
+	}
+	if clusterID == "" {
+		return nil, fmt.Errorf("cluster_id is required")
+	}
+	if secondaryCertFP == "" {
+		return nil, fmt.Errorf("secondary certificate fingerprint is required")
+	}
+	if primaryIdentity == "" {
+		return nil, fmt.Errorf("primary identity is required")
+	}
+	if len(clientNonce) != drBootstrapNonceSize {
+		return nil, fmt.Errorf("client nonce must be %d bytes", drBootstrapNonceSize)
+	}
+
 	aad := drWrapAAD{
 		RelationshipID:  relationshipID,
 		ClusterID:       clusterID,
@@ -67,6 +83,9 @@ func buildDRWrapAAD(relationshipID, clusterID, secondaryCertFP, primaryIdentity 
 }
 
 func wrapRootKeyForSecondary(rootKey []byte, relationshipID, clusterID, secondaryCertFP, primaryIdentity string, clientPubBytes []byte, clientNonce []byte) (wrappedRootKey []byte, serverPub []byte, serverNonce []byte, gcmIV []byte, aadVersion uint32, err error) {
+	if len(rootKey) == 0 {
+		return nil, nil, nil, nil, 0, fmt.Errorf("root key is required")
+	}
 	curve := ecdh.X25519()
 
 	clientPub, err := curve.NewPublicKey(clientPubBytes)
@@ -126,6 +145,18 @@ func unwrapRootKeyFromPrimary(wrappedRootKey []byte, relationshipID, clusterID, 
 	if aadVersion != drWrappedRootKeyAADVersion {
 		return nil, fmt.Errorf("unsupported wrapped root key AAD version: %d", aadVersion)
 	}
+	if len(wrappedRootKey) == 0 {
+		return nil, fmt.Errorf("wrapped root key is required")
+	}
+	if clientPriv == nil {
+		return nil, fmt.Errorf("client ephemeral private key is required")
+	}
+	if len(serverNonce) != drServerNonceSize {
+		return nil, fmt.Errorf("server nonce must be %d bytes", drServerNonceSize)
+	}
+	if len(gcmIV) != drGCMIVSize {
+		return nil, fmt.Errorf("GCM IV must be %d bytes", drGCMIVSize)
+	}
 
 	curve := ecdh.X25519()
 	serverPub, err := curve.NewPublicKey(serverPubBytes)
@@ -183,4 +214,25 @@ func deriveDRWrapKey(sharedSecret []byte, clientNonce []byte, serverNonce []byte
 func certFingerprintSHA256(cert *x509.Certificate) string {
 	sum := sha256.Sum256(cert.Raw)
 	return hex.EncodeToString(sum[:])
+}
+
+var wrapRootKeyForDRSync = wrapRootKeyForSecondary
+
+func certFingerprintSHA256RawDER(certDER []byte) string {
+	if len(certDER) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256(certDER)
+	return hex.EncodeToString(sum[:])
+}
+
+func certFingerprintSHA256DER(certDER []byte) string {
+	if len(certDER) == 0 {
+		return ""
+	}
+	cert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		return ""
+	}
+	return certFingerprintSHA256(cert)
 }

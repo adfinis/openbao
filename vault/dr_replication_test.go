@@ -4,6 +4,7 @@
 package vault
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -12,6 +13,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -20,6 +22,8 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,6 +33,7 @@ import (
 	"time"
 
 	log "github.com/hashicorp/go-hclog"
+	"github.com/openbao/openbao/helper/namespace"
 	"github.com/openbao/openbao/physical/replication/reconciler"
 	"github.com/openbao/openbao/sdk/v2/logical"
 	"github.com/openbao/openbao/sdk/v2/physical"
@@ -207,6 +212,50 @@ func TestDRRelationshipManager_EnableSecondary_SaveConfigFailureRollsBackState(t
 	}
 }
 
+func TestDRRelationshipManager_EnableSecondaryClearsStaleCheckpointCursor(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	mgr := newDRRelationshipManager(core, core.logger)
+
+	if err := core.barrier.Put(ctx, &logical.StorageEntry{
+		Key:   drCheckpointHWMPath,
+		Value: []byte("6685"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	token := &DRActivationToken{
+		ClusterID:      "new-promoted-primary",
+		RelationshipID: "new-promoted-relationship",
+		PrimaryAddr:    "127.0.0.1:8201",
+		PrimaryAddrs:   []string{"127.0.0.1:8201"},
+		ReplSalt:       make([]byte, drReplSaltLen),
+	}
+	rand.Read(token.ReplSalt)
+
+	if err := mgr.EnableSecondary(ctx, token); err != nil {
+		t.Fatal(err)
+	}
+
+	entry, err := core.barrier.Get(ctx, drCheckpointHWMPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry != nil {
+		t.Fatalf("expected stale checkpoint cursor to be cleared on secondary enable, got %q", string(entry.Value))
+	}
+	if mgr.Secondary() == nil {
+		t.Fatal("expected secondary runtime")
+	}
+	mgr.Secondary().loadCheckpointHighWaterMark()
+	if mgr.Secondary().highestCommittedCheckpointIndexSet {
+		t.Fatalf("expected no loaded stale checkpoint high-water mark, got %d", mgr.Secondary().highestCommittedCheckpointIndex)
+	}
+	if got := mgr.Secondary().lastAppliedIndex.Load(); got != 0 {
+		t.Fatalf("expected fresh secondary last applied index 0, got %d", got)
+	}
+}
+
 func TestDRRelationshipManager_ActivationToken(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	ctx := context.Background()
@@ -269,6 +318,18 @@ func TestDRRelationshipManager_ActivationToken(t *testing.T) {
 	if rel.ExpiresAt <= rel.CreatedAt {
 		t.Fatalf("expected relationship expiry after creation, got created=%d expires=%d", rel.CreatedAt, rel.ExpiresAt)
 	}
+	if rel.BootstrapToken != "" {
+		t.Fatal("expected bootstrap token plaintext not to be persisted")
+	}
+	if rel.BootstrapTokenHash == "" {
+		t.Fatal("expected bootstrap token verifier hash to be persisted")
+	}
+	if rel.BootstrapTokenHash == token.BootstrapToken {
+		t.Fatal("expected bootstrap token verifier hash not to equal bearer token")
+	}
+	if !bootstrapTokenMatches(rel, token.BootstrapToken) {
+		t.Fatal("expected persisted bootstrap verifier to accept activation token")
+	}
 }
 
 func TestDRRelationshipManager_BootstrapTokenExpires(t *testing.T) {
@@ -306,8 +367,79 @@ func TestDRRelationshipManager_BootstrapTokenExpires(t *testing.T) {
 	if updated.FailedAttempts != 1 {
 		t.Fatalf("expected failed attempts to increment, got %d", updated.FailedAttempts)
 	}
+	if updated.State != DRRelationshipStateRevoked {
+		t.Fatalf("expected expired pending relationship to be revoked, got %s", updated.State)
+	}
+	if updated.BootstrapToken != "" {
+		t.Fatal("expected expired bootstrap token to be cleared")
+	}
+	if updated.BootstrapTokenHash != "" {
+		t.Fatal("expected expired bootstrap token verifier to be cleared")
+	}
+	if updated.ExpiresAt != 0 {
+		t.Fatalf("expected expiry to be cleared after terminal failure, got %d", updated.ExpiresAt)
+	}
+	if updated.RevokedAt == 0 {
+		t.Fatal("expected revoked_at to be set")
+	}
+	if updated.LastFailedAt == 0 {
+		t.Fatal("expected last_failed_at to be set")
+	}
 	if updated.LastError == "" {
 		t.Fatal("expected last_error to be set")
+	}
+}
+
+func TestDRRelationshipManager_LegacyPlaintextBootstrapTokenMigratesToVerifier(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	setupTestClusterCert(t, core)
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	if err := mgr.EnablePrimary(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	relationshipID := "11111111-1111-1111-1111-111111111111"
+	bootstrapToken := "22222222-2222-2222-2222-222222222222"
+	now := time.Now().UTC()
+	if err := mgr.saveRelationship(ctx, &DRRelationship{
+		RelationshipID: relationshipID,
+		State:          DRRelationshipStatePending,
+		BootstrapToken: bootstrapToken,
+		CreatedAt:      now.Unix(),
+		ExpiresAt:      now.Add(drBootstrapTokenTTL).Unix(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rel, err := mgr.loadRelationship(ctx, relationshipID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rel.BootstrapToken != "" {
+		t.Fatal("expected legacy plaintext bootstrap token to be cleared on load")
+	}
+	if rel.BootstrapTokenHash == "" {
+		t.Fatal("expected legacy plaintext bootstrap token to be converted to verifier hash")
+	}
+	if !bootstrapTokenMatches(rel, bootstrapToken) {
+		t.Fatal("expected migrated verifier to accept original bootstrap token")
+	}
+
+	secondaryCertDER, _, err := generateDRSecondaryClientCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.ValidateBootstrapAndStoreCert(ctx, relationshipID, bootstrapToken, secondaryCertDER); err != nil {
+		t.Fatalf("expected migrated verifier to allow registration: %v", err)
+	}
+	rel, err = mgr.loadRelationship(ctx, relationshipID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rel.BootstrapToken != "" || rel.BootstrapTokenHash != "" {
+		t.Fatal("expected bootstrap token material to be cleared after migrated registration")
 	}
 }
 
@@ -326,8 +458,12 @@ func TestDRRelationshipManager_BootstrapTokenAttemptLockout(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	wrongToken := "11111111-1111-1111-1111-111111111111"
+	if wrongToken == token.BootstrapToken {
+		wrongToken = "22222222-2222-2222-2222-222222222222"
+	}
 	for i := 0; i < drBootstrapMaxFailedAttempts; i++ {
-		if err := mgr.ValidateBootstrapAndStoreCert(ctx, token.RelationshipID, "wrong-token", token.DRTransportCACert); err == nil {
+		if err := mgr.ValidateBootstrapAndStoreCert(ctx, token.RelationshipID, wrongToken, token.DRTransportCACert); err == nil {
 			t.Fatalf("expected bootstrap attempt %d to fail", i+1)
 		}
 	}
@@ -339,12 +475,28 @@ func TestDRRelationshipManager_BootstrapTokenAttemptLockout(t *testing.T) {
 	if rel.LockedUntil <= time.Now().Unix() {
 		t.Fatalf("expected lockout to be set in the future, got %d", rel.LockedUntil)
 	}
+	if rel.State != DRRelationshipStateRevoked {
+		t.Fatalf("expected relationship to be revoked after max failed attempts, got %s", rel.State)
+	}
+	if rel.BootstrapToken != "" {
+		t.Fatal("expected bootstrap token to be cleared after max failed attempts")
+	}
+	if rel.BootstrapTokenHash != "" {
+		t.Fatal("expected bootstrap token verifier to be cleared after max failed attempts")
+	}
 	if rel.FailedAttempts < drBootstrapMaxFailedAttempts {
 		t.Fatalf("expected failed attempts >= %d, got %d", drBootstrapMaxFailedAttempts, rel.FailedAttempts)
 	}
 
-	if err := mgr.ValidateBootstrapAndStoreCert(ctx, token.RelationshipID, token.BootstrapToken, token.DRTransportCACert); err == nil || !strings.Contains(err.Error(), "locked") {
-		t.Fatalf("expected lockout error when using correct token during lockout, got %v", err)
+	if err := mgr.ValidateBootstrapAndStoreCert(ctx, token.RelationshipID, token.BootstrapToken, token.DRTransportCACert); err == nil || !strings.Contains(err.Error(), "invalid or already-used bootstrap token") {
+		t.Fatalf("expected already-used token error when using correct token after revocation, got %v", err)
+	}
+	replayed, err := mgr.loadRelationship(ctx, token.RelationshipID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed.FailedAttempts != rel.FailedAttempts {
+		t.Fatalf("expected replay against revoked relationship not to mutate failed attempts: got %d want %d", replayed.FailedAttempts, rel.FailedAttempts)
 	}
 }
 
@@ -363,7 +515,11 @@ func TestDRRelationshipManager_BootstrapTokenSourceIPBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := mgr.ValidateBootstrapAndStoreCertWithSourceIP(ctx, token.RelationshipID, token.BootstrapToken, token.DRTransportCACert, "10.20.30.40"); err != nil {
+	secondaryCertDER, _, err := generateDRSecondaryClientCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.ValidateBootstrapAndStoreCertWithSourceIP(ctx, token.RelationshipID, token.BootstrapToken, secondaryCertDER, "10.20.30.40"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -373,6 +529,1293 @@ func TestDRRelationshipManager_BootstrapTokenSourceIPBinding(t *testing.T) {
 	}
 	if rel.RegisteredFromIP != "10.20.30.40" {
 		t.Fatalf("expected registered source IP to be persisted, got %q", rel.RegisteredFromIP)
+	}
+}
+
+func TestDRRelationshipManager_BootstrapRejectsInvalidSecondaryCertificate(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	setupTestClusterCert(t, core)
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	if err := mgr.EnablePrimary(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	token, err := mgr.GenerateActivationToken(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	expiredCert := newValidationSecondaryClientCert(t, func(tpl *x509.Certificate) {
+		tpl.NotBefore = now.Add(-2 * time.Hour)
+		tpl.NotAfter = now.Add(-time.Hour)
+	})
+
+	err = mgr.ValidateBootstrapAndStoreCert(ctx, token.RelationshipID, token.BootstrapToken, expiredCert.Raw)
+	if err == nil || !strings.Contains(err.Error(), "invalid secondary CA certificate") {
+		t.Fatalf("expected invalid secondary certificate error, got: %v", err)
+	}
+
+	rel, err := mgr.loadRelationship(ctx, token.RelationshipID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rel.State != DRRelationshipStatePending {
+		t.Fatalf("expected relationship to remain pending, got %s", rel.State)
+	}
+	if rel.BootstrapToken != "" {
+		t.Fatal("expected bootstrap token plaintext not to be persisted")
+	}
+	if rel.BootstrapTokenHash == "" {
+		t.Fatal("expected bootstrap token verifier to remain unconsumed")
+	}
+	if rel.FailedAttempts != 1 {
+		t.Fatalf("expected failed attempts to increment, got %d", rel.FailedAttempts)
+	}
+	if rel.LastFailedAt == 0 {
+		t.Fatal("expected last_failed_at to be set")
+	}
+}
+
+func TestDRRelationshipManager_BootstrapReplayDoesNotMutateRegisteredRelationship(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	setupTestClusterCert(t, core)
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	if err := mgr.EnablePrimary(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	token, err := mgr.GenerateActivationToken(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondaryCertDER, _, err := generateDRSecondaryClientCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mgr.ValidateBootstrapAndStoreCertWithSourceIP(ctx, token.RelationshipID, token.BootstrapToken, secondaryCertDER, "10.20.30.40"); err != nil {
+		t.Fatal(err)
+	}
+	registered, err := mgr.loadRelationship(ctx, token.RelationshipID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if registered.State != DRRelationshipStateRegistered {
+		t.Fatalf("expected registered relationship, got %s", registered.State)
+	}
+
+	err = mgr.ValidateBootstrapAndStoreCertWithSourceIP(ctx, token.RelationshipID, token.BootstrapToken, secondaryCertDER, "10.20.30.41")
+	if err == nil || !strings.Contains(err.Error(), "invalid or already-used bootstrap token") {
+		t.Fatalf("expected replay rejection, got: %v", err)
+	}
+	replayed, err := mgr.loadRelationship(ctx, token.RelationshipID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed.State != DRRelationshipStateRegistered {
+		t.Fatalf("expected replay to leave relationship registered, got %s", replayed.State)
+	}
+	if replayed.RegisteredAt != registered.RegisteredAt {
+		t.Fatalf("expected replay not to mutate registered_at: got %d want %d", replayed.RegisteredAt, registered.RegisteredAt)
+	}
+	if replayed.FailedAttempts != registered.FailedAttempts {
+		t.Fatalf("expected replay not to mutate failed attempts: got %d want %d", replayed.FailedAttempts, registered.FailedAttempts)
+	}
+	if replayed.LastError != registered.LastError {
+		t.Fatalf("expected replay not to mutate last_error: got %q want %q", replayed.LastError, registered.LastError)
+	}
+	if replayed.SecondaryCertFingerprint != registered.SecondaryCertFingerprint {
+		t.Fatalf("expected replay not to mutate fingerprint: got %q want %q", replayed.SecondaryCertFingerprint, registered.SecondaryCertFingerprint)
+	}
+}
+
+func TestDRRelationshipManager_BootstrapRejectsMalformedInput(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	setupTestClusterCert(t, core)
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	if err := mgr.EnablePrimary(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	validRelationshipID := "11111111-1111-1111-1111-111111111111"
+	validBootstrapToken := "22222222-2222-2222-2222-222222222222"
+	for name, tc := range map[string]struct {
+		relationshipID  string
+		bootstrapToken  string
+		certDER         []byte
+		wantErrContains string
+	}{
+		"relationship-id": {
+			relationshipID:  "not-a-uuid",
+			bootstrapToken:  validBootstrapToken,
+			certDER:         []byte("x"),
+			wantErrContains: "relationship_id must be a valid UUID",
+		},
+		"bootstrap-token": {
+			relationshipID:  validRelationshipID,
+			bootstrapToken:  "not-a-uuid",
+			certDER:         []byte("x"),
+			wantErrContains: "bootstrap_token must be a valid UUID",
+		},
+		"empty-cert": {
+			relationshipID:  validRelationshipID,
+			bootstrapToken:  validBootstrapToken,
+			certDER:         nil,
+			wantErrContains: "secondary_ca_cert is required",
+		},
+		"oversized-cert": {
+			relationshipID:  validRelationshipID,
+			bootstrapToken:  validBootstrapToken,
+			certDER:         make([]byte, drBootstrapMaxCertDERBytes+1),
+			wantErrContains: "secondary_ca_cert exceeds maximum DER size",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := mgr.ValidateBootstrapAndStoreCert(ctx, tc.relationshipID, tc.bootstrapToken, tc.certDER)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErrContains) {
+				t.Fatalf("expected %q error, got: %v", tc.wantErrContains, err)
+			}
+		})
+	}
+}
+
+func TestDRSystemBackend_RegisterSecondaryRejectsOversizedEncodedCert(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	setupTestClusterCert(t, core)
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	core.drManager = mgr
+	if err := mgr.EnablePrimary(ctx); err != nil {
+		t.Fatal(err)
+	}
+	token, err := mgr.GenerateActivationToken(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := logical.TestRequest(t, logical.UpdateOperation, "replication/dr/primary/register-secondary")
+	req.Data = map[string]interface{}{
+		"relationship_id":   token.RelationshipID,
+		"bootstrap_token":   token.BootstrapToken,
+		"secondary_ca_cert": strings.Repeat("A", base64.StdEncoding.EncodedLen(drBootstrapMaxCertDERBytes)+1),
+	}
+	resp, err := core.systemBackend.HandleRequest(namespace.RootContext(t.Context()), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp == nil || !resp.IsError() || !strings.Contains(resp.Error().Error(), "secondary_ca_cert exceeds maximum DER size") {
+		t.Fatalf("expected oversized certificate error response, got resp=%#v err=%v", resp, err)
+	}
+
+	rel, err := mgr.loadRelationship(ctx, token.RelationshipID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rel.State != DRRelationshipStatePending {
+		t.Fatalf("expected oversized API request not to mutate relationship state, got %s", rel.State)
+	}
+	if rel.FailedAttempts != 0 {
+		t.Fatalf("expected oversized API request to be rejected before failure accounting, got %d failed attempts", rel.FailedAttempts)
+	}
+	if rel.BootstrapToken != "" {
+		t.Fatal("expected bootstrap token plaintext not to be persisted after oversized API request")
+	}
+	if rel.BootstrapTokenHash == "" || !bootstrapTokenMatches(rel, token.BootstrapToken) {
+		t.Fatal("expected bootstrap token verifier to remain intact after oversized API request")
+	}
+}
+
+func TestDRSystemBackend_EnableSecondaryRejectsOversizedActivationToken(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	core.drManager = mgr
+
+	req := logical.TestRequest(t, logical.UpdateOperation, "replication/dr/secondary/enable")
+	req.Data = map[string]interface{}{
+		"token": strings.Repeat("x", drActivationTokenMaxBytes+1),
+	}
+	resp, err := core.systemBackend.HandleRequest(namespace.RootContext(t.Context()), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp == nil || !resp.IsError() || !strings.Contains(resp.Error().Error(), "activation token exceeds maximum size") {
+		t.Fatalf("expected oversized activation token error response, got resp=%#v err=%v", resp, err)
+	}
+	if mgr.Mode() != DRModeDisabled {
+		t.Fatalf("expected oversized activation token not to enable DR, got mode %s", mgr.Mode())
+	}
+	entry, err := core.barrier.Get(ctx, drConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry != nil {
+		t.Fatal("expected oversized activation token not to persist DR config")
+	}
+}
+
+func TestDRSystemBackend_StatusDoesNotExposePromotionSecrets(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	mgr.config = &DRConfig{
+		Mode:             DRModeDisabled,
+		ClusterID:        "public-cluster-id",
+		ReplSalt:         []byte("status-repl-salt-secret-must-not-appear"),
+		PrimaryAddr:      "https://status-primary-addr-secret.example:8201",
+		PrimaryAddrs:     []string{"https://status-primary-addrs-secret.example:8201"},
+		RelationshipID:   "status-relationship-id-secret",
+		PrimaryCACert:    []byte("status-primary-ca-secret-must-not-appear"),
+		PrimaryAPICACert: []byte("status-primary-api-ca-secret-must-not-appear"),
+		SecondaryClientCert: []byte(
+			"status-secondary-client-cert-secret-must-not-appear",
+		),
+		SecondaryClientKeyPEM: []byte(
+			"status-secondary-client-key-secret-must-not-appear",
+		),
+		Promotion: &DRPromotionRecord{
+			PromotionID:                 "promotion-public-id",
+			PromotedAt:                  time.Now().UTC().Unix(),
+			OldPrimaryClusterID:         "old-primary-secret",
+			OldRelationshipID:           "old-relationship-secret",
+			OldSecondaryCertFingerprint: "old-fingerprint-secret",
+			StalePrimaryClusterIDs:      []string{"stale-primary-secret"},
+			StaleRelationshipIDs:        []string{"stale-relationship-secret"},
+			StaleSecondaryFingerprints:  []string{"stale-fingerprint-secret"},
+			LocalClusterID:              "local-cluster-id",
+			LastAppliedIndex:            100,
+			LastKnownPrimaryIndex:       110,
+			PromotionClass:              DRPromotionForced,
+			EstimatedDataLossEntries:    10,
+			DataLossEstimateBasis:       drPromotionDataLossEstimateBasis,
+			DataLossAccepted:            true,
+			ForcedReasonCodes:           []string{drPromotionReasonSecondaryLagDetected},
+			ForcedReasonDetails:         []string{"secondary is behind primary by approximately 10 entries"},
+		},
+	}
+	core.drManager = mgr
+
+	req := logical.TestRequest(t, logical.ReadOperation, "replication/dr/status")
+	resp, err := core.systemBackend.HandleRequest(namespace.RootContext(t.Context()), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp == nil || resp.IsError() {
+		t.Fatalf("expected status response, got %#v", resp)
+	}
+	if resp.Data["last_promotion_id"] != "promotion-public-id" {
+		t.Fatalf("expected non-sensitive promotion id in status, got %#v", resp.Data["last_promotion_id"])
+	}
+	if resp.Data["last_promotion_clean_promotion_eligible"] != false {
+		t.Fatalf("expected forced promotion to be marked ineligible for clean promotion, got %#v", resp.Data["last_promotion_clean_promotion_eligible"])
+	}
+	if resp.Data["last_promotion_estimated_data_loss_entries_basis"] != drPromotionDataLossEstimateBasis {
+		t.Fatalf("expected non-sensitive data loss estimate basis in status, got %#v", resp.Data["last_promotion_estimated_data_loss_entries_basis"])
+	}
+	codes, ok := resp.Data["last_promotion_forced_reason_codes"].([]string)
+	if !ok || !stringSliceContains(codes, drPromotionReasonSecondaryLagDetected) {
+		t.Fatalf("expected non-sensitive forced promotion reason code in status, got %#v", resp.Data["last_promotion_forced_reason_codes"])
+	}
+	for _, key := range []string{
+		"last_promotion_old_primary_cluster_id",
+		"last_promotion_old_relationship_id",
+		"last_promotion_old_secondary_cert_fingerprint",
+		"last_promotion_stale_primary_cluster_ids",
+		"last_promotion_stale_relationship_ids",
+		"last_promotion_stale_secondary_fingerprints",
+	} {
+		if _, ok := resp.Data[key]; ok {
+			t.Fatalf("status response exposed sensitive promotion lineage field %q", key)
+		}
+	}
+	body := mustMarshalDRResponseData(t, resp)
+	requireDRResponseDoesNotContain(
+		t, body,
+		"old-primary-secret",
+		"old-relationship-secret",
+		"old-fingerprint-secret",
+		"stale-primary-secret",
+		"stale-relationship-secret",
+		"stale-fingerprint-secret",
+		"status-repl-salt-secret-must-not-appear",
+		"status-primary-addr-secret.example",
+		"status-primary-addrs-secret.example",
+		"status-relationship-id-secret",
+		"status-primary-ca-secret-must-not-appear",
+		"status-primary-api-ca-secret-must-not-appear",
+		"status-secondary-client-cert-secret-must-not-appear",
+		"status-secondary-client-key-secret-must-not-appear",
+	)
+}
+
+func TestDRSystemBackend_RelationshipResponsesDoNotExposeStoredSecrets(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := namespace.RootContext(t.Context())
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	mgr.config = &DRConfig{
+		Mode:      DRModePrimary,
+		ClusterID: "public-cluster-id",
+	}
+	core.drManager = mgr
+
+	now := time.Now().UTC().Unix()
+	relationshipID := "11111111-1111-1111-1111-111111111111"
+	rel := &DRRelationship{
+		RelationshipID:                   relationshipID,
+		State:                            DRRelationshipStatePending,
+		SecondaryCertFingerprint:         "public-secondary-fingerprint",
+		SecondaryCACert:                  []byte("relationship-secondary-ca-secret-must-not-appear"),
+		PreviousSecondaryCertFingerprint: "previous-fingerprint-secret-must-not-appear",
+		PendingSecondaryCertFingerprint:  "pending-fingerprint-secret-must-not-appear",
+		PendingSecondaryCACert:           []byte("relationship-pending-ca-secret-must-not-appear"),
+		PendingRotationOperationID:       "pending-operation-id-secret-must-not-appear",
+		BootstrapToken:                   "legacy-bootstrap-token-secret-must-not-appear",
+		BootstrapTokenHash:               "bootstrap-token-hash-secret-must-not-appear",
+		CreatedAt:                        now,
+		ExpiresAt:                        now + int64(time.Hour/time.Second),
+		LastError:                        "bootstrap token mismatch",
+	}
+	if err := mgr.saveRelationship(ctx, rel); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		path string
+	}{
+		{
+			name: "list",
+			path: "replication/dr/primary/relationships",
+		},
+		{
+			name: "status",
+			path: "replication/dr/primary/relationships/" + relationshipID + "/status",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := logical.TestRequest(t, logical.ReadOperation, tc.path)
+			resp, err := core.systemBackend.HandleRequest(ctx, req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp == nil || resp.IsError() {
+				t.Fatalf("expected relationship response, got %#v", resp)
+			}
+
+			body := mustMarshalDRResponseData(t, resp)
+			requireDRResponseDoesNotContain(
+				t, body,
+				"relationship-secondary-ca-secret-must-not-appear",
+				"relationship-pending-ca-secret-must-not-appear",
+				"previous-fingerprint-secret-must-not-appear",
+				"pending-fingerprint-secret-must-not-appear",
+				"pending-operation-id-secret-must-not-appear",
+				"legacy-bootstrap-token-secret-must-not-appear",
+				"bootstrap-token-hash-secret-must-not-appear",
+			)
+			requireDRResponseDoesNotContainKeys(
+				t, body,
+				"secondary_ca_cert",
+				"pending_secondary_ca_cert",
+				"previous_secondary_cert_fingerprint",
+				"pending_secondary_cert_fingerprint",
+				"pending_rotation_operation_id",
+				"bootstrap_token",
+				"bootstrap_token_hash",
+			)
+			if !strings.Contains(body, "public-secondary-fingerprint") {
+				t.Fatalf("expected public current fingerprint in relationship response: %s", body)
+			}
+		})
+	}
+}
+
+func TestDRSystemBackend_BootstrapRegistrationFailureResponseIsGeneric(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := namespace.RootContext(t.Context())
+	setupTestClusterCert(t, core)
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	core.drManager = mgr
+	if err := mgr.EnablePrimary(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	certDER, _, err := generateDRSecondaryClientCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	register := func(t *testing.T, relationshipID, bootstrapToken string, certDER []byte) *logical.Response {
+		t.Helper()
+		req := logical.TestRequest(t, logical.UpdateOperation, "replication/dr/primary/register-secondary")
+		req.Data = map[string]interface{}{
+			"relationship_id":   relationshipID,
+			"bootstrap_token":   bootstrapToken,
+			"secondary_ca_cert": base64.StdEncoding.EncodeToString(certDER),
+		}
+		resp, err := core.systemBackend.HandleRequest(ctx, req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	unknownRelationshipID := "11111111-1111-1111-1111-111111111111"
+	resp := register(t, unknownRelationshipID, "22222222-2222-2222-2222-222222222222", certDER)
+	requireDRPublicError(
+		t, resp, "registration failed",
+		unknownRelationshipID,
+		"not found",
+		"relationship",
+	)
+
+	expiredToken, err := mgr.GenerateActivationToken(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiredRel, err := mgr.loadRelationship(ctx, expiredToken.RelationshipID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiredRel.ExpiresAt = time.Now().UTC().Add(-time.Minute).Unix()
+	if err := mgr.saveRelationship(ctx, expiredRel); err != nil {
+		t.Fatal(err)
+	}
+	resp = register(t, expiredToken.RelationshipID, expiredToken.BootstrapToken, certDER)
+	requireDRPublicError(
+		t, resp, "registration failed",
+		expiredToken.RelationshipID,
+		"expired",
+		"locked",
+		"revoked",
+	)
+
+	registeredToken, err := mgr.GenerateActivationToken(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.ValidateBootstrapAndStoreCert(ctx, registeredToken.RelationshipID, registeredToken.BootstrapToken, certDER); err != nil {
+		t.Fatal(err)
+	}
+	duplicateToken, err := mgr.GenerateActivationToken(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp = register(t, duplicateToken.RelationshipID, duplicateToken.BootstrapToken, certDER)
+	requireDRPublicError(
+		t, resp, "registration failed",
+		registeredToken.RelationshipID,
+		duplicateToken.RelationshipID,
+		"already bound",
+		"fingerprint",
+		"stale",
+		"lineage",
+	)
+}
+
+func TestDRSystemBackend_CredentialRotationFailureResponseIsGeneric(t *testing.T) {
+	core, _, token, oldCert, _ := setupActiveDRRelationshipForCredentialRotation(t)
+	ctx := namespace.RootContext(t.Context())
+
+	newCertDER, newKeyPEM, err := generateDRSecondaryClientCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	newCert, err := parseDRSecondaryClientCert(newCertDER, newKeyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rotationRequest := func(t *testing.T, path, relationshipID, operationID string, certDER, signature []byte) *logical.Response {
+		t.Helper()
+		req := logical.TestRequest(t, logical.UpdateOperation, path)
+		req.Data = map[string]interface{}{
+			"relationship_id":   relationshipID,
+			"operation_id":      operationID,
+			"issued_at":         time.Now().UTC().Unix(),
+			"secondary_ca_cert": base64.StdEncoding.EncodeToString(certDER),
+			"signature":         base64.StdEncoding.EncodeToString(signature),
+		}
+		resp, err := core.systemBackend.HandleRequest(ctx, req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	operationID := "33333333-3333-3333-3333-333333333333"
+	issuedAt := time.Now().UTC().Unix()
+	initSig, err := signDRCredentialRotationPayload(oldCert, drCredentialRotationInitiate, token.RelationshipID, operationID, issuedAt, newCertDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badSig := append([]byte(nil), initSig...)
+	badSig[len(badSig)-1] ^= 0xff
+
+	resp := rotationRequest(t, "replication/dr/primary/rotate-secondary-certificate", token.RelationshipID, operationID, newCertDER, badSig)
+	requireDRPublicError(
+		t, resp, "credential rotation failed",
+		token.RelationshipID,
+		operationID,
+		"signature",
+		"verification",
+		"fingerprint",
+		"active",
+		"pending",
+	)
+
+	unknownRelationshipID := "44444444-4444-4444-4444-444444444444"
+	resp = rotationRequest(t, "replication/dr/primary/rotate-secondary-certificate", unknownRelationshipID, operationID, newCertDER, initSig)
+	requireDRPublicError(
+		t, resp, "credential rotation failed",
+		unknownRelationshipID,
+		"not found",
+		"relationship",
+	)
+
+	confirmSig, err := signDRCredentialRotationPayload(newCert, drCredentialRotationConfirm, token.RelationshipID, operationID, issuedAt, newCertDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp = rotationRequest(t, "replication/dr/primary/confirm-secondary-certificate", token.RelationshipID, operationID, newCertDER, confirmSig)
+	requireDRPublicError(
+		t, resp, "credential rotation failed",
+		token.RelationshipID,
+		operationID,
+		"pending",
+		"operation_id",
+		"fingerprint",
+	)
+}
+
+func requireDRPublicError(t *testing.T, resp *logical.Response, want string, forbidden ...string) {
+	t.Helper()
+	if resp == nil || !resp.IsError() {
+		t.Fatalf("expected error response %q, got %#v", want, resp)
+	}
+	got, ok := resp.Data["error"].(string)
+	if !ok {
+		t.Fatalf("expected string error response, got %#v", resp.Data["error"])
+	}
+	if got != want {
+		t.Fatalf("expected public error %q, got %q", want, got)
+	}
+	requireDRResponseDoesNotContain(t, got, forbidden...)
+}
+
+func mustMarshalDRResponseData(t *testing.T, resp *logical.Response) string {
+	t.Helper()
+	body, err := json.Marshal(resp.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(body)
+}
+
+func requireDRResponseDoesNotContain(t *testing.T, body string, values ...string) {
+	t.Helper()
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if strings.Contains(body, value) {
+			t.Fatalf("DR response exposed sensitive value %q: %s", value, body)
+		}
+		encoded := base64.StdEncoding.EncodeToString([]byte(value))
+		if strings.Contains(body, encoded) {
+			t.Fatalf("DR response exposed base64-encoded sensitive value %q: %s", value, body)
+		}
+	}
+}
+
+func requireDRResponseDoesNotContainKeys(t *testing.T, body string, keys ...string) {
+	t.Helper()
+	for _, key := range keys {
+		if strings.Contains(body, `"`+key+`"`) {
+			t.Fatalf("DR response exposed sensitive field %q: %s", key, body)
+		}
+	}
+}
+
+func setupActiveDRRelationshipForCredentialRotation(t *testing.T) (*Core, *drRelationshipManager, *DRActivationToken, *tls.Certificate, string) {
+	t.Helper()
+
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	setupTestClusterCert(t, core)
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	core.drManager = mgr
+	if err := mgr.EnablePrimary(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	token, err := mgr.GenerateActivationToken(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldCertDER, oldKeyPEM, err := generateDRSecondaryClientCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldCert, err := parseDRSecondaryClientCert(oldCertDER, oldKeyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldFP := certFingerprintSHA256(oldCert.Leaf)
+	if err := mgr.ValidateBootstrapAndStoreCert(ctx, token.RelationshipID, token.BootstrapToken, oldCertDER); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.ValidateRelationshipAccess(token.RelationshipID, oldFP, DRRelationshipStateRegistered, DRRelationshipStateActive); err != nil {
+		t.Fatal(err)
+	}
+
+	return core, mgr, token, oldCert, oldFP
+}
+
+func replaceDRCredentialRotationParserForTest(t *testing.T, fn func([]byte, time.Time) (*x509.Certificate, error)) {
+	t.Helper()
+	orig := parseDRCredentialRotationCertificate
+	parseDRCredentialRotationCertificate = fn
+	t.Cleanup(func() {
+		parseDRCredentialRotationCertificate = orig
+	})
+}
+
+func TestDRRelationshipManager_SecondaryCredentialRotationTwoPhase(t *testing.T) {
+	_, mgr, token, oldCert, oldFP := setupActiveDRRelationshipForCredentialRotation(t)
+	ctx := context.Background()
+
+	newCertDER, newKeyPEM, err := generateDRSecondaryClientCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	newCert, err := parseDRSecondaryClientCert(newCertDER, newKeyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newFP := certFingerprintSHA256(newCert.Leaf)
+	operationID := "11111111-1111-1111-1111-111111111111"
+	issuedAt := time.Now().UTC().Unix()
+
+	initSig, err := signDRCredentialRotationPayload(oldCert, drCredentialRotationInitiate, token.RelationshipID, operationID, issuedAt, newCertDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel, err := mgr.InitiateSecondaryCredentialRotation(ctx, token.RelationshipID, operationID, issuedAt, newCertDER, initSig, "10.20.30.40")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rel.PendingSecondaryCertFingerprint != newFP {
+		t.Fatalf("pending fingerprint mismatch: got %q want %q", rel.PendingSecondaryCertFingerprint, newFP)
+	}
+	if rel.SecondaryCertFingerprint != oldFP {
+		t.Fatal("expected current credential to remain active until confirmation")
+	}
+	if rel.CredentialGeneration != 1 {
+		t.Fatalf("expected generation 1 while pending, got %d", rel.CredentialGeneration)
+	}
+	if _, err := mgr.ValidateRelationshipAccess(token.RelationshipID, oldFP, DRRelationshipStateActive); err != nil {
+		t.Fatalf("expected current credential to remain authorized while rotation is pending: %v", err)
+	}
+	if _, err := mgr.ValidateRelationshipAccess(token.RelationshipID, newFP, DRRelationshipStateActive); err != nil {
+		t.Fatalf("expected pending credential to be authorized while rotation is pending: %v", err)
+	}
+
+	confirmSig, err := signDRCredentialRotationPayload(newCert, drCredentialRotationConfirm, token.RelationshipID, operationID, issuedAt, newCertDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel, err = mgr.ConfirmSecondaryCredentialRotation(ctx, token.RelationshipID, operationID, issuedAt, newCertDER, confirmSig, "10.20.30.40")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rel.SecondaryCertFingerprint != newFP {
+		t.Fatalf("current fingerprint mismatch after confirm: got %q want %q", rel.SecondaryCertFingerprint, newFP)
+	}
+	if rel.PreviousSecondaryCertFingerprint != oldFP {
+		t.Fatalf("expected previous fingerprint %q, got %q", oldFP, rel.PreviousSecondaryCertFingerprint)
+	}
+	if rel.PendingSecondaryCertFingerprint != "" || len(rel.PendingSecondaryCACert) != 0 || rel.PendingRotationOperationID != "" {
+		t.Fatal("expected pending rotation state to be cleared after confirm")
+	}
+	if rel.CredentialGeneration != 2 {
+		t.Fatalf("expected generation 2 after confirm, got %d", rel.CredentialGeneration)
+	}
+	if rel.RotatedAt == 0 {
+		t.Fatal("expected rotated_at to be recorded")
+	}
+	if _, err := mgr.ValidateRelationshipAccess(token.RelationshipID, oldFP, DRRelationshipStateActive); err == nil {
+		t.Fatal("expected previous credential to be rejected after rotation confirmation")
+	}
+	if _, err := mgr.ValidateRelationshipAccess(token.RelationshipID, newFP, DRRelationshipStateActive); err != nil {
+		t.Fatalf("expected new credential to be authorized after confirmation: %v", err)
+	}
+}
+
+func TestDRRelationshipManager_SecondaryCredentialRotationRejectsWrongSigner(t *testing.T) {
+	_, mgr, token, _, _ := setupActiveDRRelationshipForCredentialRotation(t)
+	ctx := context.Background()
+
+	newCertDER, _, err := generateDRSecondaryClientCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongCertDER, wrongKeyPEM, err := generateDRSecondaryClientCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongCert, err := parseDRSecondaryClientCert(wrongCertDER, wrongKeyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operationID := "22222222-2222-2222-2222-222222222222"
+	issuedAt := time.Now().UTC().Unix()
+	sig, err := signDRCredentialRotationPayload(wrongCert, drCredentialRotationInitiate, token.RelationshipID, operationID, issuedAt, newCertDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := mgr.InitiateSecondaryCredentialRotation(ctx, token.RelationshipID, operationID, issuedAt, newCertDER, sig, ""); err == nil || !strings.Contains(err.Error(), "signature verification failed") {
+		t.Fatalf("expected signature verification failure, got %v", err)
+	}
+}
+
+func TestDRRelationshipManager_SecondaryCredentialRotationRejectsRevokedRelationship(t *testing.T) {
+	_, mgr, token, oldCert, _ := setupActiveDRRelationshipForCredentialRotation(t)
+	ctx := context.Background()
+
+	if err := mgr.RevokeRelationship(ctx, token.RelationshipID); err != nil {
+		t.Fatal(err)
+	}
+	newCertDER, _, err := generateDRSecondaryClientCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	operationID := "33333333-3333-3333-3333-333333333333"
+	issuedAt := time.Now().UTC().Unix()
+	sig, err := signDRCredentialRotationPayload(oldCert, drCredentialRotationInitiate, token.RelationshipID, operationID, issuedAt, newCertDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := mgr.InitiateSecondaryCredentialRotation(ctx, token.RelationshipID, operationID, issuedAt, newCertDER, sig, ""); err == nil || !strings.Contains(err.Error(), "must be active") {
+		t.Fatalf("expected revoked relationship rotation failure, got %v", err)
+	}
+}
+
+func TestDRRelationshipManager_SecondaryCredentialRotationRejectsRegisteredBeforeParsingCertificate(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	setupTestClusterCert(t, core)
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	core.drManager = mgr
+	if err := mgr.EnablePrimary(ctx); err != nil {
+		t.Fatal(err)
+	}
+	token, err := mgr.GenerateActivationToken(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certDER, _, err := generateDRSecondaryClientCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.ValidateBootstrapAndStoreCert(ctx, token.RelationshipID, token.BootstrapToken, certDER); err != nil {
+		t.Fatal(err)
+	}
+
+	parseCalls := 0
+	replaceDRCredentialRotationParserForTest(t, func([]byte, time.Time) (*x509.Certificate, error) {
+		parseCalls++
+		return nil, errors.New("unexpected certificate parse")
+	})
+
+	operationID := "77777777-7777-7777-7777-777777777777"
+	issuedAt := time.Now().UTC().Unix()
+	_, err = mgr.InitiateSecondaryCredentialRotation(ctx, token.RelationshipID, operationID, issuedAt, []byte("not-a-certificate"), []byte("signature"), "")
+	if err == nil || !strings.Contains(err.Error(), "must be active") {
+		t.Fatalf("expected inactive relationship rotation failure, got %v", err)
+	}
+	if parseCalls != 0 {
+		t.Fatalf("expected inactive relationship rejection before certificate parsing, got %d parse calls", parseCalls)
+	}
+}
+
+func TestDRRelationshipManager_SecondaryCredentialRotationConfirmRejectsMissingPendingBeforeParsingCertificate(t *testing.T) {
+	_, mgr, token, _, _ := setupActiveDRRelationshipForCredentialRotation(t)
+	ctx := context.Background()
+
+	parseCalls := 0
+	replaceDRCredentialRotationParserForTest(t, func([]byte, time.Time) (*x509.Certificate, error) {
+		parseCalls++
+		return nil, errors.New("unexpected certificate parse")
+	})
+
+	operationID := "88888888-8888-8888-8888-888888888888"
+	issuedAt := time.Now().UTC().Unix()
+	_, err := mgr.ConfirmSecondaryCredentialRotation(ctx, token.RelationshipID, operationID, issuedAt, []byte("not-a-certificate"), []byte("signature"), "")
+	if err == nil || !strings.Contains(err.Error(), "no pending credential rotation") {
+		t.Fatalf("expected missing pending rotation failure, got %v", err)
+	}
+	if parseCalls != 0 {
+		t.Fatalf("expected missing pending rotation rejection before certificate parsing, got %d parse calls", parseCalls)
+	}
+}
+
+func TestDRRelationshipManager_SecondaryCredentialRotationRejectsPreviousFingerprintReuse(t *testing.T) {
+	_, mgr, token, oldCert, oldFP := setupActiveDRRelationshipForCredentialRotation(t)
+	ctx := context.Background()
+
+	newCertDER, newKeyPEM, err := generateDRSecondaryClientCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	newCert, err := parseDRSecondaryClientCert(newCertDER, newKeyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operationID := "44444444-4444-4444-4444-444444444444"
+	issuedAt := time.Now().UTC().Unix()
+	initSig, err := signDRCredentialRotationPayload(oldCert, drCredentialRotationInitiate, token.RelationshipID, operationID, issuedAt, newCertDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.InitiateSecondaryCredentialRotation(ctx, token.RelationshipID, operationID, issuedAt, newCertDER, initSig, ""); err != nil {
+		t.Fatal(err)
+	}
+	confirmSig, err := signDRCredentialRotationPayload(newCert, drCredentialRotationConfirm, token.RelationshipID, operationID, issuedAt, newCertDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.ConfirmSecondaryCredentialRotation(ctx, token.RelationshipID, operationID, issuedAt, newCertDER, confirmSig, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	token2, err := mgr.GenerateActivationToken(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.ValidateBootstrapAndStoreCert(ctx, token2.RelationshipID, token2.BootstrapToken, oldCert.Leaf.Raw); err == nil || !strings.Contains(err.Error(), token.RelationshipID) {
+		t.Fatalf("expected old fingerprint reuse to be rejected against original relationship, got %v", err)
+	}
+	if rel, err := mgr.loadRelationship(ctx, token.RelationshipID); err != nil {
+		t.Fatal(err)
+	} else if rel.PreviousSecondaryCertFingerprint != oldFP {
+		t.Fatalf("expected previous fingerprint to remain recorded, got %q", rel.PreviousSecondaryCertFingerprint)
+	}
+}
+
+func TestDRRelationshipManager_SecondaryCredentialRotationPendingExpires(t *testing.T) {
+	_, mgr, token, oldCert, _ := setupActiveDRRelationshipForCredentialRotation(t)
+	ctx := context.Background()
+
+	newCertDER, newKeyPEM, err := generateDRSecondaryClientCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	newCert, err := parseDRSecondaryClientCert(newCertDER, newKeyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newFP := certFingerprintSHA256(newCert.Leaf)
+	operationID := "66666666-6666-6666-6666-666666666666"
+	issuedAt := time.Now().UTC().Unix()
+	initSig, err := signDRCredentialRotationPayload(oldCert, drCredentialRotationInitiate, token.RelationshipID, operationID, issuedAt, newCertDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.InitiateSecondaryCredentialRotation(ctx, token.RelationshipID, operationID, issuedAt, newCertDER, initSig, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	rel, err := mgr.loadRelationship(ctx, token.RelationshipID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel.PendingRotationStartedAt = time.Now().UTC().Add(-drCredentialRotationPendingTTL - time.Second).Unix()
+	if err := mgr.saveRelationship(ctx, rel); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.ValidateRelationshipAccess(token.RelationshipID, newFP, DRRelationshipStateActive); err == nil {
+		t.Fatal("expected expired pending credential to be rejected")
+	}
+
+	confirmSig, err := signDRCredentialRotationPayload(newCert, drCredentialRotationConfirm, token.RelationshipID, operationID, issuedAt, newCertDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.ConfirmSecondaryCredentialRotation(ctx, token.RelationshipID, operationID, issuedAt, newCertDER, confirmSig, ""); err == nil || !strings.Contains(err.Error(), "pending credential rotation expired") {
+		t.Fatalf("expected expired pending rotation failure, got %v", err)
+	}
+	rel, err = mgr.loadRelationship(ctx, token.RelationshipID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rel.PendingSecondaryCertFingerprint != "" || rel.PendingRotationOperationID != "" {
+		t.Fatal("expected expired pending rotation state to be cleared")
+	}
+}
+
+func TestDRRelationshipManager_RevokeClearsPendingCredentialRotationTrust(t *testing.T) {
+	_, mgr, token, oldCert, oldFP := setupActiveDRRelationshipForCredentialRotation(t)
+	ctx := context.Background()
+
+	newCertDER, newKeyPEM, err := generateDRSecondaryClientCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	newCert, err := parseDRSecondaryClientCert(newCertDER, newKeyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newFP := certFingerprintSHA256(newCert.Leaf)
+	operationID := "99999999-9999-9999-9999-999999999999"
+	issuedAt := time.Now().UTC().Unix()
+	initSig, err := signDRCredentialRotationPayload(oldCert, drCredentialRotationInitiate, token.RelationshipID, operationID, issuedAt, newCertDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.InitiateSecondaryCredentialRotation(ctx, token.RelationshipID, operationID, issuedAt, newCertDER, initSig, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.ValidateRelationshipAccess(token.RelationshipID, oldFP, DRRelationshipStateActive); err != nil {
+		t.Fatalf("expected current credential to be authorized while pending: %v", err)
+	}
+	if _, err := mgr.ValidateRelationshipAccess(token.RelationshipID, newFP, DRRelationshipStateActive); err != nil {
+		t.Fatalf("expected pending credential to be authorized while pending: %v", err)
+	}
+
+	if err := mgr.RevokeRelationship(ctx, token.RelationshipID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.ValidateRelationshipAccess(token.RelationshipID, oldFP, DRRelationshipStateActive); err == nil {
+		t.Fatal("expected current credential to be denied after revoke")
+	}
+	if _, err := mgr.ValidateRelationshipAccess(token.RelationshipID, newFP, DRRelationshipStateActive); err == nil {
+		t.Fatal("expected pending credential to be denied after revoke")
+	}
+	mgr.handler.certMu.RLock()
+	_, trusted := mgr.handler.trustedSecondaryCerts[token.RelationshipID]
+	mgr.handler.certMu.RUnlock()
+	if trusted {
+		t.Fatal("expected revoke to remove cached current and pending relationship certificates")
+	}
+
+	confirmSig, err := signDRCredentialRotationPayload(newCert, drCredentialRotationConfirm, token.RelationshipID, operationID, issuedAt, newCertDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.ConfirmSecondaryCredentialRotation(ctx, token.RelationshipID, operationID, issuedAt, newCertDER, confirmSig, ""); err == nil || !strings.Contains(err.Error(), "must be active") {
+		t.Fatalf("expected pending rotation confirmation to fail after revoke, got %v", err)
+	}
+}
+
+func TestDRSystemBackend_SecondaryCredentialRotationEndpoints(t *testing.T) {
+	core, _, token, oldCert, _ := setupActiveDRRelationshipForCredentialRotation(t)
+
+	newCertDER, newKeyPEM, err := generateDRSecondaryClientCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	newCert, err := parseDRSecondaryClientCert(newCertDER, newKeyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newFP := certFingerprintSHA256(newCert.Leaf)
+	operationID := "55555555-5555-5555-5555-555555555555"
+	issuedAt := time.Now().UTC().Unix()
+
+	initSig, err := signDRCredentialRotationPayload(oldCert, drCredentialRotationInitiate, token.RelationshipID, operationID, issuedAt, newCertDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := logical.TestRequest(t, logical.UpdateOperation, "replication/dr/primary/rotate-secondary-certificate")
+	req.Data = map[string]interface{}{
+		"relationship_id":   token.RelationshipID,
+		"operation_id":      operationID,
+		"issued_at":         issuedAt,
+		"secondary_ca_cert": base64.StdEncoding.EncodeToString(newCertDER),
+		"signature":         base64.StdEncoding.EncodeToString(initSig),
+	}
+	resp, err := core.systemBackend.HandleRequest(namespace.RootContext(t.Context()), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp == nil || resp.IsError() {
+		t.Fatalf("expected rotation stage response, got %#v err=%v", resp, err)
+	}
+	if resp.Data["pending_secondary_cert_fingerprint"] != newFP {
+		t.Fatalf("expected pending fingerprint %q, got %#v", newFP, resp.Data["pending_secondary_cert_fingerprint"])
+	}
+
+	confirmSig, err := signDRCredentialRotationPayload(newCert, drCredentialRotationConfirm, token.RelationshipID, operationID, issuedAt, newCertDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req = logical.TestRequest(t, logical.UpdateOperation, "replication/dr/primary/confirm-secondary-certificate")
+	req.Data = map[string]interface{}{
+		"relationship_id":   token.RelationshipID,
+		"operation_id":      operationID,
+		"issued_at":         issuedAt,
+		"secondary_ca_cert": base64.StdEncoding.EncodeToString(newCertDER),
+		"signature":         base64.StdEncoding.EncodeToString(confirmSig),
+	}
+	resp, err = core.systemBackend.HandleRequest(namespace.RootContext(t.Context()), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp == nil || resp.IsError() {
+		t.Fatalf("expected rotation confirm response, got %#v err=%v", resp, err)
+	}
+	if resp.Data["secondary_cert_fingerprint"] != newFP {
+		t.Fatalf("expected current fingerprint %q, got %#v", newFP, resp.Data["secondary_cert_fingerprint"])
+	}
+	if resp.Data["credential_generation"] != uint64(2) {
+		t.Fatalf("expected credential generation 2, got %#v", resp.Data["credential_generation"])
+	}
+}
+
+func newDRPrimaryAPITestServer(t *testing.T, core *Core) *httptest.Server {
+	t.Helper()
+	return httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/v1/sys/") {
+			http.NotFound(w, r)
+			return
+		}
+		var data map[string]interface{}
+		if r.Body != nil {
+			defer r.Body.Close()
+			if err := json.NewDecoder(r.Body).Decode(&data); err != nil && !errors.Is(err, io.EOF) {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+		path := strings.TrimPrefix(r.URL.Path, "/v1/sys/")
+		op := logical.UpdateOperation
+		if r.Method == http.MethodGet {
+			op = logical.ReadOperation
+		}
+		req := &logical.Request{
+			Operation: op,
+			Path:      path,
+			Data:      data,
+			Connection: &logical.Connection{
+				RemoteAddr: r.RemoteAddr,
+			},
+		}
+		resp, err := core.systemBackend.HandleRequest(namespace.RootContext(context.Background()), req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if resp != nil && resp.IsError() {
+			http.Error(w, resp.Error().Error(), http.StatusBadRequest)
+			return
+		}
+		if resp == nil || len(resp.Data) == 0 {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(map[string]interface{}{"data": resp.Data}); err != nil {
+			t.Logf("failed to encode DR primary API test response: %v", err)
+		}
+	}))
+}
+
+func testServerNameForCertificate(cert *x509.Certificate) string {
+	if cert == nil {
+		return ""
+	}
+	if len(cert.DNSNames) > 0 {
+		return cert.DNSNames[0]
+	}
+	if len(cert.IPAddresses) > 0 {
+		return cert.IPAddresses[0].String()
+	}
+	return cert.Subject.CommonName
+}
+
+func TestPostDRPrimaryAPIJSON_AllowsExplicitHTTP(t *testing.T) {
+	var gotPath string
+	var gotBody map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Errorf("decode request body: %v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	err := postDRPrimaryAPIJSON(context.Background(), drPrimaryAPIClientConfig{
+		APIAddr: server.URL,
+	}, "replication/dr/primary/register-secondary", map[string]interface{}{
+		"relationship_id": "rel-1",
+	})
+	if err != nil {
+		t.Fatalf("expected explicit HTTP API request to succeed: %v", err)
+	}
+	if gotPath != "/v1/sys/replication/dr/primary/register-secondary" {
+		t.Fatalf("unexpected path: %q", gotPath)
+	}
+	if gotBody["relationship_id"] != "rel-1" {
+		t.Fatalf("unexpected body: %#v", gotBody)
+	}
+}
+
+func TestDRSystemBackend_SecondaryRotateCertificateWrapper(t *testing.T) {
+	ctx := context.Background()
+	primaryCore, _, _ := TestCoreUnsealed(t)
+	setupTestClusterCert(t, primaryCore)
+	primaryMgr := newDRRelationshipManager(primaryCore, primaryCore.logger)
+	primaryCore.drManager = primaryMgr
+	if err := primaryMgr.EnablePrimary(ctx); err != nil {
+		t.Fatal(err)
+	}
+	apiServer := newDRPrimaryAPITestServer(t, primaryCore)
+	defer apiServer.Close()
+
+	token, err := primaryMgr.GenerateActivationToken(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token.PrimaryAPIAddr = apiServer.URL
+	token.PrimaryAPICACert = apiServer.Certificate().Raw
+	token.PrimaryAPIServerName = testServerNameForCertificate(apiServer.Certificate())
+	token.PrimaryAddrs = []string{"https://127.0.0.1:1"}
+	token.PrimaryAddr = token.PrimaryAddrs[0]
+
+	secondaryCore, _, _ := TestCoreUnsealed(t)
+	secondaryMgr := newDRRelationshipManager(secondaryCore, secondaryCore.logger)
+	secondaryCore.drManager = secondaryMgr
+	if err := secondaryMgr.EnableSecondary(ctx, token); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = secondaryMgr.DisableSecondary(context.Background()) }()
+
+	secondaryConfig := secondaryMgr.Config()
+	if secondaryConfig.PrimaryAPIAddr != apiServer.URL {
+		t.Fatalf("expected persisted primary API addr %q, got %q", apiServer.URL, secondaryConfig.PrimaryAPIAddr)
+	}
+	if len(secondaryConfig.PrimaryAPICACert) == 0 {
+		t.Fatal("expected persisted primary API CA certificate")
+	}
+	oldFP := certFingerprintSHA256DER(secondaryConfig.SecondaryClientCert)
+	if oldFP == "" {
+		t.Fatal("expected old secondary credential fingerprint")
+	}
+	if _, err := primaryMgr.ValidateRelationshipAccess(token.RelationshipID, oldFP, DRRelationshipStateRegistered, DRRelationshipStateActive); err != nil {
+		t.Fatal(err)
+	}
+
+	req := logical.TestRequest(t, logical.UpdateOperation, "replication/dr/secondary/rotate-certificate")
+	resp, err := secondaryCore.systemBackend.HandleRequest(namespace.RootContext(t.Context()), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp == nil || resp.IsError() {
+		t.Fatalf("expected secondary rotation response, got %#v err=%v", resp, err)
+	}
+	newFP, ok := resp.Data["new_fingerprint"].(string)
+	if !ok || newFP == "" || newFP == oldFP {
+		t.Fatalf("expected new fingerprint in response, got %#v", resp.Data["new_fingerprint"])
+	}
+
+	secondaryConfig = secondaryMgr.Config()
+	if got := certFingerprintSHA256DER(secondaryConfig.SecondaryClientCert); got != newFP {
+		t.Fatalf("expected local secondary config to use new fingerprint %q, got %q", newFP, got)
+	}
+	if len(secondaryConfig.PendingSecondaryClientCert) != 0 ||
+		len(secondaryConfig.PendingSecondaryClientKeyPEM) != 0 ||
+		secondaryConfig.PendingSecondaryRotationOperation != "" {
+		t.Fatal("expected local pending secondary credential rotation state to be cleared")
+	}
+
+	rel, err := primaryMgr.loadRelationship(ctx, token.RelationshipID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rel.SecondaryCertFingerprint != newFP {
+		t.Fatalf("expected primary relationship fingerprint %q, got %q", newFP, rel.SecondaryCertFingerprint)
+	}
+	if rel.PreviousSecondaryCertFingerprint != oldFP {
+		t.Fatalf("expected primary previous fingerprint %q, got %q", oldFP, rel.PreviousSecondaryCertFingerprint)
+	}
+	if _, err := primaryMgr.ValidateRelationshipAccess(token.RelationshipID, oldFP, DRRelationshipStateActive); err == nil {
+		t.Fatal("expected old secondary credential to be rejected after wrapper rotation")
+	}
+	if _, err := primaryMgr.ValidateRelationshipAccess(token.RelationshipID, newFP, DRRelationshipStateActive); err != nil {
+		t.Fatalf("expected new secondary credential to be authorized after wrapper rotation: %v", err)
+	}
+}
+
+func TestDRRelationshipManager_BootstrapRejectsRevokedFingerprintReuse(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	setupTestClusterCert(t, core)
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	if err := mgr.EnablePrimary(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	token1, err := mgr.GenerateActivationToken(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondaryCertDER, _, err := generateDRSecondaryClientCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.ValidateBootstrapAndStoreCert(ctx, token1.RelationshipID, token1.BootstrapToken, secondaryCertDER); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.RevokeRelationship(ctx, token1.RelationshipID); err != nil {
+		t.Fatal(err)
+	}
+
+	token2, err := mgr.GenerateActivationToken(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = mgr.ValidateBootstrapAndStoreCert(ctx, token2.RelationshipID, token2.BootstrapToken, secondaryCertDER)
+	if err == nil || !strings.Contains(err.Error(), "certificate fingerprint already bound") {
+		t.Fatalf("expected fingerprint reuse rejection, got: %v", err)
+	}
+
+	rel2, err := mgr.loadRelationship(ctx, token2.RelationshipID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rel2.State != DRRelationshipStatePending {
+		t.Fatalf("expected new relationship to remain pending, got %s", rel2.State)
+	}
+	if rel2.BootstrapToken != "" {
+		t.Fatal("expected new relationship bootstrap token plaintext not to be persisted")
+	}
+	if rel2.BootstrapTokenHash == "" {
+		t.Fatal("expected new relationship bootstrap verifier to remain unconsumed")
+	}
+	if rel2.FailedAttempts != 1 {
+		t.Fatalf("expected duplicate fingerprint to count as a failed attempt, got %d", rel2.FailedAttempts)
+	}
+	if rel2.LastFailedAt == 0 {
+		t.Fatal("expected last_failed_at to be set")
 	}
 }
 
@@ -494,7 +1937,8 @@ func TestDRRelationshipManager_EnableSecondary_NormalizesPrimaryAddresses(t *tes
 			"https://127.0.0.2:8201",
 			"127.0.0.1:8201",
 		},
-		ReplSalt: replSalt,
+		PrimaryAPIAddr: "http://primary-api:8200",
+		ReplSalt:       replSalt,
 	}
 	if err := mgr.EnableSecondary(ctx, tokenAddrsOnly); err != nil {
 		t.Fatal(err)
@@ -508,6 +1952,9 @@ func TestDRRelationshipManager_EnableSecondary_NormalizesPrimaryAddresses(t *tes
 	}
 	if cfg.PrimaryAddrs[0] != "https://127.0.0.1:8201" || cfg.PrimaryAddrs[1] != "https://127.0.0.2:8201" {
 		t.Fatalf("unexpected primary_addrs ordering/content: %v", cfg.PrimaryAddrs)
+	}
+	if cfg.PrimaryAPIAddr != "http://primary-api:8200" {
+		t.Fatalf("expected explicit HTTP primary API addr to be preserved, got %q", cfg.PrimaryAPIAddr)
 	}
 	if err := mgr.DisableSecondary(ctx); err != nil {
 		t.Fatal(err)
@@ -557,6 +2004,11 @@ func TestDRRelationshipManager_Promote(t *testing.T) {
 	if err := mgr.EnableSecondary(ctx, token); err != nil {
 		t.Fatal(err)
 	}
+	beforePromotion := mgr.Config()
+	oldSecondaryFP := certFingerprintSHA256DER(beforePromotion.SecondaryClientCert)
+	if oldSecondaryFP == "" {
+		t.Fatal("expected secondary client certificate fingerprint before promotion")
+	}
 
 	// Promote.
 	if err := mgr.PromoteSecondary(ctx); err != nil {
@@ -564,6 +2016,415 @@ func TestDRRelationshipManager_Promote(t *testing.T) {
 	}
 	if mgr.Mode() != DRModeDisabled {
 		t.Fatalf("expected disabled after promote, got %s", mgr.Mode())
+	}
+	cfg := mgr.Config()
+	if cfg.ClusterID != "" || cfg.RelationshipID != "" || cfg.PrimaryAddr != "" || len(cfg.PrimaryAddrs) != 0 {
+		t.Fatalf("expected stale upstream relationship fields to be cleared, got %#v", cfg)
+	}
+	if cfg.Promotion == nil {
+		t.Fatal("expected promotion lineage after promote")
+	}
+	if cfg.Promotion.OldRelationshipID != token.RelationshipID {
+		t.Fatalf("expected old relationship ID %q, got %q", token.RelationshipID, cfg.Promotion.OldRelationshipID)
+	}
+	if cfg.Promotion.OldSecondaryCertFingerprint != oldSecondaryFP {
+		t.Fatalf("expected old secondary certificate fingerprint %q, got %q", oldSecondaryFP, cfg.Promotion.OldSecondaryCertFingerprint)
+	}
+}
+
+func TestDRRelationshipManager_EnableSecondaryRejectsStalePromotionLineage(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+
+	mgr := newDRRelationshipManager(core, core.logger)
+
+	oldToken := &DRActivationToken{
+		ClusterID:      "old-primary-cluster",
+		RelationshipID: "old-relationship",
+		PrimaryAddrs:   []string{"127.0.0.1:8201"},
+		ReplSalt:       make([]byte, drReplSaltLen),
+	}
+	rand.Read(oldToken.ReplSalt)
+
+	if err := mgr.EnableSecondary(ctx, oldToken); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.PromoteSecondaryWithRecord(ctx, &DRPromotionRecord{
+		PromotionID:         "promotion-1",
+		OldPrimaryClusterID: oldToken.ClusterID,
+		OldRelationshipID:   oldToken.RelationshipID,
+		PromotionClass:      DRPromotionClean,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mgr.EnableSecondary(ctx, oldToken); err == nil || !strings.Contains(err.Error(), "stale pre-promotion DR lineage") {
+		t.Fatalf("expected stale pre-promotion token to be rejected, got: %v", err)
+	}
+	if mgr.Mode() != DRModeDisabled {
+		t.Fatalf("expected mode to remain disabled after stale token rejection, got %s", mgr.Mode())
+	}
+	cfg := mgr.Config()
+	if cfg.Promotion == nil || cfg.Promotion.OldRelationshipID != oldToken.RelationshipID {
+		t.Fatalf("expected promotion lineage to remain intact, got %#v", cfg.Promotion)
+	}
+	if cfg.Promotion.OldSecondaryCertFingerprint == "" {
+		t.Fatal("expected old secondary certificate fingerprint in promotion lineage")
+	}
+
+	freshToken := &DRActivationToken{
+		ClusterID:      "new-authority-cluster",
+		RelationshipID: "new-relationship",
+		PrimaryAddrs:   []string{"127.0.0.2:8201"},
+		ReplSalt:       make([]byte, drReplSaltLen),
+	}
+	rand.Read(freshToken.ReplSalt)
+	if err := mgr.EnableSecondary(ctx, freshToken); err != nil {
+		t.Fatalf("expected fresh post-promotion lineage to be allowed, got: %v", err)
+	}
+	defer func() {
+		if err := mgr.DisableSecondary(ctx); err != nil {
+			t.Fatalf("failed to disable fresh secondary: %v", err)
+		}
+	}()
+	if mgr.Mode() != DRModeSecondary {
+		t.Fatalf("expected secondary mode after fresh token, got %s", mgr.Mode())
+	}
+}
+
+func TestDRRelationshipManager_RepeatedPromotionPreservesStaleLineage(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+
+	mgr := newDRRelationshipManager(core, core.logger)
+
+	firstToken := &DRActivationToken{
+		ClusterID:      "first-old-primary",
+		RelationshipID: "first-old-relationship",
+		PrimaryAddrs:   []string{"127.0.0.1:8201"},
+		ReplSalt:       make([]byte, drReplSaltLen),
+	}
+	rand.Read(firstToken.ReplSalt)
+	if err := mgr.EnableSecondary(ctx, firstToken); err != nil {
+		t.Fatal(err)
+	}
+	firstSecondaryFP := certFingerprintSHA256DER(mgr.Config().SecondaryClientCert)
+	if firstSecondaryFP == "" {
+		t.Fatal("expected first secondary fingerprint")
+	}
+	if err := mgr.PromoteSecondaryWithRecord(ctx, &DRPromotionRecord{
+		PromotionID:         "promotion-first",
+		OldPrimaryClusterID: firstToken.ClusterID,
+		OldRelationshipID:   firstToken.RelationshipID,
+		PromotionClass:      DRPromotionClean,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	secondToken := &DRActivationToken{
+		ClusterID:      "second-old-primary",
+		RelationshipID: "second-old-relationship",
+		PrimaryAddrs:   []string{"127.0.0.2:8201"},
+		ReplSalt:       make([]byte, drReplSaltLen),
+	}
+	rand.Read(secondToken.ReplSalt)
+	if err := mgr.EnableSecondary(ctx, secondToken); err != nil {
+		t.Fatalf("expected explicit reseed to fresh authority to be allowed: %v", err)
+	}
+	secondSecondaryFP := certFingerprintSHA256DER(mgr.Config().SecondaryClientCert)
+	if secondSecondaryFP == "" {
+		t.Fatal("expected second secondary fingerprint")
+	}
+	if err := mgr.PromoteSecondaryWithRecord(ctx, &DRPromotionRecord{
+		PromotionID:         "promotion-second",
+		OldPrimaryClusterID: secondToken.ClusterID,
+		OldRelationshipID:   secondToken.RelationshipID,
+		PromotionClass:      DRPromotionClean,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := mgr.Config()
+	if cfg.Promotion == nil {
+		t.Fatal("expected second promotion record")
+	}
+	if cfg.Promotion.OldPrimaryClusterID != secondToken.ClusterID {
+		t.Fatalf("expected current old primary %q, got %q", secondToken.ClusterID, cfg.Promotion.OldPrimaryClusterID)
+	}
+	if !stringSliceContains(cfg.Promotion.StalePrimaryClusterIDs, firstToken.ClusterID) {
+		t.Fatalf("expected first old primary to remain denylisted, got %#v", cfg.Promotion.StalePrimaryClusterIDs)
+	}
+	if !stringSliceContains(cfg.Promotion.StaleRelationshipIDs, firstToken.RelationshipID) {
+		t.Fatalf("expected first old relationship to remain denylisted, got %#v", cfg.Promotion.StaleRelationshipIDs)
+	}
+	if !stringSliceContainsFold(cfg.Promotion.StaleSecondaryFingerprints, firstSecondaryFP) {
+		t.Fatalf("expected first old secondary fingerprint to remain denylisted, got %#v", cfg.Promotion.StaleSecondaryFingerprints)
+	}
+	if isStalePostPromotionFingerprint(cfg.Promotion, secondSecondaryFP) != true {
+		t.Fatal("expected latest old secondary fingerprint to be stale")
+	}
+
+	if err := mgr.EnableSecondary(ctx, firstToken); err == nil || !strings.Contains(err.Error(), "stale pre-promotion DR lineage") {
+		t.Fatalf("expected first old token to remain rejected after second promotion, got: %v", err)
+	}
+	if err := mgr.EnableSecondary(ctx, secondToken); err == nil || !strings.Contains(err.Error(), "stale pre-promotion DR lineage") {
+		t.Fatalf("expected second old token to be rejected after second promotion, got: %v", err)
+	}
+}
+
+func stringSliceContains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func stringSliceContainsFold(values []string, want string) bool {
+	for _, value := range values {
+		if strings.EqualFold(value, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestDRRelationshipManager_LoadConfigDisablesStalePostPromotionSecondaryConfig(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	promotion := &DRPromotionRecord{
+		PromotionID:         "promotion-load-stale",
+		PromotedAt:          time.Now().UTC().Unix(),
+		OldPrimaryClusterID: "old-primary-cluster",
+		OldRelationshipID:   "old-relationship",
+		PromotionClass:      DRPromotionClean,
+	}
+	staleConfig := &DRConfig{
+		Mode:           DRModeSecondary,
+		ClusterID:      promotion.OldPrimaryClusterID,
+		RelationshipID: promotion.OldRelationshipID,
+		PrimaryAddrs:   []string{"127.0.0.1:8201"},
+		ReplSalt:       make([]byte, drReplSaltLen),
+		Promotion:      promotion,
+	}
+	rand.Read(staleConfig.ReplSalt)
+	data, err := json.Marshal(staleConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := core.barrier.Put(ctx, &logical.StorageEntry{Key: drConfigPath, Value: data}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mgr.LoadConfig(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cfg := mgr.Config()
+	if cfg.Mode != DRModeDisabled {
+		t.Fatalf("expected stale secondary config to be disabled during load, got %s", cfg.Mode)
+	}
+	if cfg.Promotion == nil || cfg.Promotion.PromotionID != promotion.PromotionID {
+		t.Fatalf("expected promotion lineage to be preserved, got %#v", cfg.Promotion)
+	}
+	entry, err := core.barrier.Get(ctx, drConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted DRConfig
+	if err := json.Unmarshal(entry.Value, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Mode != DRModeDisabled {
+		t.Fatalf("expected persisted stale config to be disabled, got %s", persisted.Mode)
+	}
+
+	if err := core.barrier.Put(ctx, &logical.StorageEntry{Key: drConfigPath, Value: data}); err != nil {
+		t.Fatal(err)
+	}
+	mode, err := mgr.RefreshConfigFromStorage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode != DRModeDisabled {
+		t.Fatalf("expected stale secondary config refresh to return disabled, got %s", mode)
+	}
+}
+
+func TestDRRelationshipManager_RefreshStalePostPromotionConfigStopsSecondaryRuntime(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	oldToken := &DRActivationToken{
+		ClusterID:      "old-primary-cluster",
+		RelationshipID: "old-relationship",
+		PrimaryAddrs:   []string{"127.0.0.1:8201"},
+		ReplSalt:       make([]byte, drReplSaltLen),
+	}
+	rand.Read(oldToken.ReplSalt)
+	if err := mgr.EnableSecondary(ctx, oldToken); err != nil {
+		t.Fatal(err)
+	}
+	if mgr.Secondary() == nil {
+		t.Fatal("expected secondary runtime before stale refresh")
+	}
+
+	staleConfig := mgr.Config()
+	staleConfig.Promotion = &DRPromotionRecord{
+		PromotionID:         "promotion-refresh-stale",
+		PromotedAt:          time.Now().UTC().Unix(),
+		OldPrimaryClusterID: oldToken.ClusterID,
+		OldRelationshipID:   oldToken.RelationshipID,
+		PromotionClass:      DRPromotionClean,
+	}
+	data, err := json.Marshal(staleConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := core.barrier.Put(ctx, &logical.StorageEntry{Key: drConfigPath, Value: data}); err != nil {
+		t.Fatal(err)
+	}
+
+	mode, err := mgr.RefreshConfigFromStorage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode != DRModeDisabled {
+		t.Fatalf("expected stale secondary config refresh to return disabled, got %s", mode)
+	}
+	if mgr.Mode() != DRModeDisabled {
+		t.Fatalf("expected manager mode disabled after stale refresh, got %s", mgr.Mode())
+	}
+	if mgr.Secondary() != nil {
+		t.Fatal("expected stale refresh to stop secondary runtime")
+	}
+}
+
+func TestDRRelationshipManager_BootstrapRejectsPrePromotionSecondaryFingerprint(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	setupTestClusterCert(t, core)
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	oldToken := &DRActivationToken{
+		ClusterID:      "old-primary-cluster",
+		RelationshipID: "old-relationship",
+		PrimaryAddrs:   []string{"127.0.0.1:8201"},
+		ReplSalt:       make([]byte, drReplSaltLen),
+	}
+	rand.Read(oldToken.ReplSalt)
+	if err := mgr.EnableSecondary(ctx, oldToken); err != nil {
+		t.Fatal(err)
+	}
+	oldSecondaryCert := append([]byte(nil), mgr.Config().SecondaryClientCert...)
+	oldSecondaryFP := certFingerprintSHA256DER(oldSecondaryCert)
+	if oldSecondaryFP == "" {
+		t.Fatal("expected old secondary certificate fingerprint")
+	}
+	if err := mgr.PromoteSecondary(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := mgr.Config().Promotion.OldSecondaryCertFingerprint; got != oldSecondaryFP {
+		t.Fatalf("expected promotion fingerprint %q, got %q", oldSecondaryFP, got)
+	}
+	if err := mgr.EnablePrimary(ctx); err != nil {
+		t.Fatal(err)
+	}
+	token, err := mgr.GenerateActivationToken(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = mgr.ValidateBootstrapAndStoreCert(ctx, token.RelationshipID, token.BootstrapToken, oldSecondaryCert)
+	if err == nil || !strings.Contains(err.Error(), "stale pre-promotion DR lineage") {
+		t.Fatalf("expected stale certificate fingerprint rejection, got: %v", err)
+	}
+	rel, err := mgr.loadRelationship(ctx, token.RelationshipID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rel.State != DRRelationshipStateRevoked {
+		t.Fatalf("expected stale certificate attempt to revoke pending relationship, got %s", rel.State)
+	}
+	if rel.BootstrapToken != "" {
+		t.Fatal("expected stale certificate attempt to clear bootstrap token")
+	}
+	if rel.BootstrapTokenHash != "" {
+		t.Fatal("expected stale certificate attempt to clear bootstrap token verifier")
+	}
+}
+
+func TestDRRelationshipManager_LoadConfigSkipsStalePromotionRelationshipCerts(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	setupTestClusterCert(t, core)
+
+	oldSecondaryCert, _, err := generateDRSecondaryClientCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldSecondaryFP := certFingerprintSHA256DER(oldSecondaryCert)
+	if oldSecondaryFP == "" {
+		t.Fatal("expected old secondary certificate fingerprint")
+	}
+	promotion := &DRPromotionRecord{
+		PromotionID:                 "promotion-skip-cert",
+		PromotedAt:                  time.Now().UTC().Unix(),
+		OldPrimaryClusterID:         "old-primary",
+		OldRelationshipID:           "old-relationship",
+		OldSecondaryCertFingerprint: oldSecondaryFP,
+		PromotionClass:              DRPromotionClean,
+	}
+	cfg := &DRConfig{
+		Mode:      DRModePrimary,
+		ClusterID: "new-primary",
+		ReplSalt:  make([]byte, drReplSaltLen),
+		Promotion: promotion,
+	}
+	rand.Read(cfg.ReplSalt)
+	cfgBytes, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := core.barrier.Put(ctx, &logical.StorageEntry{Key: drConfigPath, Value: cfgBytes}); err != nil {
+		t.Fatal(err)
+	}
+
+	rel := &DRRelationship{
+		RelationshipID:           promotion.OldRelationshipID,
+		State:                    DRRelationshipStateActive,
+		SecondaryCACert:          oldSecondaryCert,
+		SecondaryCertFingerprint: oldSecondaryFP,
+		CreatedAt:                time.Now().UTC().Unix(),
+		LastSeenAt:               time.Now().UTC().Unix(),
+	}
+	relBytes, err := json.Marshal(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := core.barrier.Put(ctx, &logical.StorageEntry{Key: drRelationshipsPath + rel.RelationshipID, Value: relBytes}); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	if err := mgr.LoadConfig(ctx); err != nil {
+		t.Fatal(err)
+	}
+	handler := mgr.Handler()
+	if handler == nil {
+		t.Fatal("expected handler after primary config restore")
+	}
+	certs, err := handler.CALookup(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cert := range certs {
+		if bytes.Equal(cert.Raw, oldSecondaryCert) {
+			t.Fatal("stale pre-promotion relationship certificate was restored into trust pool")
+		}
 	}
 }
 
@@ -876,6 +2737,43 @@ func TestDRRelationshipManager_UpdateTuningAppliesSecondaryRuntime(t *testing.T)
 
 // --- Unit Tests for DR Failover ---
 
+func stopDRSecondaryControllerForTest(t *testing.T, mgr *drRelationshipManager) {
+	t.Helper()
+
+	mgr.mu.RLock()
+	cancel := mgr.secondaryLoopCancel
+	mgr.mu.RUnlock()
+	if cancel != nil {
+		cancel()
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mgr.mu.RLock()
+		stopped := mgr.secondaryLoopCancel == nil
+		mgr.mu.RUnlock()
+		if stopped {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for DR secondary controller to stop")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func configureDRFailoverSecondaryForTest(t *testing.T, mgr *drRelationshipManager, state DRSecondaryState, lastAppliedIndex, primaryIndex uint64) {
+	t.Helper()
+
+	stopDRSecondaryControllerForTest(t, mgr)
+	if mgr.secondary == nil {
+		t.Fatal("expected DR secondary runtime")
+	}
+	mgr.secondary.setState(state)
+	mgr.secondary.lastAppliedIndex.Store(lastAppliedIndex)
+	mgr.secondary.primaryIndex.Store(primaryIndex)
+}
+
 func TestDRFailover_NotSecondary(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	ctx := context.Background()
@@ -883,7 +2781,7 @@ func TestDRFailover_NotSecondary(t *testing.T) {
 	core.drManager = newDRRelationshipManager(core, core.logger)
 
 	// Failover should fail when not in secondary mode.
-	_, err := core.DRFailover(ctx, true)
+	_, err := core.DRFailover(ctx, true, false)
 	if err == nil {
 		t.Fatal("expected error for failover when not secondary")
 	}
@@ -909,10 +2807,9 @@ func TestDRFailover_FromSecondary(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Simulate some applied entries.
-	mgr.secondary.lastAppliedIndex.Store(500)
+	configureDRFailoverSecondaryForTest(t, mgr, DRSecondaryStreaming, 500, 500)
 
-	result, err := core.DRFailover(ctx, true)
+	result, err := core.DRFailover(ctx, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -925,8 +2822,278 @@ func TestDRFailover_FromSecondary(t *testing.T) {
 	if result.LastAppliedIndex != 500 {
 		t.Fatalf("expected last applied index 500, got %d", result.LastAppliedIndex)
 	}
+	if result.LastKnownPrimaryIndex != 500 {
+		t.Fatalf("expected last known primary index 500, got %d", result.LastKnownPrimaryIndex)
+	}
+	if result.PromotionClass != DRPromotionClean {
+		t.Fatalf("expected clean promotion, got %s", result.PromotionClass)
+	}
+	if !result.CleanPromotionEligible {
+		t.Fatal("expected clean promotion proof to be available")
+	}
+	if result.ForcedPromotionRequiresAcknowledgement {
+		t.Fatal("did not expect forced-promotion acknowledgement requirement")
+	}
+	if len(result.ForcedPromotionReasonCodes) != 0 || len(result.ForcedPromotionReasonDetails) != 0 {
+		t.Fatalf("did not expect forced-promotion reasons for clean promotion, got codes=%v details=%v", result.ForcedPromotionReasonCodes, result.ForcedPromotionReasonDetails)
+	}
+	if result.DataLossEstimateBasis != drPromotionDataLossEstimateBasis {
+		t.Fatalf("expected data loss estimate basis %q, got %q", drPromotionDataLossEstimateBasis, result.DataLossEstimateBasis)
+	}
+	if result.PromotionID == "" {
+		t.Fatal("expected promotion ID")
+	}
+	if result.DataLossAccepted {
+		t.Fatal("did not expect data loss acknowledgement for clean promotion")
+	}
 	if mgr.Mode() != DRModeDisabled {
 		t.Fatalf("expected disabled after failover, got %s", mgr.Mode())
+	}
+	cfg := mgr.Config()
+	if cfg.Promotion == nil {
+		t.Fatal("expected persisted promotion record")
+	}
+	if cfg.Promotion.PromotionID != result.PromotionID {
+		t.Fatalf("expected persisted promotion ID %q, got %q", result.PromotionID, cfg.Promotion.PromotionID)
+	}
+	if cfg.ClusterID != "" || cfg.RelationshipID != "" || cfg.PrimaryAddr != "" || len(cfg.PrimaryAddrs) != 0 {
+		t.Fatalf("expected stale upstream relationship fields to be cleared, got %#v", cfg)
+	}
+	if len(cfg.ReplSalt) != 0 || len(cfg.PrimaryCACert) != 0 || len(cfg.SecondaryClientCert) != 0 || len(cfg.SecondaryClientKeyPEM) != 0 {
+		t.Fatal("expected stale replication secrets to be cleared after promotion")
+	}
+}
+
+func TestDRFailover_ForcedRequiresAcceptDataLoss(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	core.drManager = mgr
+
+	token := &DRActivationToken{
+		ClusterID:      "test-cluster",
+		RelationshipID: "rel-forced-required",
+		PrimaryAddr:    "127.0.0.1:8201",
+		PrimaryAddrs:   []string{"127.0.0.1:8201"},
+		ReplSalt:       make([]byte, 32),
+	}
+	rand.Read(token.ReplSalt)
+
+	if err := mgr.EnableSecondary(ctx, token); err != nil {
+		t.Fatal(err)
+	}
+
+	configureDRFailoverSecondaryForTest(t, mgr, DRSecondaryReconciling, 500, 510)
+
+	_, err := core.DRFailover(ctx, true, false)
+	if err == nil {
+		t.Fatal("expected forced promotion to require accept_data_loss")
+	}
+	if !strings.Contains(err.Error(), "accept_data_loss=true") {
+		t.Fatalf("expected accept_data_loss error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "clean promotion proof unavailable") {
+		t.Fatalf("expected clean-promotion proof explanation, got %v", err)
+	}
+	if mgr.Mode() != DRModeSecondary {
+		t.Fatalf("expected secondary mode after rejected promotion, got %s", mgr.Mode())
+	}
+}
+
+func TestDRFailover_ForcedWithAcceptDataLoss(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	core.drManager = mgr
+
+	token := &DRActivationToken{
+		ClusterID:      "test-cluster",
+		RelationshipID: "rel-forced-accepted",
+		PrimaryAddr:    "127.0.0.1:8201",
+		PrimaryAddrs:   []string{"127.0.0.1:8201"},
+		ReplSalt:       make([]byte, 32),
+	}
+	rand.Read(token.ReplSalt)
+
+	if err := mgr.EnableSecondary(ctx, token); err != nil {
+		t.Fatal(err)
+	}
+
+	configureDRFailoverSecondaryForTest(t, mgr, DRSecondaryReconciling, 500, 510)
+
+	result, err := core.DRFailover(ctx, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.PromotionClass != DRPromotionForced {
+		t.Fatalf("expected forced promotion, got %s", result.PromotionClass)
+	}
+	if result.CleanPromotionEligible {
+		t.Fatal("did not expect clean promotion proof for forced promotion")
+	}
+	if !result.ForcedPromotionRequiresAcknowledgement {
+		t.Fatal("expected forced-promotion acknowledgement requirement")
+	}
+	if !stringSliceContains(result.ForcedPromotionReasonCodes, drPromotionReasonSecondaryStateNotStableStreaming) {
+		t.Fatalf("expected state reason code, got %v", result.ForcedPromotionReasonCodes)
+	}
+	if !stringSliceContains(result.ForcedPromotionReasonCodes, drPromotionReasonSecondaryLagDetected) {
+		t.Fatalf("expected lag reason code, got %v", result.ForcedPromotionReasonCodes)
+	}
+	if !result.DataLossAccepted {
+		t.Fatal("expected data loss acknowledgement to be recorded")
+	}
+	if result.EstimatedDataLossEntries != 10 {
+		t.Fatalf("expected estimated data loss of 10 entries, got %d", result.EstimatedDataLossEntries)
+	}
+	if result.Warning == "" {
+		t.Fatal("expected forced promotion warning")
+	}
+	cfg := mgr.Config()
+	if cfg.Promotion == nil {
+		t.Fatal("expected persisted promotion record")
+	}
+	if cfg.Promotion.PromotionClass != DRPromotionForced {
+		t.Fatalf("expected persisted forced promotion, got %s", cfg.Promotion.PromotionClass)
+	}
+	if !stringSliceContains(cfg.Promotion.ForcedReasonCodes, drPromotionReasonSecondaryStateNotStableStreaming) {
+		t.Fatalf("expected persisted state reason code, got %v", cfg.Promotion.ForcedReasonCodes)
+	}
+	if !stringSliceContains(cfg.Promotion.ForcedReasonCodes, drPromotionReasonSecondaryLagDetected) {
+		t.Fatalf("expected persisted lag reason code, got %v", cfg.Promotion.ForcedReasonCodes)
+	}
+	if !cfg.Promotion.DataLossAccepted {
+		t.Fatal("expected persisted data loss acknowledgement")
+	}
+	if cfg.Promotion.DataLossEstimateBasis != drPromotionDataLossEstimateBasis {
+		t.Fatalf("expected persisted data loss estimate basis %q, got %q", drPromotionDataLossEstimateBasis, cfg.Promotion.DataLossEstimateBasis)
+	}
+	if cfg.Promotion.OldPrimaryClusterID != token.ClusterID {
+		t.Fatalf("expected old primary cluster ID %q, got %q", token.ClusterID, cfg.Promotion.OldPrimaryClusterID)
+	}
+	if cfg.Promotion.OldRelationshipID != token.RelationshipID {
+		t.Fatalf("expected old relationship ID %q, got %q", token.RelationshipID, cfg.Promotion.OldRelationshipID)
+	}
+}
+
+func TestDRFailover_ForcedWithZeroEstimatedLossExplainsCleanProofUnavailable(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	core.drManager = mgr
+
+	token := &DRActivationToken{
+		ClusterID:      "test-cluster",
+		RelationshipID: "rel-forced-zero-loss",
+		PrimaryAddr:    "127.0.0.1:8201",
+		PrimaryAddrs:   []string{"127.0.0.1:8201"},
+		ReplSalt:       make([]byte, 32),
+	}
+	rand.Read(token.ReplSalt)
+
+	if err := mgr.EnableSecondary(ctx, token); err != nil {
+		t.Fatal(err)
+	}
+
+	configureDRFailoverSecondaryForTest(t, mgr, DRSecondaryReconciling, 500, 500)
+
+	_, err := core.DRFailover(ctx, true, false)
+	if err == nil {
+		t.Fatal("expected zero-loss forced promotion to require accept_data_loss")
+	}
+	if !strings.Contains(err.Error(), "clean promotion proof unavailable") {
+		t.Fatalf("expected clean-promotion proof explanation, got %v", err)
+	}
+
+	result, err := core.DRFailover(ctx, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.PromotionClass != DRPromotionForced {
+		t.Fatalf("expected forced promotion, got %s", result.PromotionClass)
+	}
+	if result.EstimatedDataLossEntries != 0 {
+		t.Fatalf("expected zero estimated data loss, got %d", result.EstimatedDataLossEntries)
+	}
+	if result.CleanPromotionEligible {
+		t.Fatal("did not expect clean promotion proof")
+	}
+	if !result.ForcedPromotionRequiresAcknowledgement {
+		t.Fatal("expected forced-promotion acknowledgement requirement")
+	}
+	if !stringSliceContains(result.ForcedPromotionReasonCodes, drPromotionReasonSecondaryStateNotStableStreaming) {
+		t.Fatalf("expected state reason code, got %v", result.ForcedPromotionReasonCodes)
+	}
+	if stringSliceContains(result.ForcedPromotionReasonCodes, drPromotionReasonSecondaryLagDetected) {
+		t.Fatalf("did not expect lag reason code for zero estimated loss, got %v", result.ForcedPromotionReasonCodes)
+	}
+	if result.DataLossEstimateBasis != drPromotionDataLossEstimateBasis {
+		t.Fatalf("expected data loss estimate basis %q, got %q", drPromotionDataLossEstimateBasis, result.DataLossEstimateBasis)
+	}
+}
+
+func TestDRSystemBackend_PromoteResponseExplainsForcedPromotion(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	core.drManager = mgr
+
+	token := &DRActivationToken{
+		ClusterID:      "test-cluster",
+		RelationshipID: "rel-promote-response",
+		PrimaryAddr:    "127.0.0.1:8201",
+		PrimaryAddrs:   []string{"127.0.0.1:8201"},
+		ReplSalt:       make([]byte, 32),
+	}
+	rand.Read(token.ReplSalt)
+
+	if err := mgr.EnableSecondary(t.Context(), token); err != nil {
+		t.Fatal(err)
+	}
+
+	configureDRFailoverSecondaryForTest(t, mgr, DRSecondaryReconciling, 500, 500)
+
+	req := logical.TestRequest(t, logical.UpdateOperation, "replication/dr/secondary/promote")
+	req.Storage = core.systemBarrierView
+	req.Data = map[string]interface{}{
+		"confirm_primary_unreachable": true,
+		"accept_data_loss":            true,
+	}
+	resp, err := core.systemBackend.HandleRequest(namespace.RootContext(t.Context()), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp == nil || resp.IsError() {
+		t.Fatalf("expected promotion response, got %#v", resp)
+	}
+	if resp.Data["promotion_class"] != string(DRPromotionForced) {
+		t.Fatalf("expected forced promotion response, got %#v", resp.Data["promotion_class"])
+	}
+	if resp.Data["estimated_data_loss_entries"] != uint64(0) {
+		t.Fatalf("expected zero estimated loss, got %#v", resp.Data["estimated_data_loss_entries"])
+	}
+	if resp.Data["clean_promotion_eligible"] != false {
+		t.Fatalf("expected clean promotion ineligible, got %#v", resp.Data["clean_promotion_eligible"])
+	}
+	if resp.Data["clean_promotion_proof_available"] != false {
+		t.Fatalf("expected clean promotion proof unavailable, got %#v", resp.Data["clean_promotion_proof_available"])
+	}
+	if resp.Data["forced_promotion_requires_acknowledgement"] != true {
+		t.Fatalf("expected forced-promotion acknowledgement requirement, got %#v", resp.Data["forced_promotion_requires_acknowledgement"])
+	}
+	if resp.Data["estimated_data_loss_entries_basis"] != drPromotionDataLossEstimateBasis {
+		t.Fatalf("expected data loss estimate basis %q, got %#v", drPromotionDataLossEstimateBasis, resp.Data["estimated_data_loss_entries_basis"])
+	}
+	codes, ok := resp.Data["forced_promotion_reason_codes"].([]string)
+	if !ok || !stringSliceContains(codes, drPromotionReasonSecondaryStateNotStableStreaming) {
+		t.Fatalf("expected state reason code, got %#v", resp.Data["forced_promotion_reason_codes"])
+	}
+	details, ok := resp.Data["forced_promotion_reason_details"].([]string)
+	if !ok || len(details) == 0 || !strings.Contains(details[0], "not stable streaming") {
+		t.Fatalf("expected operator-facing forced promotion detail, got %#v", resp.Data["forced_promotion_reason_details"])
 	}
 }
 
@@ -949,8 +3116,9 @@ func TestDRFailoverToPrimary(t *testing.T) {
 	if err := mgr.EnableSecondary(ctx, token); err != nil {
 		t.Fatal(err)
 	}
+	configureDRFailoverSecondaryForTest(t, mgr, DRSecondaryStreaming, 500, 500)
 
-	result, err := core.DRFailoverToPrimary(ctx, true)
+	result, err := core.DRFailoverToPrimary(ctx, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -962,6 +3130,13 @@ func TestDRFailoverToPrimary(t *testing.T) {
 	}
 	if mgr.Primary() == nil {
 		t.Fatal("expected primary server after failover-to-primary")
+	}
+	cfg := mgr.Config()
+	if cfg.Promotion == nil {
+		t.Fatal("expected promotion lineage to survive enabling primary mode")
+	}
+	if cfg.Promotion.PromotionID != result.PromotionID {
+		t.Fatalf("expected promotion ID %q, got %q", result.PromotionID, cfg.Promotion.PromotionID)
 	}
 }
 
@@ -1276,10 +3451,7 @@ func TestDRPrimary_ValidateCheckpointTuple(t *testing.T) {
 }
 
 func TestDRPrimary_ExchangeRangeChecksums_CheckpointTupleMismatch(t *testing.T) {
-	core, _, _ := TestCoreUnsealed(t)
-	replSalt := make([]byte, 32)
-	rand.Read(replSalt)
-	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
+	_, primary, relationshipID, rpcCtx := setupDRPrimaryForDirtyBitmapAuthz(t, "test-checksum-tuple-fp")
 
 	var start [32]byte
 	cp := &drCheckpointCacheEntry{
@@ -1287,7 +3459,7 @@ func TestDRPrimary_ExchangeRangeChecksums_CheckpointTupleMismatch(t *testing.T) 
 			ID:          "cp-1",
 			CommitIndex: 10,
 		},
-		relationshipID: "rel-1",
+		relationshipID: relationshipID,
 		kidToVID: map[[32]byte][32]byte{
 			start: {},
 		},
@@ -1297,7 +3469,8 @@ func TestDRPrimary_ExchangeRangeChecksums_CheckpointTupleMismatch(t *testing.T) 
 	primary.checkpoints[cp.checkpoint.ID] = cp
 	primary.checkpointMu.Unlock()
 
-	_, err := primary.ExchangeRangeChecksums(context.Background(), &RangeChecksumRequest{
+	_, err := primary.ExchangeRangeChecksums(rpcCtx, &RangeChecksumRequest{
+		RelationshipId:  relationshipID,
 		CheckpointId:    "cp-1",
 		CheckpointIndex: 11, // mismatch (cached index is 10)
 		RangeIds:        []uint64{0},
@@ -1307,6 +3480,139 @@ func TestDRPrimary_ExchangeRangeChecksums_CheckpointTupleMismatch(t *testing.T) 
 	}
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("expected FailedPrecondition, got %v", status.Code(err))
+	}
+}
+
+func addDRRequestValidationCheckpoint(t *testing.T, primary *drReplicationPrimary, checkpointID, relationshipID string, index uint64) {
+	t.Helper()
+
+	primary.checkpointMu.Lock()
+	defer primary.checkpointMu.Unlock()
+	primary.checkpoints[checkpointID] = &drCheckpointCacheEntry{
+		checkpoint: reconciler.Checkpoint{
+			ID:          checkpointID,
+			CommitIndex: index,
+		},
+		relationshipID: relationshipID,
+		createdAt:      time.Now().UTC(),
+		kidToVID:       map[[32]byte][32]byte{},
+		kidToKey:       map[[32]byte]string{},
+	}
+}
+
+func fullDRRangeSpanProto(depth uint32) *RangeSpan {
+	end := make([]byte, 32)
+	for i := range end {
+		end[i] = 0xff
+	}
+	return &RangeSpan{
+		StartKid:   make([]byte, 32),
+		EndKid:     end,
+		SplitDepth: depth,
+	}
+}
+
+func invertedDRRangeSpanProto() *RangeSpan {
+	start := make([]byte, 32)
+	end := make([]byte, 32)
+	start[31] = 2
+	end[31] = 1
+	return &RangeSpan{
+		StartKid: start,
+		EndKid:   end,
+	}
+}
+
+func TestDRPrimary_ExchangeRangeChecksumsRejectsOversizedRequests(t *testing.T) {
+	_, primary, relationshipID, rpcCtx := setupDRPrimaryForDirtyBitmapAuthz(t, "test-checksum-size-fp")
+
+	tooManyRanges := make([]uint64, drRangeMaxTotalRanges+1)
+	_, err := primary.ExchangeRangeChecksums(rpcCtx, &RangeChecksumRequest{
+		RelationshipId: relationshipID,
+		RangeIds:       tooManyRanges,
+	})
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("expected ResourceExhausted for excessive ranges, got %v: %v", status.Code(err), err)
+	}
+
+	_, err = primary.ExchangeRangeChecksums(rpcCtx, &RangeChecksumRequest{
+		RelationshipId: relationshipID,
+		RangeIds:       []uint64{uint64(drRangeMaxTotalRanges)},
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument for out-of-range range_id, got %v: %v", status.Code(err), err)
+	}
+}
+
+func TestDRPrimary_ExchangeRangeDigestsRejectsMalformedParentSpan(t *testing.T) {
+	_, primary, relationshipID, rpcCtx := setupDRPrimaryForDirtyBitmapAuthz(t, "test-digest-span-fp")
+	addDRRequestValidationCheckpoint(t, primary, "cp-digest-validation", relationshipID, 100)
+
+	_, err := primary.ExchangeRangeDigests(rpcCtx, &RangeDigestRequest{
+		RelationshipId:  relationshipID,
+		CheckpointId:    "cp-digest-validation",
+		CheckpointIndex: 100,
+		ParentSpan:      fullDRRangeSpanProto(uint32(drRangeMaxSplitDepth + 1)),
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument for excessive split depth, got %v: %v", status.Code(err), err)
+	}
+
+	_, err = primary.ExchangeRangeDigests(rpcCtx, &RangeDigestRequest{
+		RelationshipId:  relationshipID,
+		CheckpointId:    "cp-digest-validation",
+		CheckpointIndex: 100,
+		ParentSpan:      invertedDRRangeSpanProto(),
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument for inverted span, got %v: %v", status.Code(err), err)
+	}
+}
+
+func TestFetchEntriesRejectsOversizedAndMalformedRequests(t *testing.T) {
+	_, primary, relationshipID, rpcCtx := setupDRPrimaryForDirtyBitmapAuthz(t, "test-fetch-validation-fp")
+	addDRRequestValidationCheckpoint(t, primary, "cp-fetch-validation", relationshipID, 100)
+
+	stream := &fetchTestServerStream{ctx: rpcCtx}
+
+	tooManyKids := make([][]byte, drFetchRequestMaxSelectors+1)
+	err := primary.FetchEntries(&FetchEntriesRequest{
+		RelationshipId:  relationshipID,
+		CheckpointId:    "cp-fetch-validation",
+		CheckpointIndex: 100,
+		Kids:            tooManyKids,
+	}, stream)
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("expected ResourceExhausted for excessive point selectors, got %v: %v", status.Code(err), err)
+	}
+
+	tooManyRanges := make([]*RangeSpan, drRangeMaxTotalRanges+1)
+	err = primary.FetchEntries(&FetchEntriesRequest{
+		RelationshipId:  relationshipID,
+		CheckpointId:    "cp-fetch-validation",
+		CheckpointIndex: 100,
+		Ranges:          tooManyRanges,
+	}, stream)
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("expected ResourceExhausted for excessive ranges, got %v: %v", status.Code(err), err)
+	}
+
+	for name, ranges := range map[string][]*RangeSpan{
+		"nil":           {nil},
+		"split-depth":   {fullDRRangeSpanProto(uint32(drRangeMaxSplitDepth + 1))},
+		"inverted-span": {invertedDRRangeSpanProto()},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := primary.FetchEntries(&FetchEntriesRequest{
+				RelationshipId:  relationshipID,
+				CheckpointId:    "cp-fetch-validation",
+				CheckpointIndex: 100,
+				Ranges:          ranges,
+			}, stream)
+			if status.Code(err) != codes.InvalidArgument {
+				t.Fatalf("expected InvalidArgument, got %v: %v", status.Code(err), err)
+			}
+		})
 	}
 }
 
@@ -1573,6 +3879,51 @@ func TestDRCheckpointArtifactStore_EvictsByGlobalBudget(t *testing.T) {
 	}
 }
 
+func TestDRCheckpointArtifactStore_DoesNotEvictRetainedArtifact(t *testing.T) {
+	store := newDRCheckpointArtifactStore(log.NewNullLogger(), t.TempDir())
+	store.configure(true, time.Hour, 128, 128, 64)
+
+	makeArtifact := func(id string, createdAt time.Time) *drCheckpointArtifact {
+		path := filepath.Join(t.TempDir(), id)
+		if err := os.MkdirAll(path, 0o750); err != nil {
+			t.Fatalf("mkdir artifact path: %v", err)
+		}
+		return &drCheckpointArtifact{
+			CheckpointID:    id,
+			CheckpointIndex: 1,
+			RelationshipID:  "rel-1",
+			CreatedAt:       createdAt,
+			Path:            path,
+			Bytes:           96,
+			Records:         map[[32]byte]drCheckpointArtifactRecord{},
+		}
+	}
+
+	if err := store.putArtifact(makeArtifact("cp-active", time.Now().Add(-2*time.Minute))); err != nil {
+		t.Fatalf("put active artifact: %v", err)
+	}
+	if !store.retain("cp-active") {
+		t.Fatal("expected retain to find active artifact")
+	}
+	defer store.release("cp-active")
+
+	err := store.putArtifact(makeArtifact("cp-new", time.Now().Add(-1*time.Minute)))
+	if err == nil {
+		t.Fatal("expected budget exhaustion instead of evicting retained artifact")
+	}
+
+	store.mu.RLock()
+	_, hasActive := store.artifacts["cp-active"]
+	_, hasNew := store.artifacts["cp-new"]
+	store.mu.RUnlock()
+	if !hasActive {
+		t.Fatal("retained artifact was evicted")
+	}
+	if hasNew {
+		t.Fatal("new artifact should not be admitted when budget is exhausted by retained artifact")
+	}
+}
+
 func TestDRCheckpointArtifactStore_RejectsOversizedArtifact(t *testing.T) {
 	store := newDRCheckpointArtifactStore(log.NewNullLogger(), t.TempDir())
 	store.configure(true, time.Hour, 64, 64, 64)
@@ -1787,7 +4138,20 @@ func registerDRRelationshipWithFingerprint(t *testing.T, mgr *drRelationshipMana
 	return token.RelationshipID
 }
 
-func setupDRPrimaryForDirtyBitmapAuthz(t *testing.T, fingerprint string) (*drRelationshipManager, *drReplicationPrimary, string, context.Context) {
+func markDRRelationshipActive(t *testing.T, mgr *drRelationshipManager, relationshipID string) {
+	t.Helper()
+
+	rel, err := mgr.loadRelationship(context.Background(), relationshipID)
+	if err != nil {
+		t.Fatalf("failed to load relationship: %v", err)
+	}
+	rel.State = DRRelationshipStateActive
+	if err := mgr.saveRelationship(context.Background(), rel); err != nil {
+		t.Fatalf("failed to persist active relationship state: %v", err)
+	}
+}
+
+func setupDRPrimaryForRelationshipAuthz(t *testing.T, fingerprint string, state DRRelationshipState) (*drRelationshipManager, *drReplicationPrimary, string, context.Context) {
 	t.Helper()
 
 	core, _, _ := TestCoreUnsealed(t)
@@ -1800,6 +4164,9 @@ func setupDRPrimaryForDirtyBitmapAuthz(t *testing.T, fingerprint string) (*drRel
 	}
 
 	relationshipID := registerDRRelationshipWithFingerprint(t, mgr, fingerprint)
+	if state == DRRelationshipStateActive {
+		markDRRelationshipActive(t, mgr, relationshipID)
+	}
 	primary := mgr.Primary()
 	if primary == nil {
 		t.Fatal("expected primary after enable")
@@ -1807,6 +4174,18 @@ func setupDRPrimaryForDirtyBitmapAuthz(t *testing.T, fingerprint string) (*drRel
 
 	rpcCtx := context.WithValue(context.Background(), drPeerFingerprintContextKey{}, fingerprint)
 	return mgr, primary, relationshipID, rpcCtx
+}
+
+func setupDRPrimaryForDirtyBitmapAuthz(t *testing.T, fingerprint string) (*drRelationshipManager, *drReplicationPrimary, string, context.Context) {
+	t.Helper()
+
+	return setupDRPrimaryForRelationshipAuthz(t, fingerprint, DRRelationshipStateActive)
+}
+
+func setupDRPrimaryForRegisteredSyncKeyring(t *testing.T, fingerprint string) (*drRelationshipManager, *drReplicationPrimary, string, context.Context) {
+	t.Helper()
+
+	return setupDRPrimaryForRelationshipAuthz(t, fingerprint, DRRelationshipStateRegistered)
 }
 
 func TestDRPrimary_ExchangeDirtyBitmap_PostRestartReturnsAllDirty(t *testing.T) {
@@ -1962,6 +4341,458 @@ func TestDRPrimary_ExchangeDirtyBitmap_RequiresRelationshipAuthorization(t *test
 		CheckpointId:   "cp-revoked",
 	}); status.Code(err) != codes.PermissionDenied {
 		t.Fatalf("expected PermissionDenied for revoked relationship, got: %v (%v)", err, status.Code(err))
+	}
+}
+
+func requireDRRPCStatusCode(t *testing.T, err error, want codes.Code, context string) {
+	t.Helper()
+
+	if status.Code(err) != want {
+		t.Fatalf("expected %s for %s, got: %v (%v)", want, context, err, status.Code(err))
+	}
+}
+
+func newStreamAuthzTestStream(ctx context.Context, relationshipID string) *creditTestBidiStream {
+	return &creditTestBidiStream{
+		ctx: ctx,
+		initMsg: &StreamChangesUpstream{
+			Msg: &StreamChangesUpstream_Init{
+				Init: &StreamChangesRequest{
+					RelationshipId: relationshipID,
+					InitialWindow:  1,
+				},
+			},
+		},
+		creditCh: make(chan *StreamChangesUpstream),
+		sentCh:   make(chan *EntryChange, 1),
+	}
+}
+
+func TestDRPrimary_StreamChangesRequiresRelationshipAuthorization(t *testing.T) {
+	primary, relationshipID, fingerprint := newCreditTestPrimary(t, 2*time.Second)
+	mgr := primary.core.drManager
+	rpcCtx := context.WithValue(context.Background(), drPeerFingerprintContextKey{}, fingerprint)
+
+	requireDRRPCStatusCode(
+		t,
+		primary.StreamChanges(newStreamAuthzTestStream(context.Background(), relationshipID)),
+		codes.PermissionDenied,
+		"StreamChanges without peer identity",
+	)
+
+	wrongFingerprintCtx := context.WithValue(context.Background(), drPeerFingerprintContextKey{}, "test-stream-authz-fp-2")
+	requireDRRPCStatusCode(
+		t,
+		primary.StreamChanges(newStreamAuthzTestStream(wrongFingerprintCtx, relationshipID)),
+		codes.PermissionDenied,
+		"StreamChanges with mismatched peer fingerprint",
+	)
+
+	otherRelationshipID := registerDRRelationshipWithFingerprint(t, mgr, "test-stream-authz-fp-2")
+	requireDRRPCStatusCode(
+		t,
+		primary.StreamChanges(newStreamAuthzTestStream(rpcCtx, otherRelationshipID)),
+		codes.PermissionDenied,
+		"StreamChanges with mismatched relationship",
+	)
+
+	if err := mgr.RevokeRelationship(context.Background(), relationshipID); err != nil {
+		t.Fatalf("failed to revoke relationship: %v", err)
+	}
+	requireDRRPCStatusCode(
+		t,
+		primary.StreamChanges(newStreamAuthzTestStream(rpcCtx, relationshipID)),
+		codes.PermissionDenied,
+		"StreamChanges with revoked relationship",
+	)
+}
+
+func TestDRPrimary_RequestCheckpointRequiresRelationshipAuthorization(t *testing.T) {
+	mgr, primary, relationshipID, rpcCtx := setupDRPrimaryForDirtyBitmapAuthz(t, "test-checkpoint-authz-fp-1")
+	req := &CheckpointRequest{RelationshipId: relationshipID}
+
+	requireDRRPCStatusCode(
+		t,
+		func() error {
+			_, err := primary.RequestCheckpoint(context.Background(), req)
+			return err
+		}(),
+		codes.PermissionDenied,
+		"RequestCheckpoint without peer identity",
+	)
+
+	wrongFingerprintCtx := context.WithValue(context.Background(), drPeerFingerprintContextKey{}, "test-checkpoint-authz-fp-2")
+	requireDRRPCStatusCode(
+		t,
+		func() error {
+			_, err := primary.RequestCheckpoint(wrongFingerprintCtx, req)
+			return err
+		}(),
+		codes.PermissionDenied,
+		"RequestCheckpoint with mismatched peer fingerprint",
+	)
+
+	otherRelationshipID := registerDRRelationshipWithFingerprint(t, mgr, "test-checkpoint-authz-fp-2")
+	requireDRRPCStatusCode(
+		t,
+		func() error {
+			_, err := primary.RequestCheckpoint(rpcCtx, &CheckpointRequest{RelationshipId: otherRelationshipID})
+			return err
+		}(),
+		codes.PermissionDenied,
+		"RequestCheckpoint with mismatched relationship",
+	)
+
+	if err := mgr.RevokeRelationship(context.Background(), relationshipID); err != nil {
+		t.Fatalf("failed to revoke relationship: %v", err)
+	}
+	requireDRRPCStatusCode(
+		t,
+		func() error {
+			_, err := primary.RequestCheckpoint(rpcCtx, req)
+			return err
+		}(),
+		codes.PermissionDenied,
+		"RequestCheckpoint with revoked relationship",
+	)
+}
+
+func TestDRPrimary_HeartbeatRequiresRelationshipAuthorization(t *testing.T) {
+	mgr, primary, relationshipID, rpcCtx := setupDRPrimaryForDirtyBitmapAuthz(t, "test-heartbeat-authz-fp-1")
+	req := &DRHeartbeatRequest{RelationshipId: relationshipID}
+
+	requireDRRPCStatusCode(
+		t,
+		func() error {
+			_, err := primary.Heartbeat(context.Background(), req)
+			return err
+		}(),
+		codes.PermissionDenied,
+		"Heartbeat without peer identity",
+	)
+
+	wrongFingerprintCtx := context.WithValue(context.Background(), drPeerFingerprintContextKey{}, "test-heartbeat-authz-fp-2")
+	requireDRRPCStatusCode(
+		t,
+		func() error {
+			_, err := primary.Heartbeat(wrongFingerprintCtx, req)
+			return err
+		}(),
+		codes.PermissionDenied,
+		"Heartbeat with mismatched peer fingerprint",
+	)
+
+	otherRelationshipID := registerDRRelationshipWithFingerprint(t, mgr, "test-heartbeat-authz-fp-2")
+	requireDRRPCStatusCode(
+		t,
+		func() error {
+			_, err := primary.Heartbeat(rpcCtx, &DRHeartbeatRequest{RelationshipId: otherRelationshipID})
+			return err
+		}(),
+		codes.PermissionDenied,
+		"Heartbeat with mismatched relationship",
+	)
+
+	if err := mgr.RevokeRelationship(context.Background(), relationshipID); err != nil {
+		t.Fatalf("failed to revoke relationship: %v", err)
+	}
+	requireDRRPCStatusCode(
+		t,
+		func() error {
+			_, err := primary.Heartbeat(rpcCtx, req)
+			return err
+		}(),
+		codes.PermissionDenied,
+		"Heartbeat with revoked relationship",
+	)
+}
+
+func TestDRPrimary_CheckpointRPCsRequireRelationshipAuthorization(t *testing.T) {
+	mgr, primary, relationshipID, rpcCtx := setupDRPrimaryForDirtyBitmapAuthz(t, "test-range-authz-fp-1")
+	const checkpointID = "cp-range-authz"
+	const checkpointIndex = 100
+	addDRRequestValidationCheckpoint(t, primary, checkpointID, relationshipID, checkpointIndex)
+
+	fetchKid := make([]byte, 32)
+	calls := []struct {
+		name string
+		call func(context.Context) error
+	}{
+		{
+			name: "ExchangeRangeChecksums",
+			call: func(ctx context.Context) error {
+				_, err := primary.ExchangeRangeChecksums(ctx, &RangeChecksumRequest{
+					RelationshipId:  relationshipID,
+					CheckpointId:    checkpointID,
+					CheckpointIndex: checkpointIndex,
+					RangeIds:        []uint64{0},
+				})
+				return err
+			},
+		},
+		{
+			name: "ExchangeRangeDigests",
+			call: func(ctx context.Context) error {
+				_, err := primary.ExchangeRangeDigests(ctx, &RangeDigestRequest{
+					RelationshipId:  relationshipID,
+					CheckpointId:    checkpointID,
+					CheckpointIndex: checkpointIndex,
+					ParentSpan:      fullDRRangeSpanProto(0),
+				})
+				return err
+			},
+		},
+		{
+			name: "FetchEntries",
+			call: func(ctx context.Context) error {
+				return primary.FetchEntries(&FetchEntriesRequest{
+					RelationshipId:  relationshipID,
+					CheckpointId:    checkpointID,
+					CheckpointIndex: checkpointIndex,
+					Kids:            [][]byte{fetchKid},
+					IncludeDeletes:  true,
+				}, &fetchTestServerStream{ctx: ctx})
+			},
+		},
+	}
+
+	for _, tc := range calls {
+		tc := tc
+		t.Run(tc.name+"/missing-peer", func(t *testing.T) {
+			requireDRRPCStatusCode(t, tc.call(context.Background()), codes.PermissionDenied, tc.name+" without peer identity")
+		})
+	}
+
+	wrongFingerprintCtx := context.WithValue(context.Background(), drPeerFingerprintContextKey{}, "test-range-authz-fp-2")
+	for _, tc := range calls {
+		tc := tc
+		t.Run(tc.name+"/wrong-fingerprint", func(t *testing.T) {
+			requireDRRPCStatusCode(t, tc.call(wrongFingerprintCtx), codes.PermissionDenied, tc.name+" with mismatched peer fingerprint")
+		})
+	}
+
+	otherRelationshipID := registerDRRelationshipWithFingerprint(t, mgr, "test-range-authz-fp-2")
+	markDRRelationshipActive(t, mgr, otherRelationshipID)
+	otherRelationshipCtx := context.WithValue(context.Background(), drPeerFingerprintContextKey{}, "test-range-authz-fp-2")
+	mismatchedRelationshipCalls := []struct {
+		name string
+		call func(context.Context) error
+	}{
+		{
+			name: "ExchangeRangeChecksums",
+			call: func(ctx context.Context) error {
+				_, err := primary.ExchangeRangeChecksums(ctx, &RangeChecksumRequest{
+					RelationshipId:  otherRelationshipID,
+					CheckpointId:    checkpointID,
+					CheckpointIndex: checkpointIndex,
+					RangeIds:        []uint64{0},
+				})
+				return err
+			},
+		},
+		{
+			name: "ExchangeRangeDigests",
+			call: func(ctx context.Context) error {
+				_, err := primary.ExchangeRangeDigests(ctx, &RangeDigestRequest{
+					RelationshipId:  otherRelationshipID,
+					CheckpointId:    checkpointID,
+					CheckpointIndex: checkpointIndex,
+					ParentSpan:      fullDRRangeSpanProto(0),
+				})
+				return err
+			},
+		},
+		{
+			name: "FetchEntries",
+			call: func(ctx context.Context) error {
+				return primary.FetchEntries(&FetchEntriesRequest{
+					RelationshipId:  otherRelationshipID,
+					CheckpointId:    checkpointID,
+					CheckpointIndex: checkpointIndex,
+					Kids:            [][]byte{fetchKid},
+					IncludeDeletes:  true,
+				}, &fetchTestServerStream{ctx: ctx})
+			},
+		},
+	}
+	for _, tc := range mismatchedRelationshipCalls {
+		tc := tc
+		t.Run(tc.name+"/checkpoint-relationship-mismatch", func(t *testing.T) {
+			requireDRRPCStatusCode(t, tc.call(otherRelationshipCtx), codes.PermissionDenied, tc.name+" with mismatched checkpoint relationship")
+		})
+	}
+
+	if err := mgr.RevokeRelationship(context.Background(), relationshipID); err != nil {
+		t.Fatalf("failed to revoke relationship: %v", err)
+	}
+	for _, tc := range calls {
+		tc := tc
+		t.Run(tc.name+"/revoked", func(t *testing.T) {
+			requireDRRPCStatusCode(t, tc.call(rpcCtx), codes.PermissionDenied, tc.name+" with revoked relationship")
+		})
+	}
+}
+
+func TestDRPrimary_SyncKeyringRequiresRelationshipAuthorization(t *testing.T) {
+	mgr, primary, relationshipID, rpcCtx := setupDRPrimaryForRegisteredSyncKeyring(t, "test-sync-keyring-fp-1")
+	clientPriv := mustGenerateX25519KeyForTest(t)
+	clientNonce := randomBytesForTest(t, drBootstrapNonceSize)
+	req := &SyncKeyringRequest{
+		RelationshipId:        relationshipID,
+		ClientEphemeralPubkey: clientPriv.PublicKey().Bytes(),
+		ClientNonce:           clientNonce,
+	}
+
+	if _, err := primary.SyncKeyring(context.Background(), req); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected PermissionDenied without peer identity, got: %v (%v)", err, status.Code(err))
+	}
+
+	wrongFingerprintCtx := context.WithValue(context.Background(), drPeerFingerprintContextKey{}, "test-sync-keyring-fp-2")
+	if _, err := primary.SyncKeyring(wrongFingerprintCtx, req); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected PermissionDenied for mismatched peer fingerprint, got: %v (%v)", err, status.Code(err))
+	}
+
+	otherRelationshipID := registerDRRelationshipWithFingerprint(t, mgr, "test-sync-keyring-fp-2")
+	if _, err := primary.SyncKeyring(rpcCtx, &SyncKeyringRequest{
+		RelationshipId:        otherRelationshipID,
+		ClientEphemeralPubkey: clientPriv.PublicKey().Bytes(),
+		ClientNonce:           clientNonce,
+	}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected PermissionDenied for mismatched relationship, got: %v (%v)", err, status.Code(err))
+	}
+
+	if _, err := primary.SyncKeyring(rpcCtx, &SyncKeyringRequest{
+		RelationshipId:        relationshipID,
+		ClientEphemeralPubkey: clientPriv.PublicKey().Bytes(),
+		ClientNonce:           clientNonce[:drBootstrapNonceSize-1],
+	}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument for short client nonce, got: %v (%v)", err, status.Code(err))
+	}
+
+	if _, err := primary.SyncKeyring(rpcCtx, &SyncKeyringRequest{
+		RelationshipId:        relationshipID,
+		ClientEphemeralPubkey: clientPriv.PublicKey().Bytes()[:31],
+		ClientNonce:           clientNonce,
+	}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument for malformed client public key, got: %v (%v)", err, status.Code(err))
+	}
+
+	rel, err := mgr.loadRelationship(context.Background(), relationshipID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rel.State != DRRelationshipStateRegistered {
+		t.Fatalf("expected malformed SyncKeyring requests to leave relationship registered, got %s", rel.State)
+	}
+
+	if _, err := primary.Heartbeat(rpcCtx, &DRHeartbeatRequest{RelationshipId: relationshipID}); err != nil {
+		t.Fatalf("expected registered relationship heartbeat to succeed before keyring sync: %v", err)
+	}
+	rel, err = mgr.loadRelationship(context.Background(), relationshipID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rel.State != DRRelationshipStateRegistered {
+		t.Fatalf("expected heartbeat to leave pre-bootstrap relationship registered, got %s", rel.State)
+	}
+
+	resp, err := primary.SyncKeyring(rpcCtx, req)
+	if err != nil {
+		t.Fatalf("expected authorized SyncKeyring to succeed: %v", err)
+	}
+	if len(resp.WrappedRootKey) == 0 {
+		t.Fatal("expected wrapped root key in SyncKeyring response")
+	}
+	if len(resp.ServerEphemeralPubkey) == 0 {
+		t.Fatal("expected server ephemeral public key in SyncKeyring response")
+	}
+	if len(resp.ServerNonce) != drServerNonceSize {
+		t.Fatalf("expected server nonce length %d, got %d", drServerNonceSize, len(resp.ServerNonce))
+	}
+	if len(resp.WrapNonce) != drGCMIVSize {
+		t.Fatalf("expected GCM IV length %d, got %d", drGCMIVSize, len(resp.WrapNonce))
+	}
+
+	primaryKeyring, err := primary.core.barrier.Keyring()
+	if err != nil {
+		t.Fatal(err)
+	}
+	unwrappedRootKey, err := unwrapRootKeyFromPrimary(
+		resp.WrappedRootKey,
+		relationshipID,
+		mgr.Config().ClusterID,
+		"test-sync-keyring-fp-1",
+		mgr.transportCA.spkiHash(),
+		resp.ServerEphemeralPubkey,
+		clientPriv,
+		clientNonce,
+		resp.ServerNonce,
+		resp.WrapNonce,
+		resp.WrapAadVersion,
+	)
+	if err != nil {
+		t.Fatalf("expected SyncKeyring response to unwrap with relationship-bound AAD: %v", err)
+	}
+	if !bytes.Equal(unwrappedRootKey, primaryKeyring.RootKey()) {
+		t.Fatal("SyncKeyring response unwrapped the wrong root key")
+	}
+
+	rel, err = mgr.loadRelationship(context.Background(), relationshipID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rel.State != DRRelationshipStateActive {
+		t.Fatalf("expected SyncKeyring to mark relationship active, got %s", rel.State)
+	}
+
+	if _, err := primary.SyncKeyring(rpcCtx, req); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected PermissionDenied for replayed SyncKeyring after activation, got: %v (%v)", err, status.Code(err))
+	}
+
+	if err := mgr.RevokeRelationship(context.Background(), relationshipID); err != nil {
+		t.Fatalf("failed to revoke relationship: %v", err)
+	}
+	if _, err := primary.SyncKeyring(rpcCtx, req); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected PermissionDenied for revoked relationship, got: %v (%v)", err, status.Code(err))
+	}
+}
+
+func TestDRPrimary_SyncKeyringRevocationDuringWrapFailsClosed(t *testing.T) {
+	mgr, primary, relationshipID, rpcCtx := setupDRPrimaryForRegisteredSyncKeyring(t, "test-sync-keyring-revoke-race-fp")
+	clientPriv := mustGenerateX25519KeyForTest(t)
+	clientNonce := randomBytesForTest(t, drBootstrapNonceSize)
+	req := &SyncKeyringRequest{
+		RelationshipId:        relationshipID,
+		ClientEphemeralPubkey: clientPriv.PublicKey().Bytes(),
+		ClientNonce:           clientNonce,
+	}
+
+	origWrap := wrapRootKeyForDRSync
+	var revokeErr error
+	wrapRootKeyForDRSync = func(rootKey []byte, relID, clusterID, secondaryCertFP, primaryIdentity string, clientPubBytes []byte, clientNonce []byte) ([]byte, []byte, []byte, []byte, uint32, error) {
+		revokeErr = mgr.RevokeRelationship(context.Background(), relationshipID)
+		return origWrap(rootKey, relID, clusterID, secondaryCertFP, primaryIdentity, clientPubBytes, clientNonce)
+	}
+	t.Cleanup(func() {
+		wrapRootKeyForDRSync = origWrap
+	})
+
+	resp, err := primary.SyncKeyring(rpcCtx, req)
+	if revokeErr != nil {
+		t.Fatalf("failed to revoke relationship during key wrap: %v", revokeErr)
+	}
+	if resp != nil {
+		t.Fatalf("expected no SyncKeyring response after revocation, got %#v", resp)
+	}
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected PermissionDenied after revocation during key wrap, got: %v (%v)", err, status.Code(err))
+	}
+	rel, loadErr := mgr.loadRelationship(context.Background(), relationshipID)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if rel.State != DRRelationshipStateRevoked {
+		t.Fatalf("expected relationship to remain revoked, got %s", rel.State)
 	}
 }
 
@@ -2149,6 +4980,7 @@ func newCreditTestPrimary(t *testing.T, creditTimeout time.Duration) (*drReplica
 	if err := mgr.saveRelationship(context.Background(), rel); err != nil {
 		t.Fatal(err)
 	}
+	markDRRelationshipActive(t, mgr, token.RelationshipID)
 
 	// Use the primary from the manager so it shares the same core state.
 	p := mgr.Primary()
@@ -2158,6 +4990,77 @@ func newCreditTestPrimary(t *testing.T, creditTimeout time.Duration) (*drReplica
 	p.creditWaitTimeout = creditTimeout
 
 	return p, token.RelationshipID, fingerprint
+}
+
+func TestStreamChanges_RejectsExcessiveInitialWindow(t *testing.T) {
+	primary, relID, fingerprint := newCreditTestPrimary(t, 2*time.Second)
+
+	ctx, cancel := context.WithCancel(
+		context.WithValue(context.Background(), drPeerFingerprintContextKey{}, fingerprint),
+	)
+	defer cancel()
+
+	stream := &creditTestBidiStream{
+		ctx: ctx,
+		initMsg: &StreamChangesUpstream{
+			Msg: &StreamChangesUpstream_Init{
+				Init: &StreamChangesRequest{
+					RelationshipId: relID,
+					InitialWindow:  uint64(primary.maxStreamWindowCredits()) + 1,
+				},
+			},
+		},
+		creditCh: make(chan *StreamChangesUpstream),
+		sentCh:   make(chan *EntryChange, 1),
+	}
+
+	err := primary.StreamChanges(stream)
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("expected ResourceExhausted, got %v: %v", status.Code(err), err)
+	}
+}
+
+func TestStreamChanges_RejectsExcessiveWindowUpdate(t *testing.T) {
+	primary, relID, fingerprint := newCreditTestPrimary(t, 2*time.Second)
+
+	ctx, cancel := context.WithCancel(
+		context.WithValue(context.Background(), drPeerFingerprintContextKey{}, fingerprint),
+	)
+	defer cancel()
+
+	stream := &creditTestBidiStream{
+		ctx: ctx,
+		initMsg: &StreamChangesUpstream{
+			Msg: &StreamChangesUpstream_Init{
+				Init: &StreamChangesRequest{
+					RelationshipId: relID,
+					InitialWindow:  1,
+				},
+			},
+		},
+		creditCh: make(chan *StreamChangesUpstream, 1),
+		sentCh:   make(chan *EntryChange, 1),
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- primary.StreamChanges(stream)
+	}()
+
+	stream.creditCh <- &StreamChangesUpstream{
+		Msg: &StreamChangesUpstream_WindowUpdate{
+			WindowUpdate: &WindowUpdate{Credits: uint64(primary.maxStreamWindowCredits()) + 1},
+		},
+	}
+
+	select {
+	case err := <-errCh:
+		if status.Code(err) != codes.ResourceExhausted {
+			t.Fatalf("expected ResourceExhausted, got %v: %v", status.Code(err), err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("StreamChanges did not return after excessive window update")
+	}
 }
 
 func TestStreamChanges_InitialWindowRespected(t *testing.T) {
@@ -3068,16 +5971,43 @@ func TestDRClusterClient_VerifyKnownCert(t *testing.T) {
 }
 
 func TestDRClusterClient_ClientLookup_CachesPresentedFingerprint(t *testing.T) {
+	certDER, keyPEM, err := generateDRSecondaryClientCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientCert, err := parseDRSecondaryClientCert(certDER, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client := &drReplicationClusterClient{
+		clientCert: clientCert,
+		logger:     log.NewNullLogger(),
+	}
+
+	cert, err := client.ClientLookup(context.Background(), &tls.CertificateRequestInfo{
+		AcceptableCAs: [][]byte{clientCert.Leaf.RawSubject},
+	})
+	if err != nil {
+		t.Fatalf("ClientLookup returned error: %v", err)
+	}
+	if cert == nil {
+		t.Fatal("ClientLookup returned nil cert")
+	}
+
+	wantFP := certFingerprintSHA256(clientCert.Leaf)
+	if gotFP := client.LastClientCertFingerprint(); gotFP != wantFP {
+		t.Fatalf("client fingerprint mismatch: got %q want %q", gotFP, wantFP)
+	}
+}
+
+func TestDRClusterClient_ClientLookupDoesNotFallbackToLocalClusterCert(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	setupTestClusterCert(t, core)
 
 	parsed := core.localClusterParsedCert.Load()
 	if parsed == nil {
 		t.Fatal("expected local parsed cert to be set")
-	}
-	raw := core.localClusterCert.Load()
-	if raw == nil || len(*raw) == 0 {
-		t.Fatal("expected local cluster cert bytes to be set")
 	}
 
 	client := &drReplicationClusterClient{
@@ -3092,13 +6022,11 @@ func TestDRClusterClient_ClientLookup_CachesPresentedFingerprint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ClientLookup returned error: %v", err)
 	}
-	if cert == nil {
-		t.Fatal("ClientLookup returned nil cert")
+	if cert != nil {
+		t.Fatal("expected DR client lookup to require the registered secondary client certificate")
 	}
-
-	wantFP := certFingerprintSHA256(parsed)
-	if gotFP := client.LastClientCertFingerprint(); gotFP != wantFP {
-		t.Fatalf("client fingerprint mismatch: got %q want %q", gotFP, wantFP)
+	if gotFP := client.LastClientCertFingerprint(); gotFP != "" {
+		t.Fatalf("expected no cached fingerprint, got %q", gotFP)
 	}
 }
 
@@ -3334,6 +6262,50 @@ func TestDRSecondary_Start_HeartbeatCertRejectForcesReconnect(t *testing.T) {
 	}
 }
 
+func TestDRSecondary_Start_HeartbeatPermissionDeniedCancelsStream(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+
+	replSalt := make([]byte, drReplSaltLen)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-heartbeat-revoked", log.NewNullLogger())
+	secondary.transportReady.Store(true)
+	secondary.state.Store(int32(DRSecondaryStreaming))
+
+	streamCanceled := make(chan struct{})
+	var cancelOnce sync.Once
+	secondary.client = &drTestClient{
+		streamChangesFn: func(ctx context.Context, _ ...grpc.CallOption) (grpc.BidiStreamingClient[StreamChangesUpstream, EntryBatch], error) {
+			go func() {
+				<-ctx.Done()
+				cancelOnce.Do(func() { close(streamCanceled) })
+			}()
+			return &blockingEntryBatchBidiClient{ctx: ctx}, nil
+		},
+		heartbeatFn: func(context.Context, *DRHeartbeatRequest, ...grpc.CallOption) (*DRHeartbeatResponse, error) {
+			return nil, status.Error(codes.PermissionDenied, "relationship revoked")
+		},
+	}
+
+	prevInterval := drHeartbeatInterval
+	drHeartbeatInterval = 10 * time.Millisecond
+	defer func() { drHeartbeatInterval = prevInterval }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := secondary.Start(ctx)
+	if err == nil {
+		t.Fatal("expected Start to fail after heartbeat permission denied")
+	}
+	if !strings.Contains(err.Error(), "heartbeat trust validation failed") {
+		t.Fatalf("expected heartbeat validation failure, got: %v", err)
+	}
+	select {
+	case <-streamCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("expected heartbeat permission denied to cancel active stream")
+	}
+}
+
 func TestInitTrustedPool(t *testing.T) {
 	_, parsed := generateTestCert(t, "fw-activation")
 	pool := make(map[string]*trustedPrimaryCert)
@@ -3384,6 +6356,7 @@ func TestDRCertFingerprint(t *testing.T) {
 type fetchTestServerStream struct {
 	ctx       context.Context
 	sendCount atomic.Int64
+	onSend    func(count int64)
 	// sendDelay adds a small delay per Send call so the test can cancel
 	// activeContext before the handler finishes all iterations.
 	sendDelay time.Duration
@@ -3397,11 +6370,68 @@ func (s *fetchTestServerStream) SendMsg(any) error              { return nil }
 func (s *fetchTestServerStream) RecvMsg(any) error              { return io.EOF }
 
 func (s *fetchTestServerStream) Send(_ *EntryBatch) error {
-	s.sendCount.Add(1)
+	count := s.sendCount.Add(1)
+	if s.onSend != nil {
+		s.onSend(count)
+	}
 	if s.sendDelay > 0 {
 		time.Sleep(s.sendDelay)
 	}
 	return nil
+}
+
+func TestFetchEntries_RechecksRelationshipRevocationDuringStream(t *testing.T) {
+	primary, relID, fingerprint := newCreditTestPrimary(t, 5*time.Second)
+	mgr := primary.core.drManager
+
+	cpID := "test-fetch-revoke-cp"
+	primary.checkpointMu.Lock()
+	if primary.checkpoints == nil {
+		primary.checkpoints = make(map[string]*drCheckpointCacheEntry)
+	}
+	primary.checkpoints[cpID] = &drCheckpointCacheEntry{
+		checkpoint:     reconciler.Checkpoint{ID: cpID, CommitIndex: 100},
+		relationshipID: relID,
+		createdAt:      time.Now(),
+		kidToVID:       make(map[[32]byte][32]byte),
+	}
+	primary.checkpointMu.Unlock()
+
+	const numKIDs = 250
+	kids := make([][]byte, numKIDs)
+	for i := range kids {
+		kid := make([]byte, 32)
+		binary.BigEndian.PutUint64(kid, uint64(i))
+		kids[i] = kid
+	}
+
+	streamCtx := context.WithValue(context.Background(), drPeerFingerprintContextKey{}, fingerprint)
+	var revokeErr error
+	stream := &fetchTestServerStream{
+		ctx: streamCtx,
+		onSend: func(count int64) {
+			if count == 1 {
+				revokeErr = mgr.RevokeRelationship(context.Background(), relID)
+			}
+		},
+	}
+
+	err := primary.FetchEntries(&FetchEntriesRequest{
+		RelationshipId:  relID,
+		CheckpointId:    cpID,
+		CheckpointIndex: 100,
+		Kids:            kids,
+		IncludeDeletes:  true,
+	}, stream)
+	if revokeErr != nil {
+		t.Fatalf("failed to revoke relationship during fetch stream: %v", revokeErr)
+	}
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected PermissionDenied after revocation during fetch stream, got: %v (%v)", err, status.Code(err))
+	}
+	if sends := stream.sendCount.Load(); sends != 1 {
+		t.Fatalf("expected fetch stream to stop after first batch, got %d sends", sends)
+	}
 }
 
 // TestFetchEntries_CancelledOnStepdown verifies that when the core's
@@ -3452,6 +6482,7 @@ func TestFetchEntries_CancelledOnStepdown(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- primary.FetchEntries(&FetchEntriesRequest{
+			RelationshipId:  relID,
 			CheckpointId:    cpID,
 			CheckpointIndex: 100,
 			Kids:            kids,
@@ -3573,7 +6604,7 @@ func TestDRPrimaryAddrRing_AddHintAndSelect(t *testing.T) {
 	}
 }
 
-func TestDRSecondary_Start_ReconciliationTransportErrorUsesLeaderHintRedirect(t *testing.T) {
+func TestDRSecondary_Start_ReconciliationTransportErrorDoesNotUseStaleLeaderHint(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 
 	replSalt := make([]byte, drReplSaltLen)
@@ -3581,6 +6612,8 @@ func TestDRSecondary_Start_ReconciliationTransportErrorUsesLeaderHintRedirect(t 
 	secondary.transportReady.Store(true)
 	secondary.state.Store(int32(DRSecondaryReconciling))
 
+	// A heartbeat hint can be stale after HA step-down. Transport failures must
+	// fall back to the controller's candidate ring instead of becoming redirects.
 	hint := "https://new-leader:8201"
 	secondary.lastKnownLeaderAddr.Store(&hint)
 
@@ -3599,11 +6632,11 @@ func TestDRSecondary_Start_ReconciliationTransportErrorUsesLeaderHintRedirect(t 
 	}
 
 	var redirect *errDRRedirect
-	if !errors.As(err, &redirect) {
-		t.Fatalf("expected errDRRedirect, got: %v", err)
+	if errors.As(err, &redirect) {
+		t.Fatalf("transport error should not use stale leader hint redirect: %v", redirect)
 	}
-	if redirect.LeaderAddr != hint {
-		t.Fatalf("expected leader hint %q, got %q", hint, redirect.LeaderAddr)
+	if !isDRTransportReconnectError(err) {
+		t.Fatalf("expected transport reconnect error, got: %v", err)
 	}
 }
 

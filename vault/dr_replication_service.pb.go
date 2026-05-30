@@ -10,11 +10,12 @@
 package vault
 
 import (
-	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
-	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
+
+	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
+	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 )
 
 const (
@@ -634,6 +635,7 @@ func (x *RangeChecksum) GetCount() uint64 {
 // RangeChecksumRequest requests checksums for specific ranges.
 type RangeChecksumRequest struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
+	RelationshipId  string                 `protobuf:"bytes,4,opt,name=relationship_id,json=relationshipId,proto3" json:"relationship_id,omitempty"`
 	CheckpointId    string                 `protobuf:"bytes,1,opt,name=checkpoint_id,json=checkpointId,proto3" json:"checkpoint_id,omitempty"`
 	CheckpointIndex uint64                 `protobuf:"varint,2,opt,name=checkpoint_index,json=checkpointIndex,proto3" json:"checkpoint_index,omitempty"`
 	RangeIds        []uint64               `protobuf:"varint,3,rep,packed,name=range_ids,json=rangeIds,proto3" json:"range_ids,omitempty"`
@@ -669,6 +671,13 @@ func (x *RangeChecksumRequest) ProtoReflect() protoreflect.Message {
 // Deprecated: Use RangeChecksumRequest.ProtoReflect.Descriptor instead.
 func (*RangeChecksumRequest) Descriptor() ([]byte, []int) {
 	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *RangeChecksumRequest) GetRelationshipId() string {
+	if x != nil {
+		return x.RelationshipId
+	}
+	return ""
 }
 
 func (x *RangeChecksumRequest) GetCheckpointId() string {
@@ -817,6 +826,7 @@ func (x *RangeDigest) GetApproxValueBytes() uint64 {
 // RangeDigestRequest asks the primary for fine-grained sub-range digests.
 type RangeDigestRequest struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
+	RelationshipId  string                 `protobuf:"bytes,4,opt,name=relationship_id,json=relationshipId,proto3" json:"relationship_id,omitempty"`
 	CheckpointId    string                 `protobuf:"bytes,1,opt,name=checkpoint_id,json=checkpointId,proto3" json:"checkpoint_id,omitempty"`
 	CheckpointIndex uint64                 `protobuf:"varint,2,opt,name=checkpoint_index,json=checkpointIndex,proto3" json:"checkpoint_index,omitempty"`
 	// parent_span is the mismatched range to drill into.
@@ -853,6 +863,13 @@ func (x *RangeDigestRequest) ProtoReflect() protoreflect.Message {
 // Deprecated: Use RangeDigestRequest.ProtoReflect.Descriptor instead.
 func (*RangeDigestRequest) Descriptor() ([]byte, []int) {
 	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *RangeDigestRequest) GetRelationshipId() string {
+	if x != nil {
+		return x.RelationshipId
+	}
+	return ""
 }
 
 func (x *RangeDigestRequest) GetCheckpointId() string {
@@ -979,8 +996,9 @@ func (x *FetchItem) GetExpectedVid() []byte {
 
 // FetchEntriesRequest asks the primary for specific entries by KID.
 type FetchEntriesRequest struct {
-	state        protoimpl.MessageState `protogen:"open.v1"`
-	CheckpointId string                 `protobuf:"bytes,1,opt,name=checkpoint_id,json=checkpointId,proto3" json:"checkpoint_id,omitempty"`
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	RelationshipId string                 `protobuf:"bytes,9,opt,name=relationship_id,json=relationshipId,proto3" json:"relationship_id,omitempty"`
+	CheckpointId   string                 `protobuf:"bytes,1,opt,name=checkpoint_id,json=checkpointId,proto3" json:"checkpoint_id,omitempty"`
 	// kids is the list of KID hashes to fetch entries for.
 	Kids [][]byte `protobuf:"bytes,2,rep,name=kids,proto3" json:"kids,omitempty"`
 	// include_deletes indicates whether tombstoned/deleted entries
@@ -1032,6 +1050,13 @@ func (x *FetchEntriesRequest) ProtoReflect() protoreflect.Message {
 // Deprecated: Use FetchEntriesRequest.ProtoReflect.Descriptor instead.
 func (*FetchEntriesRequest) Descriptor() ([]byte, []int) {
 	return file_vault_dr_replication_service_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *FetchEntriesRequest) GetRelationshipId() string {
+	if x != nil {
+		return x.RelationshipId
+	}
+	return ""
 }
 
 func (x *FetchEntriesRequest) GetCheckpointId() string {
@@ -1243,10 +1268,12 @@ type DRHeartbeatResponse struct {
 	// the current leader is, enabling fast reconnection after stepdowns
 	// without requiring a load balancer.
 	LeaderClusterAddr string `protobuf:"bytes,4,opt,name=leader_cluster_addr,json=leaderClusterAddr,proto3" json:"leader_cluster_addr,omitempty"`
-	// active_cluster_cert is the DER-encoded cluster TLS certificate
-	// of the active primary node. The secondary adds it to a dynamic
-	// trust pool so that after a leadership change the new leader's
-	// certificate can be verified without InsecureSkipVerify.
+	// active_cluster_cert is the DER-encoded DR transport leaf
+	// certificate of the active primary node (signed by the DR
+	// transport CA from the activation token). The secondary adds it
+	// to a dynamic trust pool so that after a leadership change the
+	// new leader's certificate can be verified without
+	// InsecureSkipVerify.
 	ActiveClusterCert []byte `protobuf:"bytes,5,opt,name=active_cluster_cert,json=activeClusterCert,proto3" json:"active_cluster_cert,omitempty"`
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
@@ -1576,8 +1603,9 @@ const file_vault_dr_replication_service_proto_rawDesc = "" +
 	"\rRangeChecksum\x12\x19\n" +
 	"\brange_id\x18\x01 \x01(\x04R\arangeId\x12\x1a\n" +
 	"\bchecksum\x18\x02 \x01(\x04R\bchecksum\x12\x14\n" +
-	"\x05count\x18\x03 \x01(\x04R\x05count\"\x83\x01\n" +
-	"\x14RangeChecksumRequest\x12#\n" +
+	"\x05count\x18\x03 \x01(\x04R\x05count\"\xac\x01\n" +
+	"\x14RangeChecksumRequest\x12'\n" +
+	"\x0frelationship_id\x18\x04 \x01(\tR\x0erelationshipId\x12#\n" +
 	"\rcheckpoint_id\x18\x01 \x01(\tR\fcheckpointId\x12)\n" +
 	"\x10checkpoint_index\x18\x02 \x01(\x04R\x0fcheckpointIndex\x12\x1b\n" +
 	"\trange_ids\x18\x03 \x03(\x04R\brangeIds\"K\n" +
@@ -1589,8 +1617,9 @@ const file_vault_dr_replication_service_proto_rawDesc = "" +
 	"\fxor_key_hash\x18\x03 \x01(\fR\n" +
 	"xorKeyHash\x12$\n" +
 	"\x0exor_value_hash\x18\x04 \x01(\fR\fxorValueHash\x12,\n" +
-	"\x12approx_value_bytes\x18\x05 \x01(\x04R\x10approxValueBytes\"\x97\x01\n" +
-	"\x12RangeDigestRequest\x12#\n" +
+	"\x12approx_value_bytes\x18\x05 \x01(\x04R\x10approxValueBytes\"\xc0\x01\n" +
+	"\x12RangeDigestRequest\x12'\n" +
+	"\x0frelationship_id\x18\x04 \x01(\tR\x0erelationshipId\x12#\n" +
 	"\rcheckpoint_id\x18\x01 \x01(\tR\fcheckpointId\x12)\n" +
 	"\x10checkpoint_index\x18\x02 \x01(\x04R\x0fcheckpointIndex\x121\n" +
 	"\vparent_span\x18\x03 \x01(\v2\x10.vault.RangeSpanR\n" +
@@ -1599,8 +1628,9 @@ const file_vault_dr_replication_service_proto_rawDesc = "" +
 	"\adigests\x18\x01 \x03(\v2\x12.vault.RangeDigestR\adigests\"@\n" +
 	"\tFetchItem\x12\x10\n" +
 	"\x03kid\x18\x01 \x01(\fR\x03kid\x12!\n" +
-	"\fexpected_vid\x18\x02 \x01(\fR\vexpectedVid\"\xcd\x02\n" +
-	"\x13FetchEntriesRequest\x12#\n" +
+	"\fexpected_vid\x18\x02 \x01(\fR\vexpectedVid\"\xf6\x02\n" +
+	"\x13FetchEntriesRequest\x12'\n" +
+	"\x0frelationship_id\x18\t \x01(\tR\x0erelationshipId\x12#\n" +
 	"\rcheckpoint_id\x18\x01 \x01(\tR\fcheckpointId\x12\x12\n" +
 	"\x04kids\x18\x02 \x03(\fR\x04kids\x12'\n" +
 	"\x0finclude_deletes\x18\x03 \x01(\bR\x0eincludeDeletes\x120\n" +
@@ -1664,31 +1694,34 @@ func file_vault_dr_replication_service_proto_rawDescGZIP() []byte {
 	return file_vault_dr_replication_service_proto_rawDescData
 }
 
-var file_vault_dr_replication_service_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
-var file_vault_dr_replication_service_proto_goTypes = []any{
-	(*EntryChange)(nil),           // 0: vault.EntryChange
-	(*StreamChangesUpstream)(nil), // 1: vault.StreamChangesUpstream
-	(*WindowUpdate)(nil),          // 2: vault.WindowUpdate
-	(*StreamChangesRequest)(nil),  // 3: vault.StreamChangesRequest
-	(*CheckpointRequest)(nil),     // 4: vault.CheckpointRequest
-	(*CheckpointResponse)(nil),    // 5: vault.CheckpointResponse
-	(*RangeSpan)(nil),             // 6: vault.RangeSpan
-	(*DirtyBitmapMessage)(nil),    // 7: vault.DirtyBitmapMessage
-	(*RangeChecksum)(nil),         // 8: vault.RangeChecksum
-	(*RangeChecksumRequest)(nil),  // 9: vault.RangeChecksumRequest
-	(*RangeChecksumResponse)(nil), // 10: vault.RangeChecksumResponse
-	(*RangeDigest)(nil),           // 11: vault.RangeDigest
-	(*RangeDigestRequest)(nil),    // 12: vault.RangeDigestRequest
-	(*RangeDigestResponse)(nil),   // 13: vault.RangeDigestResponse
-	(*FetchItem)(nil),             // 14: vault.FetchItem
-	(*FetchEntriesRequest)(nil),   // 15: vault.FetchEntriesRequest
-	(*EntryBatch)(nil),            // 16: vault.EntryBatch
-	(*DRHeartbeatRequest)(nil),    // 17: vault.DRHeartbeatRequest
-	(*DRHeartbeatResponse)(nil),   // 18: vault.DRHeartbeatResponse
-	(*DRRedirectDetail)(nil),      // 19: vault.DRRedirectDetail
-	(*SyncKeyringRequest)(nil),    // 20: vault.SyncKeyringRequest
-	(*SyncKeyringResponse)(nil),   // 21: vault.SyncKeyringResponse
-}
+var (
+	file_vault_dr_replication_service_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
+	file_vault_dr_replication_service_proto_goTypes  = []any{
+		(*EntryChange)(nil),           // 0: vault.EntryChange
+		(*StreamChangesUpstream)(nil), // 1: vault.StreamChangesUpstream
+		(*WindowUpdate)(nil),          // 2: vault.WindowUpdate
+		(*StreamChangesRequest)(nil),  // 3: vault.StreamChangesRequest
+		(*CheckpointRequest)(nil),     // 4: vault.CheckpointRequest
+		(*CheckpointResponse)(nil),    // 5: vault.CheckpointResponse
+		(*RangeSpan)(nil),             // 6: vault.RangeSpan
+		(*DirtyBitmapMessage)(nil),    // 7: vault.DirtyBitmapMessage
+		(*RangeChecksum)(nil),         // 8: vault.RangeChecksum
+		(*RangeChecksumRequest)(nil),  // 9: vault.RangeChecksumRequest
+		(*RangeChecksumResponse)(nil), // 10: vault.RangeChecksumResponse
+		(*RangeDigest)(nil),           // 11: vault.RangeDigest
+		(*RangeDigestRequest)(nil),    // 12: vault.RangeDigestRequest
+		(*RangeDigestResponse)(nil),   // 13: vault.RangeDigestResponse
+		(*FetchItem)(nil),             // 14: vault.FetchItem
+		(*FetchEntriesRequest)(nil),   // 15: vault.FetchEntriesRequest
+		(*EntryBatch)(nil),            // 16: vault.EntryBatch
+		(*DRHeartbeatRequest)(nil),    // 17: vault.DRHeartbeatRequest
+		(*DRHeartbeatResponse)(nil),   // 18: vault.DRHeartbeatResponse
+		(*DRRedirectDetail)(nil),      // 19: vault.DRRedirectDetail
+		(*SyncKeyringRequest)(nil),    // 20: vault.SyncKeyringRequest
+		(*SyncKeyringResponse)(nil),   // 21: vault.SyncKeyringResponse
+	}
+)
+
 var file_vault_dr_replication_service_proto_depIdxs = []int32{
 	3,  // 0: vault.StreamChangesUpstream.init:type_name -> vault.StreamChangesRequest
 	2,  // 1: vault.StreamChangesUpstream.window_update:type_name -> vault.WindowUpdate

@@ -106,6 +106,7 @@ func TestInvalidation_TransientDecryptFailureClassifier(t *testing.T) {
 	require.False(t, isTransientBarrierDecryptFailure(fmt.Errorf("some other error")))
 	require.True(t, isTransientBarrierDecryptFailure(fmt.Errorf("decryption failed: cipher: message authentication failed")))
 	require.True(t, isTransientBarrierDecryptFailure(fmt.Errorf("wrapped decrypt error: %w", fmt.Errorf("cipher: message authentication failed"))))
+	require.True(t, isTransientBarrierDecryptFailure(barrier.ErrBarrierInvalidKey))
 
 	require.True(t, isReadOnlyStorageError(logical.ErrReadOnly))
 	require.True(t, isReadOnlyStorageError(fmt.Errorf("wrapped: %w", logical.ErrReadOnly)))

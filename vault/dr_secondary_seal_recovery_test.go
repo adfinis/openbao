@@ -40,10 +40,10 @@ func TestDRBootstrapPhysicalRecursiveDelete_PreservesCriticalPaths(t *testing.T)
 		"core/seal-config",
 		"core/recovery-config",
 		"core/recovery-key",
-		"core/cluster/local/info",
 	}
 	removed := []string{
 		"core/raft/tls",
+		"core/cluster/local/info",
 		"core/dr-replication/config",
 		"core/leader/foo",
 		"foo/bar",

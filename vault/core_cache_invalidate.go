@@ -317,6 +317,9 @@ func errorChainContains(err error, matcher func(error) bool) bool {
 }
 
 func isTransientBarrierDecryptFailure(err error) bool {
+	if errors.Is(err, barrier.ErrBarrierInvalidKey) {
+		return true
+	}
 	return errorChainContains(err, func(cur error) bool {
 		msg := strings.ToLower(cur.Error())
 		return strings.Contains(msg, "cipher: message authentication failed") ||
@@ -813,7 +816,14 @@ func (im *invalidationManager) drKeyTransitionResyncAttempt(generation uint64) e
 		}
 	}
 	if err := core.barrier.ReloadKeyring(ctx); err != nil {
-		return fmt.Errorf("failed to reload keyring: %w", err)
+		if isTransientBarrierDecryptFailure(err) {
+			if recoverErr := im.recoverDRRootKeyFromStoredKeys(ctx); recoverErr != nil {
+				return fmt.Errorf("failed to reload keyring: %w (stored-key recovery failed: %v)", err, recoverErr)
+			}
+			im.dispacherLogger.Info("recovered DR keyring from stored keys after decrypt mismatch", "generation", generation)
+		} else {
+			return fmt.Errorf("failed to reload keyring: %w", err)
+		}
 	}
 	if err := core.ensureRaftTLSKeyringForDRSecondary(ctx); err != nil {
 		return fmt.Errorf("failed to ensure raft TLS keyring for DR secondary: %w", err)
