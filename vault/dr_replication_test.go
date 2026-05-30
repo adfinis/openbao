@@ -37,6 +37,8 @@ import (
 	"github.com/openbao/openbao/physical/replication/reconciler"
 	"github.com/openbao/openbao/sdk/v2/logical"
 	"github.com/openbao/openbao/sdk/v2/physical"
+	be "github.com/openbao/openbao/vault/backend"
+	"github.com/openbao/openbao/vault/routing"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -3191,6 +3193,44 @@ func TestDRChangeStream_ApplyChange(t *testing.T) {
 	}
 }
 
+func TestDRSecondaryApplyFetchedChangeInvalidatesRouteBackedStorage(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := namespace.RootContext(t.Context())
+
+	noop := &be.Noop{}
+	core.logicalBackends["noop-dr-invalidate"] = func(context.Context, *logical.BackendConfig) (logical.Backend, error) {
+		return noop, nil
+	}
+	mount := &routing.MountEntry{
+		Table: routing.MountTableType,
+		Path:  "dr-invalidate",
+		Type:  "noop-dr-invalidate",
+	}
+	if err := core.mount(ctx, mount); err != nil {
+		t.Fatalf("mount failed: %v", err)
+	}
+	route := core.router.MatchingMountEntry(ctx, "dr-invalidate/foo")
+	if route == nil || route.UUID == "" {
+		t.Fatal("expected dr-invalidate mount route")
+	}
+
+	sec := newDRReplicationSecondary(core, make([]byte, 32), "rel-invalidate", core.logger)
+	key := backendBarrierPrefix + route.UUID + "/config/legacyMigrationBundleLog"
+	if err := sec.applyFetchedChange(ctx, &EntryChange{
+		OpType: string(physical.PutOperation),
+		Key:    key,
+		Value:  []byte("replicated-value"),
+	}); err != nil {
+		t.Fatalf("apply fetched change failed: %v", err)
+	}
+
+	noop.Lock()
+	defer noop.Unlock()
+	if len(noop.Invalidations) != 1 || noop.Invalidations[0] != "config/legacyMigrationBundleLog" {
+		t.Fatalf("expected route-backed invalidation for replicated key, got %#v", noop.Invalidations)
+	}
+}
+
 // --- Integration Test: Reconciliation Set Building ---
 
 func TestDRReconciliation_BuildSet(t *testing.T) {
@@ -3613,6 +3653,109 @@ func TestFetchEntriesRejectsOversizedAndMalformedRequests(t *testing.T) {
 				t.Fatalf("expected InvalidArgument, got %v: %v", status.Code(err), err)
 			}
 		})
+	}
+}
+
+func TestFetchEntriesSplitsResponseBatchesByByteBudget(t *testing.T) {
+	_, primary, relationshipID, rpcCtx := setupDRPrimaryForDirtyBitmapAuthz(t, "test-fetch-byte-budget-fp")
+
+	cpID := "cp-fetch-byte-budget"
+	valueSize := int(drFetchSendBatchMaxBytes/2) + 1024
+	key1 := "secret/data/fetch-byte-budget-1"
+	key2 := "secret/data/fetch-byte-budget-2"
+	value1 := bytes.Repeat([]byte("a"), valueSize)
+	value2 := bytes.Repeat([]byte("b"), valueSize)
+	kid1 := primary.scanner.ComputeKID(key1)
+	kid2 := primary.scanner.ComputeKID(key2)
+	vid1 := primary.scanner.ComputeVIDWithSealWrap(value1, false)
+	vid2 := primary.scanner.ComputeVIDWithSealWrap(value2, false)
+
+	cp := &drCheckpointCacheEntry{
+		checkpoint:     reconciler.Checkpoint{ID: cpID, CommitIndex: 100},
+		relationshipID: relationshipID,
+		createdAt:      time.Now().UTC(),
+		kidToKey: map[[32]byte]string{
+			kid1: key1,
+			kid2: key2,
+		},
+		kidToVID: map[[32]byte][32]byte{
+			kid1: vid1,
+			kid2: vid2,
+		},
+	}
+	seedDRCheckpointArtifactForTest(t, primary, cp, []drCheckpointArtifactRecord{
+		{KID: kid1, VID: vid1, Key: key1},
+		{KID: kid2, VID: vid2, Key: key2},
+	}, map[[32]byte][]byte{
+		kid1: value1,
+		kid2: value2,
+	})
+	primary.checkpointMu.Lock()
+	primary.checkpoints[cpID] = cp
+	primary.checkpointMu.Unlock()
+
+	stream := &fetchTestServerStream{ctx: rpcCtx}
+	err := primary.FetchEntries(&FetchEntriesRequest{
+		RelationshipId:  relationshipID,
+		CheckpointId:    cpID,
+		CheckpointIndex: 100,
+		Kids:            [][]byte{kid1[:], kid2[:]},
+	}, stream)
+	if err != nil {
+		t.Fatalf("expected fetch to succeed: %v", err)
+	}
+	if got := stream.sendCount.Load(); got != 2 {
+		t.Fatalf("expected response to split into 2 batches, got %d", got)
+	}
+	for i, batch := range stream.sent {
+		if len(batch.GetEntries()) != 1 {
+			t.Fatalf("expected batch %d to contain 1 entry, got %d", i, len(batch.GetEntries()))
+		}
+		if got := entryBatchWireBytes(batch); got > drFetchSendBatchMaxBytes {
+			t.Fatalf("expected batch %d bytes <= %d, got %d", i, drFetchSendBatchMaxBytes, got)
+		}
+	}
+}
+
+func TestFetchEntriesRejectsSingleEntryOverResponseByteBudget(t *testing.T) {
+	_, primary, relationshipID, rpcCtx := setupDRPrimaryForDirtyBitmapAuthz(t, "test-fetch-entry-too-large-fp")
+
+	cpID := "cp-fetch-entry-too-large"
+	key := "secret/data/fetch-entry-too-large"
+	valueOverhead := entryBatchBaseWireBytes(&EntryBatch{
+		CheckpointId:    cpID,
+		CheckpointIndex: 100,
+	}) + uint64(len(string(physical.PutOperation))+len(key)+32+64)
+	value := bytes.Repeat([]byte("x"), int(drFetchSendBatchMaxBytes-valueOverhead)+1)
+	kid := primary.scanner.ComputeKID(key)
+	vid := primary.scanner.ComputeVIDWithSealWrap(value, false)
+
+	cp := &drCheckpointCacheEntry{
+		checkpoint:     reconciler.Checkpoint{ID: cpID, CommitIndex: 100},
+		relationshipID: relationshipID,
+		createdAt:      time.Now().UTC(),
+		kidToKey:       map[[32]byte]string{kid: key},
+		kidToVID:       map[[32]byte][32]byte{kid: vid},
+	}
+	seedDRCheckpointArtifactForTest(t, primary, cp, []drCheckpointArtifactRecord{
+		{KID: kid, VID: vid, Key: key},
+	}, map[[32]byte][]byte{kid: value})
+	primary.checkpointMu.Lock()
+	primary.checkpoints[cpID] = cp
+	primary.checkpointMu.Unlock()
+
+	stream := &fetchTestServerStream{ctx: rpcCtx}
+	err := primary.FetchEntries(&FetchEntriesRequest{
+		RelationshipId:  relationshipID,
+		CheckpointId:    cpID,
+		CheckpointIndex: 100,
+		Kids:            [][]byte{kid[:]},
+	}, stream)
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("expected ResourceExhausted for oversized fetch entry, got %v: %v", status.Code(err), err)
+	}
+	if got := stream.sendCount.Load(); got != 0 {
+		t.Fatalf("expected no batches to be sent for oversized entry, got %d", got)
 	}
 }
 
@@ -6356,6 +6499,7 @@ func TestDRCertFingerprint(t *testing.T) {
 type fetchTestServerStream struct {
 	ctx       context.Context
 	sendCount atomic.Int64
+	sent      []*EntryBatch
 	onSend    func(count int64)
 	// sendDelay adds a small delay per Send call so the test can cancel
 	// activeContext before the handler finishes all iterations.
@@ -6369,8 +6513,9 @@ func (s *fetchTestServerStream) Context() context.Context       { return s.ctx }
 func (s *fetchTestServerStream) SendMsg(any) error              { return nil }
 func (s *fetchTestServerStream) RecvMsg(any) error              { return io.EOF }
 
-func (s *fetchTestServerStream) Send(_ *EntryBatch) error {
+func (s *fetchTestServerStream) Send(b *EntryBatch) error {
 	count := s.sendCount.Add(1)
+	s.sent = append(s.sent, cloneEntryBatchForTest(b))
 	if s.onSend != nil {
 		s.onSend(count)
 	}
@@ -6378,6 +6523,29 @@ func (s *fetchTestServerStream) Send(_ *EntryBatch) error {
 		time.Sleep(s.sendDelay)
 	}
 	return nil
+}
+
+func cloneEntryBatchForTest(in *EntryBatch) *EntryBatch {
+	if in == nil {
+		return nil
+	}
+	out := &EntryBatch{
+		CheckpointId:    in.CheckpointId,
+		CheckpointIndex: in.CheckpointIndex,
+	}
+	if len(in.Entries) > 0 {
+		out.Entries = make([]*EntryChange, 0, len(in.Entries))
+		for _, e := range in.Entries {
+			out.Entries = append(out.Entries, cloneEntryChange(e))
+		}
+	}
+	if len(in.FailedKids) > 0 {
+		out.FailedKids = make([][]byte, 0, len(in.FailedKids))
+		for _, kid := range in.FailedKids {
+			out.FailedKids = append(out.FailedKids, append([]byte(nil), kid...))
+		}
+	}
+	return out
 }
 
 func TestFetchEntries_RechecksRelationshipRevocationDuringStream(t *testing.T) {

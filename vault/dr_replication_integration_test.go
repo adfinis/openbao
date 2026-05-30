@@ -566,26 +566,8 @@ func TestDRIntegration_DRSecondarySetupSkipsExistingProtectedRoutes(t *testing.T
 	core.drManager.config = &DRConfig{Mode: DRModeSecondary}
 	core.drManager.mu.Unlock()
 
-	var identityMount *routing.MountEntry
-	for _, entry := range core.mounts.Entries {
-		if entry.Type == routing.MountTypeIdentity {
-			identityMount = entry
-			break
-		}
-	}
-	if identityMount == nil {
-		t.Fatal("expected identity mount")
-	}
-	primaryIdentityMount := *identityMount
-	primaryIdentityMount.UUID = "primary-identity"
-	primaryIdentityMount.Accessor = "identity_primary"
-	core.mounts.Entries = append(core.mounts.Entries, &primaryIdentityMount)
-
 	if err := core.setupMounts(ctx); err != nil {
 		t.Fatalf("DR secondary mount setup should tolerate existing protected routes: %v", err)
-	}
-	if match := core.router.MatchingMount(ctx, "identity/entity/id"); match != "identity/" {
-		t.Fatalf("expected identity route to remain mounted, got %q", match)
 	}
 
 	var tokenAuth *routing.MountEntry
@@ -610,16 +592,6 @@ func TestDRIntegration_DRSecondarySetupSkipsExistingProtectedRoutes(t *testing.T
 		t.Fatalf("expected token auth route to remain mounted, got %q", match)
 	}
 
-	replayedIdentityMount := *identityMount
-	replayedIdentityMount.UUID = "primary-identity-invalidation"
-	replayedIdentityMount.Accessor = "identity_primary_invalidation"
-	if err := core.reloadMountInternal(ctx, routing.MountTableType, replayedIdentityMount.UUID, &replayedIdentityMount); err != nil {
-		t.Fatalf("DR secondary mount invalidation should tolerate existing protected route: %v", err)
-	}
-	if match := core.router.MatchingMount(ctx, "identity/entity/id"); match != "identity/" {
-		t.Fatalf("expected identity route to remain mounted after invalidation, got %q", match)
-	}
-
 	replayedTokenAuth := *tokenAuth
 	replayedTokenAuth.UUID = "primary-token-invalidation"
 	replayedTokenAuth.Accessor = "auth_token_primary_invalidation"
@@ -628,6 +600,180 @@ func TestDRIntegration_DRSecondarySetupSkipsExistingProtectedRoutes(t *testing.T
 	}
 	if match := core.router.MatchingMount(ctx, "auth/token/lookup-self"); match != "auth/token/" {
 		t.Fatalf("expected token auth route to remain mounted after invalidation, got %q", match)
+	}
+}
+
+func TestDRIntegration_RuntimeStateRefreshReplacesIdentityRoute(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := namespace.RootContext(t.Context())
+
+	sec := newDRReplicationSecondary(core, make([]byte, 32), "rel-identity-refresh", core.logger)
+	replicatedMounts := core.mounts.ShallowClone()
+	var replicatedIdentity *routing.MountEntry
+	for i, entry := range replicatedMounts.Entries {
+		if entry.Type != routing.MountTypeIdentity {
+			continue
+		}
+		clone := *entry
+		clone.UUID = "primary-identity-refresh"
+		clone.Accessor = "identity_primary_refresh"
+		clone.BackendAwareUUID = "primary-identity-backend-refresh"
+		replicatedMounts.Entries[i] = &clone
+		replicatedIdentity = &clone
+		break
+	}
+	if replicatedIdentity == nil {
+		t.Fatal("expected identity mount")
+	}
+	if err := core.persistMounts(ctx, core.barrier, replicatedMounts, nil, ""); err != nil {
+		t.Fatalf("persist replicated identity mount table failed: %v", err)
+	}
+	if err := core.loadMounts(ctx, false); err != nil {
+		t.Fatalf("reload replicated identity mount table failed: %v", err)
+	}
+	route := core.router.MatchingMountEntry(ctx, "identity/entity/id")
+	if route == nil {
+		t.Fatal("expected identity route before refresh")
+	}
+	if route.UUID == replicatedIdentity.UUID || route.Accessor == replicatedIdentity.Accessor {
+		t.Fatalf("expected identity route to remain stale before refresh, got %s/%s", route.UUID, route.Accessor)
+	}
+
+	if err := sec.refreshRuntimeStateAfterApply(ctx, "test", true); err != nil {
+		t.Fatalf("refresh runtime state failed: %v", err)
+	}
+
+	route = core.router.MatchingMountEntry(ctx, "identity/entity/id")
+	if route == nil {
+		t.Fatal("expected identity route after refresh")
+	}
+	if route.UUID != replicatedIdentity.UUID || route.Accessor != replicatedIdentity.Accessor {
+		t.Fatalf("expected identity route to use replicated entry %s/%s, got %s/%s",
+			replicatedIdentity.UUID, replicatedIdentity.Accessor, route.UUID, route.Accessor)
+	}
+}
+
+func TestDRIntegration_RuntimeStateRefreshReloadsIdentityArtifacts(t *testing.T) {
+	core, _, rootToken := TestCoreUnsealed(t)
+	ctx := namespace.RootContext(t.Context())
+
+	policyName := "dr-identity-refresh"
+	req := logical.TestRequest(t, logical.UpdateOperation, "identity/entity")
+	req.ClientToken = rootToken
+	req.Data["name"] = "entity-dr-refresh"
+	req.Data["policies"] = []string{policyName}
+	resp, err := core.HandleRequest(ctx, req)
+	if err != nil {
+		t.Fatalf("create identity entity failed: %v", err)
+	}
+	if resp == nil || resp.IsError() {
+		t.Fatalf("create identity entity returned bad response: %#v", resp)
+	}
+	entityID, ok := resp.Data["id"].(string)
+	if !ok || entityID == "" {
+		t.Fatalf("create identity entity did not return an ID: %#v", resp.Data)
+	}
+
+	req = logical.TestRequest(t, logical.UpdateOperation, "identity/group")
+	req.ClientToken = rootToken
+	req.Data["name"] = "group-dr-refresh"
+	req.Data["type"] = "internal"
+	req.Data["member_entity_ids"] = []string{entityID}
+	resp, err = core.HandleRequest(ctx, req)
+	if err != nil {
+		t.Fatalf("create identity group failed: %v", err)
+	}
+	if resp == nil || resp.IsError() {
+		t.Fatalf("create identity group returned bad response: %#v", resp)
+	}
+	groupID, ok := resp.Data["id"].(string)
+	if !ok || groupID == "" {
+		t.Fatalf("create identity group did not return an ID: %#v", resp.Data)
+	}
+
+	if err := core.identityStore.ResetDB(ctx); err != nil {
+		t.Fatalf("reset identity store failed: %v", err)
+	}
+	entity, err := core.identityStore.MemDBEntityByID(ctx, entityID, false)
+	if err != nil {
+		t.Fatalf("lookup identity entity after reset failed: %v", err)
+	}
+	if entity != nil {
+		t.Fatal("expected identity entity to be absent from memdb before refresh")
+	}
+	group, err := core.identityStore.MemDBGroupByID(ctx, groupID, false)
+	if err != nil {
+		t.Fatalf("lookup identity group after reset failed: %v", err)
+	}
+	if group != nil {
+		t.Fatal("expected identity group to be absent from memdb before refresh")
+	}
+
+	sec := newDRReplicationSecondary(core, make([]byte, 32), "rel-identity-artifacts-refresh", core.logger)
+	if err := sec.refreshRuntimeStateAfterApply(ctx, "test", true); err != nil {
+		t.Fatalf("refresh runtime state failed: %v", err)
+	}
+
+	entity, err = core.identityStore.MemDBEntityByID(ctx, entityID, false)
+	if err != nil {
+		t.Fatalf("lookup identity entity after refresh failed: %v", err)
+	}
+	if entity == nil {
+		t.Fatal("expected identity entity after refresh")
+	}
+	if len(entity.Policies) != 1 || entity.Policies[0] != policyName {
+		t.Fatalf("expected identity entity policies %q, got %v", policyName, entity.Policies)
+	}
+	group, err = core.identityStore.MemDBGroupByID(ctx, groupID, false)
+	if err != nil {
+		t.Fatalf("lookup identity group after refresh failed: %v", err)
+	}
+	if group == nil {
+		t.Fatal("expected identity group after refresh")
+	}
+	if len(group.MemberEntityIDs) != 1 || group.MemberEntityIDs[0] != entityID {
+		t.Fatalf("expected identity group member %q, got %v", entityID, group.MemberEntityIDs)
+	}
+}
+
+func TestDRIntegration_RuntimeStateRefreshLoadsReplicatedNamespace(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := namespace.RootContext(t.Context())
+
+	sec := newDRReplicationSecondary(core, make([]byte, 32), "rel-namespace-refresh", core.logger)
+	replicatedNamespace := &namespace.Namespace{
+		ID:   "drns01",
+		UUID: "11111111-1111-1111-1111-111111111111",
+		Path: "dr-refresh/",
+		CustomMetadata: map[string]string{
+			"source": "primary",
+		},
+	}
+	if err := core.namespaceStore.writeNamespace(ctx, core.NamespaceView(namespace.RootNamespace), replicatedNamespace); err != nil {
+		t.Fatalf("persist replicated namespace failed: %v", err)
+	}
+
+	before, err := core.namespaceStore.GetNamespaceByPath(ctx, "dr-refresh")
+	if err != nil {
+		t.Fatalf("pre-refresh namespace lookup failed: %v", err)
+	}
+	if before != nil {
+		t.Fatal("expected replicated namespace to be absent from in-memory store before refresh")
+	}
+
+	if err := sec.refreshRuntimeStateAfterApply(ctx, "test", true); err != nil {
+		t.Fatalf("refresh runtime state failed: %v", err)
+	}
+
+	after, err := core.namespaceStore.GetNamespaceByPath(ctx, "dr-refresh")
+	if err != nil {
+		t.Fatalf("post-refresh namespace lookup failed: %v", err)
+	}
+	if after == nil {
+		t.Fatal("expected replicated namespace after refresh")
+	}
+	if after.UUID != replicatedNamespace.UUID || after.CustomMetadata["source"] != "primary" {
+		t.Fatalf("expected replicated namespace metadata, got uuid=%q metadata=%v", after.UUID, after.CustomMetadata)
 	}
 }
 
@@ -2147,7 +2293,9 @@ func TestDRIntegration_RuntimeStatePaths(t *testing.T) {
 		{"core/auth/1234", true},
 		{"core/audit", true},
 		{"core/audit/1234", true},
+		{"core/namespaces/1234", true},
 		{"namespaces/00000000-0000-0000-0000-000000000000/core/mounts/1234", true},
+		{"namespaces/00000000-0000-0000-0000-000000000000/core/namespaces/1234", true},
 		{"core/local-mounts", false},
 		{"core/local-auth", false},
 		{"core/local-audit", false},
@@ -2159,6 +2307,76 @@ func TestDRIntegration_RuntimeStatePaths(t *testing.T) {
 		if got := isDRRuntimeStatePath(tt.path); got != tt.want {
 			t.Fatalf("isDRRuntimeStatePath(%q)=%v, want %v", tt.path, got, tt.want)
 		}
+	}
+}
+
+func TestDRIntegration_RuntimeRefreshProtectionAllowsNamespaceSingletons(t *testing.T) {
+	childNamespace := &namespace.Namespace{ID: "dr-child", Path: "dr-child/"}
+
+	tests := []struct {
+		name      string
+		entry     *routing.MountEntry
+		protected bool
+	}{
+		{
+			name: "root sys remains protected",
+			entry: &routing.MountEntry{
+				Path:        "sys/",
+				Type:        routing.MountTypeSystem,
+				NamespaceID: namespace.RootNamespaceID,
+				Namespace:   namespace.RootNamespace,
+			},
+			protected: true,
+		},
+		{
+			name: "namespace sys is refreshed",
+			entry: &routing.MountEntry{
+				Path:        "sys/",
+				Type:        routing.MountTypeNSSystem,
+				NamespaceID: childNamespace.ID,
+				Namespace:   childNamespace,
+			},
+			protected: false,
+		},
+		{
+			name: "namespace token is refreshed",
+			entry: &routing.MountEntry{
+				Path:        "token/",
+				Type:        routing.MountTypeNSToken,
+				NamespaceID: childNamespace.ID,
+				Namespace:   childNamespace,
+			},
+			protected: false,
+		},
+		{
+			name: "namespace identity is refreshed",
+			entry: &routing.MountEntry{
+				Path:        "identity/",
+				Type:        routing.MountTypeNSIdentity,
+				NamespaceID: childNamespace.ID,
+				Namespace:   childNamespace,
+			},
+			protected: false,
+		},
+		{
+			name: "local namespace mount remains protected",
+			entry: &routing.MountEntry{
+				Path:        "local/",
+				Type:        routing.MountTypeKV,
+				NamespaceID: childNamespace.ID,
+				Namespace:   childNamespace,
+				Local:       true,
+			},
+			protected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isDRRuntimeRefreshProtectedEntry(tt.entry); got != tt.protected {
+				t.Fatalf("expected protected=%t, got %t", tt.protected, got)
+			}
+		})
 	}
 }
 
@@ -2902,6 +3120,90 @@ func TestDRIntegration_RangeReconciliationRejectsIncompleteFetchBatch(t *testing
 				t.Fatalf("expected local-only key %q to remain after failed reconcile", localKey)
 			}
 		})
+	}
+}
+
+func TestDRIntegration_RangeTaskEnforcesFetchedValueByteBudget(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+
+	sec := newDRReplicationSecondary(core, replSalt, "rel-range-budget", core.logger)
+	sec.reconcileMaxRPCBytes = 512
+
+	localKey := "range/budget/value"
+	localEntry := &physical.Entry{Key: localKey, Value: []byte("stale")}
+	kid, localVID := sec.scanner.ComputeItemFromEntry(localEntry)
+	remoteValue := bytes.Repeat([]byte("r"), 2048)
+	remoteVID := sec.scanner.ComputeVIDWithSealWrap(remoteValue, false)
+	remoteIndex := reconciler.NewRangeMapIndex(map[[32]byte][32]byte{kid: remoteVID}, nil)
+
+	rangeID := reconciler.RangeIDFromKID(kid)
+	parent := reconciler.SpanFromRangeID(rangeID)
+	checkpoint := &CheckpointResponse{CheckpointId: "cp-range-budget", CommitIndex: 88}
+	if err := sec.beginReconcileSession(checkpoint.CheckpointId, checkpoint.CommitIndex); err != nil {
+		t.Fatalf("failed to begin reconcile session: %v", err)
+	}
+	defer sec.endReconcileSession()
+
+	sec.client = &drRangeTestClient{
+		exchangeRangeDigestsFn: func(_ context.Context, req *RangeDigestRequest, _ ...grpc.CallOption) (*RangeDigestResponse, error) {
+			if req.GetRelationshipId() != sec.relationshipID {
+				t.Fatalf("expected digest request relationship_id %q, got %q", sec.relationshipID, req.GetRelationshipId())
+			}
+			requestedParent, _, err := protoToRangeSpan(req.GetParentSpan())
+			if err != nil {
+				t.Fatalf("invalid parent span in request: %v", err)
+			}
+			left, right, ok := reconciler.SplitRange(requestedParent)
+			if !ok {
+				desc := reconciler.BuildRangeDigestFromIndex(remoteIndex, requestedParent)
+				return &RangeDigestResponse{Digests: []*RangeDigest{rangeDescriptorToProto(desc)}}, nil
+			}
+			leftDesc := reconciler.BuildRangeDigestFromIndex(remoteIndex, left)
+			rightDesc := reconciler.BuildRangeDigestFromIndex(remoteIndex, right)
+			return &RangeDigestResponse{Digests: []*RangeDigest{
+				rangeDescriptorToProto(leftDesc),
+				rangeDescriptorToProto(rightDesc),
+			}}, nil
+		},
+		fetchEntriesFn: func(_ context.Context, req *FetchEntriesRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[EntryBatch], error) {
+			if req.GetRelationshipId() != sec.relationshipID {
+				t.Fatalf("expected fetch request relationship_id %q, got %q", sec.relationshipID, req.GetRelationshipId())
+			}
+			return &staticEntryBatchStream{batches: []*EntryBatch{
+				{
+					CheckpointId:    req.GetCheckpointId(),
+					CheckpointIndex: req.GetCheckpointIndex(),
+					Entries: []*EntryChange{
+						{
+							OpType: string(physical.PutOperation),
+							Key:    localKey,
+							Value:  remoteValue,
+							Kid:    kid[:],
+						},
+					},
+				},
+			}}, nil
+		},
+	}
+
+	localIndex := reconciler.NewRangeMapIndex(
+		map[[32]byte][32]byte{kid: localVID},
+		map[[32]byte]*physical.Entry{kid: localEntry},
+	)
+	result := sec.processRangeTask(context.Background(), checkpoint, localIndex, map[[32]byte]string{kid: localKey}, drQueuedRangeTask{
+		id: 1,
+		task: drRangeTask{
+			rangeID: rangeID,
+			span:    parent,
+		},
+	})
+	if result.err == nil {
+		t.Fatal("expected fetched value byte budget to fail")
+	}
+	if !strings.Contains(result.err.Error(), "budget_exceeded") {
+		t.Fatalf("expected budget_exceeded error, got: %v", result.err)
 	}
 }
 

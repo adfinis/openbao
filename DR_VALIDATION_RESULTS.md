@@ -78,6 +78,35 @@ The sequence is now captured as a first-class repo-local target:
 `make dr-test-ha-failover-load-lifecycle`. A default-profile run of that target
 on 2026-05-30 passed end to end.
 
+A 2-hour repo-local HA steady-state soak on 2026-05-30 also passed. The run
+used a non-failover profile with 24 workers, 55% writes, 25% primary reads, and
+20% DR status checks. It completed 855,321 operations with zero put, get, or
+status failures, both secondaries converged in about one second, and exhaustive
+verification of 20,024 terminal keys passed on primary, secondary1, and
+secondary2.
+
+A repo-local HA engine/runtime matrix on 2026-05-30 now broadens validation
+beyond KV stress traffic. It verifies a self-contained parity set: KV v2, KV
+v1, transit, PKI, SSH, TOTP, database engine configuration, userpass, AppRole,
+cert auth, JWT auth, token roles, namespaces with namespace-scoped KV v2, ACL
+policies, service-token authentication, and identity entity/group/alias state on
+the primary and both secondaries. The expanded matrix exposed several DR
+runtime correctness gaps: route-backed backend caches needed explicit
+invalidation after replicated storage apply; the identity singleton route
+needed to be replaced from replicated mount state during runtime refresh, even
+when the mount table had already refreshed independently; and identity artifacts
+needed to be reloaded from replicated storage after route/namespace refresh.
+Namespace lifecycle validation also exposed that replicated namespace state must
+be loaded during runtime refresh and that namespace-scoped singleton routes must
+be refreshed from the replicated mount table. Those gaps were fixed and covered
+by unit/integration tests and the HA lifecycle matrix.
+
+A focused resource-control pass on 2026-05-30 tightened the checkpoint fetch
+path. `FetchEntries` response streams now split batches by approximate payload
+bytes as well as entry count, reject a single entry that cannot fit inside the
+response byte budget, and the secondary reconcile budget now accounts the actual
+bytes fetched from checkpoint artifacts instead of a per-entry placeholder.
+
 ## Test Environment
 
 - OpenBao repository: `/Users/roelc/projects/secretz/openbao`
@@ -736,6 +765,125 @@ Exhaustive verification:
 Final DR status showed two active primary relationships and both secondaries in
 `streaming` with `lag_entries=0`.
 
+## Repo-Local Steady-State HA Soak
+
+Latest steady-state soak artifact:
+
+`/Users/roelc/projects/secretz/openbao/dr-stress-results/drsoak-20260530T115719Z`
+
+Profile:
+
+| Metric | Value |
+| --- | ---: |
+| Duration | 7200s |
+| Concurrency | 24 workers |
+| Put mix | 55% |
+| Primary read mix | 25% |
+| DR status mix | 20% |
+| Forced stepdowns | 0 |
+| Total operations | 855,321 |
+| Throughput | 118.72 ops/s |
+| Successful puts | 469,804 |
+| Failed puts | 0 |
+| Successful primary gets | 214,053 |
+| Failed primary gets | 0 |
+| Successful DR status checks | 171,464 |
+| Failed DR status checks | 0 |
+| Dropped stress events | 0 |
+
+Replication convergence:
+
+| Secondary | Converged | Final lag | Final applied index | Primary index | Sentinel wait |
+| --- | --- | ---: | ---: | ---: | ---: |
+| secondary1 | yes | 0 | 472,153 | 472,153 | 1.0s |
+| secondary2 | yes | 0 | 472,153 | 472,153 | 1.0s |
+
+Exhaustive verification:
+
+| Target | Keys checked | Matches | Missing | Mismatches | Errors | Result |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| primary | 20,024 | 20,024 | 0 | 0 | 0 | PASS |
+| secondary1 | 20,024 | 20,024 | 0 | 0 | 0 | PASS |
+| secondary2 | 20,024 | 20,024 | 0 | 0 | 0 | PASS |
+
+Interpretation:
+
+- The tested steady-state write/read pressure is still materially above many
+  normal OpenBao deployments, especially on sustained writes.
+- The profile did not trigger failover, forced stepdown, promotion, or
+  intentional reconnect disruption; it is a steady-state replication signal, not
+  an adversarial lifecycle signal.
+- No client-visible errors, backpressure rejections, dropped events, secondary
+  reconcile retries, or fallback events were observed.
+- Both secondaries remained in `streaming` with `lag_entries=0` through the
+  final sentinel and exhaustive verification.
+
+## Repo-Local Engine/Runtime Feature Matrix
+
+Latest engine lifecycle matrix artifact:
+
+`/Users/roelc/projects/secretz/openbao/dr-stress-results/engine-matrix-20260530161139`
+
+Command:
+
+```bash
+scripts/dr_local_test.sh --topology ha engine-lifecycle-matrix
+```
+
+Coverage:
+
+| Area | Assertion |
+| --- | --- |
+| KV v2 | Versioned application config replicated and read on both secondaries. |
+| KV v1 | Non-versioned application config replicated and read on both secondaries. |
+| Namespaces | Namespace metadata, namespace `sys/mounts`, and namespace-scoped KV v2 state replicated and readable on both secondaries. |
+| Transit | Replicated transit mount and AES-GCM key metadata readable on both secondaries; encrypt/decrypt round trip verified on primary before replication checks. |
+| PKI | Replicated PKI mount, generated CA, role, and issued certificate readable on both secondaries. |
+| SSH | Replicated SSH CA public key and CA role state readable on both secondaries. |
+| TOTP | Replicated TOTP key metadata readable on both secondaries. |
+| Database | Replicated database config readable on both secondaries with connection verification disabled for a self-contained local test. |
+| Auth mounts | Userpass user state, AppRole role ID, cert auth config, JWT config/role, and token role state replicated and readable on both secondaries. |
+| ACL policy | Run-specific policy body replicated and visible on both secondaries. |
+| Service token | Primary-created service token can authenticate on both secondaries and self-report the replicated policy. |
+| Identity | Entity, group membership, and entity alias replicated and readable on both secondaries. |
+
+Lifecycle checks:
+
+| Check | Result |
+| --- | --- |
+| Pre-failover matrix on primary, secondary1, and secondary2 | PASS |
+| Matrix on promoted secondary1 after forced failover | PASS |
+| Matrix on secondary2 after explicit reseed from promoted authority | PASS |
+
+Result: PASS.
+
+Important findings from the expanded matrix:
+
+- PKI exposed a route-backed backend cache gap. DR apply writes below the
+  barrier, so plugin-backed storage paths did not receive the normal local
+  invalidation signal. Replicated storage apply now invalidates affected
+  route-backed backend keys after commit/refresh.
+- Identity exposed an over-protected singleton route. The secondary correctly
+  preserves local token/sys/cubbyhole routes, but identity is replicated DR
+  state. Runtime refresh now remounts the identity route from the replicated
+  mount table when the router still points at the old local UUID/accessor, and
+  updates `core.identityStore`.
+- Identity artifacts also need explicit reload after runtime refresh. A
+  secondary can have the correct identity route and durable replicated entries
+  while serving stale or empty in-memory identity state. Runtime refresh now
+  registers missing namespace views, resets the identity memdb, and reloads
+  entities, groups, aliases, and OIDC clients in read-only mode.
+- Namespace lifecycle validation exposed two related runtime refresh gaps.
+  Replicated namespace records must reload before replicated mount/auth tables,
+  and namespace-scoped singleton routes such as `sys/`, `token/`, and
+  `identity/` must be refreshed for child namespaces even though root singleton
+  routes remain protected. The fix avoids generic invalidation for
+  `core/namespaces/*` and relies on runtime refresh instead.
+- HA host-side arbitrary-token lookup against a DR secondary redirects to the
+  configured container `api_addr`. The matrix now checks service-token self
+  lookup instead, which directly validates that replicated tokens are usable on
+  secondaries without depending on host DNS for container leader addresses.
+
 ## Run Summary
 
 | Run | Profile | Result | Notes |
@@ -758,6 +906,10 @@ Final DR status showed two active primary relationships and both secondaries in
 | `promoted-durability-20260530T113032Z` | Repo-local promoted HA durability from load-generated promoted state | PASS | Promoted secondary1 survived full restart, stale old-primary token rejection after restart, active handoff from `http://localhost:8900` to `http://localhost:8902`, and post-handoff write. |
 | `reseed-secondary-20260530T113215Z` | Repo-local explicit secondary2 reseed from load-generated promoted state | PASS | Secondary2 re-enabled from the promoted authority, reached streaming with lag 0, replicated promoted-only data, and did not merge old-primary-only data. |
 | `failover-load-20260530T114237Z` | First-class `dr-test-ha-failover-load-lifecycle` target | PASS | 24,009 ops; no-ack promotion failed closed; accepted forced promotion reported reason code/details and estimate basis; exhaustive verification passed on promoted secondary1 with 0 confirmed missing keys and 0 mismatches; promoted durability and secondary2 reseed passed from the same load-generated promoted state. |
+| `drsoak-20260530T115719Z` | Repo-local 2h HA steady-state soak | PASS | 855,321 ops; 469,804 successful puts, 214,053 successful gets, 171,464 successful DR status checks, 0 failures, 0 dropped events; both secondaries converged in about 1s; exhaustive verification passed on primary, secondary1, and secondary2 for all 20,024 terminal keys. |
+| `engine-matrix-20260530144744` | Repo-local HA engine/runtime feature matrix | PASS | Verified KV v2, transit, PKI CA/role/cert, userpass, AppRole, ACL policy, service-token self lookup, and identity entity/group/alias state on primary, secondary1, and secondary2. |
+| `engine-matrix-20260530152338` | Repo-local HA engine/runtime lifecycle matrix | PASS | Verified namespace metadata, namespace-scoped KV v2, root KV v2, transit, PKI, userpass, AppRole, ACL policy, service-token self lookup, and identity on primary/secondaries before failover; reverified on promoted secondary1 after forced failover; reverified on secondary2 after promoted-authority reseed. |
+| `engine-matrix-20260530161139` | Broadened repo-local HA engine/runtime lifecycle matrix | PASS | Verified the self-contained parity set: KV v2, KV v1, transit, PKI, SSH, TOTP, database config, userpass, AppRole, cert auth, JWT auth, token role, ACL policy, service-token self lookup, namespace metadata/KV, and identity entity/group/alias before failover, after forced promotion, and after promoted-authority reseed. |
 | `promoted-durability-20260529T214508Z` | Repo-local promoted HA durability smoke | PASS | Full promoted secondary1 restart, stale old-primary token rejection after restart, active handoff from secondary1-1 to secondary1-2, and post-handoff write all passed. |
 | `reseed-secondary-20260529T215004Z` | Repo-local explicit secondary2 reseed to promoted authority | PASS | Promoted secondary1 became the new DR primary, secondary2 was re-enabled from a fresh promoted token, promoted-only data replicated, old-primary-only data was removed from secondary2, and old primary stayed separate. |
 | `drmixed-20260530T001551Z` | Repo-local HA credential rotation under load | PASS | 15,085 ops, 0 workload failures, secondary1 DR client certificate rotation during load, forced stepdowns every 30s, sentinel convergence in 1s for both secondaries, exhaustive verification passed on all clusters. |
@@ -804,12 +956,20 @@ The current design direction looks sound for data correctness:
 
 - The ordered stream path works while secondaries remain inside the replay
   horizon.
+- A 2-hour steady-state HA soak sustained materially high write/read pressure
+  with zero client-visible failures, no dropped stress events, no secondary
+  fallback/reconcile churn, and exhaustive terminal-key matches on both
+  secondaries.
 - When pressure exceeds the stream buffer horizon, reconciliation is able to
   recover secondaries back to a matching terminal state.
 - The range-first reconciliation path did not produce silent omissions in the
   observed stress runs.
 - Secondaries returned to `streaming` with lag 0 after the final sentinel.
 - Exhaustive verification confirmed all terminal values on both secondaries.
+- The engine/runtime matrix now verifies replicated non-KV runtime surfaces,
+  including namespaces, namespace-scoped KV state, route-backed PKI state,
+  transit key metadata, auth mount state, ACL policies, service-token
+  authentication, and identity objects.
 
 The important distinction is:
 
@@ -891,6 +1051,24 @@ from the DR protocol work where possible:
   stable forced-promotion reason codes/details, record data-loss
   acknowledgement state, and preserve the estimate basis for status/audit.
 - Stress-runner sentinel write retry during transient HA active handoff.
+- Route-backed backend cache invalidation for DR-applied replicated storage.
+  PKI exposed that replicated writes applied below the barrier did not notify
+  plugin backend caches; apply paths now invalidate affected route-backed keys.
+- Identity singleton runtime refresh. The secondary still protects local
+  sys/token/cubbyhole routes, but identity is replicated DR state and now gets
+  replaced from the replicated mount table during runtime refresh. Runtime
+  refresh also handles the case where the in-memory mount table already has the
+  primary identity entry but the router still points at the old local route.
+- Identity artifact reload after DR runtime refresh. Identity entities, groups,
+  aliases, and OIDC clients are cached in namespace-scoped memdb state; runtime
+  refresh now resets and reloads those artifacts from replicated storage after
+  namespace and route state are refreshed.
+- Namespace runtime refresh. Namespace records are replicated DR state and must
+  reload before mount/auth tables. Namespace-scoped singleton routes are
+  refreshed for child namespaces while root singleton routes stay protected.
+- Fetch/reconcile resource bounds. `FetchEntries` response batches now have an
+  explicit byte budget, oversized single entries fail closed, and range
+  reconciliation accounts fetched value bytes against its RPC budget.
 
 See `DR_BUG_TRACKER.md` for suggested worktree split planning.
 
@@ -898,8 +1076,9 @@ See `DR_BUG_TRACKER.md` for suggested worktree split planning.
 
 1. Keep DR correctness and HA availability as separate work streams.
 2. Add an automated exhaustive verifier target for stress results.
-3. Run a longer soak without forced stepdowns to measure steady-state DR
-   behavior under less adversarial conditions.
+3. Add opt-in dependency-backed engine profiles for LDAP, Kubernetes, RADIUS,
+   Kerberos, RabbitMQ, and live database credential issuance. The default
+   matrix now covers the self-contained built-in parity set.
 4. Reproduce `HA-005` in a smaller HA-only or DR-light scenario to determine
    whether the active handoff availability issue is baseline HA behavior,
    HAProxy health-check behavior, DR backlog pressure, or a combination.

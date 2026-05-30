@@ -52,6 +52,8 @@ const (
 	drStreamSendBatchMaxEntries = 64      // max entries per EntryBatch on the stream
 	drStreamSendBatchMaxBytes   = 1 << 20 // 1 MiB max payload per stream batch
 	drFetchRequestMaxSelectors  = 16384   // max point selectors (kids + items) per FetchEntries request
+	drFetchSendBatchMaxEntries  = 100     // max entries per FetchEntries response batch
+	drFetchSendBatchMaxBytes    = 8 << 20 // 8 MiB max approximate FetchEntries response batch payload
 
 	drBackpressureDefaultEnabled        = true
 	drBackpressureDefaultDegradedRatio  = 0.80
@@ -1440,8 +1442,65 @@ func (s *drReplicationPrimary) FetchEntries(req *FetchEntriesRequest, stream grp
 	}
 
 	var batch EntryBatch
-	batch.CheckpointId = cp.checkpoint.ID
-	batch.CheckpointIndex = cp.checkpoint.CommitIndex
+	var batchBytes uint64
+	resetFetchBatch := func() {
+		batch = EntryBatch{
+			CheckpointId:    cp.checkpoint.ID,
+			CheckpointIndex: cp.checkpoint.CommitIndex,
+		}
+		batchBytes = entryBatchBaseWireBytes(&batch)
+	}
+	resetFetchBatch()
+	flushFetchBatch := func() error {
+		if len(batch.Entries) == 0 && len(batch.FailedKids) == 0 {
+			return nil
+		}
+		if err := authorizeFetchContinuation(); err != nil {
+			return err
+		}
+		if err := stream.Send(&batch); err != nil {
+			return err
+		}
+		resetFetchBatch()
+		return nil
+	}
+	appendFailedKID := func(kid [32]byte) error {
+		const failedKIDBytes = uint64(32 + 8)
+		if batchBytes+failedKIDBytes > drFetchSendBatchMaxBytes && (len(batch.Entries) > 0 || len(batch.FailedKids) > 0) {
+			if err := flushFetchBatch(); err != nil {
+				return err
+			}
+		}
+		batch.FailedKids = append(batch.FailedKids, kid[:])
+		batchBytes += failedKIDBytes
+		if len(batch.Entries)+len(batch.FailedKids) >= drFetchSendBatchMaxEntries || batchBytes >= drFetchSendBatchMaxBytes {
+			return flushFetchBatch()
+		}
+		return nil
+	}
+	appendFetchEntry := func(change *EntryChange) error {
+		if change == nil {
+			return nil
+		}
+		changeBytes := entryChangeWireBytes(change)
+		singleEntryBatchBytes := entryBatchBaseWireBytes(&batch) + changeBytes
+		if singleEntryBatchBytes > drFetchSendBatchMaxBytes {
+			return status.Errorf(codes.ResourceExhausted,
+				"fetch entry batch payload %d exceeds maximum batch bytes %d",
+				singleEntryBatchBytes, drFetchSendBatchMaxBytes)
+		}
+		if batchBytes+changeBytes > drFetchSendBatchMaxBytes && (len(batch.Entries) > 0 || len(batch.FailedKids) > 0) {
+			if err := flushFetchBatch(); err != nil {
+				return err
+			}
+		}
+		batch.Entries = append(batch.Entries, change)
+		batchBytes += changeBytes
+		if len(batch.Entries) >= drFetchSendBatchMaxEntries || batchBytes >= drFetchSendBatchMaxBytes {
+			return flushFetchBatch()
+		}
+		return nil
+	}
 	sent := make(map[[32]byte]bool)
 	rangeSpans, err := parseRangeSpans(req.GetRanges())
 	if err != nil {
@@ -1466,26 +1525,9 @@ func (s *drReplicationPrimary) FetchEntries(req *FetchEntriesRequest, stream grp
 			if status.Code(err) == codes.FailedPrecondition {
 				return err
 			}
-			batch.FailedKids = append(batch.FailedKids, kid[:])
-			return nil
+			return appendFailedKID(kid)
 		}
-		if change == nil {
-			return nil
-		}
-		batch.Entries = append(batch.Entries, change)
-		if len(batch.Entries) >= 100 {
-			if err := authorizeFetchContinuation(); err != nil {
-				return err
-			}
-			if err := stream.Send(&batch); err != nil {
-				return err
-			}
-			batch.Entries = batch.Entries[:0]
-			batch.FailedKids = batch.FailedKids[:0]
-			batch.CheckpointId = cp.checkpoint.ID
-			batch.CheckpointIndex = cp.checkpoint.CommitIndex
-		}
-		return nil
+		return appendFetchEntry(change)
 	}
 
 	// Range-based fetching with parallel artifact reads.
@@ -1552,18 +1594,8 @@ func (s *drReplicationPrimary) FetchEntries(req *FetchEntriesRequest, stream grp
 				if res.change == nil {
 					continue
 				}
-				batch.Entries = append(batch.Entries, res.change)
-				if len(batch.Entries) >= 100 {
-					if err := authorizeFetchContinuation(); err != nil {
-						return err
-					}
-					if err := stream.Send(&batch); err != nil {
-						return err
-					}
-					batch.Entries = batch.Entries[:0]
-					batch.FailedKids = batch.FailedKids[:0]
-					batch.CheckpointId = cp.checkpoint.ID
-					batch.CheckpointIndex = cp.checkpoint.CommitIndex
+				if err := appendFetchEntry(res.change); err != nil {
+					return err
 				}
 			}
 		}
@@ -1604,13 +1636,8 @@ func (s *drReplicationPrimary) FetchEntries(req *FetchEntriesRequest, stream grp
 	}
 
 	// Send remaining entries.
-	if len(batch.Entries) > 0 || len(batch.FailedKids) > 0 {
-		if err := authorizeFetchContinuation(); err != nil {
-			return err
-		}
-		if err := stream.Send(&batch); err != nil {
-			return err
-		}
+	if err := flushFetchBatch(); err != nil {
+		return err
 	}
 
 	return nil
@@ -2194,6 +2221,32 @@ func entryChangeFromPhysical(e physical.ChangeStreamEntry) *EntryChange {
 		SealWrap:  e.SealWrap,
 		RaftIndex: e.RaftIndex,
 	}
+}
+
+func entryChangeWireBytes(e *EntryChange) uint64 {
+	if e == nil {
+		return 0
+	}
+	return uint64(len(e.OpType)+len(e.Key)+len(e.Value)+len(e.Kid)) + 64
+}
+
+func entryBatchBaseWireBytes(b *EntryBatch) uint64 {
+	if b == nil {
+		return 0
+	}
+	return uint64(len(b.CheckpointId)) + 32
+}
+
+func entryBatchWireBytes(b *EntryBatch) uint64 {
+	if b == nil {
+		return 0
+	}
+	n := entryBatchBaseWireBytes(b)
+	for _, e := range b.GetEntries() {
+		n += entryChangeWireBytes(e)
+	}
+	n += uint64(len(b.GetFailedKids())) * (32 + 8)
+	return n
 }
 
 func (s *drReplicationPrimary) updateIndexFromChanges(entries []physical.ChangeStreamEntry) {

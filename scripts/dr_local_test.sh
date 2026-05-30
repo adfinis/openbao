@@ -30,6 +30,8 @@ Usage:
   scripts/dr_local_test.sh [--topology single|ha] status
   scripts/dr_local_test.sh [--topology single|ha] smoke [dr-stress flags...]
   scripts/dr_local_test.sh [--topology single|ha] verify [RUN_DIR] [--sample N]
+  scripts/dr_local_test.sh [--topology single|ha] engine-matrix
+  scripts/dr_local_test.sh --topology ha engine-lifecycle-matrix
   scripts/dr_local_test.sh [--topology single|ha] failover-smoke
   scripts/dr_local_test.sh --topology ha promoted-durability-smoke
   scripts/dr_local_test.sh --topology ha reseed-secondary-smoke
@@ -48,9 +50,11 @@ Typical flow:
   scripts/dr_local_test.sh reset
   scripts/dr_local_test.sh smoke --duration 120 --concurrency 24
   scripts/dr_local_test.sh verify
+  scripts/dr_local_test.sh engine-matrix
 
 HA topology:
   scripts/dr_local_test.sh --topology ha reset
+  scripts/dr_local_test.sh --topology ha engine-lifecycle-matrix
   scripts/dr_local_test.sh --topology ha smoke --duration 900 --concurrency 48 --stepdown-interval 300
   scripts/dr_local_test.sh --topology ha failover-load-lifecycle
 USAGE
@@ -131,6 +135,18 @@ bao_for() {
     env BAO_ADDR="$addr" BAO_TOKEN="$token" "$(bao_bin)" "$@"
   else
     env BAO_ADDR="$addr" "$(bao_bin)" "$@"
+  fi
+}
+
+bao_for_ns() {
+  local addr="$1"
+  local token="$2"
+  local ns="$3"
+  shift 3 || true
+  if [[ -n "$token" ]]; then
+    env BAO_ADDR="$addr" BAO_TOKEN="$token" BAO_NAMESPACE="$ns" "$(bao_bin)" "$@"
+  else
+    env BAO_ADDR="$addr" BAO_NAMESPACE="$ns" "$(bao_bin)" "$@"
   fi
 }
 
@@ -324,6 +340,195 @@ wait_secondary_ready() {
     fi
     sleep 2
   done
+}
+
+wait_read_jq() {
+  local label="$1"
+  local addr="$2"
+  local token="$3"
+  local path="$4"
+  local expr="$5"
+  local timeout="${6:-120}"
+  local deadline=$(( $(date +%s) + timeout ))
+  local out=""
+
+  while true; do
+    if out="$(bao_for "$addr" "$token" read -format=json "$path" 2>/dev/null)" && jq -e "$expr" >/dev/null <<<"$out"; then
+      return 0
+    fi
+    if (( $(date +%s) >= deadline )); then
+      printf "%s\n" "$out" >&2
+      die "timed out waiting for ${label} to satisfy ${path} ${expr}"
+    fi
+    sleep 2
+  done
+}
+
+wait_kv_jq() {
+  local label="$1"
+  local addr="$2"
+  local token="$3"
+  local key_name="$4"
+  local expr="$5"
+  local timeout="${6:-120}"
+  local deadline=$(( $(date +%s) + timeout ))
+  local out=""
+
+  while true; do
+    if out="$(bao_for "$addr" "$token" kv get -format=json "kv/${key_name}" 2>/dev/null)" && jq -e "$expr" >/dev/null <<<"$out"; then
+      return 0
+    fi
+    if (( $(date +%s) >= deadline )); then
+      printf "%s\n" "$out" >&2
+      die "timed out waiting for ${label} to satisfy kv/${key_name} ${expr}"
+    fi
+    sleep 2
+  done
+}
+
+wait_namespace_lookup_jq() {
+  local label="$1"
+  local addr="$2"
+  local token="$3"
+  local ns_path="$4"
+  local expr="$5"
+  local timeout="${6:-120}"
+  local deadline=$(( $(date +%s) + timeout ))
+  local out=""
+
+  while true; do
+    if out="$(bao_for "$addr" "$token" namespace lookup -format=json "$ns_path" 2>/dev/null)" && jq -e "$expr" >/dev/null <<<"$out"; then
+      return 0
+    fi
+    if (( $(date +%s) >= deadline )); then
+      printf "%s\n" "$out" >&2
+      die "timed out waiting for ${label} namespace ${ns_path} to satisfy ${expr}"
+    fi
+    sleep 2
+  done
+}
+
+wait_namespace_kv_jq() {
+  local label="$1"
+  local addr="$2"
+  local token="$3"
+  local ns_path="$4"
+  local key_name="$5"
+  local expr="$6"
+  local timeout="${7:-120}"
+  local deadline=$(( $(date +%s) + timeout ))
+  local out=""
+
+  while true; do
+    if out="$(bao_for_ns "$addr" "$token" "$ns_path" kv get -format=json "kv/${key_name}" 2>/dev/null)" && jq -e "$expr" >/dev/null <<<"$out"; then
+      return 0
+    fi
+    if (( $(date +%s) >= deadline )); then
+      printf "%s\n" "$out" >&2
+      die "timed out waiting for ${label} namespace ${ns_path} to satisfy kv/${key_name} ${expr}"
+    fi
+    sleep 2
+  done
+}
+
+wait_token_self_lookup_jq() {
+  local label="$1"
+  local addr="$2"
+  local lookup_token="$3"
+  local expr="$4"
+  local timeout="${5:-120}"
+  local deadline=$(( $(date +%s) + timeout ))
+  local out=""
+
+  while true; do
+    if out="$(bao_for "$addr" "$lookup_token" token lookup -format=json 2>&1)" && jq -e "$expr" >/dev/null <<<"$out"; then
+      return 0
+    fi
+    if (( $(date +%s) >= deadline )); then
+      printf "%s\n" "$out" >&2
+      die "timed out waiting for ${label} token self lookup to satisfy ${expr}"
+    fi
+    sleep 2
+  done
+}
+
+cluster_active_addr() {
+  local addr status
+  for addr in "$@"; do
+    if status="$(status_json "$addr" 2>/dev/null)"; then
+      if jq -e '.sealed == false and (.is_self == true)' >/dev/null <<<"$status"; then
+        printf "%s\n" "$addr"
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
+wait_cluster_active_addr() {
+  local name="$1"
+  local timeout="$2"
+  shift 2
+  local deadline=$(( $(date +%s) + timeout ))
+  local active=""
+
+  while true; do
+    active="$(cluster_active_addr "$@" || true)"
+    if [[ -n "$active" ]]; then
+      printf "%s\n" "$active"
+      return 0
+    fi
+    if (( $(date +%s) >= deadline )); then
+      die "timed out waiting for ${name} active node"
+    fi
+    sleep 2
+  done
+}
+
+assert_secret_mount_present() {
+  local label="$1"
+  local addr="$2"
+  local token="$3"
+  local mount_path="$4"
+  local out
+
+  out="$(bao_for "$addr" "$token" secrets list -format=json)"
+  jq -e --arg path "${mount_path}/" 'has($path)' >/dev/null <<<"$out" || die "expected ${label} to have secret mount ${mount_path}/"
+}
+
+assert_auth_mount_present() {
+  local label="$1"
+  local addr="$2"
+  local token="$3"
+  local mount_path="$4"
+  local out
+
+  out="$(bao_for "$addr" "$token" auth list -format=json)"
+  jq -e --arg path "${mount_path}/" 'has($path)' >/dev/null <<<"$out" || die "expected ${label} to have auth mount ${mount_path}/"
+}
+
+assert_namespace_secret_mount_present() {
+  local label="$1"
+  local addr="$2"
+  local token="$3"
+  local ns_path="$4"
+  local mount_path="$5"
+  local out
+
+  out="$(bao_for_ns "$addr" "$token" "$ns_path" secrets list -format=json)"
+  jq -e --arg path "${mount_path}/" 'has($path)' >/dev/null <<<"$out" || die "expected ${label} namespace ${ns_path} to have secret mount ${mount_path}/"
+}
+
+assert_policy_contains() {
+  local label="$1"
+  local addr="$2"
+  local token="$3"
+  local policy_name="$4"
+  local expected="$5"
+  local out
+
+  out="$(bao_for "$addr" "$token" policy read "$policy_name")" || die "expected ${label} to read policy ${policy_name}"
+  grep -q "$expected" <<<"$out" || die "expected ${label} policy ${policy_name} to contain ${expected}"
 }
 
 cmd_up() {
@@ -526,6 +731,354 @@ cmd_verify() {
   verify_one "secondary2" "$DR_SECONDARY2_ADDR" "$run_dir" "$sample"
 }
 
+verify_engine_matrix_target() {
+  local label="$1"
+  local addr="$2"
+  local token="$3"
+  local run_id="$4"
+  local ns_path="$5"
+  local transit_path="$6"
+  local pki_path="$7"
+  local userpass_path="$8"
+  local approle_path="$9"
+  local policy_name="${10}"
+  local entity_id="${11}"
+  local group_id="${12}"
+  local alias_id="${13}"
+  local issued_serial="${14}"
+  local client_token="${15}"
+  local kv1_path="${16}"
+  local ssh_path="${17}"
+  local totp_path="${18}"
+  local database_path="${19}"
+  local cert_path="${20}"
+  local jwt_path="${21}"
+  local token_role="${22}"
+
+  echo "Verifying engine/runtime matrix on ${label}..."
+  assert_secret_mount_present "$label" "$addr" "$token" "kv"
+  assert_secret_mount_present "$label" "$addr" "$token" "$kv1_path"
+  assert_secret_mount_present "$label" "$addr" "$token" "$transit_path"
+  assert_secret_mount_present "$label" "$addr" "$token" "$pki_path"
+  assert_secret_mount_present "$label" "$addr" "$token" "$ssh_path"
+  assert_secret_mount_present "$label" "$addr" "$token" "$totp_path"
+  assert_secret_mount_present "$label" "$addr" "$token" "$database_path"
+  assert_auth_mount_present "$label" "$addr" "$token" "$userpass_path"
+  assert_auth_mount_present "$label" "$addr" "$token" "$approle_path"
+  assert_auth_mount_present "$label" "$addr" "$token" "$cert_path"
+  assert_auth_mount_present "$label" "$addr" "$token" "$jwt_path"
+  assert_policy_contains "$label" "$addr" "$token" "$policy_name" "$run_id"
+
+  wait_kv_jq "$label" "$addr" "$token" "${run_id}/app/config" '.data.data.app == "payments" and .data.data.region == "eu"'
+  wait_read_jq "$label" "$addr" "$token" "${kv1_path}/app/config" ".data.engine == \"kv-v1\" and .data.run_id == \"${run_id}\""
+  wait_namespace_lookup_jq "$label" "$addr" "$token" "$ns_path" ".data.path == \"${ns_path}/\" and .data.custom_metadata.run_id == \"${run_id}\""
+  assert_namespace_secret_mount_present "$label" "$addr" "$token" "$ns_path" "kv"
+  wait_namespace_kv_jq "$label" "$addr" "$token" "$ns_path" "app/config" ".data.data.scope == \"namespace\" and .data.data.run_id == \"${run_id}\""
+  wait_read_jq "$label" "$addr" "$token" "${transit_path}/keys/app-key" '.data.type == "aes256-gcm96"'
+  wait_read_jq "$label" "$addr" "$token" "${pki_path}/cert/ca" '.data.certificate != ""'
+  wait_read_jq "$label" "$addr" "$token" "${pki_path}/roles/app" '.data.allowed_domains | index("example.test")'
+  wait_read_jq "$label" "$addr" "$token" "${pki_path}/cert/${issued_serial}" '.data.certificate != ""'
+  wait_read_jq "$label" "$addr" "$token" "${ssh_path}/config/ca" '.data.public_key != ""'
+  wait_read_jq "$label" "$addr" "$token" "${ssh_path}/roles/app" '.data.key_type == "ca" and .data.default_user == "bao"'
+  wait_read_jq "$label" "$addr" "$token" "${totp_path}/keys/app" ".data.issuer == \"${run_id}\" and .data.account_name == \"app@example.com\""
+  wait_read_jq "$label" "$addr" "$token" "${database_path}/config/app" '.data.plugin_name == "postgresql-database-plugin" and (.data.allowed_roles | index("app"))'
+  wait_read_jq "$label" "$addr" "$token" "auth/${userpass_path}/users/alice" ".data.policies | index(\"${policy_name}\")"
+  wait_read_jq "$label" "$addr" "$token" "auth/${approle_path}/role/app/role-id" '.data.role_id != ""'
+  wait_read_jq "$label" "$addr" "$token" "auth/${cert_path}/certs/app" ".data.display_name == \"${run_id}-cert\" and .data.certificate != \"\""
+  wait_read_jq "$label" "$addr" "$token" "auth/${jwt_path}/config" '.data.jwt_validation_pubkeys[0] != ""'
+  wait_read_jq "$label" "$addr" "$token" "auth/${jwt_path}/role/app" '.data.role_type == "jwt" and (.data.bound_audiences | index("dr-engine"))'
+  wait_read_jq "$label" "$addr" "$token" "auth/token/roles/${token_role}" ".data.allowed_policies | index(\"${policy_name}\")"
+  wait_read_jq "$label" "$addr" "$token" "identity/entity/id/${entity_id}" ".data.policies | index(\"${policy_name}\")"
+  wait_read_jq "$label" "$addr" "$token" "identity/group/id/${group_id}" ".data.member_entity_ids | index(\"${entity_id}\")"
+  wait_read_jq "$label" "$addr" "$token" "identity/entity-alias/id/${alias_id}" ".data.canonical_id == \"${entity_id}\""
+  wait_token_self_lookup_jq "$label" "$addr" "$client_token" ".data.policies | index(\"${policy_name}\")"
+}
+
+cmd_engine_matrix() {
+  need_bin jq
+  load_env
+
+  local run_id run_dir ns_path kv1_path transit_path pki_path ssh_path totp_path database_path
+  local userpass_path approle_path cert_path jwt_path token_role policy_name
+  local policy_file jwt_pubkey plaintext ciphertext decrypted token_json client_token
+  local pki_json pki_ca_cert issued_serial auth_json entity_json entity_id alias_json alias_id group_json group_id userpass_accessor
+  local secondary1_verify_addr secondary2_verify_addr
+
+  run_id="engine-matrix-$(date -u +%Y%m%d%H%M%S)"
+  run_dir="${RESULTS_DIR}/${run_id}"
+  ns_path="ns-${run_id}"
+  kv1_path="kv1-${run_id}"
+  transit_path="transit-${run_id}"
+  pki_path="pki-${run_id}"
+  ssh_path="ssh-${run_id}"
+  totp_path="totp-${run_id}"
+  database_path="database-${run_id}"
+  userpass_path="userpass-${run_id}"
+  approle_path="approle-${run_id}"
+  cert_path="cert-${run_id}"
+  jwt_path="jwt-${run_id}"
+  token_role="token-${run_id}"
+  policy_name="dr-engine-${run_id}"
+  mkdir -p "$run_dir"
+
+  echo "Preparing engine/runtime matrix: ${run_id}"
+  ensure_kv_mount
+
+  echo "Seeding namespace state..."
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" namespace create -format=json \
+    -custom-metadata=run_id="$run_id" \
+    "$ns_path" >"${run_dir}/namespace.json"
+  bao_for_ns "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" "$ns_path" secrets enable -path=kv kv-v2 >/dev/null
+  bao_for_ns "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" "$ns_path" kv put "kv/app/config" \
+    scope=namespace \
+    app=payments \
+    run_id="$run_id" >/dev/null
+
+  policy_file="$(mktemp)"
+  printf 'path "kv/data/%s/*" {\n  capabilities = ["read"]\n}\npath "%s/*" {\n  capabilities = ["read"]\n}\n' "$run_id" "$transit_path" >"$policy_file"
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" policy write "$policy_name" "$policy_file" >/dev/null
+  rm -f "$policy_file"
+
+  echo "Seeding KV v2 data..."
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" kv put "kv/${run_id}/app/config" \
+    app=payments \
+    region=eu \
+    tier=prodlike \
+    run_id="$run_id" >/dev/null
+
+  echo "Seeding KV v1 data..."
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" secrets enable -path="$kv1_path" kv >/dev/null
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" write "${kv1_path}/app/config" \
+    engine=kv-v1 \
+    run_id="$run_id" >/dev/null
+
+  echo "Seeding transit key material..."
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" secrets enable -path="$transit_path" transit >/dev/null
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" write -f "${transit_path}/keys/app-key" >/dev/null
+  plaintext="$(printf 'dr-engine-matrix-%s' "$run_id" | base64)"
+  ciphertext="$(bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" write -format=json "${transit_path}/encrypt/app-key" plaintext="$plaintext" | jq -r '.data.ciphertext')"
+  decrypted="$(bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" write -format=json "${transit_path}/decrypt/app-key" ciphertext="$ciphertext" | jq -r '.data.plaintext')"
+  [[ "$decrypted" == "$plaintext" ]] || die "transit decrypt did not round-trip on primary"
+
+  echo "Seeding PKI config, role, and issued certificate..."
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" secrets enable -path="$pki_path" pki >/dev/null
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" secrets tune -max-lease-ttl=8760h "$pki_path" >/dev/null
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" write -format=json "${pki_path}/root/generate/internal" \
+    common_name="${run_id}.example.test" \
+    ttl=8760h >"${run_dir}/pki-root.json"
+  pki_ca_cert="$(jq -r '.data.certificate' "${run_dir}/pki-root.json")"
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" write "${pki_path}/roles/app" \
+    allowed_domains=example.test \
+    allow_subdomains=true \
+    max_ttl=72h >/dev/null
+  pki_json="$(bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" write -format=json "${pki_path}/issue/app" \
+    common_name="api.example.test" \
+    ttl=1h)"
+  printf "%s\n" "$pki_json" >"${run_dir}/pki-issued.json"
+  issued_serial="$(jq -r '.data.serial_number' <<<"$pki_json")"
+  [[ -n "$issued_serial" && "$issued_serial" != "null" ]] || die "PKI issue did not return a serial number"
+
+  echo "Seeding SSH, TOTP, and database secret engines..."
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" secrets enable -path="$ssh_path" ssh >/dev/null
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" write "${ssh_path}/config/ca" \
+    generate_signing_key=true \
+    key_type=ec >/dev/null
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" write "${ssh_path}/roles/app" \
+    key_type=ca \
+    allow_user_certificates=true \
+    allowed_users=bao \
+    default_user=bao \
+    ttl=30m >/dev/null
+
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" secrets enable -path="$totp_path" totp >/dev/null
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" write "${totp_path}/keys/app" \
+    generate=true \
+    exported=false \
+    issuer="$run_id" \
+    account_name=app@example.com \
+    period=30 \
+    algorithm=SHA1 \
+    digits=6 \
+    qr_size=0 >/dev/null
+
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" secrets enable -path="$database_path" database >/dev/null
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" write "${database_path}/config/app" \
+    plugin_name=postgresql-database-plugin \
+    connection_url='postgresql://{{username}}:{{password}}@localhost:5432/postgres?sslmode=disable' \
+    allowed_roles=app \
+    verify_connection=false >/dev/null
+
+  echo "Seeding userpass and AppRole auth mounts..."
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" auth enable -path="$userpass_path" userpass >/dev/null
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" write "auth/${userpass_path}/users/alice" \
+    password="correct-horse-${run_id}" \
+    policies="$policy_name" >/dev/null
+  auth_json="$(bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" write -format=json "auth/${userpass_path}/login/alice" password="correct-horse-${run_id}")"
+  printf "%s\n" "$auth_json" >"${run_dir}/userpass-login.json"
+
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" auth enable -path="$approle_path" approle >/dev/null
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" write "auth/${approle_path}/role/app" \
+    token_policies="$policy_name" \
+    token_ttl=1h >/dev/null
+
+  echo "Seeding cert, JWT, and token-role auth state..."
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" auth enable -path="$cert_path" cert >/dev/null
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" write "auth/${cert_path}/certs/app" \
+    display_name="${run_id}-cert" \
+    certificate="$pki_ca_cert" \
+    policies="$policy_name" >/dev/null
+
+  jwt_pubkey='-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEEVs/o5+uQbTjL3chynL4wXgUg2R9
+q9UU8I5mEovUf86QZ7kOBIjJwqnzD1omageEHWwHdBO6B+dFabmdT9POxg==
+-----END PUBLIC KEY-----'
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" auth enable -path="$jwt_path" jwt >/dev/null
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" write "auth/${jwt_path}/config" \
+    jwt_validation_pubkeys="$jwt_pubkey" >/dev/null
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" write "auth/${jwt_path}/role/app" \
+    role_type=jwt \
+    bound_audiences=dr-engine \
+    user_claim=sub \
+    policies="$policy_name" >/dev/null
+
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" write "auth/token/roles/${token_role}" \
+    allowed_policies="$policy_name" \
+    orphan=true \
+    token_ttl=1h >/dev/null
+
+  echo "Seeding token and identity state..."
+  token_json="$(bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" token create -format=json -policy="$policy_name" -ttl=1h)"
+  printf "%s\n" "$token_json" >"${run_dir}/token.json"
+  client_token="$(jq -r '.auth.client_token' <<<"$token_json")"
+  [[ -n "$client_token" && "$client_token" != "null" ]] || die "token create did not return a client token"
+
+  userpass_accessor="$(bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" auth list -format=json | jq -r --arg path "${userpass_path}/" '.[$path].accessor')"
+  [[ -n "$userpass_accessor" && "$userpass_accessor" != "null" ]] || die "could not find userpass accessor"
+  entity_json="$(bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" write -format=json identity/entity name="entity-${run_id}" policies="$policy_name")"
+  printf "%s\n" "$entity_json" >"${run_dir}/identity-entity.json"
+  entity_id="$(jq -r '.data.id' <<<"$entity_json")"
+  [[ -n "$entity_id" && "$entity_id" != "null" ]] || die "identity entity create did not return an ID"
+  alias_json="$(bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" write -format=json identity/entity-alias \
+    name="alice-${run_id}" \
+    canonical_id="$entity_id" \
+    mount_accessor="$userpass_accessor")"
+  printf "%s\n" "$alias_json" >"${run_dir}/identity-alias.json"
+  alias_id="$(jq -r '.data.id' <<<"$alias_json")"
+  [[ -n "$alias_id" && "$alias_id" != "null" ]] || die "identity alias create did not return an ID"
+  group_json="$(bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" write -format=json identity/group \
+    name="group-${run_id}" \
+    type=internal \
+    policies="$policy_name" \
+    member_entity_ids="$entity_id")"
+  printf "%s\n" "$group_json" >"${run_dir}/identity-group.json"
+  group_id="$(jq -r '.data.id' <<<"$group_json")"
+  [[ -n "$group_id" && "$group_id" != "null" ]] || die "identity group create did not return an ID"
+
+  wait_secondary_ready "secondary1" "$DR_SECONDARY1_ADDR" 180
+  wait_secondary_ready "secondary2" "$DR_SECONDARY2_ADDR" 180
+  secondary1_verify_addr="$(wait_cluster_active_addr "secondary1" 120 "${SECONDARY1_NODE_ADDRS[@]}")"
+  secondary2_verify_addr="$(wait_cluster_active_addr "secondary2" 120 "${SECONDARY2_NODE_ADDRS[@]}")"
+
+  verify_engine_matrix_target "primary" "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" "$run_id" "$ns_path" "$transit_path" "$pki_path" "$userpass_path" "$approle_path" "$policy_name" "$entity_id" "$group_id" "$alias_id" "$issued_serial" "$client_token" "$kv1_path" "$ssh_path" "$totp_path" "$database_path" "$cert_path" "$jwt_path" "$token_role"
+  verify_engine_matrix_target "secondary1" "$secondary1_verify_addr" "$DR_PRIMARY_TOKEN" "$run_id" "$ns_path" "$transit_path" "$pki_path" "$userpass_path" "$approle_path" "$policy_name" "$entity_id" "$group_id" "$alias_id" "$issued_serial" "$client_token" "$kv1_path" "$ssh_path" "$totp_path" "$database_path" "$cert_path" "$jwt_path" "$token_role"
+  verify_engine_matrix_target "secondary2" "$secondary2_verify_addr" "$DR_PRIMARY_TOKEN" "$run_id" "$ns_path" "$transit_path" "$pki_path" "$userpass_path" "$approle_path" "$policy_name" "$entity_id" "$group_id" "$alias_id" "$issued_serial" "$client_token" "$kv1_path" "$ssh_path" "$totp_path" "$database_path" "$cert_path" "$jwt_path" "$token_role"
+
+  jq -n \
+    --arg run_id "$run_id" \
+    --arg ns_path "$ns_path" \
+    --arg kv1_path "$kv1_path" \
+    --arg transit_path "$transit_path" \
+    --arg pki_path "$pki_path" \
+    --arg ssh_path "$ssh_path" \
+    --arg totp_path "$totp_path" \
+    --arg database_path "$database_path" \
+    --arg userpass_path "$userpass_path" \
+    --arg approle_path "$approle_path" \
+    --arg cert_path "$cert_path" \
+    --arg jwt_path "$jwt_path" \
+    --arg token_role "$token_role" \
+    --arg policy_name "$policy_name" \
+    --arg entity_id "$entity_id" \
+    --arg group_id "$group_id" \
+    --arg alias_id "$alias_id" \
+    --arg issued_serial "$issued_serial" \
+    '{run_id:$run_id,result:"pass",coverage:{namespaces:[$ns_path],secret_engines:["kv-v2",$kv1_path,$transit_path,$pki_path,$ssh_path,$totp_path,$database_path],auth_engines:[$userpass_path,$approle_path,$cert_path,$jwt_path],token_roles:[$token_role],policy:$policy_name,identity:{entity_id:$entity_id,group_id:$group_id,alias_id:$alias_id},pki_issued_serial:$issued_serial}}' >"${run_dir}/engine-matrix-summary.json"
+
+  ENGINE_MATRIX_LAST_RUN_DIR="$run_dir"
+  echo "Engine/runtime matrix passed."
+  echo "Run dir: ${run_dir}"
+}
+
+verify_engine_matrix_run_dir() {
+  local label="$1"
+  local addr="$2"
+  local token="$3"
+  local run_dir="$4"
+  local summary="${run_dir}/engine-matrix-summary.json"
+  local token_file="${run_dir}/token.json"
+  local run_id ns_path kv1_path transit_path pki_path ssh_path totp_path database_path
+  local userpass_path approle_path cert_path jwt_path token_role policy_name
+  local entity_id group_id alias_id issued_serial client_token
+
+  [[ -s "$summary" ]] || die "missing engine matrix summary: ${summary}"
+  [[ -s "$token_file" ]] || die "missing engine matrix token file: ${token_file}"
+
+  run_id="$(jq -r '.run_id' "$summary")"
+  ns_path="$(jq -r '.coverage.namespaces[0]' "$summary")"
+  kv1_path="$(jq -r '.coverage.secret_engines[] | select(startswith("kv1-"))' "$summary")"
+  transit_path="$(jq -r '.coverage.secret_engines[] | select(startswith("transit-"))' "$summary")"
+  pki_path="$(jq -r '.coverage.secret_engines[] | select(startswith("pki-"))' "$summary")"
+  ssh_path="$(jq -r '.coverage.secret_engines[] | select(startswith("ssh-"))' "$summary")"
+  totp_path="$(jq -r '.coverage.secret_engines[] | select(startswith("totp-"))' "$summary")"
+  database_path="$(jq -r '.coverage.secret_engines[] | select(startswith("database-"))' "$summary")"
+  userpass_path="$(jq -r '.coverage.auth_engines[] | select(startswith("userpass-"))' "$summary")"
+  approle_path="$(jq -r '.coverage.auth_engines[] | select(startswith("approle-"))' "$summary")"
+  cert_path="$(jq -r '.coverage.auth_engines[] | select(startswith("cert-"))' "$summary")"
+  jwt_path="$(jq -r '.coverage.auth_engines[] | select(startswith("jwt-"))' "$summary")"
+  token_role="$(jq -r '.coverage.token_roles[0]' "$summary")"
+  policy_name="$(jq -r '.coverage.policy' "$summary")"
+  entity_id="$(jq -r '.coverage.identity.entity_id' "$summary")"
+  group_id="$(jq -r '.coverage.identity.group_id' "$summary")"
+  alias_id="$(jq -r '.coverage.identity.alias_id' "$summary")"
+  issued_serial="$(jq -r '.coverage.pki_issued_serial' "$summary")"
+  client_token="$(jq -r '.auth.client_token' "$token_file")"
+
+  verify_engine_matrix_target "$label" "$addr" "$token" "$run_id" "$ns_path" "$transit_path" "$pki_path" "$userpass_path" "$approle_path" "$policy_name" "$entity_id" "$group_id" "$alias_id" "$issued_serial" "$client_token" "$kv1_path" "$ssh_path" "$totp_path" "$database_path" "$cert_path" "$jwt_path" "$token_role"
+}
+
+cmd_engine_lifecycle_matrix() {
+  [[ "$TOPOLOGY" == "ha" ]] || die "engine-lifecycle-matrix requires --topology ha"
+  need_bin jq
+  load_env
+
+  local run_dir promoted_addr secondary2_verify_addr lifecycle_summary
+
+  echo "Running pre-failover engine/runtime matrix..."
+  cmd_engine_matrix
+  run_dir="${ENGINE_MATRIX_LAST_RUN_DIR:-}"
+  [[ -n "$run_dir" && -d "$run_dir" ]] || die "engine matrix did not record a run directory"
+
+  echo "Running failover smoke before promoted-cluster engine verification..."
+  cmd_failover_smoke
+  promoted_addr="$(wait_secondary1_active_addr 120)"
+  verify_engine_matrix_run_dir "promoted secondary1" "$promoted_addr" "$DR_PRIMARY_TOKEN" "$run_dir"
+
+  echo "Running explicit secondary2 reseed before promoted-lineage engine verification..."
+  cmd_reseed_secondary_smoke
+  secondary2_verify_addr="$(wait_cluster_active_addr "secondary2" 120 "${SECONDARY2_NODE_ADDRS[@]}")"
+  verify_engine_matrix_run_dir "secondary2 promoted lineage" "$secondary2_verify_addr" "$DR_PRIMARY_TOKEN" "$run_dir"
+
+  lifecycle_summary="${run_dir}/engine-lifecycle-summary.json"
+  jq -n \
+    --arg run_dir "$run_dir" \
+    --arg result "pass" \
+    '{run_dir:$run_dir,result:$result,checks:["pre_failover_primary_and_secondaries","promoted_secondary1_after_failover","secondary2_after_promoted_reseed"]}' >"$lifecycle_summary"
+
+  echo "Engine/runtime lifecycle matrix passed."
+  echo "Run dir: ${run_dir}"
+  echo "Lifecycle summary: ${lifecycle_summary}"
+}
+
 ensure_kv_mount_on() {
   local addr="$1"
   local token="$2"
@@ -599,16 +1152,7 @@ print_key_presence() {
 }
 
 secondary1_active_addr() {
-  local addr status
-  for addr in "${SECONDARY1_NODE_ADDRS[@]}"; do
-    if status="$(status_json "$addr" 2>/dev/null)"; then
-      if jq -e '.sealed == false and (.is_self == true)' >/dev/null <<<"$status"; then
-        printf "%s\n" "$addr"
-        return 0
-      fi
-    fi
-  done
-  return 1
+  cluster_active_addr "${SECONDARY1_NODE_ADDRS[@]}"
 }
 
 wait_secondary1_active_addr() {
@@ -1244,6 +1788,8 @@ main() {
     status) cmd_status "$@" ;;
     smoke) cmd_smoke "$@" ;;
     verify) cmd_verify "$@" ;;
+    engine-matrix) cmd_engine_matrix "$@" ;;
+    engine-lifecycle-matrix) cmd_engine_lifecycle_matrix "$@" ;;
     failover-smoke) cmd_failover_smoke "$@" ;;
     promoted-durability-smoke) cmd_promoted_durability_smoke "$@" ;;
     reseed-secondary-smoke) cmd_reseed_secondary_smoke "$@" ;;

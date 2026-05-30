@@ -6,8 +6,9 @@ description: |-
 
 # Native cross-cluster DR replication
 
-**Status**: draft, proof-of-concept under active security, correctness, and HA
-validation.
+**Status**: draft, local engineering prototype with correctness, HA, failover,
+and P0 security validation. Resource limits, upgrade behavior, dependency-backed
+engine parity, and operator UX remain under hardening.
 
 ## Summary
 
@@ -22,12 +23,18 @@ The design is intentionally fail-closed:
 - Bootstrap never transfers the root key in plaintext.
 - Reconciliation is bound to immutable checkpoint tuples.
 - Fetched range contents must prove completeness before deletes are inferred.
+- Replicated runtime state, including namespaces and mount/auth metadata, is
+  refreshed from the replicated storage view before it is exposed on a
+  secondary.
 - A secondary only advances `lastAppliedIndex` after every required apply and
   delete phase succeeds.
 
-This RFC reflects the current PoC direction after stress-test hardening. It
-does not treat dirty bitmaps, stream replay, or partial range fetches as
-authoritative unless their coverage and completeness are proven.
+This RFC reflects the current local prototype after stress-test and security
+hardening. The implementation has exercised streaming, checkpoint-fenced
+reconciliation, forced failover, promoted-authority reseed, certificate
+rotation, revocation, runtime-state refresh, and self-contained engine/runtime
+parity. It still treats dirty bitmaps, stream replay, and partial range fetches
+as non-authoritative unless their coverage and completeness are proven.
 
 ## Problem statement
 
@@ -72,6 +79,11 @@ old primary cannot automatically rejoin or merge. If the secondary is not known
 to be fully caught up, promotion must require an explicit data-loss
 acknowledgement.
 
+Secondaries that were not promoted do not automatically follow the promoted
+cluster. They remain tied to the old relationship lineage until an operator
+explicitly re-enables or reseeds them from a fresh activation token issued by
+the promoted authority.
+
 ## Goals
 
 1. Provide native DR replication across independent OpenBao clusters.
@@ -82,16 +94,21 @@ acknowledgement.
    failures.
 6. Avoid plaintext root-key transfer during bootstrap.
 7. Keep replicated data in the ciphertext storage domain.
-8. Preserve local-only cluster state such as seal configuration and DR
-   relationship configuration.
-9. Provide explicit promotion semantics for disaster recovery failover.
-10. Provide failover guardrails that make split-brain and data-loss risks
+8. Replicate and refresh the runtime metadata required to make the replicated
+   dataset usable, including mount tables, auth tables, audit tables,
+   namespaces, policies, identity state, and route-backed backend caches.
+9. Preserve local-only cluster state such as seal configuration, local cluster
+   identity, HA coordination state, and DR relationship configuration.
+10. Provide explicit promotion semantics for disaster recovery failover.
+11. Provide failover guardrails that make split-brain and data-loss risks
     explicit to operators.
 
 ## Non-goals
 
 1. Active-active writes across clusters.
-2. Tenant or namespace-level keyspace partitioning.
+2. Selective tenant or namespace-level replication. Namespace state is
+   replicated as part of whole-cluster DR, but per-namespace inclusion,
+   exclusion, or independent failover is out of scope.
 3. Compatibility with any legacy DR protocol.
 4. Storage-layer replication outside OpenBao.
 5. Merkle tree persistence as the primary reconciliation strategy.
@@ -101,6 +118,10 @@ acknowledgement.
    promoted secondary accept writes.
 8. Automatic failback to the former primary. Failback is modeled as a new DR
    relationship or rebuild from the promoted authority.
+9. Transparent client traffic routing, old-primary isolation, or load-balancer
+   failover. Those are operational controls around the DR protocol.
+10. Running every dependency-backed auth or secrets engine in the default local
+    test profile. Dependency-backed engines need opt-in topology profiles.
 
 ## Technical description
 
@@ -116,6 +137,11 @@ metadata, range digests, and checkpoint-fenced entry fetches.
 Each secondary cluster is an independent OpenBao cluster with its own storage,
 seal, Raft state, and cluster identity. Secondary mode makes replicated data
 read-only to clients while allowing DR control operations.
+
+The repo-local validation topology exercises both single-node and HA clusters.
+The HA profile connects DR endpoints directly to node addresses rather than
+through a proxy or load balancer, so proxy behavior remains an operational
+deployment concern outside the protocol.
 
 ```mermaid
 graph TD
@@ -151,11 +177,16 @@ The relationship lifecycle is:
 5. Secondary registers its certificate with the primary HTTP API using the
    activation token's single-use bootstrap token.
 6. Secondary connects to the primary over DR mTLS and performs keyring
-   bootstrap through `SyncKeyring`.
+   bootstrap through `SyncKeyring`; successful keyring sync is the
+   linearization point from registered relationship to active relationship.
 7. Primary authorizes every DR RPC against the relationship record and the
    mTLS peer certificate.
 8. Operator can revoke the relationship, which denies further RPCs and
    terminates matching streams.
+9. After promotion, any later relationship to the promoted authority is a new
+   lineage. Old-primary activation tokens, old relationship IDs, and stale
+   secondary certificate fingerprints must not revive the pre-promotion
+   relationship.
 
 ### Bootstrap
 
@@ -234,8 +265,8 @@ registered once with the primary through the bootstrap endpoint, and then used
 for mTLS on every DR RPC. The primary binds authorization to the registered
 certificate fingerprint and the relationship record.
 
-This PoC does not silently renew secondary relationship credentials. Healthy
-relationships can use a first-class two-phase rotation protocol: stage a new
+The design does not silently renew secondary relationship credentials. Healthy
+relationships use a first-class two-phase rotation protocol: stage a new
 secondary certificate with a request signed by the current relationship
 credential, trust both current and pending certificates while the rotation is
 pending, then finalize with a request signed by the pending credential. Final
@@ -258,13 +289,64 @@ Fetched values and streamed values are stored as encrypted physical entries.
 This avoids decrypting secrets for replication and preserves storage-level
 representation.
 
+The replicated domain includes the storage-backed runtime state needed for a
+secondary to make the copied dataset usable after bootstrap, reconnect,
+reconcile, promotion, or reseed:
+
+- mount, auth, and audit tables
+- namespace records and namespace-scoped mount/auth entries
+- ACL policy state
+- identity entities, groups, aliases, and identity mount metadata
+- route-backed backend storage, such as PKI and transit metadata
+
+Audit tables are replicated because they are storage-backed runtime
+configuration. Audit device validation is topology-dependent, however: the
+secondary can only validate a replicated audit device if the corresponding sink
+or file path exists in that cluster. The default self-contained validation
+matrix therefore treats audit parity as a topology-specific profile rather than
+an API-driven engine check.
+
 Some paths are cluster-local and must not be replicated. Examples include local
 seal configuration, local root-key wrapping state, local mount/auth/audit tables
-when they represent secondary-local configuration, cluster identity, DR
+when they represent secondary-local configuration, local cluster identity, DR
 relationship configuration, and leadership coordination locks.
 
 The implementation must centralize these exclusions and apply them consistently
 to stream apply, fetched entry apply, and inferred deletes.
+
+### Runtime state refresh
+
+Replicated physical writes alone are not sufficient for correctness. OpenBao
+also has in-memory route tables, namespace stores, identity stores, and backend
+caches that normally update through local write paths. DR secondaries apply
+replicated mutations below those local paths, so stream apply and reconciliation
+must refresh affected runtime state after the storage commit.
+
+Runtime refresh treats mount, auth, audit, namespace, identity, and
+route-backed backend paths as triggers. The normative refresh order is:
+namespace store first, mount and auth tables second, identity route and
+identity store artifacts third, and route-backed cache invalidation last. This
+order lets namespace-scoped routes resolve their namespace before mount or
+identity reload work depends on them.
+
+The refresh protects root-local singleton routes such as root `sys/`, root
+`token/`, and cubbyhole, while still mounting namespace-scoped singleton routes
+such as namespace `sys/`, namespace `token/`, and namespace `identity/` because
+those are required for replicated namespaces to function.
+
+Identity is replicated DR state even though it is a singleton mount type. The
+secondary refresh remounts the identity route from the replicated mount table
+when the router still points at the old local UUID/accessor, and reconnects
+`core.identityStore` to the replicated identity backend. After namespace and
+route refresh, the secondary resets the identity store's in-memory artifacts and
+reloads entities, groups, aliases, and OIDC clients from replicated storage in
+read-only mode.
+
+Route-backed backends can cache storage reads. DR apply therefore invalidates
+affected route-backed keys after replicated storage commits. This is separate
+from runtime-state refresh: namespace records are refreshed through the
+namespace store and must not be sent through generic invalidation because that
+can collide with already-mounted namespace singleton routes.
 
 ### Streaming mode
 
@@ -278,9 +360,14 @@ The stream supports reconnect. If the primary can replay from the secondary's
 last applied index, the secondary resumes streaming. If replay is unavailable
 or a gap is detected, the secondary enters reconciliation.
 
-The PoC includes an in-memory stream buffer and disk-backed stream journal.
+The current prototype includes an in-memory stream buffer and disk-backed stream
+journal.
 The design intent is that journal replay extends the reconnect horizon and
 survives primary-node restarts and leader changes.
+
+Final replay-horizon sizing, retention defaults, and backpressure behavior are
+resource-policy decisions and remain separate from the correctness rule that a
+secondary must reconcile when replay coverage cannot be proven.
 
 ### Checkpoints
 
@@ -410,7 +497,7 @@ The required invariant is:
 > `lastAppliedIndex` must not advance for a checkpoint unless range selection
 > is complete for that checkpoint.
 
-The current PoC implements the conservative design: every checkpoint
+The current prototype implements the conservative design: every checkpoint
 reconciliation verifies the complete top-level range partition before it can
 advance. Dirty bitmaps are accepted only as ordering hints. Bitmap-marked
 ranges are checked first, then every unmarked top-level range is checked in a
@@ -443,6 +530,10 @@ and fail-closed apply semantics.
 Fallback is a recovery mechanism, not a way to bypass reconciliation proofs.
 It should be triggered by explicit operator action or by configured convergence
 policy after repeated bounded failures.
+
+The current implementation has operator-triggered resnapshot API wiring and
+proof validation, but resnapshot has not been exercised as deeply as normal
+streaming, checkpoint reconciliation, promotion, and promoted-authority reseed.
 
 ### Failover and promotion
 
@@ -552,7 +643,7 @@ The promotion lineage record should include:
 
 ### API surface
 
-The expected HTTP API shape is:
+The intended HTTP API shape is:
 
 - `sys/replication/dr/primary/enable`
 - `sys/replication/dr/primary/disable`
@@ -690,6 +781,8 @@ The protocol needs bounded resource use:
 - max split depth
 - max split count
 - batch sizes for fetched puts and deletes
+- byte limits for `FetchEntries` response batches, including fail-closed
+  handling for a single entry that cannot fit in one response batch
 - bounded stream apply queues
 - primary-side backpressure when secondaries cannot converge
 - unauthenticated bootstrap and credential-rotation endpoints perform only
@@ -700,6 +793,13 @@ The protocol needs bounded resource use:
 
 Budget exhaustion is a reconciliation failure unless an operator explicitly
 chooses a fallback path.
+
+The current prototype has bounds on the unauthenticated bootstrap and rotation
+paths, checkpoint fetch response batches, and secondary reconciliation fetch
+accounting, with targeted tests for those gates. Production readiness still
+requires final defaults, sustained-abuse testing, and tuning guidance for
+checkpoint retention, stream journal retention, digest split limits, fetch
+batch byte limits, and primary-side backpressure.
 
 ### Observability
 
@@ -737,6 +837,10 @@ Metrics should make it possible to distinguish:
 - apply failures
 - budget failures
 - delete safety failures
+
+The current prototype exposes enough state for local validation and debugging.
+Final operator dashboards, alert thresholds, and runbook wording remain product
+and operations work.
 
 ## Rationale and alternatives
 
@@ -870,6 +974,11 @@ This design adds a substantial protocol surface and correctness burden.
 Checkpoint artifacts, range descriptors, stream journals, and proof validation
 all require careful resource management.
 
+Runtime-state refresh is a first-class source of complexity. Correct DR is not
+only physical storage convergence: namespaces, mount tables, auth tables,
+identity artifacts, route-backed backends, and backend caches must observe the
+replicated storage view without overwriting protected local cluster state.
+
 Mandatory drill-down means older or partially implemented primaries cannot be
 used for reconciliation. That is acceptable for a greenfield feature but makes
 rolling upgrades a future design topic.
@@ -891,6 +1000,12 @@ site-rebuild decisions into operational runbooks.
 The design improves security by avoiding plaintext root-key transfer, requiring
 mTLS, binding every RPC to a relationship, and failing closed on revoked
 relationships or checkpoint mismatches.
+
+Several P0 security invariants have targeted prototype tests, including
+bootstrap single-use behavior, unauthenticated endpoint error oracles,
+certificate rotation, gRPC relationship authorization, `SyncKeyring` binding,
+revocation, and stale promotion-lineage rejection. This RFC is still not a
+substitute for independent security review or sustained abuse testing.
 
 ### Trust model
 
@@ -930,6 +1045,7 @@ The most sensitive assets are:
 - DR transport CA private keys and trust anchors
 - relationship records, certificate fingerprints, and revocation state
 - checkpoint artifacts and provenance metadata
+- namespace metadata and namespace-scoped mount/auth state
 - local-only storage paths, including seal state, root-key wrapping state,
   cluster identity, DR configuration, and HA coordination state
 - promotion lineage records
@@ -1040,7 +1156,9 @@ delete local data based on incomplete or unproven primary output.
 Local-only paths must be excluded consistently from stream apply, fetched entry
 apply, and inferred deletes. Replication must not overwrite or delete local
 seal state, local root-key wrapping state, DR relationship configuration,
-cluster identity, or HA coordination state.
+cluster identity, or HA coordination state. Namespace metadata and
+namespace-scoped runtime routes are replicated state, but root-local singleton
+routes and local mount/auth/audit paths remain protected.
 
 Promotion must be a security boundary. A promoted cluster must not accept
 activation tokens, certificates, or relationship state from the pre-promotion
@@ -1103,6 +1221,12 @@ Developers get a protocol with explicit phases and failure classes. Tests can
 target each invariant independently: authz, checkpoint tuple binding, digest
 coverage, fetch proof validation, delete safety, stream replay, and promotion.
 
+The repo-local Docker topology and `scripts/dr_local_test.sh` harness are now
+part of the development workflow. The default profile favors self-contained
+engines and deterministic HA/failover validation. Engines that require external
+services, audit sinks, or infrastructure-specific credentials should live in
+opt-in profiles so the baseline matrix remains reliable on developer machines.
+
 ## Unresolved questions
 
 1. What are the final retention defaults for checkpoint artifacts and stream
@@ -1117,16 +1241,25 @@ coverage, fetch proof validation, delete safety, stream replay, and promotion.
    data-loss acknowledgement, and estimate-basis wording?
 6. What availability guarantees should the feature target during HA active
    handoff while a primary is under sustained DR backlog pressure?
+7. Which dependency-backed auth and secrets engines belong in mandatory release
+   validation, and which should remain opt-in topology profiles?
+8. What declarative audit-device topology should the local harness support so
+   replicated audit tables can be validated without relying on environment-local
+   sink paths?
+9. What production defaults should be used for digest split depth, fetch batch
+   sizes, checkpoint retention, stream journal retention, and primary-side
+   backpressure?
 
 ## Related issues
 
-This RFC is currently local to the PoC branch. Before upstream submission it
-should reference any OpenBao issue or discussion used to track native DR
-replication.
+This RFC is currently local to the prototype branch. If this work is ever
+recreated for an upstream contribution path, it should reference the OpenBao
+issue or discussion used to track native DR replication and should not treat
+local prototype commits as directly upstreamable work.
 
-## Proof of concept
+## Implementation status
 
-The PoC currently includes:
+The current local prototype includes:
 
 - relationship manager and DR mode state
 - activation token flow
@@ -1158,17 +1291,35 @@ The PoC currently includes:
 - stop/promotion cancellation of reconcile contexts
 - repo-local single-node and HA Docker test topology
 - explicit promoted-authority reseed flow for non-promoted secondaries
+- replicated runtime refresh for mount/auth/audit tables, namespaces, and
+  identity routes
+- route-backed backend cache invalidation after DR-applied storage writes
+- `FetchEntries` response byte budgeting and fetched-value byte accounting in
+  secondary reconciliation
+- namespace lifecycle validation across initial replication, promotion, and
+  promoted-authority reseed
+- self-contained engine/runtime parity validation for KV v2, KV v1, transit,
+  PKI, SSH, TOTP, database config, userpass, AppRole, cert auth, JWT auth,
+  token roles, policies, namespaces, service tokens, and identity artifacts
 
-The PoC is still under hardening, but recent validation produced a strong
+The prototype is still under hardening, but recent validation produced a strong
 data-correctness signal across sustained writes, stream buffer pressure,
 reconciliation, active handoff, failover under load, promotion durability, and
 explicit secondary reseed. A repo-local HA lifecycle rerun on 2026-05-30 passed
-against a rebuilt image: `reset --build`, forced failover smoke, promoted-cluster
-restart and active-handoff durability smoke, and explicit secondary reseed from
-the promoted authority. The main known gap is availability during primary HA
-active handoff under sustained write and DR backlog pressure; stress runs
-observed transient client-visible errors even when final replicated data
-converged.
+against a rebuilt image and clean HA reset: forced failover smoke,
+promoted-cluster restart and active-handoff durability smoke, and explicit
+secondary reseed from the promoted authority. A later engine/runtime lifecycle
+matrix on 2026-05-30 verified namespace metadata, namespace-scoped KV v2, root
+KV v2, KV v1, transit, PKI, SSH, TOTP, database config, userpass, AppRole, cert
+auth, JWT auth, token roles, ACL policy, service-token lookup, and identity
+state before failover, after promotion, and after promoted-authority reseed.
+
+The main known gap is availability during primary HA active handoff under
+sustained write and DR backlog pressure; stress runs observed transient
+client-visible errors even when final replicated data converged. Remaining
+prototype-hardening work also includes sustained resource-exhaustion testing,
+rolling-upgrade behavior, dependency-backed engine profiles, audit topology
+validation, and final operator-facing observability.
 
 ## Test plan
 
@@ -1198,8 +1349,22 @@ Tests should cover the following groups:
 - promotion durability across promoted-cluster restart
 - stale old-primary activation token rejection after promoted-cluster restart
 - explicit secondary reseed from the promoted authority
+- replicated namespace records and namespace-scoped singleton routes
+- route-backed backend cache invalidation for DR-applied storage writes
+- identity route replacement from replicated runtime state
+- identity artifact reload from replicated storage after runtime refresh
+- engine/runtime lifecycle validation before failover, after promotion, and
+  after promoted-authority reseed
+- opt-in dependency-backed parity profiles for engines that need external
+  services, such as LDAP, Kubernetes, RADIUS, Kerberos, RabbitMQ, and live
+  database credential issuance
 - dirty bitmap false-negative behavior
 - stress convergence under sustained writes
+
+The default repo-local matrix should remain self-contained and deterministic.
+Dependency-backed engine parity, audit sink validation, longer chaos runs, and
+rolling-upgrade validation should be separate profiles so failures identify a
+specific external dependency or topology assumption.
 
 The local test matrix is tracked in `DR_TEST_MATRIX.md`. Current validation
 results are summarized in `DR_VALIDATION_RESULTS.md`.

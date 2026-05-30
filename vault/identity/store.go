@@ -169,6 +169,14 @@ func (i *IdentityStore) AddNamespaceView(la LoggerAdder, ns *namespace.Namespace
 	return nil
 }
 
+func (i *IdentityStore) HasNamespaceView(ns *namespace.Namespace) bool {
+	if ns == nil {
+		return false
+	}
+	_, ok := i.views.Load(ns.UUID)
+	return ok
+}
+
 func (i *IdentityStore) RemoveNamespaceView(ns *namespace.Namespace) error {
 	if ns.ID == namespace.RootNamespaceID {
 		return fmt.Errorf("refusing to remove root namespace from identity store")

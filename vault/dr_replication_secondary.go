@@ -1014,9 +1014,10 @@ func (s *drReplicationSecondary) Promote() error {
 // reloadCoreState reloads the critical in-memory subsystems from storage.
 // The storage now contains the primary's replicated mount/auth tables, but
 // the live router may still reflect an older secondary view. Avoid a full
-// router reset because singleton mounts such as sys/, identity/, cubbyhole/,
-// and token/ are process-local runtime state. Instead, reconcile non-singleton
-// secret and auth routes against the replicated tables.
+// router reset because singleton mounts such as sys/, cubbyhole/, and token/
+// are process-local runtime state. Identity is the exception: its storage is
+// replicated DR state, so the route must be reconciled to the primary's mount
+// UUID/accessor.
 func (s *drReplicationSecondary) reloadCoreState(ctx context.Context) error {
 	// Purge physical cache first to ensure all reads go to storage.
 	if s.core.physicalCache != nil {
@@ -1030,6 +1031,13 @@ func (s *drReplicationSecondary) reloadCoreState(ctx context.Context) error {
 
 	oldMounts := cloneDRMountTable(s.core.mounts)
 	oldAuth := cloneDRMountTable(s.core.auth)
+
+	// Namespaces are replicated DR runtime state. Reload them before mount/auth
+	// tables so namespace-scoped mount entries can resolve their namespace.
+	s.logger.Info("reloading namespace store from storage")
+	if err := s.core.setupNamespaceStore(ctx); err != nil {
+		return fmt.Errorf("failed to reload namespaces: %w", err)
+	}
 
 	// Load the primary's mount table from storage. This replaces the
 	// in-memory mount table but doesn't touch the router or backends.
@@ -1060,7 +1068,43 @@ func (s *drReplicationSecondary) reloadCoreState(ctx context.Context) error {
 		return fmt.Errorf("failed to mount new auth backends: %w", err)
 	}
 
+	if err := s.reloadIdentityStoreArtifacts(ctx); err != nil {
+		return err
+	}
+
 	s.logger.Info("core state reloaded from storage")
+	return nil
+}
+
+func (s *drReplicationSecondary) reloadIdentityStoreArtifacts(ctx context.Context) error {
+	if s.core.identityStore == nil {
+		return nil
+	}
+
+	// Identity artifacts are stored in replicated storage but cached in the
+	// identity store's per-namespace memdb. A reseeded secondary can otherwise
+	// have the correct identity route and durable entries while serving stale or
+	// empty in-memory identity state.
+	s.logger.Info("reloading identity store artifacts from storage")
+	namespaces, err := s.core.ListNamespaces(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to list namespaces for identity reload: %w", err)
+	}
+	for _, ns := range namespaces {
+		if ns.ID == namespace.RootNamespaceID || s.core.identityStore.HasNamespaceView(ns) {
+			continue
+		}
+		if err := s.core.identityStore.AddNamespaceView(s.core, ns, s.core.NamespaceView(ns)); err != nil {
+			return fmt.Errorf("failed to register namespace %q to identity store: %w", ns.Path, err)
+		}
+	}
+	if err := s.core.identityStore.ResetDB(ctx); err != nil {
+		return fmt.Errorf("failed to reset identity store artifacts: %w", err)
+	}
+	if err := s.core.loadIdentityStoreArtifacts(ctx, true); err != nil {
+		return fmt.Errorf("failed to reload identity store artifacts: %w", err)
+	}
+
 	return nil
 }
 
@@ -1097,6 +1141,8 @@ func isDRRuntimeStatePath(path string) bool {
 
 	for _, candidate := range candidates {
 		switch {
+		case candidate == namespaceStoreSubPath || strings.HasPrefix(candidate, namespaceStoreSubPath):
+			return true
 		case candidate == coreMountConfigPath || strings.HasPrefix(candidate, coreMountConfigPath+"/"):
 			return true
 		case candidate == coreAuthConfigPath || strings.HasPrefix(candidate, coreAuthConfigPath+"/"):
@@ -1135,6 +1181,22 @@ func isDRRuntimeRouterProtectedEntry(entry *routing.MountEntry) bool {
 		}
 	}
 	return false
+}
+
+func isDRRuntimeRefreshProtectedEntry(entry *routing.MountEntry) bool {
+	if entry == nil {
+		return true
+	}
+	if entry.Type == routing.MountTypeIdentity || entry.Type == routing.MountTypeNSIdentity {
+		return false
+	}
+	if entry.NamespaceID != "" && entry.NamespaceID != namespace.RootNamespaceID {
+		return entry.Local
+	}
+	if entry.Namespace != nil && entry.Namespace.ID != namespace.RootNamespaceID {
+		return entry.Local
+	}
+	return isDRRuntimeRouterProtectedEntry(entry)
 }
 
 func isSingletonMountType(mountType string) bool {
@@ -1184,7 +1246,7 @@ func (s *drReplicationSecondary) unmountStaleRouterEntries(ctx context.Context, 
 	}
 	current := drMountAccessors(newTable)
 	for _, entry := range oldTable.Entries {
-		if isDRRuntimeRouterProtectedEntry(entry) {
+		if isDRRuntimeRefreshProtectedEntry(entry) {
 			continue
 		}
 		if _, ok := current[entry.Accessor]; ok {
@@ -1213,20 +1275,31 @@ func (s *drReplicationSecondary) unmountStaleRouterEntries(ctx context.Context, 
 
 // mountNewEntries iterates the loaded mount table and initializes
 // backends for any mount entries not already present in the router.
-// Existing mounts (sys/, identity/, cubbyhole/) are left untouched.
+// Protected local singleton routes are left untouched. Identity is remounted
+// when the router still points at the secondary-local identity entry because
+// identity storage is replicated DR state.
 func (s *drReplicationSecondary) mountNewEntries(ctx context.Context) error {
 	if s.core.mounts == nil {
 		return nil
 	}
 
 	for _, entry := range s.core.mounts.Entries {
-		if isDRRuntimeRouterProtectedEntry(entry) {
+		if isDRRuntimeRefreshProtectedEntry(entry) {
 			continue
 		}
-		// Check if this mount is already in the router.
 		nsCtx := drMountEntryContext(ctx, entry)
-		if s.core.router.MatchingMount(nsCtx, entry.Path) != "" {
-			continue
+		if existing := s.core.router.MatchingMountEntry(nsCtx, entry.Path); existing != nil {
+			if !shouldRemountDRRuntimeEntry(existing, entry) {
+				continue
+			}
+			path := entry.Path
+			if !strings.HasSuffix(path, "/") {
+				path += "/"
+			}
+			s.logger.Info("remounting replicated router entry", "path", path, "type", entry.Type, "old_uuid", existing.UUID, "new_uuid", entry.UUID)
+			if err := s.core.router.Unmount(nsCtx, path); err != nil {
+				return err
+			}
 		}
 
 		s.logger.Info("mounting new entry from primary", "path", entry.Path, "type", entry.Type)
@@ -1244,6 +1317,9 @@ func (s *drReplicationSecondary) mountNewEntries(ctx context.Context) error {
 			continue
 		}
 		entry.RunningSha256 = sha256
+		if backend != nil {
+			s.core.setCoreBackend(entry, backend, view)
+		}
 
 		if err := s.core.router.Mount(backend, entry.Path, entry, view); err != nil {
 			s.logger.Error("failed to router-mount entry", "path", entry.Path, "error", err)
@@ -1259,6 +1335,18 @@ func (s *drReplicationSecondary) mountNewEntries(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func shouldRemountDRRuntimeEntry(existing, desired *routing.MountEntry) bool {
+	if existing == nil || desired == nil {
+		return false
+	}
+	if desired.Type != routing.MountTypeIdentity && desired.Type != routing.MountTypeNSIdentity {
+		return false
+	}
+	return existing.UUID != desired.UUID ||
+		existing.Accessor != desired.Accessor ||
+		existing.BackendAwareUUID != desired.BackendAwareUUID
 }
 
 // mountNewCredentialEntries initializes auth backends from the loaded auth
@@ -2800,6 +2888,7 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 	var keyringTouched bool
 	var rootKeyTouched bool
 	var runtimeStateTouched bool
+	var invalidateKeys []string
 
 	for _, change := range batch {
 		if change.RaftIndex < current {
@@ -2826,6 +2915,7 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 			if err := txn.Delete(ctx, change.Key); err != nil {
 				return err
 			}
+			invalidateKeys = append(invalidateKeys, change.Key)
 			if isDRRuntimeStatePath(change.Key) {
 				runtimeStateTouched = true
 			}
@@ -2838,6 +2928,7 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 			if err := txn.Put(ctx, entry); err != nil {
 				return err
 			}
+			invalidateKeys = append(invalidateKeys, change.Key)
 
 			switch change.Key {
 			case "core/keyring":
@@ -2886,6 +2977,7 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 			return err
 		}
 	}
+	s.invalidateAppliedStorageKeys(ctx, invalidateKeys)
 
 	s.setLastAppliedIndex(lastIndex)
 	s.entriesApplied.Add(uint64(affected))
@@ -2949,6 +3041,7 @@ func (s *drReplicationSecondary) applyStreamChange(ctx context.Context, change *
 				return err
 			}
 		}
+		s.invalidateAppliedStorageKey(ctx, change.Key)
 		return nil
 
 	case physical.DeleteOperation:
@@ -2960,6 +3053,7 @@ func (s *drReplicationSecondary) applyStreamChange(ctx context.Context, change *
 				return err
 			}
 		}
+		s.invalidateAppliedStorageKey(ctx, change.Key)
 		return nil
 
 	default:
@@ -3009,6 +3103,55 @@ func (s *drReplicationSecondary) handleReplicatedKeyringUpdate(ctx context.Conte
 	return nil
 }
 
+func (s *drReplicationSecondary) invalidateAppliedStorageKeys(ctx context.Context, keys []string) {
+	if len(keys) == 0 {
+		return
+	}
+
+	seen := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		s.invalidateAppliedStorageKey(ctx, key)
+	}
+}
+
+func (s *drReplicationSecondary) invalidateAppliedStorageKey(ctx context.Context, key string) {
+	if s == nil || s.core == nil || key == "" || !isDRAppliedStorageInvalidationPath(key) {
+		return
+	}
+
+	// DR secondaries apply primary storage mutations directly below the
+	// barrier. Route-backed backends therefore do not see the normal local
+	// write-side invalidation path, so force the same invalidation after the
+	// replicated write commits.
+	s.core.invalidateSynchronous(key)
+}
+
+func isDRAppliedStorageInvalidationPath(key string) bool {
+	normalized := strings.Trim(key, "/")
+	if normalized == "" {
+		return false
+	}
+
+	candidates := []string{normalized}
+	if keySuffix, ok := strings.CutPrefix(normalized, namespaceBarrierPrefix); ok {
+		if namespaceUUID, namespacedKey, found := strings.Cut(keySuffix, "/"); found && namespaceUUID != "" && namespacedKey != "" {
+			candidates = append(candidates, namespacedKey)
+		}
+	}
+
+	for _, candidate := range candidates {
+		if isMissedMountKey(candidate) ||
+			strings.HasPrefix(candidate, "sys/policy/") {
+			return true
+		}
+	}
+	return false
+}
+
 // applyFetchedChange applies a single entry change received via
 // FetchEntries (reconciliation). Reconciliation runs below the barrier,
 // so fetched values are ciphertext bytes and must be written directly to
@@ -3056,6 +3199,7 @@ func (s *drReplicationSecondary) applyFetchedChangeWithKIDMap(ctx context.Contex
 				return err
 			}
 		}
+		s.invalidateAppliedStorageKey(ctx, change.Key)
 		return nil
 
 	case physical.DeleteOperation:
@@ -3068,6 +3212,7 @@ func (s *drReplicationSecondary) applyFetchedChangeWithKIDMap(ctx context.Contex
 					return err
 				}
 			}
+			s.invalidateAppliedStorageKey(ctx, change.Key)
 			return nil
 		}
 		// If Key is empty but KID is present, resolve via local KID map.
@@ -3086,6 +3231,7 @@ func (s *drReplicationSecondary) applyFetchedChangeWithKIDMap(ctx context.Contex
 						return err
 					}
 				}
+				s.invalidateAppliedStorageKey(ctx, key)
 				return nil
 			}
 			s.logger.Warn("delete with KID but key not found in local map",
@@ -3427,6 +3573,7 @@ func (p *drPutApplyPipeline) applyBatchTxn(entries []*EntryChange) error {
 	var keyringEntries []*EntryChange
 	normalEntries := make([]*EntryChange, 0, len(entries))
 	var runtimeStateTouched bool
+	var invalidateKeys []string
 
 	for _, change := range entries {
 		if change == nil {
@@ -3453,6 +3600,7 @@ func (p *drPutApplyPipeline) applyBatchTxn(entries []*EntryChange) error {
 		}
 
 		for _, change := range normalEntries {
+			appliedKey := change.Key
 			switch physical.Operation(change.OpType) {
 			case physical.PutOperation:
 				if err := tx.Put(p.ctx, &physical.Entry{
@@ -3482,10 +3630,14 @@ func (p *drPutApplyPipeline) applyBatchTxn(entries []*EntryChange) error {
 						return fmt.Errorf("batch txn delete %q: %w", key, err)
 					}
 				}
+				appliedKey = key
 
 			default:
 				_ = tx.Rollback(p.ctx)
 				return fmt.Errorf("unknown operation type in fetched change: op_type=%s key=%s", change.OpType, change.Key)
+			}
+			if appliedKey != "" {
+				invalidateKeys = append(invalidateKeys, appliedKey)
 			}
 		}
 
@@ -3497,6 +3649,7 @@ func (p *drPutApplyPipeline) applyBatchTxn(entries []*EntryChange) error {
 				return err
 			}
 		}
+		p.secondary.invalidateAppliedStorageKeys(p.ctx, invalidateKeys)
 	}
 
 	// Apply keyring / root-key entries individually so that the barrier
@@ -3963,6 +4116,10 @@ func (s *drReplicationSecondary) processRangeTask(ctx context.Context, checkpoin
 	}
 
 	var rpcBytes uint64
+	maxRPCBytes := s.reconcileMaxRPCBytes
+	if maxRPCBytes == 0 {
+		maxRPCBytes = drDefaultReconcileMaxRPCBytes
+	}
 	remoteKIDs := make(map[[32]byte]struct{})
 	seenRemoteKIDs := make(map[[32]byte]struct{})
 	accumulators := make([]drFetchedRangeAccumulator, len(fetchSpans))
@@ -3988,7 +4145,11 @@ func (s *drReplicationSecondary) processRangeTask(ctx context.Context, checkpoin
 			result.err = fmt.Errorf("fetch stream returned failed_kids: %d", len(batch.GetFailedKids()))
 			return result
 		}
-		rpcBytes += uint64(len(batch.Entries) * 128) // Estimate
+		rpcBytes += entryBatchWireBytes(batch)
+		if rpcBytes > maxRPCBytes {
+			result.err = fmt.Errorf("budget_exceeded: fetch stream bytes exceeded (%d > %d)", rpcBytes, maxRPCBytes)
+			return result
+		}
 		for _, e := range batch.Entries {
 			kid, vid, err := s.kidVIDFromFetchedChange(e)
 			if err != nil {

@@ -69,6 +69,9 @@ dr-test-smoke:
 dr-test-verify:
 	@./scripts/dr_local_test.sh verify
 
+dr-test-engine-matrix:
+	@./scripts/dr_local_test.sh engine-matrix
+
 dr-test-failover-smoke:
 	@./scripts/dr_local_test.sh failover-smoke
 
@@ -86,6 +89,12 @@ dr-test-ha-smoke:
 
 dr-test-ha-verify:
 	@./scripts/dr_local_test.sh --topology ha verify
+
+dr-test-ha-engine-matrix:
+	@./scripts/dr_local_test.sh --topology ha engine-matrix
+
+dr-test-ha-engine-lifecycle-matrix:
+	@./scripts/dr_local_test.sh --topology ha engine-lifecycle-matrix
 
 dr-test-ha-failover-smoke:
 	@./scripts/dr_local_test.sh --topology ha failover-smoke
