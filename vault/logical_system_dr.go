@@ -1397,120 +1397,123 @@ func (b *SystemBackend) handleDRTuningWrite(ctx context.Context, req *logical.Re
 	if mgr == nil {
 		return logical.ErrorResponse("DR replication not initialized"), nil
 	}
+	getPositiveInt := func(name string) (int, bool, error) {
+		raw, ok, err := d.GetOkErr(name)
+		if err != nil || !ok {
+			return 0, ok, err
+		}
+		value, ok := raw.(int)
+		if !ok {
+			return 0, false, fmt.Errorf("%s must be an integer", name)
+		}
+		if value <= 0 {
+			return 0, false, fmt.Errorf("%s must be greater than zero", name)
+		}
+		return value, true, nil
+	}
+	setInt := func(name string, dest *int) error {
+		value, ok, err := getPositiveInt(name)
+		if err != nil || !ok {
+			return err
+		}
+		*dest = value
+		return nil
+	}
+	setInt64 := func(name string, dest *int64) error {
+		value, ok, err := getPositiveInt(name)
+		if err != nil || !ok {
+			return err
+		}
+		*dest = int64(value)
+		return nil
+	}
+	setUint64 := func(name string, dest *uint64) error {
+		value, ok, err := getPositiveInt(name)
+		if err != nil || !ok {
+			return err
+		}
+		*dest = uint64(value)
+		return nil
+	}
+	setRatio := func(name string, dest *float64) error {
+		raw, ok, err := d.GetOkErr(name)
+		if err != nil || !ok {
+			return err
+		}
+		value, ok := raw.(float64)
+		if !ok {
+			return fmt.Errorf("%s must be a number", name)
+		}
+		if value <= 0 || value > 1 {
+			return fmt.Errorf("%s must be > 0 and <= 1", name)
+		}
+		*dest = value
+		return nil
+	}
+	setBool := func(name string, dest *bool) error {
+		raw, ok, err := d.GetOkErr(name)
+		if err != nil || !ok {
+			return err
+		}
+		value, ok := raw.(bool)
+		if !ok {
+			return fmt.Errorf("%s must be a boolean", name)
+		}
+		*dest = value
+		return nil
+	}
 	if err := mgr.UpdateTuning(ctx, func(cfg *DRConfig) error {
-		if raw, ok := d.GetOk("checkpoint_ttl_seconds"); ok {
-			cfg.CheckpointTTLSeconds = int64(raw.(int))
-		}
-		if raw, ok := d.GetOk("checkpoint_global_budget_bytes"); ok {
-			cfg.CheckpointGlobalBudgetBytes = uint64(raw.(int))
-		}
-		if raw, ok := d.GetOk("checkpoint_per_relationship_budget_bytes"); ok {
-			cfg.CheckpointPerRelBudgetBytes = uint64(raw.(int))
-		}
-		if raw, ok := d.GetOk("stream_buffer_max_entries"); ok {
-			cfg.StreamBufferMaxEntries = raw.(int)
-		}
-		if raw, ok := d.GetOk("stream_buffer_max_bytes"); ok {
-			cfg.StreamBufferMaxBytes = uint64(raw.(int))
-		}
-		if raw, ok := d.GetOk("reconcile_max_rpc_bytes"); ok {
-			cfg.ReconcileMaxRPCBytes = uint64(raw.(int))
-		}
-		if raw, ok := d.GetOk("reconcile_max_wall_time_seconds"); ok {
-			cfg.ReconcileMaxWallTimeSeconds = int64(raw.(int))
-		}
-		if raw, ok := d.GetOk("reconcile_max_inflight_tasks"); ok {
-			cfg.ReconcileMaxInflightTasks = raw.(int)
-		}
-		if raw, ok := d.GetOk("stream_batch_max_entries"); ok {
-			cfg.StreamBatchMaxEntries = raw.(int)
-		}
-		if raw, ok := d.GetOk("stream_batch_max_bytes"); ok {
-			cfg.StreamBatchMaxBytes = raw.(int)
-		}
-		if raw, ok := d.GetOk("stream_batch_max_wait_milliseconds"); ok {
-			cfg.StreamBatchMaxWaitMillis = int64(raw.(int))
-		}
-		if raw, ok := d.GetOk("stream_journal_enabled"); ok {
-			cfg.StreamJournalEnabled = raw.(bool)
-		}
-		if raw, ok := d.GetOk("stream_journal_max_bytes"); ok {
-			cfg.StreamJournalMaxBytes = uint64(raw.(int))
-		}
-		if raw, ok := d.GetOk("stream_journal_segment_bytes"); ok {
-			cfg.StreamJournalSegmentBytes = uint64(raw.(int))
-		}
-		if raw, ok := d.GetOk("stream_journal_retention_seconds"); ok {
-			cfg.StreamJournalRetentionSecs = int64(raw.(int))
-		}
-		if raw, ok := d.GetOk("reconcile_apply_workers"); ok {
-			cfg.ReconcileApplyWorkers = raw.(int)
-		}
-		if raw, ok := d.GetOk("reconcile_put_batch_max_entries"); ok {
-			cfg.ReconcilePutBatchMaxEntries = raw.(int)
-		}
-		if raw, ok := d.GetOk("reconcile_put_batch_max_bytes"); ok {
-			cfg.ReconcilePutBatchMaxBytes = raw.(int)
-		}
-		if raw, ok := d.GetOk("convergence_min_rate_ratio"); ok {
-			cfg.ConvergenceMinRateRatio = raw.(float64)
-		}
-		if raw, ok := d.GetOk("convergence_stall_seconds"); ok {
-			cfg.ConvergenceStallSeconds = int64(raw.(int))
-		}
-		if raw, ok := d.GetOk("fallback_enabled"); ok {
-			cfg.FallbackEnabled = raw.(bool)
-		}
-		if raw, ok := d.GetOk("fallback_stall_seconds"); ok {
-			cfg.FallbackStallSeconds = int64(raw.(int))
-		}
-		if raw, ok := d.GetOk("fallback_failure_threshold"); ok {
-			cfg.FallbackFailureThreshold = raw.(int)
-		}
-		if raw, ok := d.GetOk("fallback_min_lag_entries"); ok {
-			cfg.FallbackMinLagEntries = uint64(raw.(int))
-		}
-		if raw, ok := d.GetOk("fallback_cooldown_seconds"); ok {
-			cfg.FallbackCooldownSeconds = int64(raw.(int))
-		}
-		if raw, ok := d.GetOk("fallback_max_per_hour"); ok {
-			cfg.FallbackMaxPerHour = raw.(int)
-		}
-		if raw, ok := d.GetOk("checkpoint_artifact_enabled"); ok {
-			cfg.CheckpointArtifactEnabled = raw.(bool)
-		}
-		if raw, ok := d.GetOk("checkpoint_artifact_global_budget_bytes"); ok {
-			cfg.CheckpointArtifactGlobalBudgetBytes = uint64(raw.(int))
-		}
-		if raw, ok := d.GetOk("checkpoint_artifact_per_relationship_budget_bytes"); ok {
-			cfg.CheckpointArtifactPerRelBudgetBytes = uint64(raw.(int))
-		}
-		if raw, ok := d.GetOk("checkpoint_artifact_ttl_seconds"); ok {
-			cfg.CheckpointArtifactTTLSeconds = int64(raw.(int))
-		}
-		if raw, ok := d.GetOk("checkpoint_artifact_segment_bytes"); ok {
-			cfg.CheckpointArtifactSegmentBytes = uint64(raw.(int))
-		}
-		if raw, ok := d.GetOk("dr_backpressure_enabled"); ok {
-			cfg.DRBackpressureEnabled = raw.(bool)
-		}
-		if raw, ok := d.GetOk("dr_backpressure_degraded_ratio"); ok {
-			cfg.DRBackpressureDegradedRatio = raw.(float64)
-		}
-		if raw, ok := d.GetOk("dr_backpressure_critical_ratio"); ok {
-			cfg.DRBackpressureCriticalRatio = raw.(float64)
-		}
-		if raw, ok := d.GetOk("dr_backpressure_min_lag_entries"); ok {
-			cfg.DRBackpressureMinLagEntries = uint64(raw.(int))
-		}
-		if raw, ok := d.GetOk("dr_backpressure_horizon_seconds"); ok {
-			cfg.DRBackpressureHorizonSeconds = int64(raw.(int))
-		}
-		if raw, ok := d.GetOk("dr_backpressure_degraded_min_qps"); ok {
-			cfg.DRBackpressureDegradedMinQPS = int64(raw.(int))
-		}
-		if raw, ok := d.GetOk("dr_backpressure_critical_min_qps"); ok {
-			cfg.DRBackpressureCriticalMinQPS = int64(raw.(int))
+		for _, set := range []func() error{
+			func() error { return setInt64("checkpoint_ttl_seconds", &cfg.CheckpointTTLSeconds) },
+			func() error { return setUint64("checkpoint_global_budget_bytes", &cfg.CheckpointGlobalBudgetBytes) },
+			func() error {
+				return setUint64("checkpoint_per_relationship_budget_bytes", &cfg.CheckpointPerRelBudgetBytes)
+			},
+			func() error { return setInt("stream_buffer_max_entries", &cfg.StreamBufferMaxEntries) },
+			func() error { return setUint64("stream_buffer_max_bytes", &cfg.StreamBufferMaxBytes) },
+			func() error { return setUint64("reconcile_max_rpc_bytes", &cfg.ReconcileMaxRPCBytes) },
+			func() error { return setInt64("reconcile_max_wall_time_seconds", &cfg.ReconcileMaxWallTimeSeconds) },
+			func() error { return setInt("reconcile_max_inflight_tasks", &cfg.ReconcileMaxInflightTasks) },
+			func() error { return setInt("stream_batch_max_entries", &cfg.StreamBatchMaxEntries) },
+			func() error { return setInt("stream_batch_max_bytes", &cfg.StreamBatchMaxBytes) },
+			func() error { return setInt64("stream_batch_max_wait_milliseconds", &cfg.StreamBatchMaxWaitMillis) },
+			func() error { return setBool("stream_journal_enabled", &cfg.StreamJournalEnabled) },
+			func() error { return setUint64("stream_journal_max_bytes", &cfg.StreamJournalMaxBytes) },
+			func() error { return setUint64("stream_journal_segment_bytes", &cfg.StreamJournalSegmentBytes) },
+			func() error { return setInt64("stream_journal_retention_seconds", &cfg.StreamJournalRetentionSecs) },
+			func() error { return setInt("reconcile_apply_workers", &cfg.ReconcileApplyWorkers) },
+			func() error { return setInt("reconcile_put_batch_max_entries", &cfg.ReconcilePutBatchMaxEntries) },
+			func() error { return setInt("reconcile_put_batch_max_bytes", &cfg.ReconcilePutBatchMaxBytes) },
+			func() error { return setRatio("convergence_min_rate_ratio", &cfg.ConvergenceMinRateRatio) },
+			func() error { return setInt64("convergence_stall_seconds", &cfg.ConvergenceStallSeconds) },
+			func() error { return setBool("fallback_enabled", &cfg.FallbackEnabled) },
+			func() error { return setInt64("fallback_stall_seconds", &cfg.FallbackStallSeconds) },
+			func() error { return setInt("fallback_failure_threshold", &cfg.FallbackFailureThreshold) },
+			func() error { return setUint64("fallback_min_lag_entries", &cfg.FallbackMinLagEntries) },
+			func() error { return setInt64("fallback_cooldown_seconds", &cfg.FallbackCooldownSeconds) },
+			func() error { return setInt("fallback_max_per_hour", &cfg.FallbackMaxPerHour) },
+			func() error { return setBool("checkpoint_artifact_enabled", &cfg.CheckpointArtifactEnabled) },
+			func() error {
+				return setUint64("checkpoint_artifact_global_budget_bytes", &cfg.CheckpointArtifactGlobalBudgetBytes)
+			},
+			func() error {
+				return setUint64("checkpoint_artifact_per_relationship_budget_bytes", &cfg.CheckpointArtifactPerRelBudgetBytes)
+			},
+			func() error { return setInt64("checkpoint_artifact_ttl_seconds", &cfg.CheckpointArtifactTTLSeconds) },
+			func() error {
+				return setUint64("checkpoint_artifact_segment_bytes", &cfg.CheckpointArtifactSegmentBytes)
+			},
+			func() error { return setBool("dr_backpressure_enabled", &cfg.DRBackpressureEnabled) },
+			func() error { return setRatio("dr_backpressure_degraded_ratio", &cfg.DRBackpressureDegradedRatio) },
+			func() error { return setRatio("dr_backpressure_critical_ratio", &cfg.DRBackpressureCriticalRatio) },
+			func() error { return setUint64("dr_backpressure_min_lag_entries", &cfg.DRBackpressureMinLagEntries) },
+			func() error { return setInt64("dr_backpressure_horizon_seconds", &cfg.DRBackpressureHorizonSeconds) },
+			func() error { return setInt64("dr_backpressure_degraded_min_qps", &cfg.DRBackpressureDegradedMinQPS) },
+			func() error { return setInt64("dr_backpressure_critical_min_qps", &cfg.DRBackpressureCriticalMinQPS) },
+		} {
+			if err := set(); err != nil {
+				return err
+			}
 		}
 		return nil
 	}); err != nil {

@@ -865,6 +865,9 @@ The protocol needs bounded resource use:
   handling for a single entry that cannot fit in one response batch
 - bounded stream apply queues
 - primary-side backpressure when secondaries cannot converge
+- tuning inputs validated before persistence or runtime apply, including
+  signed-to-unsigned conversion guards and cross-field budget/backpressure
+  constraints
 - unauthenticated bootstrap and credential-rotation endpoints perform only
   request-shape parsing, base64 decoding, and fixed-size hashing before
   relationship state gates; attacker-supplied certificate parsing and
@@ -876,11 +879,12 @@ chooses a fallback path.
 
 The current prototype has bounds on the unauthenticated bootstrap and rotation
 paths, checkpoint build admission, checkpoint fetch response batches, and
-secondary reconciliation fetch accounting, with targeted tests for those gates.
-Production readiness still requires final defaults, sustained-abuse testing, and
-tuning guidance for checkpoint retention, checkpoint build concurrency, stream
-journal retention, digest split limits, fetch batch byte limits, and primary-
-side backpressure.
+secondary reconciliation fetch accounting. DR tuning updates are validated at
+the API and manager boundary before persistence or runtime apply. Targeted tests
+cover these gates. Production readiness still requires final defaults,
+sustained-abuse testing, and tuning guidance for checkpoint retention,
+checkpoint build concurrency, stream journal retention, digest split limits,
+fetch batch byte limits, and primary-side backpressure.
 
 ### Observability
 

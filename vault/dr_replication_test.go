@@ -26,6 +26,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2734,6 +2735,183 @@ func TestDRRelationshipManager_UpdateTuningAppliesSecondaryRuntime(t *testing.T)
 	}
 	if mgr.secondary.fallbackMinLagEntries != 1234 {
 		t.Fatalf("expected runtime fallback min lag entries=1234, got %d", mgr.secondary.fallbackMinLagEntries)
+	}
+}
+
+func TestDRRelationshipManager_UpdateTuningRejectsInvalidAndRollsBack(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	if err := mgr.EnablePrimary(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.UpdateTuning(ctx, func(cfg *DRConfig) error {
+		cfg.StreamBatchMaxEntries = 64
+		cfg.CheckpointGlobalBudgetBytes = 1024
+		cfg.CheckpointPerRelBudgetBytes = 256
+		cfg.DRBackpressureDegradedRatio = 0.8
+		cfg.DRBackpressureCriticalRatio = 0.5
+		cfg.DRBackpressureDegradedMinQPS = 10
+		cfg.DRBackpressureCriticalMinQPS = 5
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	before := mgr.Config()
+	tests := []struct {
+		name            string
+		wantErrContains string
+		apply           func(*DRConfig) error
+	}{
+		{
+			name:            "callback error",
+			wantErrContains: "boom",
+			apply: func(cfg *DRConfig) error {
+				cfg.StreamBatchMaxEntries = 128
+				return errors.New("boom")
+			},
+		},
+		{
+			name:            "negative signed field",
+			wantErrContains: "stream_batch_max_entries",
+			apply: func(cfg *DRConfig) error {
+				cfg.StreamBatchMaxEntries = -1
+				return nil
+			},
+		},
+		{
+			name:            "per relationship budget exceeds global budget",
+			wantErrContains: "checkpoint_per_relationship_budget_bytes",
+			apply: func(cfg *DRConfig) error {
+				cfg.CheckpointPerRelBudgetBytes = cfg.CheckpointGlobalBudgetBytes + 1
+				return nil
+			},
+		},
+		{
+			name:            "critical ratio exceeds degraded ratio",
+			wantErrContains: "dr_backpressure_critical_ratio",
+			apply: func(cfg *DRConfig) error {
+				cfg.DRBackpressureCriticalRatio = 0.9
+				return nil
+			},
+		},
+		{
+			name:            "critical minimum qps exceeds degraded minimum qps",
+			wantErrContains: "dr_backpressure_critical_min_qps",
+			apply: func(cfg *DRConfig) error {
+				cfg.DRBackpressureCriticalMinQPS = cfg.DRBackpressureDegradedMinQPS + 1
+				return nil
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := mgr.UpdateTuning(ctx, tc.apply)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErrContains) {
+				t.Fatalf("expected %q error, got %v", tc.wantErrContains, err)
+			}
+			if after := mgr.Config(); !reflect.DeepEqual(after, before) {
+				t.Fatalf("expected tuning config rollback\nbefore=%#v\nafter=%#v", before, after)
+			}
+		})
+	}
+}
+
+func TestDRSystemBackend_DRTuningRejectsInvalidInputs(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := namespace.RootContext(t.Context())
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	core.drManager = mgr
+	if err := mgr.EnablePrimary(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.UpdateTuning(ctx, func(cfg *DRConfig) error {
+		cfg.CheckpointGlobalBudgetBytes = 8192
+		cfg.CheckpointPerRelBudgetBytes = 4096
+		cfg.StreamBufferMaxBytes = 4096
+		cfg.StreamJournalMaxBytes = 8192
+		cfg.StreamJournalSegmentBytes = 4096
+		cfg.FallbackMinLagEntries = 64
+		cfg.DRBackpressureDegradedRatio = 0.8
+		cfg.DRBackpressureCriticalRatio = 0.5
+		cfg.DRBackpressureDegradedMinQPS = 10
+		cfg.DRBackpressureCriticalMinQPS = 5
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	before := mgr.Config()
+	tests := []struct {
+		name            string
+		data            map[string]interface{}
+		wantErrContains string
+	}{
+		{
+			name:            "negative unsigned budget",
+			data:            map[string]interface{}{"stream_buffer_max_bytes": -1},
+			wantErrContains: "stream_buffer_max_bytes",
+		},
+		{
+			name:            "zero signed integer",
+			data:            map[string]interface{}{"stream_batch_max_entries": 0},
+			wantErrContains: "stream_batch_max_entries",
+		},
+		{
+			name:            "negative duration",
+			data:            map[string]interface{}{"checkpoint_ttl_seconds": -1},
+			wantErrContains: "checkpoint_ttl_seconds",
+		},
+		{
+			name:            "invalid ratio",
+			data:            map[string]interface{}{"convergence_min_rate_ratio": 1.1},
+			wantErrContains: "convergence_min_rate_ratio",
+		},
+		{
+			name: "relationship budget exceeds global budget",
+			data: map[string]interface{}{
+				"checkpoint_global_budget_bytes":           1024,
+				"checkpoint_per_relationship_budget_bytes": 2048,
+			},
+			wantErrContains: "checkpoint_per_relationship_budget_bytes",
+		},
+		{
+			name: "critical ratio exceeds degraded ratio",
+			data: map[string]interface{}{
+				"dr_backpressure_degraded_ratio": 0.5,
+				"dr_backpressure_critical_ratio": 0.9,
+			},
+			wantErrContains: "dr_backpressure_critical_ratio",
+		},
+		{
+			name: "critical qps exceeds degraded qps",
+			data: map[string]interface{}{
+				"dr_backpressure_degraded_min_qps": 5,
+				"dr_backpressure_critical_min_qps": 10,
+			},
+			wantErrContains: "dr_backpressure_critical_min_qps",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := logical.TestRequest(t, logical.UpdateOperation, "replication/dr/tuning")
+			req.Data = tc.data
+			resp, err := core.systemBackend.HandleRequest(ctx, req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp == nil || !resp.IsError() || !strings.Contains(resp.Error().Error(), tc.wantErrContains) {
+				t.Fatalf("expected %q error response, got resp=%#v err=%v", tc.wantErrContains, resp, err)
+			}
+			if after := mgr.Config(); !reflect.DeepEqual(after, before) {
+				t.Fatalf("expected tuning config rollback\nbefore=%#v\nafter=%#v", before, after)
+			}
+		})
 	}
 }
 

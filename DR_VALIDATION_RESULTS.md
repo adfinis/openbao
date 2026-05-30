@@ -110,6 +110,12 @@ follow-up pass also added primary-side checkpoint build admission: requests from
 the same relationship share the in-flight build while cross-relationship build
 storms fail fast once the global build limit is reached.
 
+A DR tuning validation pass on 2026-05-30 now rejects invalid tuning before
+persistence or runtime apply. This closes signed-to-unsigned API conversion
+hazards for byte/entry budgets, enforces cross-field budget and backpressure
+relationships, and verifies manager/API rollback so rejected updates cannot
+leave partial in-memory tuning behind.
+
 ## Test Environment
 
 - OpenBao repository: `/Users/roelc/projects/secretz/openbao`
@@ -1075,6 +1081,10 @@ from the DR protocol work where possible:
 - Checkpoint build admission. Same-relationship checkpoint requests reuse the
   in-flight build result, while cross-relationship checkpoint build concurrency
   is globally bounded and rejected with retryable resource pressure once full.
+- DR tuning validation. Invalid API and manager-side tuning changes now fail
+  before persistence or runtime apply, signed API integers cannot wrap into
+  unsigned byte/entry budgets, and rejected updates roll back without partial
+  in-memory mutation.
 
 See `DR_BUG_TRACKER.md` for suggested worktree split planning.
 

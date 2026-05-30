@@ -47,6 +47,11 @@ const (
 	drLastSeenPersistInterval = 30 * time.Second
 )
 
+const (
+	drMaxTuningDurationSeconds = int64(1<<63-1) / int64(time.Second)
+	drMaxTuningDurationMillis  = int64(1<<63-1) / int64(time.Millisecond)
+)
+
 // DRMode represents the DR replication role of this cluster.
 type DRMode string
 
@@ -625,6 +630,126 @@ func applyDRConfigDefaults(cfg *DRConfig) {
 	if cfg.DRBackpressureCriticalMinQPS <= 0 {
 		cfg.DRBackpressureCriticalMinQPS = drBackpressureDefaultCriticalMinQPS
 	}
+}
+
+func validateDRTuningConfig(cfg *DRConfig) error {
+	if cfg == nil {
+		return nil
+	}
+
+	positiveInt := func(name string, value int) error {
+		if value < 0 {
+			return fmt.Errorf("%s must be zero or greater", name)
+		}
+		return nil
+	}
+	positiveInt64 := func(name string, value int64) error {
+		if value < 0 {
+			return fmt.Errorf("%s must be zero or greater", name)
+		}
+		return nil
+	}
+	seconds := func(name string, value int64) error {
+		if err := positiveInt64(name, value); err != nil {
+			return err
+		}
+		if value > drMaxTuningDurationSeconds {
+			return fmt.Errorf("%s is too large", name)
+		}
+		return nil
+	}
+	millis := func(name string, value int64) error {
+		if err := positiveInt64(name, value); err != nil {
+			return err
+		}
+		if value > drMaxTuningDurationMillis {
+			return fmt.Errorf("%s is too large", name)
+		}
+		return nil
+	}
+	ratio := func(name string, value float64) error {
+		if value < 0 {
+			return fmt.Errorf("%s must be zero or greater", name)
+		}
+		if value > 1 {
+			return fmt.Errorf("%s must be <= 1", name)
+		}
+		return nil
+	}
+
+	for name, value := range map[string]int{
+		"stream_buffer_max_entries":       cfg.StreamBufferMaxEntries,
+		"reconcile_max_inflight_tasks":    cfg.ReconcileMaxInflightTasks,
+		"stream_batch_max_entries":        cfg.StreamBatchMaxEntries,
+		"stream_batch_max_bytes":          cfg.StreamBatchMaxBytes,
+		"reconcile_apply_workers":         cfg.ReconcileApplyWorkers,
+		"reconcile_put_batch_max_entries": cfg.ReconcilePutBatchMaxEntries,
+		"reconcile_put_batch_max_bytes":   cfg.ReconcilePutBatchMaxBytes,
+		"fallback_failure_threshold":      cfg.FallbackFailureThreshold,
+		"fallback_max_per_hour":           cfg.FallbackMaxPerHour,
+	} {
+		if err := positiveInt(name, value); err != nil {
+			return err
+		}
+	}
+
+	for name, value := range map[string]int64{
+		"checkpoint_ttl_seconds":           cfg.CheckpointTTLSeconds,
+		"reconcile_max_wall_time_seconds":  cfg.ReconcileMaxWallTimeSeconds,
+		"stream_journal_retention_seconds": cfg.StreamJournalRetentionSecs,
+		"convergence_stall_seconds":        cfg.ConvergenceStallSeconds,
+		"fallback_stall_seconds":           cfg.FallbackStallSeconds,
+		"fallback_cooldown_seconds":        cfg.FallbackCooldownSeconds,
+		"checkpoint_artifact_ttl_seconds":  cfg.CheckpointArtifactTTLSeconds,
+		"dr_backpressure_horizon_seconds":  cfg.DRBackpressureHorizonSeconds,
+	} {
+		if err := seconds(name, value); err != nil {
+			return err
+		}
+	}
+	if err := millis("stream_batch_max_wait_milliseconds", cfg.StreamBatchMaxWaitMillis); err != nil {
+		return err
+	}
+
+	for name, value := range map[string]int64{
+		"dr_backpressure_degraded_min_qps": cfg.DRBackpressureDegradedMinQPS,
+		"dr_backpressure_critical_min_qps": cfg.DRBackpressureCriticalMinQPS,
+	} {
+		if err := positiveInt64(name, value); err != nil {
+			return err
+		}
+	}
+
+	for name, value := range map[string]float64{
+		"convergence_min_rate_ratio":     cfg.ConvergenceMinRateRatio,
+		"dr_backpressure_degraded_ratio": cfg.DRBackpressureDegradedRatio,
+		"dr_backpressure_critical_ratio": cfg.DRBackpressureCriticalRatio,
+	} {
+		if err := ratio(name, value); err != nil {
+			return err
+		}
+	}
+
+	if cfg.CheckpointGlobalBudgetBytes > 0 && cfg.CheckpointPerRelBudgetBytes > cfg.CheckpointGlobalBudgetBytes {
+		return fmt.Errorf("checkpoint_per_relationship_budget_bytes must be <= checkpoint_global_budget_bytes")
+	}
+	if cfg.StreamJournalMaxBytes > 0 && cfg.StreamJournalSegmentBytes > cfg.StreamJournalMaxBytes {
+		return fmt.Errorf("stream_journal_segment_bytes must be <= stream_journal_max_bytes")
+	}
+	if cfg.CheckpointArtifactGlobalBudgetBytes > 0 && cfg.CheckpointArtifactPerRelBudgetBytes > cfg.CheckpointArtifactGlobalBudgetBytes {
+		return fmt.Errorf("checkpoint_artifact_per_relationship_budget_bytes must be <= checkpoint_artifact_global_budget_bytes")
+	}
+	if cfg.CheckpointArtifactGlobalBudgetBytes > 0 && cfg.CheckpointArtifactSegmentBytes > cfg.CheckpointArtifactGlobalBudgetBytes {
+		return fmt.Errorf("checkpoint_artifact_segment_bytes must be <= checkpoint_artifact_global_budget_bytes")
+	}
+	if cfg.DRBackpressureDegradedRatio > 0 && cfg.DRBackpressureCriticalRatio > 0 && cfg.DRBackpressureCriticalRatio > cfg.DRBackpressureDegradedRatio {
+		return fmt.Errorf("dr_backpressure_critical_ratio must be <= dr_backpressure_degraded_ratio")
+	}
+	if cfg.DRBackpressureDegradedMinQPS > 0 && cfg.DRBackpressureCriticalMinQPS > cfg.DRBackpressureDegradedMinQPS {
+		return fmt.Errorf("dr_backpressure_critical_min_qps must be <= dr_backpressure_degraded_min_qps")
+	}
+
+	return nil
 }
 
 // LoadConfig loads the DR configuration from storage and restores
@@ -1362,9 +1487,14 @@ func (m *drRelationshipManager) UpdateTuning(ctx context.Context, apply func(cfg
 	}
 
 	previous := *m.config
-	if err := apply(m.config); err != nil {
+	next := previous
+	if err := apply(&next); err != nil {
 		return err
 	}
+	if err := validateDRTuningConfig(&next); err != nil {
+		return err
+	}
+	*m.config = next
 	if err := m.saveConfig(ctx); err != nil {
 		*m.config = previous
 		return err
