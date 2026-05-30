@@ -49,10 +49,12 @@ type Config struct {
 	WriteRetries int           `json:"write_retries"`
 
 	// Intervals
-	MonitorInterval  time.Duration `json:"monitor_interval_seconds"`
-	ProgressInterval time.Duration `json:"progress_interval_seconds"`
-	MaxWaitSeconds   int           `json:"max_wait_seconds"`
-	StepdownInterval time.Duration `json:"stepdown_interval_seconds"`
+	MonitorInterval            time.Duration `json:"monitor_interval_seconds"`
+	ProgressInterval           time.Duration `json:"progress_interval_seconds"`
+	MaxWaitSeconds             int           `json:"max_wait_seconds"`
+	StepdownInterval           time.Duration `json:"stepdown_interval_seconds"`
+	SentinelWriteTimeout       time.Duration `json:"sentinel_write_timeout_seconds"`
+	SentinelWriteRetryInterval time.Duration `json:"sentinel_write_retry_interval_seconds"`
 
 	// Operation mix (must sum to 100)
 	PutPercent        int `json:"put_percent"`
@@ -100,10 +102,12 @@ func DefaultConfig() *Config {
 		Concurrency:  24,
 		WriteRetries: 2,
 
-		MonitorInterval:  2 * time.Second,
-		ProgressInterval: 2 * time.Second,
-		MaxWaitSeconds:   600,
-		StepdownInterval: 0,
+		MonitorInterval:            2 * time.Second,
+		ProgressInterval:           2 * time.Second,
+		MaxWaitSeconds:             600,
+		StepdownInterval:           0,
+		SentinelWriteTimeout:       60 * time.Second,
+		SentinelWriteRetryInterval: time.Second,
 
 		PutPercent:        55,
 		GetPrimaryPercent: 25,
@@ -141,6 +145,12 @@ func (c *Config) Validate() error {
 		}
 		if c.Duration <= 0 {
 			return fmt.Errorf("--duration must be > 0")
+		}
+		if c.SentinelWriteTimeout <= 0 {
+			return fmt.Errorf("--sentinel-write-timeout must be > 0")
+		}
+		if c.SentinelWriteRetryInterval <= 0 {
+			return fmt.Errorf("--sentinel-write-retry-interval must be > 0")
 		}
 
 		mix := c.PutPercent + c.GetPrimaryPercent + c.StatusS1Percent + c.StatusS2Percent

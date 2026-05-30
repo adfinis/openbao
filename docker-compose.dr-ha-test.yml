@@ -1,0 +1,211 @@
+# DR Replication HA Test Setup
+#
+# Three independent three-node Raft clusters:
+#   - primary:    primary-1, primary-2, primary-3
+#   - secondary1: secondary1-1, secondary1-2, secondary1-3
+#   - secondary2: secondary2-1, secondary2-2, secondary2-3
+#
+# Usage:
+#   make docker-dev
+#   DR_TOPOLOGY=ha scripts/dr_local_test.sh reset
+#   DR_TOPOLOGY=ha scripts/dr_local_test.sh smoke --duration 900 --concurrency 48 --stepdown-interval 300
+#   DR_TOPOLOGY=ha scripts/dr_local_test.sh verify
+#   DR_TOPOLOGY=ha scripts/dr_local_test.sh down
+
+x-openbao-common: &openbao-common
+  image: openbao:dev
+  pull_policy: never
+  command: ["server"]
+  cap_add: [IPC_LOCK]
+  networks:
+    - dr-ha-net
+
+services:
+  primary-1:
+    <<: *openbao-common
+    environment:
+      BAO_LOCAL_CONFIG: |
+        {
+          "storage": {"raft": {"path": "/openbao/file", "node_id": "primary-1"}},
+          "listener": [{"tcp": {"address": "0.0.0.0:8200", "tls_disable": true, "cluster_address": "0.0.0.0:8201"}}],
+          "api_addr": "http://primary-1:8200",
+          "cluster_addr": "https://primary-1:8201",
+          "disable_mlock": true,
+          "log_level": "debug"
+        }
+    ports:
+      - "8800:8200"
+      - "8801:8201"
+    volumes:
+      - primary-1-data:/openbao/file
+
+  primary-2:
+    <<: *openbao-common
+    environment:
+      BAO_LOCAL_CONFIG: |
+        {
+          "storage": {"raft": {"path": "/openbao/file", "node_id": "primary-2", "retry_join": [{"leader_api_addr": "http://primary-1:8200"}]}},
+          "listener": [{"tcp": {"address": "0.0.0.0:8200", "tls_disable": true, "cluster_address": "0.0.0.0:8201"}}],
+          "api_addr": "http://primary-2:8200",
+          "cluster_addr": "https://primary-2:8201",
+          "disable_mlock": true,
+          "log_level": "debug"
+        }
+    ports:
+      - "8802:8200"
+      - "8803:8201"
+    volumes:
+      - primary-2-data:/openbao/file
+    depends_on:
+      - primary-1
+
+  primary-3:
+    <<: *openbao-common
+    environment:
+      BAO_LOCAL_CONFIG: |
+        {
+          "storage": {"raft": {"path": "/openbao/file", "node_id": "primary-3", "retry_join": [{"leader_api_addr": "http://primary-1:8200"}]}},
+          "listener": [{"tcp": {"address": "0.0.0.0:8200", "tls_disable": true, "cluster_address": "0.0.0.0:8201"}}],
+          "api_addr": "http://primary-3:8200",
+          "cluster_addr": "https://primary-3:8201",
+          "disable_mlock": true,
+          "log_level": "debug"
+        }
+    ports:
+      - "8804:8200"
+      - "8805:8201"
+    volumes:
+      - primary-3-data:/openbao/file
+    depends_on:
+      - primary-1
+
+  secondary1-1:
+    <<: *openbao-common
+    environment:
+      BAO_LOCAL_CONFIG: |
+        {
+          "storage": {"raft": {"path": "/openbao/file", "node_id": "secondary1-1"}},
+          "listener": [{"tcp": {"address": "0.0.0.0:8200", "tls_disable": true, "cluster_address": "0.0.0.0:8201"}}],
+          "api_addr": "http://secondary1-1:8200",
+          "cluster_addr": "https://secondary1-1:8201",
+          "disable_mlock": true,
+          "log_level": "debug"
+        }
+    ports:
+      - "8900:8200"
+      - "8901:8201"
+    volumes:
+      - secondary1-1-data:/openbao/file
+
+  secondary1-2:
+    <<: *openbao-common
+    environment:
+      BAO_LOCAL_CONFIG: |
+        {
+          "storage": {"raft": {"path": "/openbao/file", "node_id": "secondary1-2", "retry_join": [{"leader_api_addr": "http://secondary1-1:8200"}]}},
+          "listener": [{"tcp": {"address": "0.0.0.0:8200", "tls_disable": true, "cluster_address": "0.0.0.0:8201"}}],
+          "api_addr": "http://secondary1-2:8200",
+          "cluster_addr": "https://secondary1-2:8201",
+          "disable_mlock": true,
+          "log_level": "debug"
+        }
+    ports:
+      - "8902:8200"
+      - "8903:8201"
+    volumes:
+      - secondary1-2-data:/openbao/file
+    depends_on:
+      - secondary1-1
+
+  secondary1-3:
+    <<: *openbao-common
+    environment:
+      BAO_LOCAL_CONFIG: |
+        {
+          "storage": {"raft": {"path": "/openbao/file", "node_id": "secondary1-3", "retry_join": [{"leader_api_addr": "http://secondary1-1:8200"}]}},
+          "listener": [{"tcp": {"address": "0.0.0.0:8200", "tls_disable": true, "cluster_address": "0.0.0.0:8201"}}],
+          "api_addr": "http://secondary1-3:8200",
+          "cluster_addr": "https://secondary1-3:8201",
+          "disable_mlock": true,
+          "log_level": "debug"
+        }
+    ports:
+      - "8904:8200"
+      - "8905:8201"
+    volumes:
+      - secondary1-3-data:/openbao/file
+    depends_on:
+      - secondary1-1
+
+  secondary2-1:
+    <<: *openbao-common
+    environment:
+      BAO_LOCAL_CONFIG: |
+        {
+          "storage": {"raft": {"path": "/openbao/file", "node_id": "secondary2-1"}},
+          "listener": [{"tcp": {"address": "0.0.0.0:8200", "tls_disable": true, "cluster_address": "0.0.0.0:8201"}}],
+          "api_addr": "http://secondary2-1:8200",
+          "cluster_addr": "https://secondary2-1:8201",
+          "disable_mlock": true,
+          "log_level": "debug"
+        }
+    ports:
+      - "9000:8200"
+      - "9001:8201"
+    volumes:
+      - secondary2-1-data:/openbao/file
+
+  secondary2-2:
+    <<: *openbao-common
+    environment:
+      BAO_LOCAL_CONFIG: |
+        {
+          "storage": {"raft": {"path": "/openbao/file", "node_id": "secondary2-2", "retry_join": [{"leader_api_addr": "http://secondary2-1:8200"}]}},
+          "listener": [{"tcp": {"address": "0.0.0.0:8200", "tls_disable": true, "cluster_address": "0.0.0.0:8201"}}],
+          "api_addr": "http://secondary2-2:8200",
+          "cluster_addr": "https://secondary2-2:8201",
+          "disable_mlock": true,
+          "log_level": "debug"
+        }
+    ports:
+      - "9002:8200"
+      - "9003:8201"
+    volumes:
+      - secondary2-2-data:/openbao/file
+    depends_on:
+      - secondary2-1
+
+  secondary2-3:
+    <<: *openbao-common
+    environment:
+      BAO_LOCAL_CONFIG: |
+        {
+          "storage": {"raft": {"path": "/openbao/file", "node_id": "secondary2-3", "retry_join": [{"leader_api_addr": "http://secondary2-1:8200"}]}},
+          "listener": [{"tcp": {"address": "0.0.0.0:8200", "tls_disable": true, "cluster_address": "0.0.0.0:8201"}}],
+          "api_addr": "http://secondary2-3:8200",
+          "cluster_addr": "https://secondary2-3:8201",
+          "disable_mlock": true,
+          "log_level": "debug"
+        }
+    ports:
+      - "9004:8200"
+      - "9005:8201"
+    volumes:
+      - secondary2-3-data:/openbao/file
+    depends_on:
+      - secondary2-1
+
+volumes:
+  primary-1-data:
+  primary-2-data:
+  primary-3-data:
+  secondary1-1-data:
+  secondary1-2-data:
+  secondary1-3-data:
+  secondary2-1-data:
+  secondary2-2-data:
+  secondary2-3-data:
+
+networks:
+  dr-ha-net:
+    driver: bridge

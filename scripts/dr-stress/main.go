@@ -90,11 +90,13 @@ func runMode(args []string) {
 	fs.IntVar(&cfg.WriteRetries, "write-retries", cfg.WriteRetries, "PUT retry count")
 
 	// Intervals.
-	var monitorSec, progressSec, stepdownSec int
+	var monitorSec, progressSec, stepdownSec, sentinelWriteTimeoutSec, sentinelWriteRetryIntervalMs int
 	fs.IntVar(&monitorSec, "monitor-interval", 2, "Status poll interval in seconds")
 	fs.IntVar(&progressSec, "progress-interval", 2, "Console progress interval in seconds")
 	fs.IntVar(&cfg.MaxWaitSeconds, "max-wait-seconds", cfg.MaxWaitSeconds, "Sentinel convergence timeout")
 	fs.IntVar(&stepdownSec, "stepdown-interval", 0, "Primary stepdown interval; 0 disables")
+	fs.IntVar(&sentinelWriteTimeoutSec, "sentinel-write-timeout", int(cfg.SentinelWriteTimeout.Seconds()), "Sentinel write retry timeout in seconds")
+	fs.IntVar(&sentinelWriteRetryIntervalMs, "sentinel-write-retry-interval", int(cfg.SentinelWriteRetryInterval/time.Millisecond), "Sentinel write retry interval in milliseconds")
 
 	// Operation mix.
 	fs.IntVar(&cfg.PutPercent, "put-percent", cfg.PutPercent, "Percent PUT ops")
@@ -132,6 +134,8 @@ func runMode(args []string) {
 	cfg.ProgressInterval = time.Duration(progressSec) * time.Second
 	cfg.StepdownInterval = time.Duration(stepdownSec) * time.Second
 	cfg.HTTPTimeout = time.Duration(httpTimeoutSec) * time.Second
+	cfg.SentinelWriteTimeout = time.Duration(sentinelWriteTimeoutSec) * time.Second
+	cfg.SentinelWriteRetryInterval = time.Duration(sentinelWriteRetryIntervalMs) * time.Millisecond
 
 	if err := cfg.Validate(); err != nil {
 		log.Fatalf("config error: %v", err)
@@ -214,9 +218,13 @@ func executeRun(cfg *Config) error {
 	progressPath := filepath.Join(runDir, "progress.log")
 	progress := NewProgressReporter(rec, mon, cfg, progressPath)
 
-	// Set up context with deadline and signal handling.
+	// Stop scheduling new operations at the configured duration, but let
+	// in-flight requests finish under the HTTP client timeout. Otherwise the
+	// natural run deadline is recorded as a burst of operation failures.
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Duration)
 	defer cancel()
+	opCtx, cancelOps := context.WithCancel(context.Background())
+	defer cancelOps()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -225,6 +233,7 @@ func executeRun(cfg *Config) error {
 		case sig := <-sigCh:
 			log.Printf("received %v, stopping workload...", sig)
 			cancel()
+			cancelOps()
 		case <-ctx.Done():
 		}
 	}()
@@ -239,7 +248,7 @@ func executeRun(cfg *Config) error {
 	// Run workers (blocks until all done).
 	log.Printf("starting %d workers for %s (seed=%d, workload=%s)",
 		cfg.Concurrency, cfg.Duration, cfg.Seed, cfg.Workload)
-	RunWorkers(ctx, cfg, wl, rec)
+	RunWorkers(ctx, opCtx, cfg, wl, rec)
 
 	// Stop recorder (flush remaining events).
 	rec.Close()
@@ -248,7 +257,7 @@ func executeRun(cfg *Config) error {
 	cancel()
 
 	// Run sentinel convergence check.
-	sentinelCtx, sentinelCancel := context.WithTimeout(context.Background(), time.Duration(cfg.MaxWaitSeconds)*time.Second+10*time.Second)
+	sentinelCtx, sentinelCancel := context.WithTimeout(context.Background(), cfg.SentinelWriteTimeout+time.Duration(cfg.MaxWaitSeconds)*time.Second+10*time.Second)
 	defer sentinelCancel()
 	s1Result, s2Result := RunSentinel(sentinelCtx, cfg, clients)
 
@@ -270,22 +279,24 @@ func executeRun(cfg *Config) error {
 		"created_at":  startAt.UTC().Format(time.RFC3339),
 		"data_prefix": fmt.Sprintf("%s/%s/%s", cfg.KVMount, cfg.KeyPrefix, cfg.RunID),
 		"parameters": map[string]interface{}{
-			"duration_seconds":      int(cfg.Duration.Seconds()),
-			"concurrency":           cfg.Concurrency,
-			"put_percent":           cfg.PutPercent,
-			"get_primary_percent":   cfg.GetPrimaryPercent,
-			"status_s1_percent":     cfg.StatusS1Percent,
-			"status_s2_percent":     cfg.StatusS2Percent,
-			"hot_key_count":         cfg.HotKeyCount,
-			"cold_key_count":        cfg.ColdKeyCount,
-			"hot_percent":           cfg.HotPercent,
-			"small_bytes":           cfg.SmallBytes,
-			"large_bytes":           cfg.LargeBytes,
-			"large_payload_percent": cfg.LargePayloadPercent,
-			"write_retries":         cfg.WriteRetries,
-			"stepdown_interval":     int(cfg.StepdownInterval.Seconds()),
-			"seed":                  cfg.Seed,
-			"workload":              cfg.Workload,
+			"duration_seconds":              int(cfg.Duration.Seconds()),
+			"concurrency":                   cfg.Concurrency,
+			"put_percent":                   cfg.PutPercent,
+			"get_primary_percent":           cfg.GetPrimaryPercent,
+			"status_s1_percent":             cfg.StatusS1Percent,
+			"status_s2_percent":             cfg.StatusS2Percent,
+			"hot_key_count":                 cfg.HotKeyCount,
+			"cold_key_count":                cfg.ColdKeyCount,
+			"hot_percent":                   cfg.HotPercent,
+			"small_bytes":                   cfg.SmallBytes,
+			"large_bytes":                   cfg.LargeBytes,
+			"large_payload_percent":         cfg.LargePayloadPercent,
+			"write_retries":                 cfg.WriteRetries,
+			"stepdown_interval":             int(cfg.StepdownInterval.Seconds()),
+			"sentinel_write_timeout":        int(cfg.SentinelWriteTimeout.Seconds()),
+			"sentinel_write_retry_interval": int(cfg.SentinelWriteRetryInterval / time.Millisecond),
+			"seed":                          cfg.Seed,
+			"workload":                      cfg.Workload,
 		},
 		"workload": map[string]interface{}{
 			"duration_ms":           durationMS,

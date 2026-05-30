@@ -95,31 +95,32 @@ func (w *Worker) ChooseKeyIndex() int {
 	return hotCount + 1 + w.Rand.Intn(coldCount)
 }
 
-// Run executes the worker loop until the context is cancelled or the deadline
-// is reached.
-func (w *Worker) Run(ctx context.Context) {
+// Run executes the worker loop until stopCtx is cancelled or its deadline is
+// reached. Individual operations use opCtx so natural workload expiry stops new
+// operations without cancelling requests already in flight.
+func (w *Worker) Run(stopCtx, opCtx context.Context) {
 	for {
 		select {
-		case <-ctx.Done():
+		case <-stopCtx.Done():
 			return
 		default:
 		}
 
 		op := w.ChooseOp()
-		ev := w.workload.Execute(ctx, op, w)
+		ev := w.workload.Execute(opCtx, op, w)
 		w.recorder.Send(ev)
 	}
 }
 
 // RunWorkers starts N workers and blocks until all complete.
-func RunWorkers(ctx context.Context, cfg *Config, wl Workload, rec *Recorder) {
+func RunWorkers(stopCtx, opCtx context.Context, cfg *Config, wl Workload, rec *Recorder) {
 	var wg sync.WaitGroup
 	for i := 0; i < cfg.Concurrency; i++ {
 		w := NewWorker(i, cfg, wl, rec)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			w.Run(ctx)
+			w.Run(stopCtx, opCtx)
 		}()
 	}
 	wg.Wait()

@@ -126,7 +126,8 @@ func (c *BaoClient) KVPut(ctx context.Context, mount, key string, data map[strin
 
 // KVGetResponse is the outer envelope for a KV v2 GET.
 type KVGetResponse struct {
-	Data *KVGetData `json:"data"`
+	Data   *KVGetData `json:"data"`
+	Errors []string   `json:"errors"`
 }
 
 // KVGetData contains the versioned data from a KV v2 GET.
@@ -142,7 +143,7 @@ func (c *BaoClient) KVGet(ctx context.Context, mount, key string) (int, *KVGetRe
 	if err != nil {
 		return code, nil, err
 	}
-	if code == 404 {
+	if len(body) == 0 {
 		return code, nil, nil
 	}
 	var resp KVGetResponse

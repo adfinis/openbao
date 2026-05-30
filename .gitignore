@@ -76,3 +76,4 @@ LICENSE_DEPENDENCIES.md
 
 # DR Test
 dr-stress-results/*
+.dr-test.env

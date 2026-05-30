@@ -67,9 +67,14 @@ func verifyMode(args []string) {
 		}
 	}
 
-	// Read writes.ndjson and build truth map.
-	writesPath := filepath.Join(*runDir, "writes.ndjson")
-	truthMap := buildTruthMap(writesPath, *kvMount, runIDFromConfig)
+	// Build the truth map from events.ndjson when available. Timeout/cancelled
+	// client writes may still commit server-side, so writes.ndjson alone is not
+	// enough to determine post-run correctness.
+	truthPath := filepath.Join(*runDir, "events.ndjson")
+	if _, err := os.Stat(truthPath); err != nil {
+		truthPath = filepath.Join(*runDir, "writes.ndjson")
+	}
+	truthMap := buildTruthMap(truthPath, *kvMount, runIDFromConfig)
 	if len(truthMap) == 0 {
 		log.Fatal("no writes found in truth log")
 	}
@@ -81,18 +86,23 @@ func verifyMode(args []string) {
 	log.Printf("verifying %d sampled keys", len(keys))
 
 	// Verify each key.
-	var matches, mismatches, missing, errors int
+	var matches, mismatches, missing, uncertainMissing, errors int
 	type mismatchDetail struct {
-		Key         string `json:"key"`
-		ExpectedSeq uint64 `json:"expected_seq"`
-		ActualSeq   string `json:"actual_seq"`
-		ActualRunID string `json:"actual_run_id"`
-		Reason      string `json:"reason"`
+		Key         string   `json:"key"`
+		ExpectedSeq uint64   `json:"expected_seq,omitempty"`
+		AllowedSeqs []uint64 `json:"allowed_seqs,omitempty"`
+		ActualSeq   string   `json:"actual_seq,omitempty"`
+		ActualRunID string   `json:"actual_run_id,omitempty"`
+		Reason      string   `json:"reason"`
 	}
 	var details []mismatchDetail
+	var ambiguousSampled int
 
 	for _, key := range keys {
 		expected := truthMap[key]
+		if len(expected.allowedSeqs) > 1 {
+			ambiguousSampled++
+		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		code, resp, err := client.KVGet(ctx, *kvMount, key)
@@ -102,18 +112,54 @@ func verifyMode(args []string) {
 			errors++
 			details = append(details, mismatchDetail{
 				Key:         key,
-				ExpectedSeq: expected.seq,
+				ExpectedSeq: expected.seq(),
+				AllowedSeqs: expected.allowedSeqs,
 				Reason:      fmt.Sprintf("error: %v", err),
 			})
 			continue
 		}
 
-		if code == 404 || resp == nil || resp.Data == nil || resp.Data.Data == nil {
+		if code == 404 {
+			if hasNoHandlerError(resp) {
+				errors++
+				details = append(details, mismatchDetail{
+					Key:         key,
+					ExpectedSeq: expected.seq(),
+					AllowedSeqs: expected.allowedSeqs,
+					Reason:      fmt.Sprintf("route not found: %s", strings.Join(resp.Errors, "; ")),
+				})
+				continue
+			}
+			if expected.allowMissing {
+				uncertainMissing++
+				continue
+			}
 			missing++
 			details = append(details, mismatchDetail{
 				Key:         key,
-				ExpectedSeq: expected.seq,
+				ExpectedSeq: expected.seq(),
+				AllowedSeqs: expected.allowedSeqs,
 				Reason:      "key not found",
+			})
+			continue
+		}
+		if code != 200 {
+			errors++
+			details = append(details, mismatchDetail{
+				Key:         key,
+				ExpectedSeq: expected.seq(),
+				AllowedSeqs: expected.allowedSeqs,
+				Reason:      fmt.Sprintf("unexpected HTTP status: %d", code),
+			})
+			continue
+		}
+		if resp == nil || resp.Data == nil || resp.Data.Data == nil {
+			errors++
+			details = append(details, mismatchDetail{
+				Key:         key,
+				ExpectedSeq: expected.seq(),
+				AllowedSeqs: expected.allowedSeqs,
+				Reason:      "malformed KV response: missing data",
 			})
 			continue
 		}
@@ -132,7 +178,7 @@ func verifyMode(args []string) {
 
 		actualRunID, _ := data["run_id"].(string)
 
-		seqOK := actualSeq == expected.seq
+		seqOK := expected.allowsSeq(actualSeq)
 		runIDOK := expected.runID == "" || actualRunID == expected.runID
 
 		if seqOK && runIDOK {
@@ -141,12 +187,17 @@ func verifyMode(args []string) {
 			mismatches++
 			d := mismatchDetail{
 				Key:         key,
-				ExpectedSeq: expected.seq,
+				ExpectedSeq: expected.seq(),
+				AllowedSeqs: expected.allowedSeqs,
 				ActualSeq:   fmt.Sprintf("%d", actualSeq),
 				ActualRunID: actualRunID,
 			}
 			if !seqOK {
-				d.Reason = fmt.Sprintf("seq mismatch: expected %d got %d", expected.seq, actualSeq)
+				if len(expected.allowedSeqs) > 1 {
+					d.Reason = fmt.Sprintf("seq mismatch: expected one of %v got %d", expected.allowedSeqs, actualSeq)
+				} else {
+					d.Reason = fmt.Sprintf("seq mismatch: expected %d got %d", expected.seq(), actualSeq)
+				}
 			} else {
 				d.Reason = fmt.Sprintf("run_id mismatch: expected %s got %s", expected.runID, actualRunID)
 			}
@@ -160,7 +211,9 @@ func verifyMode(args []string) {
 		"matches":             matches,
 		"mismatches":          mismatches,
 		"missing":             missing,
+		"uncertain_missing":   uncertainMissing,
 		"errors":              errors,
+		"ambiguous_sampled":   ambiguousSampled,
 		"pass":                mismatches == 0 && missing == 0 && errors == 0,
 	}
 	if len(details) > 0 {
@@ -178,7 +231,9 @@ func verifyMode(args []string) {
 		fmt.Printf("Matches:        %d\n", matches)
 		fmt.Printf("Mismatches:     %d\n", mismatches)
 		fmt.Printf("Missing:        %d\n", missing)
+		fmt.Printf("Uncertain miss: %d\n", uncertainMissing)
 		fmt.Printf("Errors:         %d\n", errors)
+		fmt.Printf("Ambiguous:      %d\n", ambiguousSampled)
 
 		pass := mismatches == 0 && missing == 0 && errors == 0
 		if pass {
@@ -198,16 +253,48 @@ func verifyMode(args []string) {
 }
 
 type truthEntry struct {
-	seq   uint64
-	runID string
+	allowedSeqs  []uint64
+	runID        string
+	allowMissing bool
 }
 
-// buildTruthMap reads writes.ndjson and builds a map from KV API path
-// (without the mount prefix) to the highest seq for that key.
+func (e truthEntry) seq() uint64 {
+	if len(e.allowedSeqs) == 0 {
+		return 0
+	}
+	return e.allowedSeqs[0]
+}
+
+func (e truthEntry) allowsSeq(seq uint64) bool {
+	for _, allowed := range e.allowedSeqs {
+		if seq == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+type truthWrite struct {
+	seq       uint64
+	start     time.Time
+	end       time.Time
+	confirmed bool
+}
+
+// buildTruthMap reads events.ndjson or writes.ndjson and builds a map from KV API path
+// (without the mount prefix) to the possible final seq values for that key.
 // The event Key field is stored as <mount>/<prefix>/<run_id>/k<N>.
 // We strip the mount prefix so the map keys are the path to pass to KVGet.
-func buildTruthMap(writesPath, kvMount, runID string) map[string]truthEntry {
-	f, err := os.Open(writesPath)
+//
+// The stress workload writes hot keys concurrently from many workers. The seq
+// field is per-worker, so "highest seq" is not a valid last-writer rule. Use
+// the client-visible operation intervals instead: a write is a possible final
+// value only if no confirmed write to that key started after it completed. If
+// exactly one candidate remains, the final value is deterministic; if multiple
+// overlapping or commit-uncertain tail writes remain, any candidate is
+// linearizable.
+func buildTruthMap(truthPath, kvMount, runID string) map[string]truthEntry {
+	f, err := os.Open(truthPath)
 	if err != nil {
 		log.Printf("cannot open writes file: %v", err)
 		return nil
@@ -215,7 +302,7 @@ func buildTruthMap(writesPath, kvMount, runID string) map[string]truthEntry {
 	defer f.Close()
 
 	mountPrefix := kvMount + "/"
-	truth := make(map[string]truthEntry)
+	writesByKey := make(map[string][]truthWrite)
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
@@ -224,7 +311,14 @@ func buildTruthMap(writesPath, kvMount, runID string) map[string]truthEntry {
 		if err := json.Unmarshal(scanner.Bytes(), &ev); err != nil {
 			continue
 		}
-		if ev.Key == "" || ev.Seq == 0 {
+		if ev.Op != "" && ev.Op != "put" {
+			continue
+		}
+		confirmed := ev.Err == "" && (ev.Code == 200 || ev.Code == 204)
+		if !confirmed && !isCommitUncertainPut(ev) {
+			continue
+		}
+		if ev.Key == "" || ev.Seq == 0 || ev.TS.IsZero() {
 			continue
 		}
 
@@ -234,14 +328,86 @@ func buildTruthMap(writesPath, kvMount, runID string) map[string]truthEntry {
 			apiPath = strings.TrimPrefix(apiPath, mountPrefix)
 		}
 
-		// Keep the highest seq per key (last writer wins).
-		existing, exists := truth[apiPath]
-		if !exists || ev.Seq > existing.seq {
-			truth[apiPath] = truthEntry{seq: ev.Seq, runID: runID}
-		}
+		writesByKey[apiPath] = append(writesByKey[apiPath], truthWrite{
+			seq:       ev.Seq,
+			start:     ev.TS,
+			end:       ev.TS.Add(time.Duration(ev.LatencyNS)),
+			confirmed: confirmed,
+		})
 	}
 
+	truth := make(map[string]truthEntry, len(writesByKey))
+	for key, writes := range writesByKey {
+		allowed := terminalWriteSeqs(writes)
+		if len(allowed) == 0 {
+			continue
+		}
+		truth[key] = truthEntry{allowedSeqs: allowed, runID: runID, allowMissing: !hasConfirmedWrite(writes)}
+	}
 	return truth
+}
+
+func hasConfirmedWrite(writes []truthWrite) bool {
+	for _, write := range writes {
+		if write.confirmed {
+			return true
+		}
+	}
+	return false
+}
+
+func terminalWriteSeqs(writes []truthWrite) []uint64 {
+	seqs := make([]uint64, 0, len(writes))
+	seen := make(map[uint64]struct{}, len(writes))
+	for i, write := range writes {
+		overwritten := false
+		for j, other := range writes {
+			if i == j {
+				continue
+			}
+			if other.confirmed && other.start.After(write.end) {
+				overwritten = true
+				break
+			}
+		}
+		if overwritten {
+			continue
+		}
+		if _, ok := seen[write.seq]; ok {
+			continue
+		}
+		seen[write.seq] = struct{}{}
+		seqs = append(seqs, write.seq)
+	}
+	sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
+	return seqs
+}
+
+func isCommitUncertainPut(ev Event) bool {
+	if ev.Op != "" && ev.Op != "put" {
+		return false
+	}
+	if ev.Code != 0 || ev.Err == "" {
+		return false
+	}
+	switch ev.Err {
+	case "ctx_deadline", "ctx_canceled", "timeout", "eof", "conn_reset":
+		return true
+	default:
+		return false
+	}
+}
+
+func hasNoHandlerError(resp *KVGetResponse) bool {
+	if resp == nil {
+		return false
+	}
+	for _, errText := range resp.Errors {
+		if strings.Contains(errText, "no handler for route") || strings.Contains(errText, "route entry not found") {
+			return true
+		}
+	}
+	return false
 }
 
 func sampleKeys(truth map[string]truthEntry, n int) []string {
@@ -251,7 +417,7 @@ func sampleKeys(truth map[string]truthEntry, n int) []string {
 	}
 	sort.Strings(keys)
 
-	if n >= len(keys) {
+	if n <= 0 || n >= len(keys) {
 		return keys
 	}
 

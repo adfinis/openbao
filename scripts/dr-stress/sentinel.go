@@ -31,14 +31,17 @@ func RunSentinel(ctx context.Context, cfg *Config, clients *ClientSet) (s1, s2 S
 		"run_id":  cfg.RunID,
 	}
 
-	code, err := clients.Primary.KVPut(ctx, cfg.KVMount, sentinelPath, data)
+	code, err, attempts, elapsed := writeSentinelWithRetry(ctx, cfg, clients.Primary, sentinelPath, data)
 	if err != nil || (code != 200 && code != 204) {
-		log.Printf("[sentinel] failed to write sentinel key: code=%d err=%v", code, err)
+		log.Printf("[sentinel] failed to write sentinel key after %d attempts in %s: code=%d err=%v", attempts, elapsed.Round(time.Millisecond), code, err)
 		s1.Role = "secondary1"
 		s1.ConvergeSeconds = -1
 		s2.Role = "secondary2"
 		s2.ConvergeSeconds = -1
 		return
+	}
+	if attempts > 1 {
+		log.Printf("[sentinel] sentinel write succeeded after %d attempts in %s", attempts, elapsed.Round(time.Millisecond))
 	}
 
 	// Brief pause to let the write propagate.
@@ -60,6 +63,49 @@ func RunSentinel(ctx context.Context, cfg *Config, clients *ClientSet) (s1, s2 S
 	}
 
 	return
+}
+
+func writeSentinelWithRetry(ctx context.Context, cfg *Config, client *BaoClient, sentinelPath string, data map[string]interface{}) (code int, err error, attempts int, elapsed time.Duration) {
+	start := time.Now()
+	writeCtx, cancel := context.WithTimeout(ctx, cfg.SentinelWriteTimeout)
+	defer cancel()
+
+	for {
+		attempts++
+		code, err = client.KVPut(writeCtx, cfg.KVMount, sentinelPath, data)
+		elapsed = time.Since(start)
+		if err == nil && (code == 200 || code == 204) {
+			return code, nil, attempts, elapsed
+		}
+		if !sentinelWriteRetriable(code, err) || writeCtx.Err() != nil {
+			return code, err, attempts, elapsed
+		}
+
+		if attempts == 1 || attempts%10 == 0 {
+			log.Printf("[sentinel] sentinel write retrying after transient failure: attempt=%d code=%d err=%v", attempts, code, err)
+		}
+
+		timer := time.NewTimer(cfg.SentinelWriteRetryInterval)
+		select {
+		case <-writeCtx.Done():
+			timer.Stop()
+			elapsed = time.Since(start)
+			return code, err, attempts, elapsed
+		case <-timer.C:
+		}
+	}
+}
+
+func sentinelWriteRetriable(code int, err error) bool {
+	if err != nil {
+		return true
+	}
+	switch code {
+	case 0, 429, 500, 502, 503, 504:
+		return true
+	default:
+		return false
+	}
 }
 
 func waitForConvergence(ctx context.Context, role string, client *BaoClient, timeout time.Duration) SentinelResult {

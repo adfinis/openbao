@@ -103,7 +103,8 @@ func (p *ProgressReporter) printLine(w io.Writer) {
 		s2Idx = snap.Secondary2.LastAppliedIndex
 	}
 
-	fmt.Fprintf(w, "[mixed] elapsed=%s remaining=%s ops=%d rate=%.1f/s put(ok=%d fail=%d) get(ok=%d fail=%d) status(ok=%d fail=%d) s1=%s(idx=%d) s2=%s(idx=%d) buf=%d/%d horizon=%.0fs dropped=%d\n",
+	fmt.Fprintf(
+		w, "[mixed] elapsed=%s remaining=%s ops=%d rate=%.1f/s put(ok=%d fail=%d) get(ok=%d fail=%d) status(ok=%d fail=%d) s1=%s(idx=%d) s2=%s(idx=%d) buf=%d/%d horizon=%.0fs dropped=%d\n",
 		formatDuration(elapsed), formatDuration(remaining),
 		total, opsRate,
 		putOK, putFail,

@@ -54,6 +54,54 @@ docker-dev: prep
 docker-dev-ui: prep
 	$(DOCKER_CMD) build --build-arg VERSION=$(GO_VERSION_MIN) --build-arg BUILD_TAGS="$(BUILD_TAGS)" -f scripts/docker/Dockerfile.ui -t openbao:dev-ui .
 
+dr-test-up:
+	@./scripts/dr_local_test.sh up
+
+dr-test-reset:
+	@./scripts/dr_local_test.sh reset
+
+dr-test-status:
+	@./scripts/dr_local_test.sh status
+
+dr-test-smoke:
+	@./scripts/dr_local_test.sh smoke
+
+dr-test-verify:
+	@./scripts/dr_local_test.sh verify
+
+dr-test-failover-smoke:
+	@./scripts/dr_local_test.sh failover-smoke
+
+dr-test-down:
+	@./scripts/dr_local_test.sh down
+
+dr-test-ha-reset:
+	@./scripts/dr_local_test.sh --topology ha reset
+
+dr-test-ha-status:
+	@./scripts/dr_local_test.sh --topology ha status
+
+dr-test-ha-smoke:
+	@./scripts/dr_local_test.sh --topology ha smoke --duration 900 --concurrency 48 --stepdown-interval 300
+
+dr-test-ha-verify:
+	@./scripts/dr_local_test.sh --topology ha verify
+
+dr-test-ha-failover-smoke:
+	@./scripts/dr_local_test.sh --topology ha failover-smoke
+
+dr-test-ha-promoted-durability-smoke:
+	@./scripts/dr_local_test.sh --topology ha promoted-durability-smoke
+
+dr-test-ha-reseed-secondary-smoke:
+	@./scripts/dr_local_test.sh --topology ha reseed-secondary-smoke
+
+dr-test-ha-failover-load-lifecycle:
+	@./scripts/dr_local_test.sh --topology ha failover-load-lifecycle
+
+dr-test-ha-down:
+	@./scripts/dr_local_test.sh --topology ha down
+
 # test runs the unit tests and vets the code
 test: prep
 	@CGO_ENABLED=$(CGO_ENABLED) \
@@ -179,6 +227,7 @@ proto: bootstrap
 	protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative physical/raft/types.proto
 	protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative helper/identity/mfa/types.proto
 	protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative helper/identity/types.proto
+	protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative vault/dr_replication_service.proto
 	protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative sdk/database/dbplugin/*.proto
 	protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative sdk/database/dbplugin/v5/proto/*.proto
 	protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative sdk/plugin/pb/*.proto
@@ -235,7 +284,7 @@ influxdb-database-plugin:
 postgresql-database-plugin:
 	@CGO_ENABLED=0 go build -o bin/postgresql-database-plugin ./plugins/database/postgresql/postgresql-database-plugin
 
-.PHONY: bin default prep test vet bootstrap fmt fmtcheck mysql-database-plugin mysql-legacy-database-plugin cassandra-database-plugin influxdb-database-plugin postgresql-database-plugin ember-dist ember-dist-dev static-dist static-dist-dev assetcheck check-openbao-in-path packages build build-ci semgrep semgrep-ci vet-godoctests ci-vet-godoctests
+.PHONY: bin default prep test vet bootstrap fmt fmtcheck mysql-database-plugin mysql-legacy-database-plugin cassandra-database-plugin influxdb-database-plugin postgresql-database-plugin ember-dist ember-dist-dev static-dist static-dist-dev assetcheck check-openbao-in-path packages build build-ci semgrep semgrep-ci vet-godoctests ci-vet-godoctests dr-test-up dr-test-reset dr-test-status dr-test-smoke dr-test-verify dr-test-failover-smoke dr-test-down dr-test-ha-reset dr-test-ha-status dr-test-ha-smoke dr-test-ha-verify dr-test-ha-failover-smoke dr-test-ha-promoted-durability-smoke dr-test-ha-reseed-secondary-smoke dr-test-ha-failover-load-lifecycle dr-test-ha-down
 
 .NOTPARALLEL: ember-dist ember-dist-dev
 
