@@ -4230,6 +4230,56 @@ func TestDRPrimary_AllowForcedCheckpointBuild_Cooldown(t *testing.T) {
 	}
 }
 
+func TestDRPrimary_CheckpointBuildAdmissionLimitsCrossRelationshipConcurrency(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
+	primary.checkpointBuildMaxInFlight = 1
+
+	first, owner, err := primary.claimCheckpointBuild("rel-a")
+	if err != nil {
+		t.Fatalf("expected first checkpoint build claim to pass: %v", err)
+	}
+	if !owner {
+		t.Fatal("expected first checkpoint build claim to own the build")
+	}
+
+	same, owner, err := primary.claimCheckpointBuild("rel-a")
+	if err != nil {
+		t.Fatalf("expected same relationship checkpoint claim to wait on existing build: %v", err)
+	}
+	if owner {
+		t.Fatal("expected same relationship checkpoint claim to reuse in-flight build")
+	}
+	if same != first {
+		t.Fatal("expected same relationship checkpoint claim to receive existing build result")
+	}
+
+	_, owner, err = primary.claimCheckpointBuild("rel-b")
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("expected cross-relationship checkpoint admission to fail with ResourceExhausted, got %v: %v", status.Code(err), err)
+	}
+	if owner {
+		t.Fatal("expected rejected checkpoint build claim not to own a build")
+	}
+	inFlight, maxInFlight, failures := primary.checkpointBuildStats()
+	if inFlight != 1 || maxInFlight != 1 || failures != 1 {
+		t.Fatalf("unexpected checkpoint build stats: inFlight=%d max=%d failures=%d", inFlight, maxInFlight, failures)
+	}
+
+	primary.finishCheckpointBuild("rel-a", first, &CheckpointResponse{CheckpointId: "cp-a", CommitIndex: 1}, nil)
+
+	second, owner, err := primary.claimCheckpointBuild("rel-b")
+	if err != nil {
+		t.Fatalf("expected checkpoint claim to pass after previous build finishes: %v", err)
+	}
+	if !owner {
+		t.Fatal("expected rel-b checkpoint claim to own the build after capacity frees")
+	}
+	primary.finishCheckpointBuild("rel-b", second, &CheckpointResponse{CheckpointId: "cp-b", CommitIndex: 2}, nil)
+}
+
 // --- Integration Test: Strata Estimator Roundtrip ---
 
 func TestDRPeerFingerprintFromContext_FallbackConnContext(t *testing.T) {

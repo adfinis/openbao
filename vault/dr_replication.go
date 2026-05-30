@@ -40,6 +40,7 @@ const (
 	drCheckpointLaggingActiveWindow        = 10 * time.Second
 	drCheckpointForceBuildInterval         = 15 * time.Second
 	drCheckpointIndexFullScanInterval      = 4 * time.Hour
+	drCheckpointBuildMaxInFlight           = 1
 
 	drDirtyBitmapSize            = 1024
 	drDirtyBitmapBytes           = drDirtyBitmapSize / 8
@@ -199,25 +200,28 @@ type drReplicationPrimary struct {
 	streamLaggingSubscribersActive atomic.Uint64
 	streamLaggingLastEventUnix     atomic.Int64
 
-	checkpointMu                    sync.RWMutex
-	checkpoints                     map[string]*drCheckpointCacheEntry
-	checkpointTTL                   time.Duration
-	maxCheckpoints                  int
-	checkpointBytes                 uint64
-	checkpointMetaBytes             uint64
-	checkpointValueBytes            uint64
-	checkpointManifestBytes         uint64
-	checkpointDerivedBytes          uint64
-	checkpointEvictions             atomic.Uint64
-	checkpointAdmissionFailures     atomic.Uint64
-	checkpointThrottleTotal         atomic.Uint64
-	checkpointGlobalBudget          uint64
-	checkpointPerRelationshipBudget uint64
-	maxCheckpointsPerRelationship   int
-	rangePlanConfig                 reconciler.RangePlanConfig
+	checkpointMu                     sync.RWMutex
+	checkpoints                      map[string]*drCheckpointCacheEntry
+	checkpointTTL                    time.Duration
+	maxCheckpoints                   int
+	checkpointBytes                  uint64
+	checkpointMetaBytes              uint64
+	checkpointValueBytes             uint64
+	checkpointManifestBytes          uint64
+	checkpointDerivedBytes           uint64
+	checkpointEvictions              atomic.Uint64
+	checkpointAdmissionFailures      atomic.Uint64
+	checkpointThrottleTotal          atomic.Uint64
+	checkpointBuildAdmissionFailures atomic.Uint64
+	checkpointGlobalBudget           uint64
+	checkpointPerRelationshipBudget  uint64
+	maxCheckpointsPerRelationship    int
+	rangePlanConfig                  reconciler.RangePlanConfig
 	// checkpointBuildInFlight de-amplifies parallel checkpoint requests
-	// for the same relationship.
+	// for the same relationship. checkpointBuildMaxInFlight bounds
+	// concurrent full checkpoint builders across relationships.
 	checkpointBuildInFlight        map[string]*drCheckpointBuildResult
+	checkpointBuildMaxInFlight     int
 	latestCheckpointByRelationship map[string]string
 	activeCheckpointRefs           map[string]int
 	// checkpointLastForcedBuildByRelationship prevents permanent reconcile
@@ -363,6 +367,7 @@ func NewDRReplicationPrimary(core *Core, replSalt []byte, logger log.Logger, jou
 		maxCheckpointsPerRelationship:           drCheckpointMaxPerRelationship,
 		rangePlanConfig:                         reconciler.DefaultRangePlanConfig(),
 		checkpointBuildInFlight:                 make(map[string]*drCheckpointBuildResult),
+		checkpointBuildMaxInFlight:              drCheckpointBuildMaxInFlight,
 		latestCheckpointByRelationship:          make(map[string]string),
 		activeCheckpointRefs:                    make(map[string]int),
 		checkpointLastForcedBuildByRelationship: make(map[string]time.Time),
@@ -1042,7 +1047,10 @@ func (s *drReplicationPrimary) RequestCheckpoint(ctx context.Context, req *Check
 			}
 		}
 
-		wait, owner := s.claimCheckpointBuild(req.RelationshipId)
+		wait, owner, err := s.claimCheckpointBuild(req.RelationshipId)
+		if err != nil {
+			return nil, err
+		}
 		if !owner {
 			select {
 			case <-ctx.Done():
@@ -1835,15 +1843,27 @@ func (s *drReplicationPrimary) SyncKeyring(ctx context.Context, req *SyncKeyring
 
 // --- Helpers ---
 
-func (s *drReplicationPrimary) claimCheckpointBuild(relationshipID string) (*drCheckpointBuildResult, bool) {
+func (s *drReplicationPrimary) claimCheckpointBuild(relationshipID string) (*drCheckpointBuildResult, bool, error) {
 	s.checkpointMu.Lock()
 	defer s.checkpointMu.Unlock()
 	if in, ok := s.checkpointBuildInFlight[relationshipID]; ok {
-		return in, false
+		return in, false, nil
+	}
+	maxInFlight := s.checkpointBuildMaxInFlight
+	if maxInFlight <= 0 {
+		maxInFlight = drCheckpointBuildMaxInFlight
+	}
+	if len(s.checkpointBuildInFlight) >= maxInFlight {
+		s.checkpointBuildAdmissionFailures.Add(1)
+		metrics.IncrCounter([]string{"replication", "dr", "checkpoint", "build_admission_failures"}, 1)
+		return nil, false, status.Errorf(codes.ResourceExhausted,
+			"budget_exceeded: checkpoint build concurrency exceeded (%d >= %d); retry",
+			len(s.checkpointBuildInFlight), maxInFlight)
 	}
 	in := &drCheckpointBuildResult{done: make(chan struct{})}
 	s.checkpointBuildInFlight[relationshipID] = in
-	return in, true
+	metrics.SetGauge([]string{"replication", "dr", "checkpoint", "build_inflight"}, float32(len(s.checkpointBuildInFlight)))
+	return in, true, nil
 }
 
 func (s *drReplicationPrimary) finishCheckpointBuild(relationshipID string, in *drCheckpointBuildResult, resp *CheckpointResponse, err error) {
@@ -1853,6 +1873,7 @@ func (s *drReplicationPrimary) finishCheckpointBuild(relationshipID string, in *
 	in.err = err
 	close(in.done)
 	delete(s.checkpointBuildInFlight, relationshipID)
+	metrics.SetGauge([]string{"replication", "dr", "checkpoint", "build_inflight"}, float32(len(s.checkpointBuildInFlight)))
 }
 
 func (s *drReplicationPrimary) reuseCheckpointResponse(relationshipID string, commitIndex uint64) (*CheckpointResponse, bool) {
@@ -2683,6 +2704,17 @@ func (s *drReplicationPrimary) checkpointThrottleCount() uint64 {
 
 func (s *drReplicationPrimary) checkpointThrottleBypassCount() uint64 {
 	return s.checkpointThrottleBypassTotal.Load()
+}
+
+func (s *drReplicationPrimary) checkpointBuildStats() (inFlight int, maxInFlight int, admissionFailures uint64) {
+	s.checkpointMu.RLock()
+	inFlight = len(s.checkpointBuildInFlight)
+	maxInFlight = s.checkpointBuildMaxInFlight
+	s.checkpointMu.RUnlock()
+	if maxInFlight <= 0 {
+		maxInFlight = drCheckpointBuildMaxInFlight
+	}
+	return inFlight, maxInFlight, s.checkpointBuildAdmissionFailures.Load()
 }
 
 func (s *drReplicationPrimary) tuningSnapshot() (checkpointTTLSeconds int64, checkpointGlobalBudget uint64, checkpointPerRelationshipBudget uint64, streamBufferMaxEntries int, streamBufferMaxBytes uint64) {

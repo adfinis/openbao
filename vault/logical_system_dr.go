@@ -777,6 +777,10 @@ func (b *SystemBackend) handleDRStatus(ctx context.Context, req *logical.Request
 		data["checkpoint_admission_failures"] = cacheAdmissionFailures
 		data["checkpoint_throttle_total"] = primary.checkpointThrottleCount()
 		data["checkpoint_throttle_bypass_total"] = primary.checkpointThrottleBypassCount()
+		checkpointBuildInFlight, checkpointBuildMaxInFlight, checkpointBuildAdmissionFailures := primary.checkpointBuildStats()
+		data["checkpoint_build_inflight"] = checkpointBuildInFlight
+		data["checkpoint_build_max_inflight"] = checkpointBuildMaxInFlight
+		data["checkpoint_build_admission_failures"] = checkpointBuildAdmissionFailures
 		data["revoked_streams_terminated"] = primary.revokedStreamsTerminatedCount()
 		data["stream_buffer_entries"] = streamEntries
 		data["stream_buffer_bytes"] = streamBytes

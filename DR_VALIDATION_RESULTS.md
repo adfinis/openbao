@@ -105,7 +105,10 @@ A focused resource-control pass on 2026-05-30 tightened the checkpoint fetch
 path. `FetchEntries` response streams now split batches by approximate payload
 bytes as well as entry count, reject a single entry that cannot fit inside the
 response byte budget, and the secondary reconcile budget now accounts the actual
-bytes fetched from checkpoint artifacts instead of a per-entry placeholder.
+bytes fetched from checkpoint artifacts instead of a per-entry placeholder. A
+follow-up pass also added primary-side checkpoint build admission: requests from
+the same relationship share the in-flight build while cross-relationship build
+storms fail fast once the global build limit is reached.
 
 ## Test Environment
 
@@ -1069,6 +1072,9 @@ from the DR protocol work where possible:
 - Fetch/reconcile resource bounds. `FetchEntries` response batches now have an
   explicit byte budget, oversized single entries fail closed, and range
   reconciliation accounts fetched value bytes against its RPC budget.
+- Checkpoint build admission. Same-relationship checkpoint requests reuse the
+  in-flight build result, while cross-relationship checkpoint build concurrency
+  is globally bounded and rejected with retryable resource pressure once full.
 
 See `DR_BUG_TRACKER.md` for suggested worktree split planning.
 

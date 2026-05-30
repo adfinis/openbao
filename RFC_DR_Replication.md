@@ -774,6 +774,7 @@ The protocol needs bounded resource use:
 
 - checkpoint artifact retention budgets
 - checkpoint build throttling
+- max concurrent checkpoint artifact builders across relationships
 - stream replay horizon budgets
 - max in-flight reconcile tasks
 - max RPC bytes per reconciliation
@@ -795,11 +796,12 @@ Budget exhaustion is a reconciliation failure unless an operator explicitly
 chooses a fallback path.
 
 The current prototype has bounds on the unauthenticated bootstrap and rotation
-paths, checkpoint fetch response batches, and secondary reconciliation fetch
-accounting, with targeted tests for those gates. Production readiness still
-requires final defaults, sustained-abuse testing, and tuning guidance for
-checkpoint retention, stream journal retention, digest split limits, fetch
-batch byte limits, and primary-side backpressure.
+paths, checkpoint build admission, checkpoint fetch response batches, and
+secondary reconciliation fetch accounting, with targeted tests for those gates.
+Production readiness still requires final defaults, sustained-abuse testing, and
+tuning guidance for checkpoint retention, checkpoint build concurrency, stream
+journal retention, digest split limits, fetch batch byte limits, and primary-
+side backpressure.
 
 ### Observability
 
@@ -1294,6 +1296,7 @@ The current local prototype includes:
 - replicated runtime refresh for mount/auth/audit tables, namespaces, and
   identity routes
 - route-backed backend cache invalidation after DR-applied storage writes
+- primary-side checkpoint build admission across relationships
 - `FetchEntries` response byte budgeting and fetched-value byte accounting in
   secondary reconciliation
 - namespace lifecycle validation across initial replication, promotion, and
