@@ -35,6 +35,7 @@ Usage:
   scripts/dr_local_test.sh [--topology single|ha] failover-smoke
   scripts/dr_local_test.sh --topology ha promoted-durability-smoke
   scripts/dr_local_test.sh --topology ha reseed-secondary-smoke
+  scripts/dr_local_test.sh --topology ha tuning-load-smoke [--duration N] [--concurrency N] [--no-reset]
   scripts/dr_local_test.sh --topology ha failover-load-lifecycle [--duration N] [--concurrency N] [--hard-stop-after N] [--no-reset]
   scripts/dr_local_test.sh [--topology single|ha] down
   scripts/dr_local_test.sh [--topology single|ha] logs [service]
@@ -56,6 +57,7 @@ HA topology:
   scripts/dr_local_test.sh --topology ha reset
   scripts/dr_local_test.sh --topology ha engine-lifecycle-matrix
   scripts/dr_local_test.sh --topology ha smoke --duration 900 --concurrency 48 --stepdown-interval 300
+  scripts/dr_local_test.sh --topology ha tuning-load-smoke
   scripts/dr_local_test.sh --topology ha failover-load-lifecycle
 USAGE
 }
@@ -1533,6 +1535,311 @@ cmd_reseed_secondary_smoke() {
   echo "Secondary reseed smoke passed. Secondary2 now follows the promoted authority and old-primary-only keys did not merge."
 }
 
+capture_tuning_load_state() {
+  local run_dir="$1"
+  local label="$2"
+
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" read -format=json sys/replication/dr/status >"$run_dir/${label}-primary-status.json" 2>"$run_dir/${label}-primary-status.err" || true
+  bao_for "$DR_SECONDARY1_ADDR" "$DR_PRIMARY_TOKEN" read -format=json sys/replication/dr/status >"$run_dir/${label}-secondary1-status.json" 2>"$run_dir/${label}-secondary1-status.err" || true
+  bao_for "$DR_SECONDARY2_ADDR" "$DR_PRIMARY_TOKEN" read -format=json sys/replication/dr/status >"$run_dir/${label}-secondary2-status.json" 2>"$run_dir/${label}-secondary2-status.err" || true
+  bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" read -format=json sys/replication/dr/tuning >"$run_dir/${label}-primary-tuning.json" 2>"$run_dir/${label}-primary-tuning.err" || true
+  bao_for "$DR_SECONDARY1_ADDR" "$DR_PRIMARY_TOKEN" read -format=json sys/replication/dr/tuning >"$run_dir/${label}-secondary1-tuning.json" 2>"$run_dir/${label}-secondary1-tuning.err" || true
+  bao_for "$DR_SECONDARY2_ADDR" "$DR_PRIMARY_TOKEN" read -format=json sys/replication/dr/tuning >"$run_dir/${label}-secondary2-tuning.json" 2>"$run_dir/${label}-secondary2-tuning.err" || true
+}
+
+write_tuning_profile() {
+  local label="$1"
+  local addr="$2"
+  local token="$3"
+  local profile="$4"
+  local run_dir="$5"
+  local args=()
+
+  case "$profile" in
+    constrained)
+      args=(
+        checkpoint_ttl_seconds=900
+        checkpoint_global_budget_bytes=536870912
+        checkpoint_per_relationship_budget_bytes=134217728
+        stream_buffer_max_entries=20000
+        stream_buffer_max_bytes=134217728
+        reconcile_max_rpc_bytes=67108864
+        reconcile_max_wall_time_seconds=900
+        reconcile_max_inflight_tasks=8
+        stream_batch_max_entries=128
+        stream_batch_max_bytes=524288
+        stream_batch_max_wait_milliseconds=20
+        stream_journal_enabled=true
+        stream_journal_max_bytes=67108864
+        stream_journal_segment_bytes=4194304
+        stream_journal_retention_seconds=900
+        reconcile_apply_workers=8
+        reconcile_put_batch_max_entries=256
+        reconcile_put_batch_max_bytes=1048576
+        convergence_min_rate_ratio=0.40
+        convergence_stall_seconds=90
+        fallback_enabled=true
+        fallback_stall_seconds=90
+        fallback_failure_threshold=2
+        fallback_min_lag_entries=256
+        fallback_cooldown_seconds=180
+        fallback_max_per_hour=4
+        checkpoint_artifact_enabled=true
+        checkpoint_artifact_global_budget_bytes=536870912
+        checkpoint_artifact_per_relationship_budget_bytes=134217728
+        checkpoint_artifact_ttl_seconds=900
+        checkpoint_artifact_segment_bytes=4194304
+        dr_backpressure_enabled=true
+        dr_backpressure_degraded_ratio=0.75
+        dr_backpressure_critical_ratio=0.50
+        dr_backpressure_min_lag_entries=512
+        dr_backpressure_horizon_seconds=60
+        dr_backpressure_degraded_min_qps=96
+        dr_backpressure_critical_min_qps=48
+      )
+      ;;
+    relaxed)
+      args=(
+        checkpoint_ttl_seconds=1800
+        checkpoint_global_budget_bytes=1073741824
+        checkpoint_per_relationship_budget_bytes=268435456
+        stream_buffer_max_entries=50000
+        stream_buffer_max_bytes=268435456
+        reconcile_max_rpc_bytes=134217728
+        reconcile_max_wall_time_seconds=1800
+        reconcile_max_inflight_tasks=16
+        stream_batch_max_entries=256
+        stream_batch_max_bytes=1048576
+        stream_batch_max_wait_milliseconds=10
+        stream_journal_enabled=true
+        stream_journal_max_bytes=4294967296
+        stream_journal_segment_bytes=67108864
+        stream_journal_retention_seconds=7200
+        reconcile_apply_workers=16
+        reconcile_put_batch_max_entries=512
+        reconcile_put_batch_max_bytes=2097152
+        convergence_min_rate_ratio=0.80
+        convergence_stall_seconds=180
+        fallback_enabled=true
+        fallback_stall_seconds=180
+        fallback_failure_threshold=3
+        fallback_min_lag_entries=1024
+        fallback_cooldown_seconds=600
+        fallback_max_per_hour=2
+        checkpoint_artifact_enabled=true
+        checkpoint_artifact_global_budget_bytes=8589934592
+        checkpoint_artifact_per_relationship_budget_bytes=2147483648
+        checkpoint_artifact_ttl_seconds=1800
+        checkpoint_artifact_segment_bytes=67108864
+        dr_backpressure_enabled=true
+        dr_backpressure_degraded_ratio=0.80
+        dr_backpressure_critical_ratio=0.50
+        dr_backpressure_min_lag_entries=1024
+        dr_backpressure_horizon_seconds=180
+        dr_backpressure_degraded_min_qps=50
+        dr_backpressure_critical_min_qps=10
+      )
+      ;;
+    *)
+      die "unknown tuning profile: $profile"
+      ;;
+  esac
+
+  bao_for "$addr" "$token" write sys/replication/dr/tuning "${args[@]}" >"$run_dir/tuning-${profile}-${label}.out" 2>"$run_dir/tuning-${profile}-${label}.err"
+}
+
+apply_tuning_profile_to_all() {
+  local profile="$1"
+  local run_dir="$2"
+
+  echo "Applying ${profile} tuning profile..."
+  write_tuning_profile "primary" "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" "$profile" "$run_dir"
+  write_tuning_profile "secondary1" "$DR_SECONDARY1_ADDR" "$DR_PRIMARY_TOKEN" "$profile" "$run_dir"
+  write_tuning_profile "secondary2" "$DR_SECONDARY2_ADDR" "$DR_PRIMARY_TOKEN" "$profile" "$run_dir"
+}
+
+force_ha_handoff_for_tuning_load() {
+  local run_dir="$1"
+  local primary_active secondary1_active secondary2_active
+
+  primary_active="$(wait_cluster_active_addr "primary" 120 "${PRIMARY_NODE_ADDRS[@]}")"
+  secondary1_active="$(wait_cluster_active_addr "secondary1" 120 "${SECONDARY1_NODE_ADDRS[@]}")"
+  secondary2_active="$(wait_cluster_active_addr "secondary2" 120 "${SECONDARY2_NODE_ADDRS[@]}")"
+
+  echo "Forcing HA handoff after tuning: primary=${primary_active} secondary1=${secondary1_active} secondary2=${secondary2_active}" | tee -a "$run_dir/orchestrator.log"
+  bao_for "$primary_active" "$DR_PRIMARY_TOKEN" write -f sys/step-down >"$run_dir/stepdown-primary.out" 2>"$run_dir/stepdown-primary.err" || true
+  bao_for "$secondary1_active" "$DR_PRIMARY_TOKEN" write -f sys/step-down >"$run_dir/stepdown-secondary1.out" 2>"$run_dir/stepdown-secondary1.err" || true
+  bao_for "$secondary2_active" "$DR_PRIMARY_TOKEN" write -f sys/step-down >"$run_dir/stepdown-secondary2.out" 2>"$run_dir/stepdown-secondary2.err" || true
+
+  wait_cluster_active_addr "primary after handoff" 120 "${PRIMARY_NODE_ADDRS[@]}" >/dev/null
+  wait_secondary_ready "secondary1 after handoff" "$DR_SECONDARY1_ADDR" 240
+  wait_secondary_ready "secondary2 after handoff" "$DR_SECONDARY2_ADDR" 240
+}
+
+cmd_tuning_load_smoke() {
+  [[ "$TOPOLOGY" == "ha" ]] || die "tuning-load-smoke requires --topology ha"
+  need_bin jq
+
+  local duration=360
+  local concurrency=36
+  local stepdown_interval=90
+  local first_tune_after=60
+  local second_tune_after=180
+  local progress_interval=10
+  local monitor_interval=2
+  local max_wait_seconds=600
+  local do_reset=true
+  local do_build=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --duration)
+        duration="${2:?missing value for --duration}"
+        shift 2
+        ;;
+      --concurrency)
+        concurrency="${2:?missing value for --concurrency}"
+        shift 2
+        ;;
+      --stepdown-interval)
+        stepdown_interval="${2:?missing value for --stepdown-interval}"
+        shift 2
+        ;;
+      --first-tune-after)
+        first_tune_after="${2:?missing value for --first-tune-after}"
+        shift 2
+        ;;
+      --second-tune-after)
+        second_tune_after="${2:?missing value for --second-tune-after}"
+        shift 2
+        ;;
+      --progress-interval)
+        progress_interval="${2:?missing value for --progress-interval}"
+        shift 2
+        ;;
+      --monitor-interval)
+        monitor_interval="${2:?missing value for --monitor-interval}"
+        shift 2
+        ;;
+      --max-wait-seconds)
+        max_wait_seconds="${2:?missing value for --max-wait-seconds}"
+        shift 2
+        ;;
+      --no-reset)
+        do_reset=false
+        shift
+        ;;
+      --build)
+        do_build=true
+        shift
+        ;;
+      *)
+        die "unknown tuning-load-smoke option: $1"
+        ;;
+    esac
+  done
+
+  [[ "$duration" =~ ^[0-9]+$ ]] || die "--duration must be an integer"
+  [[ "$concurrency" =~ ^[0-9]+$ ]] || die "--concurrency must be an integer"
+  [[ "$stepdown_interval" =~ ^[0-9]+$ ]] || die "--stepdown-interval must be an integer"
+  [[ "$first_tune_after" =~ ^[0-9]+$ ]] || die "--first-tune-after must be an integer"
+  [[ "$second_tune_after" =~ ^[0-9]+$ ]] || die "--second-tune-after must be an integer"
+  (( duration > 0 )) || die "--duration must be > 0"
+  (( concurrency > 0 )) || die "--concurrency must be > 0"
+  (( first_tune_after > 0 && first_tune_after < duration )) || die "--first-tune-after must be > 0 and less than --duration"
+  (( second_tune_after > first_tune_after && second_tune_after < duration )) || die "--second-tune-after must be greater than --first-tune-after and less than --duration"
+
+  if [[ "$do_reset" == "true" ]]; then
+    if [[ "$do_build" == "true" ]]; then
+      cmd_reset --build
+    else
+      cmd_reset
+    fi
+  else
+    load_env
+    wait_secondary_ready "secondary1" "$DR_SECONDARY1_ADDR"
+    wait_secondary_ready "secondary2" "$DR_SECONDARY2_ADDR"
+  fi
+
+  ensure_dr_stress
+
+  local run_id run_dir stress_pid stress_rc
+  run_id="tuning-ha-load-$(date -u +%Y%m%dT%H%M%SZ)"
+  run_dir="${RESULTS_DIR}/${run_id}"
+  mkdir -p "$run_dir"
+
+  {
+    echo "run_id=${run_id}"
+    echo "run_dir=${run_dir}"
+    echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "duration=${duration}"
+    echo "concurrency=${concurrency}"
+    echo "stepdown_interval=${stepdown_interval}"
+    echo "first_tune_after=${first_tune_after}"
+    echo "second_tune_after=${second_tune_after}"
+  } | tee "$run_dir/orchestrator.log"
+
+  capture_tuning_load_state "$run_dir" "before"
+
+  "$DR_STRESS_BIN" run \
+    -run-id "$run_id" \
+    -output-dir "$RESULTS_DIR" \
+    -primary-addr "$DR_PRIMARY_ADDR" \
+    -primary-token "$DR_PRIMARY_TOKEN" \
+    -secondary1-addr "$DR_SECONDARY1_ADDR" \
+    -secondary1-token "$DR_PRIMARY_TOKEN" \
+    -secondary2-addr "$DR_SECONDARY2_ADDR" \
+    -secondary2-token "$DR_PRIMARY_TOKEN" \
+    -ensure-kv \
+    -duration "$duration" \
+    -concurrency "$concurrency" \
+    -stepdown-interval "$stepdown_interval" \
+    -put-percent 55 \
+    -get-primary-percent 25 \
+    -status-s1-percent 10 \
+    -status-s2-percent 10 \
+    -max-wait-seconds "$max_wait_seconds" \
+    -progress-interval "$progress_interval" \
+    -monitor-interval "$monitor_interval" \
+    >"$run_dir/harness.out" 2>"$run_dir/harness.err" &
+  stress_pid=$!
+  echo "stress_pid=${stress_pid}" | tee -a "$run_dir/orchestrator.log"
+
+  sleep "$first_tune_after"
+  echo "constrained_tuning_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$run_dir/orchestrator.log"
+  apply_tuning_profile_to_all "constrained" "$run_dir"
+  capture_tuning_load_state "$run_dir" "after-constrained"
+
+  sleep "$((second_tune_after - first_tune_after))"
+  echo "relaxed_tuning_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$run_dir/orchestrator.log"
+  apply_tuning_profile_to_all "relaxed" "$run_dir"
+  capture_tuning_load_state "$run_dir" "after-relaxed"
+  force_ha_handoff_for_tuning_load "$run_dir"
+  capture_tuning_load_state "$run_dir" "after-handoff"
+
+  echo "waiting_for_stress_pid=${stress_pid}" | tee -a "$run_dir/orchestrator.log"
+  set +e
+  wait "$stress_pid"
+  stress_rc=$?
+  set -e
+  echo "stress_rc=${stress_rc}" | tee -a "$run_dir/orchestrator.log"
+  if [[ "$stress_rc" -ne 0 ]]; then
+    die "dr-stress exited non-zero; artifacts preserved in ${run_dir}"
+  fi
+
+  wait_secondary_ready "secondary1 final" "$DR_SECONDARY1_ADDR" 300
+  wait_secondary_ready "secondary2 final" "$DR_SECONDARY2_ADDR" 300
+  capture_tuning_load_state "$run_dir" "final"
+
+  verify_one "primary" "$DR_PRIMARY_ADDR" "$run_dir" 0
+  verify_one "secondary1" "$DR_SECONDARY1_ADDR" "$run_dir" 0
+  verify_one "secondary2" "$DR_SECONDARY2_ADDR" "$run_dir" 0
+
+  echo "completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$run_dir/orchestrator.log"
+  echo "Dynamic tuning HA load smoke passed."
+  echo "Run: ${run_dir}"
+}
+
 cmd_failover_load_lifecycle() {
   [[ "$TOPOLOGY" == "ha" ]] || die "failover-load-lifecycle requires --topology ha"
   need_bin jq
@@ -1793,6 +2100,7 @@ main() {
     failover-smoke) cmd_failover_smoke "$@" ;;
     promoted-durability-smoke) cmd_promoted_durability_smoke "$@" ;;
     reseed-secondary-smoke) cmd_reseed_secondary_smoke "$@" ;;
+    tuning-load-smoke) cmd_tuning_load_smoke "$@" ;;
     failover-load-lifecycle) cmd_failover_load_lifecycle "$@" ;;
     down) cmd_down "$@" ;;
     logs) cmd_logs "$@" ;;

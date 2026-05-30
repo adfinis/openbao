@@ -50,6 +50,8 @@ func (e *errDRRedirect) Error() string {
 	return fmt.Sprintf("DR redirect to leader at %s", e.LeaderAddr)
 }
 
+var errDRSecondaryApplyStopped = errors.New("DR secondary stream apply stopped")
+
 // extractDRRedirect checks whether a gRPC error contains a
 // DRRedirectDetail and returns the leader address if so.
 func extractDRRedirect(err error) (string, bool) {
@@ -2431,11 +2433,11 @@ func (s *drReplicationSecondary) bootstrapKeyring(ctx context.Context) error {
 		return fmt.Errorf("failed to recreate local cluster info after bootstrap purge: %w", err)
 	}
 	if mgr := s.core.drManager; mgr != nil {
-		if err := mgr.PersistConfigSnapshot(ctx); err != nil {
-			return fmt.Errorf("failed to repersist DR config after bootstrap purge: %w", err)
+		if err := mgr.PersistSecondaryKeyringBootstrap(ctx); err != nil {
+			return fmt.Errorf("failed to persist DR keyring bootstrap state after purge: %w", err)
 		}
 	} else {
-		return fmt.Errorf("failed to repersist DR config after bootstrap purge: DR manager unavailable")
+		return fmt.Errorf("failed to persist DR keyring bootstrap state after purge: DR manager unavailable")
 	}
 	if err := s.core.ensureRaftTLSKeyringForDRSecondary(ctx); err != nil {
 		return fmt.Errorf("failed to ensure raft TLS keyring after bootstrap purge: %w", err)
@@ -2787,10 +2789,31 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 		time.Sleep(yieldDuration)
 	}
 
+	applyStopped := func() bool {
+		if ctx.Err() != nil {
+			return true
+		}
+		select {
+		case <-s.stopCh:
+			return true
+		default:
+			return false
+		}
+	}
+
+	discardBatch := func() {
+		batch = batch[:0]
+		batchBytes = 0
+	}
+
 	// Flush consumes the current batch. It optimistically tries a transaction,
 	// and falls back to sequential application on error.
 	flush := func() error {
 		if len(batch) == 0 {
+			return nil
+		}
+		if applyStopped() {
+			discardBatch()
 			return nil
 		}
 
@@ -2816,6 +2839,10 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 				applyYield()
 				return nil
 			} else {
+				if errors.Is(err, errDRSecondaryApplyStopped) || applyStopped() {
+					discardBatch()
+					return nil
+				}
 				// Transaction failed; log warning and fall back to sequential
 				metrics.IncrCounter([]string{"replication", "dr", "secondary", "stream_txn_fallback"}, 1)
 				s.logger.Warn("transactional batch apply failed, falling back to sequential",
@@ -2825,6 +2852,10 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 
 		// Fallback: apply sequentially
 		for _, change := range batch {
+			if applyStopped() {
+				discardBatch()
+				return nil
+			}
 			current := s.lastAppliedIndex.Load()
 			if change.RaftIndex < current {
 				continue
@@ -2839,8 +2870,7 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 		}
 
 		metrics.MeasureSince([]string{"replication", "dr", "secondary", "apply_latency"}, applyStart)
-		batch = batch[:0]
-		batchBytes = 0
+		discardBatch()
 		replenishCredits(flushedCount)
 		applyYield()
 		return nil
@@ -2849,9 +2879,11 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 	for {
 		select {
 		case <-ctx.Done():
-			return flush()
+			discardBatch()
+			return ctx.Err()
 		case <-s.stopCh:
-			return flush()
+			discardBatch()
+			return nil
 		case <-ticker.C:
 			if err := flush(); err != nil {
 				return err
@@ -2876,6 +2908,10 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 
 // applyStreamTxn attempts to apply a batch of changes in a single transaction.
 func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend physical.Transactional, batch []*EntryChange) error {
+	if err := s.ensureStreamApplyActive(ctx); err != nil {
+		return err
+	}
+
 	txn, err := backend.BeginTx(ctx)
 	if err != nil {
 		return err
@@ -2891,6 +2927,9 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 	var invalidateKeys []string
 
 	for _, change := range batch {
+		if err := s.ensureStreamApplyActive(ctx); err != nil {
+			return err
+		}
 		if change.RaftIndex < current {
 			continue
 		}
@@ -2950,6 +2989,9 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 	// If we only saw index-advance markers (no storage ops) we still
 	// need to advance lastAppliedIndex so lag reporting stays accurate.
 	if affected == 0 && lastIndex > 0 && lastIndex > current {
+		if err := s.ensureStreamApplyActive(ctx); err != nil {
+			return err
+		}
 		s.setLastAppliedIndex(lastIndex)
 		metrics.SetGauge([]string{"replication", "dr", "secondary", "last_applied_index"}, float32(lastIndex))
 		return nil
@@ -2960,6 +3002,9 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 	}
 
 	if err := txn.Commit(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureStreamApplyActive(ctx); err != nil {
 		return err
 	}
 
@@ -2977,6 +3022,9 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 			return err
 		}
 	}
+	if err := s.ensureStreamApplyActive(ctx); err != nil {
+		return err
+	}
 	s.invalidateAppliedStorageKeys(ctx, invalidateKeys)
 
 	s.setLastAppliedIndex(lastIndex)
@@ -2985,6 +3033,21 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 	metrics.SetGauge([]string{"replication", "dr", "secondary", "last_applied_index"}, float32(lastIndex))
 
 	return nil
+}
+
+func (s *drReplicationSecondary) ensureStreamApplyActive(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s == nil {
+		return errDRSecondaryApplyStopped
+	}
+	select {
+	case <-s.stopCh:
+		return errDRSecondaryApplyStopped
+	default:
+		return nil
+	}
 }
 
 // applyStreamChange applies a single entry change from the FSM change
@@ -3120,6 +3183,10 @@ func (s *drReplicationSecondary) invalidateAppliedStorageKeys(ctx context.Contex
 
 func (s *drReplicationSecondary) invalidateAppliedStorageKey(ctx context.Context, key string) {
 	if s == nil || s.core == nil || key == "" || !isDRAppliedStorageInvalidationPath(key) {
+		return
+	}
+	if s.core.namespaceStore == nil {
+		s.logger.Debug("skipping DR applied storage invalidation because namespace store is not available", "key", key)
 		return
 	}
 

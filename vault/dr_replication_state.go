@@ -113,6 +113,11 @@ type DRConfig struct {
 	// RelationshipID is the active relationship ID on secondary nodes.
 	RelationshipID string `json:"relationship_id,omitempty"`
 
+	// SecondaryKeyringBootstrapped records that the secondary has already
+	// adopted the primary root key/keyring. This makes HA active restore skip
+	// the one-time SyncKeyring bootstrap for an already-active relationship.
+	SecondaryKeyringBootstrapped bool `json:"secondary_keyring_bootstrapped,omitempty"`
+
 	// PrimaryCACert is the primary's DR transport CA certificate (DER-encoded).
 	// Persisted so the secondary can re-establish mTLS after a restart.
 	// This is the sole trust anchor for verifying primary identity.
@@ -873,6 +878,9 @@ func (m *drRelationshipManager) LoadConfig(ctx context.Context) error {
 			config.RelationshipID,
 			m.logger,
 		)
+		if config.SecondaryKeyringBootstrapped {
+			m.secondary.keyringBootstrapped.Store(true)
+		}
 		m.applySecondaryTunablesLocked()
 
 		// Restore the primary's CA cert so mTLS works after restart.
@@ -966,6 +974,27 @@ func (m *drRelationshipManager) PersistConfigSnapshot(ctx context.Context) error
 	return m.saveConfig(ctx)
 }
 
+// PersistSecondaryKeyringBootstrap marks the secondary keyring bootstrap as
+// durable and re-persists DR config under the current barrier key.
+func (m *drRelationshipManager) PersistSecondaryKeyringBootstrap(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.config == nil {
+		return fmt.Errorf("DR config not initialized")
+	}
+	if m.config.Mode != DRModeSecondary {
+		return fmt.Errorf("not in DR secondary mode")
+	}
+
+	m.config.SecondaryKeyringBootstrapped = true
+	if m.secondary != nil {
+		m.secondary.keyringBootstrapped.Store(true)
+	}
+
+	return m.saveConfig(ctx)
+}
+
 // RefreshConfigFromStorage reloads the persisted DR config into in-memory
 // manager state without changing runtime primary/secondary processes.
 // It is used by standby invalidation handling to pick up mode transitions
@@ -1015,6 +1044,9 @@ func (m *drRelationshipManager) RefreshConfigFromStorage(ctx context.Context) (D
 	}
 
 	m.config = &config
+	if config.Mode == DRModeSecondary && config.SecondaryKeyringBootstrapped && m.secondary != nil {
+		m.secondary.keyringBootstrapped.Store(true)
+	}
 	return config.Mode, nil
 }
 

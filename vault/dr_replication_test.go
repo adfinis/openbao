@@ -2596,6 +2596,103 @@ func TestDRRelationshipManager_PersistConfig(t *testing.T) {
 	}
 }
 
+func TestDRRelationshipManager_PersistSecondaryKeyringBootstrap(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+
+	mgr := core.drManager
+	replSalt := make([]byte, drReplSaltLen)
+	if _, err := rand.Read(replSalt); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr.mu.Lock()
+	mgr.config = &DRConfig{
+		Mode:           DRModeSecondary,
+		ClusterID:      "cluster-1",
+		RelationshipID: "relationship-1",
+		ReplSalt:       replSalt,
+		PrimaryAddr:    "https://primary.example:8201",
+		PrimaryAddrs:   []string{"https://primary.example:8201"},
+	}
+	mgr.secondary = newDRReplicationSecondary(core, replSalt, "relationship-1", core.logger)
+	mgr.mu.Unlock()
+
+	if mgr.secondary.keyringBootstrapped.Load() {
+		t.Fatal("expected secondary keyring bootstrap marker to start false")
+	}
+	if err := mgr.PersistSecondaryKeyringBootstrap(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !mgr.secondary.keyringBootstrapped.Load() {
+		t.Fatal("expected runtime secondary keyring bootstrap marker to be true")
+	}
+
+	cfg := mgr.Config()
+	if !cfg.SecondaryKeyringBootstrapped {
+		t.Fatal("expected in-memory config to mark secondary keyring bootstrapped")
+	}
+
+	entry, err := core.barrier.Get(ctx, drConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry == nil {
+		t.Fatal("expected persisted DR config")
+	}
+	var persisted DRConfig
+	if err := entry.DecodeJSON(&persisted); err != nil {
+		t.Fatal(err)
+	}
+	if !persisted.SecondaryKeyringBootstrapped {
+		t.Fatal("expected persisted config to mark secondary keyring bootstrapped")
+	}
+}
+
+func TestDRRelationshipManager_LoadConfigRestoresSecondaryKeyringBootstrap(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+
+	replSalt := make([]byte, drReplSaltLen)
+	if _, err := rand.Read(replSalt); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &DRConfig{
+		Mode:                         DRModeSecondary,
+		ClusterID:                    "cluster-1",
+		RelationshipID:               "relationship-1",
+		ReplSalt:                     replSalt,
+		PrimaryAddr:                  "https://primary.example:8201",
+		PrimaryAddrs:                 []string{"https://primary.example:8201"},
+		SecondaryKeyringBootstrapped: true,
+	}
+	entry, err := logical.StorageEntryJSON(drConfigPath, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := core.barrier.Put(ctx, entry); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	if err := mgr.LoadConfig(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		mgr.mu.Lock()
+		mgr.stopSecondaryRuntimeLocked()
+		mgr.mu.Unlock()
+	}()
+
+	secondary := mgr.Secondary()
+	if secondary == nil {
+		t.Fatal("expected secondary runtime after config load")
+	}
+	if !secondary.keyringBootstrapped.Load() {
+		t.Fatal("expected restored secondary to skip one-time keyring bootstrap")
+	}
+}
+
 // --- Unit Tests for DR Secondary State Machine ---
 
 func TestDRSecondaryState_String(t *testing.T) {
@@ -2913,6 +3010,54 @@ func TestDRSystemBackend_DRTuningRejectsInvalidInputs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDRSecondaryStreamApplyStopsWithoutFlushingOnStepdown(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+
+	replSalt := make([]byte, drReplSaltLen)
+	if _, err := rand.Read(replSalt); err != nil {
+		t.Fatal(err)
+	}
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-stop-apply", log.NewNullLogger())
+	close(secondary.stopCh)
+
+	applyCh := make(chan []*EntryChange, 1)
+	applyCh <- []*EntryChange{{
+		OpType:    string(physical.PutOperation),
+		Key:       "sys/policy/dr-stop-apply",
+		Value:     []byte("policy"),
+		RaftIndex: 10,
+	}}
+	close(applyCh)
+
+	creditCh := make(chan uint64, 1)
+	if err := secondary.runStreamApplyWorker(ctx, applyCh, creditCh); err != nil {
+		t.Fatal(err)
+	}
+	entry, err := core.physical.Get(ctx, "sys/policy/dr-stop-apply")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry != nil {
+		t.Fatal("expected queued stream batch to be discarded after stop")
+	}
+	if got := secondary.lastAppliedIndex.Load(); got != 0 {
+		t.Fatalf("expected lastAppliedIndex to remain unchanged after stop, got %d", got)
+	}
+}
+
+func TestDRSecondaryAppliedInvalidationSkipsDuringCoreTeardown(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, drReplSaltLen)
+	if _, err := rand.Read(replSalt); err != nil {
+		t.Fatal(err)
+	}
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-invalidation-teardown", log.NewNullLogger())
+
+	core.namespaceStore = nil
+	secondary.invalidateAppliedStorageKey(context.Background(), "sys/policy/dr-teardown")
 }
 
 // --- Unit Tests for DR Failover ---

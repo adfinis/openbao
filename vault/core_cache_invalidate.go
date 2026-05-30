@@ -532,6 +532,66 @@ func (c *Core) recordDeferredInvalidation(key string) (uint64, error) {
 	return state.generation, nil
 }
 
+func (c *Core) beginAndRecordDeferredInvalidation(key, reason string) (uint64, error) {
+	if c == nil {
+		return 0, fmt.Errorf("core unavailable for deferred invalidation")
+	}
+
+	now := time.Now()
+	state := &c.drSecondaryKeyTransition
+
+	state.mu.Lock()
+	started := false
+	switch {
+	case !state.active || now.After(state.deadline):
+		state.active = true
+		state.replaying = false
+		state.generation++
+		state.deadline = now.Add(drKeyTransitionTimeout)
+		state.workerRunning = false
+		state.workerGeneration = 0
+		started = true
+	case state.replaying:
+		// Start a fresh generation when a new transition event arrives while
+		// replaying deferred keys.
+		state.generation++
+		state.replaying = false
+		state.deadline = now.Add(drKeyTransitionTimeout)
+		state.workerRunning = false
+		state.workerGeneration = 0
+		started = true
+	}
+	if state.deferredSet == nil {
+		state.deferredSet = make(map[string]struct{})
+	}
+
+	generation := state.generation
+	deadline := state.deadline
+	if _, exists := state.deferredSet[key]; !exists {
+		if len(state.deferredKeys) >= drKeyTransitionDeferredKeyCap {
+			deferredCount := len(state.deferredKeys)
+			state.mu.Unlock()
+			if started {
+				metrics.IncrCounter([]string{"replication", "dr", "secondary", "key_transition_started_total"}, 1)
+				c.logger.Warn("DR key transition started", "generation", generation, "deadline", deadline, "reason", reason)
+			}
+			metrics.SetGauge([]string{"replication", "dr", "secondary", "key_transition_deferred_keys_current"}, float32(deferredCount))
+			return generation, errDRKeyTransitionQueueOverflow
+		}
+		state.deferredSet[key] = struct{}{}
+		state.deferredKeys = append(state.deferredKeys, key)
+	}
+	deferredCount := len(state.deferredKeys)
+	state.mu.Unlock()
+
+	if started {
+		metrics.IncrCounter([]string{"replication", "dr", "secondary", "key_transition_started_total"}, 1)
+		c.logger.Warn("DR key transition started", "generation", generation, "deadline", deadline, "reason", reason)
+	}
+	metrics.SetGauge([]string{"replication", "dr", "secondary", "key_transition_deferred_keys_current"}, float32(deferredCount))
+	return generation, nil
+}
+
 func (c *Core) snapshotDeferredInvalidations(generation uint64) ([]string, bool) {
 	if c == nil {
 		return nil, false
@@ -594,8 +654,7 @@ func (ij *invalidationJob) deferInvalidation(reason string) error {
 		return nil
 	}
 
-	generation, _ := core.beginDRKeyTransition(reason)
-	generation, err := core.recordDeferredInvalidation(ij.key)
+	generation, err := core.beginAndRecordDeferredInvalidation(ij.key, reason)
 	if err != nil {
 		if errors.Is(err, errDRKeyTransitionQueueOverflow) {
 			metrics.IncrCounter([]string{"replication", "dr", "secondary", "key_transition_queue_overflow_total"}, 1)

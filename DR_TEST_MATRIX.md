@@ -237,6 +237,7 @@ scripts remain available under `/Users/roelc/projects/secretz/openbao/scripts`.
 | S8 | Convergence-controller trigger | S3 with reduced reconcile throughput tuning (for test) | Verify automatic fallback behavior | `fallback_count` increments, secondaries return to `streaming`, `last_applied_index` resumes growth |
 | S9 | Backpressure enforcement | S3 with high write concurrency and low secondary apply tuning | Verify bounded ingress on overload | `dr_backpressure_state` reaches `degraded/critical`, `dr_backpressure_rejections_total` increases, secondaries avoid permanent flatline |
 | S10 | HA steady-state soak | `scripts/dr_local_test.sh --topology ha smoke --duration 7200 --concurrency 24 --put-percent 55 --get-primary-percent 25 --status-s1-percent 10 --status-s2-percent 10 --max-wait-seconds 600 --progress-interval 30` | Measure non-failover DR behavior under sustained but non-adversarial load | 0 workload failures, 0 dropped events, both secondaries converge with lag 0, and exhaustive verification passes with `scripts/dr_local_test.sh --topology ha verify <run-dir> --sample 0` |
+| S11 | Dynamic tuning under HA load | `scripts/dr_local_test.sh --topology ha tuning-load-smoke` | Update primary and secondary DR tuning while mixed load is running, then force HA handoffs | Tuning writes succeed, new active nodes report the updated profile, workload exits cleanly, both secondaries return to `streaming` with lag 0, and exhaustive verification passes on primary and both secondaries |
 
 ### Stress Run Examples
 

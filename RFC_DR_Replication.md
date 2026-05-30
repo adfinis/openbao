@@ -231,6 +231,13 @@ primary root key under the secondary's seal, and removes or preserves
 local-only state according to the replication exclusion rules below. Operators
 continue to use the secondary cluster's local unseal mechanism.
 
+Successful keyring bootstrap also persists a local
+`secondary_keyring_bootstrapped` marker in DR configuration. This marker is not
+authority for the relationship; the primary relationship record remains
+authoritative. It is a secondary-local HA restore guard that prevents a new
+active secondary node from retrying the one-time `SyncKeyring` exchange after
+the primary has already moved the relationship to `active`.
+
 ### Transport trust model
 
 DR traffic uses mTLS. The primary owns a dedicated DR transport CA. Primary
@@ -954,6 +961,36 @@ This is a greenfield feature. There is no compatibility requirement to support
 older primaries that lack `ExchangeRangeDigests`. Mandatory drill-down removes
 an unsafe fallback path and makes proof validation uniform.
 
+### Implementation lineage: from sketches to checkpoint proofs
+
+The first prototype explored IBLT, strata estimation, and prefix-digest
+reconciliation as the primary repair mechanism. The intuition was reasonable:
+when two large key/value sets mostly agree, probabilistic set reconciliation can
+cheaply identify the small difference set. Prefix digests localize mismatched
+buckets, strata estimate divergence, and an IBLT can decode a bounded symmetric
+difference without transferring every key.
+
+Stress testing changed the correctness boundary. The hard failures were not
+only IBLT decode failures. The larger problem was that probabilistic sketches do
+not, by themselves, prove the operational facts DR needs under sustained writes,
+HA active handoff, deletes, and reconnect churn:
+
+- both sides compared the same point in time
+- fetched values are the same values that were digested
+- an omitted key is a real checkpoint absence rather than a live-storage race,
+  fetch omission, or stale view
+- range selection is complete before `lastAppliedIndex` advances
+- decode failure or high divergence cannot silently leave partial progress
+  committed
+
+For that reason, the current prototype moved sketches out of the trust boundary.
+The authoritative boundary is now the immutable checkpoint tuple,
+checkpoint-scoped KID/VID metadata, complete range selection, checkpoint
+artifact fetches, digest proof validation, and fail-closed high-water
+finalization. IBLT-style reconciliation could still be reintroduced later as an
+optimization inside a checkpoint-fenced range, but not as the proof that a
+secondary may commit convergence.
+
 ### Prior art and design-space positioning
 
 DR replication for stateful systems is a well-established problem. This design
@@ -1043,6 +1080,13 @@ Merkle tree persistence:
 Useful, but adds persistent index maintenance and failure modes. The current
 proposal starts with checkpoint-built range descriptors and can evolve toward
 persistent structures later.
+
+IBLT/prefix-digest as the primary authority:
+The initial prototype explored this path. It remains attractive for reducing
+comparison traffic when divergence is small, but stress testing showed that it
+cannot be the correctness boundary. It estimates or decodes set differences; it
+does not prove checkpoint identity, fetch completeness, live-storage drift
+absence, or safe delete inference.
 
 WAL shipping:
 Efficient for storage engines with a native WAL contract, but it couples DR to
@@ -1399,13 +1443,17 @@ matrix on 2026-05-30 verified namespace metadata, namespace-scoped KV v2, root
 KV v2, KV v1, transit, PKI, SSH, TOTP, database config, userpass, AppRole, cert
 auth, JWT auth, token roles, ACL policy, service-token lookup, and identity
 state before failover, after promotion, and after promoted-authority reseed.
+A dynamic tuning HA load smoke on 2026-05-30 changed primary and secondary
+tuning while mixed load was running, forced HA handoffs, returned both
+secondaries to `streaming` at lag 0, and exhaustively verified primary,
+secondary1, and secondary2 against the stress truth log.
 
-The main known gap is availability during primary HA active handoff under
-sustained write and DR backlog pressure; stress runs observed transient
-client-visible errors even when final replicated data converged. Remaining
-prototype-hardening work also includes sustained resource-exhaustion testing,
-rolling-upgrade behavior, dependency-backed engine profiles, audit topology
-validation, and final operator-facing observability.
+The main known gap is availability polish during primary HA active handoff
+under sustained write and DR backlog pressure; stress runs still observe
+transient client-visible errors even when final replicated data converges.
+Remaining prototype-hardening work also includes sustained resource-exhaustion
+testing, rolling-upgrade behavior, dependency-backed engine profiles, audit
+topology validation, and final operator-facing observability.
 
 ## Test plan
 
