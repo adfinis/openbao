@@ -369,6 +369,45 @@ Final replay-horizon sizing, retention defaults, and backpressure behavior are
 resource-policy decisions and remain separate from the correctness rule that a
 secondary must reconcile when replay coverage cannot be proven.
 
+### Steady streaming mental model
+
+Steady streaming is ordered physical log shipping:
+
+```text
+primary Raft-applied physical changes
+  -> filter cluster-local paths
+  -> append to the DR stream journal
+  -> active primary leader fans out to secondary subscribers
+  -> secondary writes ciphertext bytes directly to physical storage
+  -> secondary advances lastAppliedIndex after durable apply
+```
+
+The primary stream has two replay horizons:
+
+- an in-memory ring buffer for short reconnects
+- a disk-backed stream journal for longer reconnects and HA leader handoff
+
+Primary HA followers also append the filtered stream journal. When leadership
+moves, the new active primary should already have journal coverage for changes
+that occurred while it was a follower. This allows secondaries to reconnect to
+the new leader and catch up from journal before falling back to reconciliation.
+
+Flow control is credit-based. The secondary opens `StreamChanges` with its
+current `lastAppliedIndex` and an initial window. The primary sends entry
+batches only while credits are available. The secondary replenishes credits only
+after the apply worker has durably flushed entries, so stream throughput is
+bounded by secondary apply progress rather than by unbounded buffering.
+
+If a Raft batch contains only cluster-local paths, the primary sends an
+index-advance marker instead of a storage mutation. The marker lets the
+secondary advance `lastAppliedIndex` for lag accounting without writing any
+replicated storage entry.
+
+Streaming fails closed. A lagging subscriber is disconnected instead of silently
+dropping entries. On reconnect, the primary tries journal and buffer replay from
+the secondary's last applied index. If replay coverage cannot be proven, the
+secondary must enter checkpoint reconciliation.
+
 ### Checkpoints
 
 A checkpoint is an immutable primary-side view of replicated storage at a
@@ -417,6 +456,46 @@ Reconciliation compares storage entries by:
 
 The primary and secondary compare KID/VID metadata first, then fetch concrete
 entries only for mismatched spans.
+
+### KID/VID projection mental model
+
+OpenBao physical storage is conceptually a key/value table:
+
+```text
+storage key                         value bytes
+---------------------------------------------------------
+auth/userpass/users/alice           ...
+secret/data/app/config              ...
+identity/entity/id/123              ...
+```
+
+Reconciliation projects that table into comparison metadata:
+
+```text
+storage key                         KID = H(key, salt)    VID = H(value)
+----------------------------------------------------------------------------
+auth/userpass/users/alice           0x91ab...             0x4410...
+secret/data/app/config              0x04c2...             0xa183...
+identity/entity/id/123              0x60fe...             0xff02...
+```
+
+The implementation then sorts by KID and divides the one-dimensional KID space
+into deterministic ranges. Range checksums and digests are aggregates over the
+KID/VID pairs in each span:
+
+```text
+0x0000...                                                0xffff...
+| range 0 | range 1 | range 2 | ... | range 1023 |
+    same      diff      same              same
+               |
+               +-- drill down, fetch proven mismatched spans, apply puts,
+                   then infer deletes only after fetch completeness is proven
+```
+
+This is not a two-dimensional matrix in implementation. The useful mental model
+is a key/value table projected into a sorted hash space. Hashing keys into KID
+space keeps range distribution independent of OpenBao's path prefixes, while
+VIDs represent the value state for each KID.
 
 ### Range checksums
 
