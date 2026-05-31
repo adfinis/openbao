@@ -3606,7 +3606,7 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 		if err := s.persistFlatAccumulatorState(ctx, txn, lastIndex, accumulatorNext, forceAccumulatorSnapshot, accumulatorDeltas); err != nil {
 			return fmt.Errorf("persist flat accumulator: %w", err)
 		}
-		if err := s.persistLocalKIDIndexChanges(ctx, txn, lastIndex, batch); err != nil {
+		if err := s.persistLocalKIDIndexChanges(ctx, txn, lastIndex, batch, accumulatorDeltas); err != nil {
 			return fmt.Errorf("persist local kid index: %w", err)
 		}
 	} else if err := s.deletePersistedFlatAccumulator(ctx, txn); err != nil {

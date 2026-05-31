@@ -4455,7 +4455,7 @@ func TestDRLocalKIDIndexChangesRequireCompleteBaseline(t *testing.T) {
 		Value:  newValue,
 	}
 
-	if err := secondary.persistLocalKIDIndexChanges(ctx, core.physical, 11, []*EntryChange{change}); err != nil {
+	if err := secondary.persistLocalKIDIndexChanges(ctx, core.physical, 11, []*EntryChange{change}, nil); err != nil {
 		t.Fatalf("unexpected stream-delta persist error without baseline: %v", err)
 	}
 	if entry, err := core.physical.Get(ctx, drLocalKIDIndexMetaPath); err != nil {
@@ -4478,7 +4478,7 @@ func TestDRLocalKIDIndexChangesRequireCompleteBaseline(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := secondary.persistLocalKIDIndexChanges(ctx, core.physical, 11, []*EntryChange{change}); err != nil {
+	if err := secondary.persistLocalKIDIndexChanges(ctx, core.physical, 11, []*EntryChange{change}, nil); err != nil {
 		t.Fatalf("unexpected stream-delta persist error with invalid baseline: %v", err)
 	}
 	if entry, err := core.physical.Get(ctx, drLocalKIDIndexMetaPath); err != nil {
@@ -4501,8 +4501,19 @@ func TestDRLocalKIDIndexChangesRequireCompleteBaseline(t *testing.T) {
 	if err := secondary.resetLocalKIDIndexFromSet(ctx, core.physical, 10, localSet); err != nil {
 		t.Fatalf("failed to seed complete local KID index baseline: %v", err)
 	}
-	if err := secondary.persistLocalKIDIndexChanges(ctx, core.physical, 11, []*EntryChange{change}); err != nil {
+	expectedVID := secondary.scanner.ComputeVIDWithSealWrap(newValue, false)
+	updateDelta := drFlatAccumulatorDelta{
+		kid:       kid,
+		oldExists: true,
+		oldVID:    oldVID,
+		newExists: true,
+		newVID:    expectedVID,
+	}
+	if err := secondary.persistLocalKIDIndexChanges(ctx, core.physical, 11, []*EntryChange{change}, []drFlatAccumulatorDelta{updateDelta}); err != nil {
 		t.Fatalf("failed to apply local KID index stream delta: %v", err)
+	}
+	if got := secondary.localKIDIndexUpdates.Load(); got != 0 {
+		t.Fatalf("expected value-only update not to rewrite local KID index, got %d updates", got)
 	}
 
 	metaEntry, err := core.physical.Get(ctx, drLocalKIDIndexMetaPath)
@@ -4516,8 +4527,8 @@ func TestDRLocalKIDIndexChangesRequireCompleteBaseline(t *testing.T) {
 	if err := json.Unmarshal(metaEntry.Value, &meta); err != nil {
 		t.Fatal(err)
 	}
-	if meta.CommitIndex != 11 {
-		t.Fatalf("expected local KID index meta at index 11, got %d", meta.CommitIndex)
+	if meta.CommitIndex != 10 {
+		t.Fatalf("expected value-only update to keep local KID index meta at key-set index 10, got %d", meta.CommitIndex)
 	}
 	indexEntry, err := core.physical.Get(ctx, drLocalKIDIndexEntryStoragePath(kid))
 	if err != nil {
@@ -4533,9 +4544,59 @@ func TestDRLocalKIDIndexChangesRequireCompleteBaseline(t *testing.T) {
 	if item.key != key {
 		t.Fatalf("expected indexed key %q, got %q", key, item.key)
 	}
-	expectedVID := secondary.scanner.ComputeVIDWithSealWrap(newValue, false)
-	if item.vid != expectedVID {
-		t.Fatalf("expected updated indexed VID %x, got %x", expectedVID, item.vid)
+	if err := core.physical.Put(ctx, &physical.Entry{Key: key, Value: newValue}); err != nil {
+		t.Fatal(err)
+	}
+	buckets := drFlatAccumulatorBucketsFromSet(&reconciler.ReconciliationSet{
+		KIDToVID: map[[32]byte][32]byte{kid: expectedVID},
+	})
+	loaded, ok, reason, err := secondary.loadLocalKIDIndexForRanges(ctx, core.physical, 11, []uint64{reconciler.RangeIDFromKID(kid)}, buckets)
+	if err != nil {
+		t.Fatalf("failed to load key-only local KID index: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected key-only local KID index to load, reason=%q", reason)
+	}
+	if got := loaded.KIDToVID[kid]; got != expectedVID {
+		t.Fatalf("expected recomputed indexed VID %x, got %x", expectedVID, got)
+	}
+
+	createKey := "secret/local-index-baseline-created"
+	createValue := []byte("created")
+	createKID := secondary.scanner.ComputeKID(createKey)
+	createVID := secondary.scanner.ComputeVIDWithSealWrap(createValue, false)
+	createChange := &EntryChange{
+		OpType: string(physical.PutOperation),
+		Key:    createKey,
+		Value:  createValue,
+	}
+	createDelta := drFlatAccumulatorDelta{
+		kid:       createKID,
+		newExists: true,
+		newVID:    createVID,
+	}
+	if err := secondary.persistLocalKIDIndexChanges(ctx, core.physical, 12, []*EntryChange{createChange}, []drFlatAccumulatorDelta{createDelta}); err != nil {
+		t.Fatalf("failed to apply local KID index create delta: %v", err)
+	}
+	if got := secondary.localKIDIndexUpdates.Load(); got != 1 {
+		t.Fatalf("expected key-create update to rewrite local KID index once, got %d", got)
+	}
+	metaEntry, err = core.physical.Get(ctx, drLocalKIDIndexMetaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(metaEntry.Value, &meta); err != nil {
+		t.Fatal(err)
+	}
+	if meta.CommitIndex != 12 {
+		t.Fatalf("expected key-create update to advance local KID index meta to 12, got %d", meta.CommitIndex)
+	}
+	createIndexEntry, err := core.physical.Get(ctx, drLocalKIDIndexEntryStoragePath(createKID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if createIndexEntry == nil {
+		t.Fatal("expected local KID index entry after key-create delta")
 	}
 }
 
@@ -4603,13 +4664,13 @@ func TestDRLocalKIDIndexLoadReasons(t *testing.T) {
 		t.Fatalf("expected meta_missing without local KID index meta, ok=%t reason=%q", ok, reason)
 	}
 
-	if err := secondary.persistLocalKIDIndexMeta(ctx, core.physical, 9); err != nil {
+	if err := secondary.persistLocalKIDIndexMeta(ctx, core.physical, 11); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok, reason, err := secondary.loadLocalKIDIndexForRanges(ctx, core.physical, 10, []uint64{0}, buckets); err != nil {
 		t.Fatal(err)
 	} else if ok || reason != "meta_index_mismatch" {
-		t.Fatalf("expected meta_index_mismatch for stale local KID index meta, ok=%t reason=%q", ok, reason)
+		t.Fatalf("expected meta_index_mismatch for future local KID index meta, ok=%t reason=%q", ok, reason)
 	}
 
 	key := "secret/local-index-reasons"
@@ -4618,6 +4679,9 @@ func TestDRLocalKIDIndexLoadReasons(t *testing.T) {
 	localSet := &reconciler.ReconciliationSet{
 		KIDToVID: map[[32]byte][32]byte{kid: vid},
 		KIDToKey: map[[32]byte]string{kid: key},
+	}
+	if err := core.physical.Put(ctx, &physical.Entry{Key: key, Value: []byte("value")}); err != nil {
+		t.Fatal(err)
 	}
 	if err := secondary.resetLocalKIDIndexFromSet(ctx, core.physical, 10, localSet); err != nil {
 		t.Fatal(err)

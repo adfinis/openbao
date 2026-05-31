@@ -82,7 +82,90 @@
         "secondary1": { "pass": true, "sampled": 7744, "missing": 0, "mismatches": 0, "errors": 0 },
         "secondary2": { "pass": true, "sampled": 7744, "missing": 0, "mismatches": 0, "errors": 0 }
       },
+      "optimization_baseline": {
+        "secondary1": {
+          "stream_txn_batches_total": 6764,
+          "stream_txn_average_entries": 19.642519219396807,
+          "stream_txn_commit_milliseconds_average": 100.55124529183915,
+          "stream_txn_commit_milliseconds_max": 5687.649124,
+          "flat_accumulator_cursor_writes_total": 6768,
+          "flat_accumulator_snapshot_persists_total": 175,
+          "flat_accumulator_snapshot_skipped_total": 6593,
+          "local_kid_index_updates_total": 132799,
+          "local_kid_index_fallback_scans_total": 0
+        },
+        "secondary2": {
+          "stream_txn_batches_total": 6716,
+          "stream_txn_average_entries": 19.74940440738535,
+          "stream_txn_commit_milliseconds_average": 100.51566648079213,
+          "stream_txn_commit_milliseconds_max": 5466.992376,
+          "flat_accumulator_cursor_writes_total": 6724,
+          "flat_accumulator_snapshot_persists_total": 179,
+          "flat_accumulator_snapshot_skipped_total": 6545,
+          "local_kid_index_updates_total": 132512,
+          "local_kid_index_fallback_scans_total": 0
+        }
+      },
       "notes": "Adversarial HA handoff load. Client-facing PUT/GET failures occurred during active movement; status, stream drops, sentinel convergence, and exhaustive verification remained clean."
+    },
+    {
+      "scenario_id": "S17",
+      "scenario": "HA mixed load after key-only local KID index",
+      "run_id": "drmixed-20260531T231905Z",
+      "path": "dr-stress-results/drmixed-20260531T231905Z",
+      "topology": "ha-primary-plus-two-secondaries",
+      "command_shape": "scripts/dr_local_test.sh --topology ha smoke --duration 900 --concurrency 48 --stepdown-interval 300 --progress-interval 30 --monitor-interval 5 && verify --sample 0",
+      "result": "pass_with_expected_client_transients",
+      "duration_seconds": 900,
+      "concurrency": 48,
+      "operations_total": 133318,
+      "operations_per_second": 147.34917813911952,
+      "put_fail": 111,
+      "get_fail": 96,
+      "status_fail": 0,
+      "events_dropped": 0,
+      "sentinel_converged": {
+        "secondary1_seconds": 1.003659958,
+        "secondary2_seconds": 1.002205917
+      },
+      "verification": {
+        "primary": { "pass": true, "sampled": 10430, "missing": 0, "mismatches": 0, "errors": 0 },
+        "secondary1": { "pass": true, "sampled": 10430, "missing": 0, "mismatches": 0, "errors": 0 },
+        "secondary2": { "pass": true, "sampled": 10430, "missing": 0, "mismatches": 0, "errors": 0 }
+      },
+      "optimization_validation": {
+        "secondary1": {
+          "stream_txn_batches_total": 9713,
+          "stream_txn_physical_entries_total": 201556,
+          "stream_txn_average_entries": 20.77391125295995,
+          "stream_txn_commit_milliseconds_average": 61.702934336971076,
+          "stream_txn_commit_milliseconds_max": 1376.584921,
+          "flat_accumulator_cursor_writes_total": 9719,
+          "flat_accumulator_snapshot_persists_total": 180,
+          "flat_accumulator_snapshot_skipped_total": 9539,
+          "flat_accumulator_indexed_repair_ranges_total": 558,
+          "local_kid_index_updates_total": 139416,
+          "local_kid_index_bucket_loads_total": 558,
+          "local_kid_index_entries_loaded_total": 12760,
+          "local_kid_index_fallback_scans_total": 0
+        },
+        "secondary2": {
+          "stream_txn_batches_total": 9803,
+          "stream_txn_physical_entries_total": 202283,
+          "stream_txn_average_entries": 20.652453330613078,
+          "stream_txn_commit_milliseconds_average": 61.69663830500867,
+          "stream_txn_commit_milliseconds_max": 1266.542701,
+          "flat_accumulator_cursor_writes_total": 9809,
+          "flat_accumulator_snapshot_persists_total": 181,
+          "flat_accumulator_snapshot_skipped_total": 9628,
+          "flat_accumulator_indexed_repair_ranges_total": 298,
+          "local_kid_index_updates_total": 139880,
+          "local_kid_index_bucket_loads_total": 298,
+          "local_kid_index_entries_loaded_total": 6824,
+          "local_kid_index_fallback_scans_total": 0
+        }
+      },
+      "notes": "Validates the key-only local KID index under adversarial HA handoff load. Indexed repair completed with zero fallback scans, zero proof mismatches, and exhaustive verification remained clean. Client-facing PUT/GET failures occurred during active movement."
     },
     {
       "scenario_id": "S15",

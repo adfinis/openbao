@@ -35,7 +35,6 @@ type drLocalKIDIndexEntry struct {
 	RelationshipID string `json:"relationship_id"`
 	ClusterID      string `json:"cluster_id,omitempty"`
 	KID            []byte `json:"kid"`
-	VID            []byte `json:"vid"`
 	Key            string `json:"key"`
 }
 
@@ -87,13 +86,13 @@ func (s *drReplicationSecondary) advanceLocalKIDIndexMetaIfCurrent(ctx context.C
 	if err := s.validateLocalKIDIndexMeta(&meta); err != nil {
 		return s.invalidatePersistedLocalKIDIndexWithReason(ctx, writer, "advance_meta_invalid")
 	}
-	if meta.CommitIndex != fromIndex {
-		return nil
-	}
-	return s.persistLocalKIDIndexMeta(ctx, writer, toIndex)
+	// The key-only index is valid across value-only index advancement. Keep
+	// this helper as a validation hook for older call sites, but avoid a
+	// metadata write unless key membership changed.
+	return nil
 }
 
-func (s *drReplicationSecondary) persistLocalKIDIndexChanges(ctx context.Context, writer physical.Backend, index uint64, changes []*EntryChange) error {
+func (s *drReplicationSecondary) persistLocalKIDIndexChanges(ctx context.Context, writer physical.Backend, index uint64, changes []*EntryChange, deltas []drFlatAccumulatorDelta) error {
 	if s == nil || writer == nil || index == 0 {
 		return nil
 	}
@@ -115,6 +114,11 @@ func (s *drReplicationSecondary) persistLocalKIDIndexChanges(ctx context.Context
 		return nil
 	}
 
+	deltaByKID := make(map[[32]byte]drFlatAccumulatorDelta, len(deltas))
+	for _, delta := range deltas {
+		deltaByKID[delta.kid] = delta
+	}
+
 	updates := 0
 	for _, change := range changes {
 		if change == nil || change.Key == "" || isDRNeverReplicatePath(change.Key) {
@@ -126,12 +130,17 @@ func (s *drReplicationSecondary) persistLocalKIDIndexChanges(ctx context.Context
 		}
 		switch physical.Operation(change.OpType) {
 		case physical.PutOperation:
-			vid := s.scanner.ComputeVIDWithSealWrap(change.Value, change.SealWrap)
-			if err := s.putLocalKIDIndexEntry(ctx, writer, kid, vid, change.Key); err != nil {
+			if delta, ok := deltaByKID[kid]; ok && delta.oldExists && delta.newExists {
+				continue
+			}
+			if err := s.putLocalKIDIndexEntry(ctx, writer, kid, change.Key); err != nil {
 				return err
 			}
 			updates++
 		case physical.DeleteOperation:
+			if delta, ok := deltaByKID[kid]; ok && !delta.oldExists {
+				continue
+			}
 			if err := writer.Delete(ctx, drLocalKIDIndexEntryStoragePath(kid)); err != nil {
 				return err
 			}
@@ -140,27 +149,27 @@ func (s *drReplicationSecondary) persistLocalKIDIndexChanges(ctx context.Context
 	}
 	if updates > 0 {
 		s.localKIDIndexUpdates.Add(uint64(updates))
+		return s.persistLocalKIDIndexMeta(ctx, writer, index)
 	}
-	return s.persistLocalKIDIndexMeta(ctx, writer, index)
+	return nil
 }
 
-func (s *drReplicationSecondary) localKIDIndexEntryData(kid, vid [32]byte, key string) ([]byte, error) {
+func (s *drReplicationSecondary) localKIDIndexEntryData(kid [32]byte, key string) ([]byte, error) {
 	entry := drLocalKIDIndexEntry{
 		Version:        drLocalKIDIndexEntryVersion,
 		RelationshipID: s.relationshipID,
 		ClusterID:      s.flatAccumulatorClusterID(),
 		KID:            append([]byte(nil), kid[:]...),
-		VID:            append([]byte(nil), vid[:]...),
 		Key:            key,
 	}
 	return json.Marshal(entry)
 }
 
-func (s *drReplicationSecondary) putLocalKIDIndexEntry(ctx context.Context, writer physical.Backend, kid, vid [32]byte, key string) error {
+func (s *drReplicationSecondary) putLocalKIDIndexEntry(ctx context.Context, writer physical.Backend, kid [32]byte, key string) error {
 	if key == "" {
 		return nil
 	}
-	data, err := s.localKIDIndexEntryData(kid, vid, key)
+	data, err := s.localKIDIndexEntryData(kid, key)
 	if err != nil {
 		return err
 	}
@@ -223,7 +232,6 @@ func (s *drReplicationSecondary) resetLocalKIDIndexRangesFromSet(ctx context.Con
 		}
 	}
 	for _, kid := range kids {
-		vid := rs.KIDToVID[kid]
 		key := ""
 		if rs.KIDToKey != nil {
 			key = rs.KIDToKey[kid]
@@ -234,7 +242,7 @@ func (s *drReplicationSecondary) resetLocalKIDIndexRangesFromSet(ctx context.Con
 		if isDRNeverReplicatePath(key) {
 			continue
 		}
-		if err := s.putLocalKIDIndexEntry(ctx, writer, kid, vid, key); err != nil {
+		if err := s.putLocalKIDIndexEntry(ctx, writer, kid, key); err != nil {
 			return err
 		}
 	}
@@ -271,7 +279,6 @@ func (s *drReplicationSecondary) resetLocalKIDIndexRangesFromSetTxn(ctx context.
 
 	entries := make([]*physical.Entry, 0, len(kids))
 	for _, kid := range kids {
-		vid := rs.KIDToVID[kid]
 		key := ""
 		if rs.KIDToKey != nil {
 			key = rs.KIDToKey[kid]
@@ -282,7 +289,7 @@ func (s *drReplicationSecondary) resetLocalKIDIndexRangesFromSetTxn(ctx context.
 		if isDRNeverReplicatePath(key) {
 			continue
 		}
-		data, err := s.localKIDIndexEntryData(kid, vid, key)
+		data, err := s.localKIDIndexEntryData(kid, key)
 		if err != nil {
 			return err
 		}
@@ -410,7 +417,7 @@ func (s *drReplicationSecondary) loadLocalKIDIndexForRanges(
 	if err := s.validateLocalKIDIndexMeta(&meta); err != nil {
 		return nil, false, "meta_invalid", err
 	}
-	if meta.CommitIndex != expectedIndex {
+	if meta.CommitIndex > expectedIndex {
 		return nil, false, "meta_index_mismatch", nil
 	}
 
@@ -449,7 +456,19 @@ func (s *drReplicationSecondary) loadLocalKIDIndexForRanges(
 			if rangeForKID != rangeID {
 				return nil, false, "entry_range_mismatch", fmt.Errorf("local kid index entry %x stored under range %d but maps to %d", item.kid, rangeID, rangeForKID)
 			}
-			rs.KIDToVID[item.kid] = item.vid
+			computedKID := s.scanner.ComputeKID(item.key)
+			if computedKID != item.kid {
+				return nil, false, "entry_key_mismatch", fmt.Errorf("local kid index entry key %q maps to kid %x, expected %x", item.key, computedKID, item.kid)
+			}
+			valueEntry, err := reader.Get(ctx, item.key)
+			if err != nil {
+				return nil, false, "entry_value_read_failed", err
+			}
+			if valueEntry == nil {
+				return nil, false, "entry_value_missing", fmt.Errorf("local kid index entry %x references missing key %q", item.kid, item.key)
+			}
+			vid := s.scanner.ComputeVIDWithSealWrap(valueEntry.Value, valueEntry.SealWrap)
+			rs.KIDToVID[item.kid] = vid
 			rs.KIDToKey[item.kid] = item.key
 		}
 	}
@@ -489,7 +508,6 @@ func (s *drReplicationSecondary) validateLocalKIDIndexMeta(meta *drLocalKIDIndex
 
 type drDecodedLocalKIDIndexEntry struct {
 	kid [32]byte
-	vid [32]byte
 	key string
 }
 
@@ -507,15 +525,14 @@ func (s *drReplicationSecondary) decodeLocalKIDIndexEntry(data []byte) (drDecode
 	if item.ClusterID != "" && item.ClusterID != s.flatAccumulatorClusterID() {
 		return drDecodedLocalKIDIndexEntry{}, fmt.Errorf("local kid index entry cluster mismatch")
 	}
-	if len(item.KID) != 32 || len(item.VID) != 32 {
-		return drDecodedLocalKIDIndexEntry{}, fmt.Errorf("local kid index entry has invalid kid/vid length")
+	if len(item.KID) != 32 {
+		return drDecodedLocalKIDIndexEntry{}, fmt.Errorf("local kid index entry has invalid kid length")
 	}
 	if item.Key == "" {
 		return drDecodedLocalKIDIndexEntry{}, fmt.Errorf("local kid index entry has empty key")
 	}
 	var out drDecodedLocalKIDIndexEntry
 	copy(out.kid[:], item.KID)
-	copy(out.vid[:], item.VID)
 	out.key = item.Key
 	return out, nil
 }

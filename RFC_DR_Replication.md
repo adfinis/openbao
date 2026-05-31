@@ -238,7 +238,10 @@ drill-down, and fetched spans must prove completeness before the secondary can
 infer that a local key absent from the primary should be deleted.
 
 The secondary maintains a flat accumulator over top-level KID ranges and a
-local-only KID-to-key/VID point index. These are accelerators, not authority.
+local-only KID-to-key point index. The index stores stable key identity only;
+VIDs are recomputed from local physical values when an indexed repair loads a
+mismatched bucket. Its metadata tracks key-set changes and may lag the value
+accumulator after value-only batches. These are accelerators, not authority.
 If they are absent, stale, relationship-mismatched, cluster-mismatched, or fail
 bucket proof validation, reconciliation falls back to a full local scan.
 

@@ -323,8 +323,8 @@ During stream apply, the secondary computes old and new VID contribution for
 each replicated physical mutation, XORs the old contribution out of the bucket,
 and XORs the new contribution in. For transactional backends, replicated
 storage mutations, the stream-applied index marker, flat-accumulator cursor and
-deltas, and local KID index updates are committed in the same local
-transaction.
+deltas, and local KID index create/delete updates are committed in the same
+local transaction.
 
 The full accumulator snapshot is persisted on a bounded cadence and graceful
 stream shutdown. Between snapshots, the secondary persists local-only delta
@@ -346,7 +346,7 @@ flowchart TD
     C --> D["Apply final physical mutation"]
     D --> E["Update stream-applied index marker"]
     E --> F["Update flat accumulator bucket<br/>XOR old out / new in"]
-    F --> G["Update local KID index<br/>KID -> key, VID"]
+    F --> G["Update local KID index<br/>KID -> key"]
     G --> H["Commit local transaction"]
 
     H --> I{"Snapshot cadence reached?"}
@@ -365,18 +365,26 @@ flowchart TD
 The secondary also maintains a local-only bucketed point index:
 
 ```text
-KID -> (physical key, VID)
+KID -> physical key
 ```
 
 The index is scoped to the same top-level buckets as the flat accumulator and
 is stored under never-replicated local DR paths. It lets the secondary repair a
 non-empty divergent bucket without scanning unrelated storage because
 local-only KIDs can be resolved back to physical keys for delete application.
+The index deliberately does not persist VID. When indexed repair loads a
+bucket, the secondary reads the indexed local physical keys and recomputes VIDs
+from current ciphertext values before comparing the bucket checksum against
+the flat accumulator. This makes hot-key value updates avoid local KID-index
+rewrites; only key creation and deletion need point-index changes. The index
+metadata commit index is therefore a key-set index and may lag the accumulator
+value index after value-only batches.
 
 The index is an optimization, not authority. If metadata is absent, stale,
 relationship-mismatched, cluster-mismatched, or inconsistent with the
-accumulator bucket count/checksum, the secondary invalidates the index and
-falls back to full local scan.
+accumulator bucket count/checksum, or if an indexed key no longer resolves to
+the expected local value, the secondary invalidates the index and falls back to
+full local scan.
 
 After indexed repair, the secondary recomputes the repaired bucket's count and
 checksum. If it does not exactly match the checkpoint remote checksum, the
