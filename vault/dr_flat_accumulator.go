@@ -20,7 +20,9 @@ var drFlatAccumulatorCRCTable = crc64.MakeTable(crc64.ISO)
 
 const (
 	drFlatAccumulatorStoragePath       = "core/cluster/local/dr/flat-accumulator"
+	drFlatAccumulatorCursorStoragePath = "core/cluster/local/dr/flat-accumulator-cursor"
 	drFlatAccumulatorSnapshotVersion   = 1
+	drFlatAccumulatorCursorVersion     = 1
 	drFlatAccumulatorRangeBits         = 10
 	drFlatAccumulatorChecksumAlgorithm = "crc64-iso-xor-kid-vid-v1"
 )
@@ -44,6 +46,14 @@ type drFlatAccumulatorPersistedSnapshot struct {
 	ChecksumAlgorithm string                             `json:"checksum_algorithm"`
 	CommitIndex       uint64                             `json:"commit_index"`
 	Buckets           []drFlatAccumulatorPersistedBucket `json:"buckets"`
+}
+
+type drFlatAccumulatorPersistedCursor struct {
+	Version             int    `json:"version"`
+	RelationshipID      string `json:"relationship_id"`
+	ClusterID           string `json:"cluster_id,omitempty"`
+	CommitIndex         uint64 `json:"commit_index"`
+	SnapshotCommitIndex uint64 `json:"snapshot_commit_index,omitempty"`
 }
 
 type drFlatAccumulatorDelta struct {
@@ -255,12 +265,12 @@ func (s *drReplicationSecondary) persistFlatAccumulatorSnapshot(
 		Value: data,
 	})
 	if err == nil {
-		s.recordFlatAccumulatorSnapshotPersist(len(data), time.Since(start))
+		s.recordFlatAccumulatorSnapshotPersist(index, len(data), time.Since(start))
 	}
 	return err
 }
 
-func (s *drReplicationSecondary) recordFlatAccumulatorSnapshotPersist(bytes int, duration time.Duration) {
+func (s *drReplicationSecondary) recordFlatAccumulatorSnapshotPersist(index uint64, bytes int, duration time.Duration) {
 	if s == nil || bytes < 0 {
 		return
 	}
@@ -268,6 +278,8 @@ func (s *drReplicationSecondary) recordFlatAccumulatorSnapshotPersist(bytes int,
 	nanos := durationNanos(duration)
 
 	s.flatAccumulatorSnapshotCount.Add(1)
+	s.flatAccumulatorSnapshotIndex.Store(index)
+	s.flatAccumulatorSnapshotLastAt.Store(time.Now().UnixNano())
 	s.flatAccumulatorSnapshotBytes.Add(byteCount)
 	s.flatAccumulatorSnapshotLast.Store(byteCount)
 	s.flatAccumulatorSnapshotNanos.Add(nanos)
@@ -279,11 +291,126 @@ func (s *drReplicationSecondary) recordFlatAccumulatorSnapshotPersist(bytes int,
 	metrics.MeasureSince([]string{"replication", "dr", "secondary", "flat_accumulator_snapshot_persist_duration"}, time.Now().Add(-duration))
 }
 
+func (s *drReplicationSecondary) persistFlatAccumulatorCursor(
+	ctx context.Context,
+	writer physical.Backend,
+	index uint64,
+	snapshotIndex uint64,
+) error {
+	if s == nil || writer == nil || index == 0 {
+		return nil
+	}
+	cursor := drFlatAccumulatorPersistedCursor{
+		Version:             drFlatAccumulatorCursorVersion,
+		RelationshipID:      s.relationshipID,
+		ClusterID:           s.flatAccumulatorClusterID(),
+		CommitIndex:         index,
+		SnapshotCommitIndex: snapshotIndex,
+	}
+	data, err := json.Marshal(cursor)
+	if err != nil {
+		return err
+	}
+	if err := writer.Put(ctx, &physical.Entry{
+		Key:   drFlatAccumulatorCursorStoragePath,
+		Value: data,
+	}); err != nil {
+		return err
+	}
+	s.flatAccumulatorCursorWrites.Add(1)
+	s.flatAccumulatorCursorIndex.Store(index)
+	metrics.IncrCounter([]string{"replication", "dr", "secondary", "flat_accumulator_cursor_writes_total"}, 1)
+	metrics.SetGauge([]string{"replication", "dr", "secondary", "flat_accumulator_cursor_index"}, float32(index))
+	return nil
+}
+
+func (s *drReplicationSecondary) shouldPersistFlatAccumulatorSnapshot(index uint64, force bool) bool {
+	if s == nil || index == 0 {
+		return false
+	}
+	if force {
+		return true
+	}
+	lastIndex := s.flatAccumulatorSnapshotIndex.Load()
+	if lastIndex == 0 || index <= lastIndex {
+		return true
+	}
+	if minEntries := s.flatAccumulatorSnapshotMinEntries; minEntries > 0 && index-lastIndex >= minEntries {
+		return true
+	}
+	if minInterval := s.flatAccumulatorSnapshotMinInterval; minInterval > 0 {
+		lastAt := s.flatAccumulatorSnapshotLastAt.Load()
+		if lastAt == 0 || time.Since(time.Unix(0, lastAt)) >= minInterval {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *drReplicationSecondary) persistFlatAccumulatorState(
+	ctx context.Context,
+	writer physical.Backend,
+	index uint64,
+	buckets [drRangeMaxTotalRanges]drFlatAccumulatorBucket,
+	forceSnapshot bool,
+) error {
+	if s == nil || writer == nil || index == 0 {
+		return nil
+	}
+	snapshotIndex := s.flatAccumulatorSnapshotIndex.Load()
+	if s.shouldPersistFlatAccumulatorSnapshot(index, forceSnapshot) {
+		if err := s.persistFlatAccumulatorSnapshot(ctx, writer, index, buckets); err != nil {
+			return err
+		}
+		snapshotIndex = index
+	} else {
+		s.flatAccumulatorSnapshotSkipped.Add(1)
+		metrics.IncrCounter([]string{"replication", "dr", "secondary", "flat_accumulator_snapshot_skipped_total"}, 1)
+	}
+	return s.persistFlatAccumulatorCursor(ctx, writer, index, snapshotIndex)
+}
+
+func (s *drReplicationSecondary) persistCurrentFlatAccumulatorSnapshot(ctx context.Context) {
+	if s == nil || s.rangeAccumulator == nil || s.core == nil || s.core.physical == nil {
+		return
+	}
+	index := s.lastAppliedIndex.Load()
+	if index == 0 {
+		return
+	}
+	buckets, ok := s.rangeAccumulator.snapshotExact(index)
+	if !ok {
+		return
+	}
+	if err := s.persistFlatAccumulatorState(ctx, s.core.physical, index, buckets, true); err != nil {
+		s.logger.Warn("failed to persist final DR flat accumulator snapshot", "commit_index", index, "error", err)
+	}
+}
+
 func (s *drReplicationSecondary) deletePersistedFlatAccumulator(ctx context.Context, writer physical.Backend) error {
 	if s == nil || writer == nil {
 		return nil
 	}
-	return writer.Delete(ctx, drFlatAccumulatorStoragePath)
+	if err := writer.Delete(ctx, drFlatAccumulatorStoragePath); err != nil {
+		return err
+	}
+	s.flatAccumulatorSnapshotIndex.Store(0)
+	return nil
+}
+
+func (s *drReplicationSecondary) deletePersistedFlatAccumulatorState(ctx context.Context, writer physical.Backend) error {
+	if err := s.deletePersistedFlatAccumulator(ctx, writer); err != nil {
+		return err
+	}
+	if s == nil || writer == nil {
+		return nil
+	}
+	if err := writer.Delete(ctx, drFlatAccumulatorCursorStoragePath); err != nil {
+		return err
+	}
+	s.flatAccumulatorCursorIndex.Store(0)
+	s.flatAccumulatorSnapshotIndex.Store(0)
+	return nil
 }
 
 func (s *drReplicationSecondary) resetAndPersistFlatAccumulatorFromSet(ctx context.Context, rs *reconciler.ReconciliationSet, index uint64) error {
@@ -294,6 +421,9 @@ func (s *drReplicationSecondary) resetAndPersistFlatAccumulatorFromSet(ctx conte
 	if err := s.persistFlatAccumulatorSnapshot(ctx, s.core.physical, index, buckets); err != nil {
 		return err
 	}
+	if err := s.persistFlatAccumulatorCursor(ctx, s.core.physical, index, index); err != nil {
+		return err
+	}
 	s.rangeAccumulator.replace(index, buckets)
 	return nil
 }
@@ -302,12 +432,20 @@ func (s *drReplicationSecondary) loadPersistentFlatAccumulator(ctx context.Conte
 	if s == nil || s.rangeAccumulator == nil || s.core == nil || s.core.physical == nil {
 		return
 	}
+	cursor, cursorOK := s.loadPersistentFlatAccumulatorCursor(ctx)
 	entry, err := s.core.physical.Get(ctx, drFlatAccumulatorStoragePath)
 	if err != nil {
 		s.logger.Warn("failed to load DR flat accumulator snapshot", "error", err)
+		if cursorOK {
+			s.setLastAppliedIndex(cursor.CommitIndex)
+		}
 		return
 	}
 	if entry == nil || len(entry.Value) == 0 {
+		if cursorOK {
+			s.setLastAppliedIndex(cursor.CommitIndex)
+			s.logger.Info("loaded DR flat accumulator cursor without snapshot", "commit_index", cursor.CommitIndex)
+		}
 		return
 	}
 
@@ -315,11 +453,25 @@ func (s *drReplicationSecondary) loadPersistentFlatAccumulator(ctx context.Conte
 	if err := json.Unmarshal(entry.Value, &snapshot); err != nil {
 		s.logger.Warn("discarding unreadable DR flat accumulator snapshot", "error", err)
 		_ = s.deletePersistedFlatAccumulator(ctx, s.core.physical)
+		if cursorOK {
+			s.setLastAppliedIndex(cursor.CommitIndex)
+		}
 		return
 	}
 	if err := s.validateFlatAccumulatorSnapshot(&snapshot); err != nil {
 		s.logger.Warn("discarding incompatible DR flat accumulator snapshot", "error", err)
 		_ = s.deletePersistedFlatAccumulator(ctx, s.core.physical)
+		if cursorOK {
+			s.setLastAppliedIndex(cursor.CommitIndex)
+		}
+		return
+	}
+	if cursorOK && cursor.CommitIndex > snapshot.CommitIndex {
+		s.logger.Info("discarding stale DR flat accumulator snapshot behind cursor",
+			"snapshot_commit_index", snapshot.CommitIndex,
+			"cursor_commit_index", cursor.CommitIndex)
+		_ = s.deletePersistedFlatAccumulator(ctx, s.core.physical)
+		s.setLastAppliedIndex(cursor.CommitIndex)
 		return
 	}
 
@@ -331,10 +483,39 @@ func (s *drReplicationSecondary) loadPersistentFlatAccumulator(ctx context.Conte
 		}
 	}
 	s.rangeAccumulator.replace(snapshot.CommitIndex, buckets)
+	s.flatAccumulatorSnapshotIndex.Store(snapshot.CommitIndex)
+	s.flatAccumulatorSnapshotLastAt.Store(time.Now().UnixNano())
 	if snapshot.CommitIndex > s.lastAppliedIndex.Load() {
 		s.setLastAppliedIndex(snapshot.CommitIndex)
 	}
 	s.logger.Info("loaded DR flat accumulator snapshot", "commit_index", snapshot.CommitIndex)
+}
+
+func (s *drReplicationSecondary) loadPersistentFlatAccumulatorCursor(ctx context.Context) (drFlatAccumulatorPersistedCursor, bool) {
+	var cursor drFlatAccumulatorPersistedCursor
+	if s == nil || s.core == nil || s.core.physical == nil {
+		return cursor, false
+	}
+	entry, err := s.core.physical.Get(ctx, drFlatAccumulatorCursorStoragePath)
+	if err != nil {
+		s.logger.Warn("failed to load DR flat accumulator cursor", "error", err)
+		return cursor, false
+	}
+	if entry == nil || len(entry.Value) == 0 {
+		return cursor, false
+	}
+	if err := json.Unmarshal(entry.Value, &cursor); err != nil {
+		s.logger.Warn("discarding unreadable DR flat accumulator cursor", "error", err)
+		_ = s.core.physical.Delete(ctx, drFlatAccumulatorCursorStoragePath)
+		return cursor, false
+	}
+	if err := s.validateFlatAccumulatorCursor(&cursor); err != nil {
+		s.logger.Warn("discarding incompatible DR flat accumulator cursor", "error", err)
+		_ = s.core.physical.Delete(ctx, drFlatAccumulatorCursorStoragePath)
+		return cursor, false
+	}
+	s.flatAccumulatorCursorIndex.Store(cursor.CommitIndex)
+	return cursor, true
 }
 
 func (s *drReplicationSecondary) validateFlatAccumulatorSnapshot(snapshot *drFlatAccumulatorPersistedSnapshot) error {
@@ -361,6 +542,28 @@ func (s *drReplicationSecondary) validateFlatAccumulatorSnapshot(snapshot *drFla
 	}
 	if snapshot.CommitIndex == 0 {
 		return fmt.Errorf("commit_index is zero")
+	}
+	return nil
+}
+
+func (s *drReplicationSecondary) validateFlatAccumulatorCursor(cursor *drFlatAccumulatorPersistedCursor) error {
+	if cursor == nil {
+		return fmt.Errorf("cursor is nil")
+	}
+	if cursor.Version != drFlatAccumulatorCursorVersion {
+		return fmt.Errorf("unsupported cursor version %d", cursor.Version)
+	}
+	if cursor.RelationshipID == "" || cursor.RelationshipID != s.relationshipID {
+		return fmt.Errorf("relationship_id mismatch")
+	}
+	if clusterID := s.flatAccumulatorClusterID(); clusterID != "" && cursor.ClusterID != "" && cursor.ClusterID != clusterID {
+		return fmt.Errorf("cluster_id mismatch")
+	}
+	if cursor.CommitIndex == 0 {
+		return fmt.Errorf("commit_index is zero")
+	}
+	if cursor.SnapshotCommitIndex > cursor.CommitIndex {
+		return fmt.Errorf("snapshot_commit_index is ahead of commit_index")
 	}
 	return nil
 }

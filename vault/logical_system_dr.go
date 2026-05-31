@@ -555,6 +555,14 @@ func (b *SystemBackend) drReplicationPaths() []*framework.Path {
 					Type:        framework.TypeInt,
 					Description: "Secondary stream apply batch max wait in milliseconds.",
 				},
+				"flat_accumulator_snapshot_min_entries": {
+					Type:        framework.TypeInt,
+					Description: "Minimum applied entry delta before persisting a full flat-accumulator snapshot.",
+				},
+				"flat_accumulator_snapshot_min_interval_milliseconds": {
+					Type:        framework.TypeInt,
+					Description: "Minimum elapsed time before persisting a full flat-accumulator snapshot.",
+				},
 				"stream_journal_enabled": {
 					Type:        framework.TypeBool,
 					Description: "Enable persistent primary stream journal replay.",
@@ -754,13 +762,19 @@ func (b *SystemBackend) handleDRStatus(ctx context.Context, req *logical.Request
 		data["stream_batch_flush_max_bytes_total"] = status.StreamBatchFlushMaxBytesTotal
 		data["stream_batch_flush_max_wait_total"] = status.StreamBatchFlushMaxWaitTotal
 		data["stream_batch_flush_shutdown_total"] = status.StreamBatchFlushShutdownTotal
+		data["flat_accumulator_cursor_writes_total"] = status.FlatAccumulatorCursorWritesTotal
+		data["flat_accumulator_cursor_index"] = status.FlatAccumulatorCursorIndex
 		data["flat_accumulator_snapshot_persists_total"] = status.FlatAccumulatorSnapshotPersistsTotal
+		data["flat_accumulator_snapshot_index"] = status.FlatAccumulatorSnapshotIndex
 		data["flat_accumulator_snapshot_bytes_total"] = status.FlatAccumulatorSnapshotBytesTotal
 		data["flat_accumulator_snapshot_bytes_average"] = status.FlatAccumulatorSnapshotBytesAverage
 		data["flat_accumulator_snapshot_bytes_last"] = status.FlatAccumulatorSnapshotBytesLast
 		data["flat_accumulator_snapshot_persist_milliseconds_total"] = status.FlatAccumulatorSnapshotPersistMsTotal
 		data["flat_accumulator_snapshot_persist_milliseconds_average"] = status.FlatAccumulatorSnapshotPersistMsAverage
 		data["flat_accumulator_snapshot_persist_milliseconds_max"] = status.FlatAccumulatorSnapshotPersistMsMax
+		data["flat_accumulator_snapshot_skipped_total"] = status.FlatAccumulatorSnapshotSkippedTotal
+		data["flat_accumulator_snapshot_min_entries"] = status.FlatAccumulatorSnapshotMinEntries
+		data["flat_accumulator_snapshot_min_interval_milliseconds"] = status.FlatAccumulatorSnapshotMinIntervalMilliseconds
 		data["scan_failures_total"] = status.ScanFailuresTotal
 		data["checkpoint_conflicts_total"] = status.CheckpointConflictsTotal
 		data["reconcile_retries_total"] = status.ReconcileRetriesTotal
@@ -1376,44 +1390,46 @@ func (b *SystemBackend) handleDRTuningRead(ctx context.Context, req *logical.Req
 	cfg := mgr.Config()
 	return &logical.Response{
 		Data: map[string]interface{}{
-			"checkpoint_ttl_seconds":                            cfg.CheckpointTTLSeconds,
-			"checkpoint_global_budget_bytes":                    cfg.CheckpointGlobalBudgetBytes,
-			"checkpoint_per_relationship_budget_bytes":          cfg.CheckpointPerRelBudgetBytes,
-			"stream_buffer_max_entries":                         cfg.StreamBufferMaxEntries,
-			"stream_buffer_max_bytes":                           cfg.StreamBufferMaxBytes,
-			"reconcile_max_rpc_bytes":                           cfg.ReconcileMaxRPCBytes,
-			"reconcile_max_wall_time_seconds":                   cfg.ReconcileMaxWallTimeSeconds,
-			"reconcile_max_inflight_tasks":                      cfg.ReconcileMaxInflightTasks,
-			"stream_batch_max_entries":                          cfg.StreamBatchMaxEntries,
-			"stream_batch_max_bytes":                            cfg.StreamBatchMaxBytes,
-			"stream_batch_max_wait_milliseconds":                cfg.StreamBatchMaxWaitMillis,
-			"stream_journal_enabled":                            cfg.StreamJournalEnabled,
-			"stream_journal_max_bytes":                          cfg.StreamJournalMaxBytes,
-			"stream_journal_segment_bytes":                      cfg.StreamJournalSegmentBytes,
-			"stream_journal_retention_seconds":                  cfg.StreamJournalRetentionSecs,
-			"reconcile_apply_workers":                           cfg.ReconcileApplyWorkers,
-			"reconcile_put_batch_max_entries":                   cfg.ReconcilePutBatchMaxEntries,
-			"reconcile_put_batch_max_bytes":                     cfg.ReconcilePutBatchMaxBytes,
-			"convergence_min_rate_ratio":                        cfg.ConvergenceMinRateRatio,
-			"convergence_stall_seconds":                         cfg.ConvergenceStallSeconds,
-			"fallback_enabled":                                  cfg.FallbackEnabled,
-			"fallback_stall_seconds":                            cfg.FallbackStallSeconds,
-			"fallback_failure_threshold":                        cfg.FallbackFailureThreshold,
-			"fallback_min_lag_entries":                          cfg.FallbackMinLagEntries,
-			"fallback_cooldown_seconds":                         cfg.FallbackCooldownSeconds,
-			"fallback_max_per_hour":                             cfg.FallbackMaxPerHour,
-			"checkpoint_artifact_enabled":                       cfg.CheckpointArtifactEnabled,
-			"checkpoint_artifact_global_budget_bytes":           cfg.CheckpointArtifactGlobalBudgetBytes,
-			"checkpoint_artifact_per_relationship_budget_bytes": cfg.CheckpointArtifactPerRelBudgetBytes,
-			"checkpoint_artifact_ttl_seconds":                   cfg.CheckpointArtifactTTLSeconds,
-			"checkpoint_artifact_segment_bytes":                 cfg.CheckpointArtifactSegmentBytes,
-			"dr_backpressure_enabled":                           cfg.DRBackpressureEnabled,
-			"dr_backpressure_degraded_ratio":                    cfg.DRBackpressureDegradedRatio,
-			"dr_backpressure_critical_ratio":                    cfg.DRBackpressureCriticalRatio,
-			"dr_backpressure_min_lag_entries":                   cfg.DRBackpressureMinLagEntries,
-			"dr_backpressure_horizon_seconds":                   cfg.DRBackpressureHorizonSeconds,
-			"dr_backpressure_degraded_min_qps":                  cfg.DRBackpressureDegradedMinQPS,
-			"dr_backpressure_critical_min_qps":                  cfg.DRBackpressureCriticalMinQPS,
+			"checkpoint_ttl_seconds":                              cfg.CheckpointTTLSeconds,
+			"checkpoint_global_budget_bytes":                      cfg.CheckpointGlobalBudgetBytes,
+			"checkpoint_per_relationship_budget_bytes":            cfg.CheckpointPerRelBudgetBytes,
+			"stream_buffer_max_entries":                           cfg.StreamBufferMaxEntries,
+			"stream_buffer_max_bytes":                             cfg.StreamBufferMaxBytes,
+			"reconcile_max_rpc_bytes":                             cfg.ReconcileMaxRPCBytes,
+			"reconcile_max_wall_time_seconds":                     cfg.ReconcileMaxWallTimeSeconds,
+			"reconcile_max_inflight_tasks":                        cfg.ReconcileMaxInflightTasks,
+			"stream_batch_max_entries":                            cfg.StreamBatchMaxEntries,
+			"stream_batch_max_bytes":                              cfg.StreamBatchMaxBytes,
+			"stream_batch_max_wait_milliseconds":                  cfg.StreamBatchMaxWaitMillis,
+			"flat_accumulator_snapshot_min_entries":               cfg.FlatAccumulatorSnapshotMinEntries,
+			"flat_accumulator_snapshot_min_interval_milliseconds": cfg.FlatAccumulatorSnapshotMinIntervalMillis,
+			"stream_journal_enabled":                              cfg.StreamJournalEnabled,
+			"stream_journal_max_bytes":                            cfg.StreamJournalMaxBytes,
+			"stream_journal_segment_bytes":                        cfg.StreamJournalSegmentBytes,
+			"stream_journal_retention_seconds":                    cfg.StreamJournalRetentionSecs,
+			"reconcile_apply_workers":                             cfg.ReconcileApplyWorkers,
+			"reconcile_put_batch_max_entries":                     cfg.ReconcilePutBatchMaxEntries,
+			"reconcile_put_batch_max_bytes":                       cfg.ReconcilePutBatchMaxBytes,
+			"convergence_min_rate_ratio":                          cfg.ConvergenceMinRateRatio,
+			"convergence_stall_seconds":                           cfg.ConvergenceStallSeconds,
+			"fallback_enabled":                                    cfg.FallbackEnabled,
+			"fallback_stall_seconds":                              cfg.FallbackStallSeconds,
+			"fallback_failure_threshold":                          cfg.FallbackFailureThreshold,
+			"fallback_min_lag_entries":                            cfg.FallbackMinLagEntries,
+			"fallback_cooldown_seconds":                           cfg.FallbackCooldownSeconds,
+			"fallback_max_per_hour":                               cfg.FallbackMaxPerHour,
+			"checkpoint_artifact_enabled":                         cfg.CheckpointArtifactEnabled,
+			"checkpoint_artifact_global_budget_bytes":             cfg.CheckpointArtifactGlobalBudgetBytes,
+			"checkpoint_artifact_per_relationship_budget_bytes":   cfg.CheckpointArtifactPerRelBudgetBytes,
+			"checkpoint_artifact_ttl_seconds":                     cfg.CheckpointArtifactTTLSeconds,
+			"checkpoint_artifact_segment_bytes":                   cfg.CheckpointArtifactSegmentBytes,
+			"dr_backpressure_enabled":                             cfg.DRBackpressureEnabled,
+			"dr_backpressure_degraded_ratio":                      cfg.DRBackpressureDegradedRatio,
+			"dr_backpressure_critical_ratio":                      cfg.DRBackpressureCriticalRatio,
+			"dr_backpressure_min_lag_entries":                     cfg.DRBackpressureMinLagEntries,
+			"dr_backpressure_horizon_seconds":                     cfg.DRBackpressureHorizonSeconds,
+			"dr_backpressure_degraded_min_qps":                    cfg.DRBackpressureDegradedMinQPS,
+			"dr_backpressure_critical_min_qps":                    cfg.DRBackpressureCriticalMinQPS,
 		},
 	}, nil
 }
@@ -1503,6 +1519,12 @@ func (b *SystemBackend) handleDRTuningWrite(ctx context.Context, req *logical.Re
 			func() error { return setInt("stream_batch_max_entries", &cfg.StreamBatchMaxEntries) },
 			func() error { return setInt("stream_batch_max_bytes", &cfg.StreamBatchMaxBytes) },
 			func() error { return setInt64("stream_batch_max_wait_milliseconds", &cfg.StreamBatchMaxWaitMillis) },
+			func() error {
+				return setUint64("flat_accumulator_snapshot_min_entries", &cfg.FlatAccumulatorSnapshotMinEntries)
+			},
+			func() error {
+				return setInt64("flat_accumulator_snapshot_min_interval_milliseconds", &cfg.FlatAccumulatorSnapshotMinIntervalMillis)
+			},
 			func() error { return setBool("stream_journal_enabled", &cfg.StreamJournalEnabled) },
 			func() error { return setUint64("stream_journal_max_bytes", &cfg.StreamJournalMaxBytes) },
 			func() error { return setUint64("stream_journal_segment_bytes", &cfg.StreamJournalSegmentBytes) },

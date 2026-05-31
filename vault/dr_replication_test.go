@@ -2754,11 +2754,15 @@ func TestDRSecondaryStatus(t *testing.T) {
 	sec.streamBatchFlushMaxBytes.Store(5)
 	sec.streamBatchFlushMaxWait.Store(6)
 	sec.streamBatchFlushShutdown.Store(7)
+	sec.flatAccumulatorCursorWrites.Store(8)
+	sec.flatAccumulatorCursorIndex.Store(41)
 	sec.flatAccumulatorSnapshotCount.Store(2)
+	sec.flatAccumulatorSnapshotIndex.Store(40)
 	sec.flatAccumulatorSnapshotBytes.Store(1000)
 	sec.flatAccumulatorSnapshotLast.Store(600)
 	sec.flatAccumulatorSnapshotNanos.Store(uint64(5 * time.Millisecond))
 	sec.flatAccumulatorSnapshotMaxNs.Store(uint64(3 * time.Millisecond))
+	sec.flatAccumulatorSnapshotSkipped.Store(9)
 	sec.lastReconcileAt.Store(time.Now().Unix())
 
 	status := sec.Status()
@@ -2798,11 +2802,23 @@ func TestDRSecondaryStatus(t *testing.T) {
 	if status.StreamBatchFlushMaxWaitTotal != 6 {
 		t.Fatalf("expected stream batch max-wait flush total 6, got %d", status.StreamBatchFlushMaxWaitTotal)
 	}
+	if status.FlatAccumulatorCursorWritesTotal != 8 {
+		t.Fatalf("expected flat accumulator cursor writes total 8, got %d", status.FlatAccumulatorCursorWritesTotal)
+	}
+	if status.FlatAccumulatorCursorIndex != 41 {
+		t.Fatalf("expected flat accumulator cursor index 41, got %d", status.FlatAccumulatorCursorIndex)
+	}
+	if status.FlatAccumulatorSnapshotIndex != 40 {
+		t.Fatalf("expected flat accumulator snapshot index 40, got %d", status.FlatAccumulatorSnapshotIndex)
+	}
 	if status.FlatAccumulatorSnapshotBytesAverage != 500 {
 		t.Fatalf("expected flat accumulator average snapshot bytes 500, got %f", status.FlatAccumulatorSnapshotBytesAverage)
 	}
 	if status.FlatAccumulatorSnapshotPersistMsAverage != 2.5 {
 		t.Fatalf("expected flat accumulator average persist ms 2.5, got %f", status.FlatAccumulatorSnapshotPersistMsAverage)
+	}
+	if status.FlatAccumulatorSnapshotSkippedTotal != 9 {
+		t.Fatalf("expected flat accumulator snapshot skipped total 9, got %d", status.FlatAccumulatorSnapshotSkippedTotal)
 	}
 }
 
@@ -2823,9 +2839,13 @@ func TestDRSystemBackend_StatusIncludesStreamOptimizationCounters(t *testing.T) 
 	secondary.streamTxnMaxEntries.Store(9)
 	secondary.streamTxnMaxPhysicalEntries.Store(8)
 	secondary.streamBatchFlushMaxWait.Store(5)
+	secondary.flatAccumulatorCursorWrites.Store(3)
+	secondary.flatAccumulatorCursorIndex.Store(15)
 	secondary.flatAccumulatorSnapshotCount.Store(2)
+	secondary.flatAccumulatorSnapshotIndex.Store(14)
 	secondary.flatAccumulatorSnapshotBytes.Store(1000)
 	secondary.flatAccumulatorSnapshotLast.Store(512)
+	secondary.flatAccumulatorSnapshotSkipped.Store(4)
 	mgr.secondary = secondary
 	core.drManager = mgr
 
@@ -2855,11 +2875,23 @@ func TestDRSystemBackend_StatusIncludesStreamOptimizationCounters(t *testing.T) 
 	if got := resp.Data["stream_batch_flush_max_wait_total"]; got != uint64(5) {
 		t.Fatalf("expected stream_batch_flush_max_wait_total=5, got %#v", got)
 	}
+	if got := resp.Data["flat_accumulator_cursor_writes_total"]; got != uint64(3) {
+		t.Fatalf("expected flat_accumulator_cursor_writes_total=3, got %#v", got)
+	}
+	if got := resp.Data["flat_accumulator_cursor_index"]; got != uint64(15) {
+		t.Fatalf("expected flat_accumulator_cursor_index=15, got %#v", got)
+	}
+	if got := resp.Data["flat_accumulator_snapshot_index"]; got != uint64(14) {
+		t.Fatalf("expected flat_accumulator_snapshot_index=14, got %#v", got)
+	}
 	if got := resp.Data["flat_accumulator_snapshot_bytes_average"]; got != float64(500) {
 		t.Fatalf("expected flat_accumulator_snapshot_bytes_average=500, got %#v", got)
 	}
 	if got := resp.Data["flat_accumulator_snapshot_bytes_last"]; got != uint64(512) {
 		t.Fatalf("expected flat_accumulator_snapshot_bytes_last=512, got %#v", got)
+	}
+	if got := resp.Data["flat_accumulator_snapshot_skipped_total"]; got != uint64(4) {
+		t.Fatalf("expected flat_accumulator_snapshot_skipped_total=4, got %#v", got)
 	}
 }
 
@@ -2906,6 +2938,8 @@ func TestDRRelationshipManager_UpdateTuningAppliesSecondaryRuntime(t *testing.T)
 		cfg.StreamBatchMaxEntries = 1024
 		cfg.StreamBatchMaxBytes = 4 << 20
 		cfg.StreamBatchMaxWaitMillis = 20
+		cfg.FlatAccumulatorSnapshotMinEntries = 2048
+		cfg.FlatAccumulatorSnapshotMinIntervalMillis = 2500
 		cfg.FallbackEnabled = false
 		cfg.FallbackStallSeconds = 90
 		cfg.FallbackFailureThreshold = 4
@@ -2933,6 +2967,12 @@ func TestDRRelationshipManager_UpdateTuningAppliesSecondaryRuntime(t *testing.T)
 	if cfg.StreamBatchMaxWaitMillis != 20 {
 		t.Fatalf("expected stream batch max wait millis=20, got %d", cfg.StreamBatchMaxWaitMillis)
 	}
+	if cfg.FlatAccumulatorSnapshotMinEntries != 2048 {
+		t.Fatalf("expected flat accumulator snapshot min entries=2048, got %d", cfg.FlatAccumulatorSnapshotMinEntries)
+	}
+	if cfg.FlatAccumulatorSnapshotMinIntervalMillis != 2500 {
+		t.Fatalf("expected flat accumulator snapshot min interval=2500, got %d", cfg.FlatAccumulatorSnapshotMinIntervalMillis)
+	}
 	if mgr.secondary.reconcileMaxInflightTasks != 7 {
 		t.Fatalf("expected runtime inflight=7, got %d", mgr.secondary.reconcileMaxInflightTasks)
 	}
@@ -2944,6 +2984,12 @@ func TestDRRelationshipManager_UpdateTuningAppliesSecondaryRuntime(t *testing.T)
 	}
 	if mgr.secondary.streamBatchMaxWait != 20*time.Millisecond {
 		t.Fatalf("expected runtime stream batch max wait=%s, got %s", 20*time.Millisecond, mgr.secondary.streamBatchMaxWait)
+	}
+	if mgr.secondary.flatAccumulatorSnapshotMinEntries != 2048 {
+		t.Fatalf("expected runtime flat accumulator snapshot min entries=2048, got %d", mgr.secondary.flatAccumulatorSnapshotMinEntries)
+	}
+	if mgr.secondary.flatAccumulatorSnapshotMinInterval != 2500*time.Millisecond {
+		t.Fatalf("expected runtime flat accumulator snapshot min interval=%s, got %s", 2500*time.Millisecond, mgr.secondary.flatAccumulatorSnapshotMinInterval)
 	}
 	if mgr.secondary.fallbackEnabled {
 		t.Fatal("expected runtime fallback to be disabled")
@@ -3753,6 +3799,7 @@ func TestDRSecondaryFlatAccumulatorAdvancesOnStreamApply(t *testing.T) {
 	ctx := context.Background()
 	replSalt := bytes.Repeat([]byte{0x43}, 32)
 	secondary := newDRReplicationSecondary(core, replSalt, "rel-flat-stream", core.logger)
+	secondary.flatAccumulatorSnapshotMinEntries = 1
 
 	key := "secret/flat-stream"
 	oldEntry := &physical.Entry{Key: key, Value: []byte("old")}
@@ -3819,6 +3866,7 @@ func TestDRSecondaryStreamTxnPersistsFlatAccumulator(t *testing.T) {
 	ctx := context.Background()
 	replSalt := bytes.Repeat([]byte{0x46}, 32)
 	secondary := newDRReplicationSecondary(core, replSalt, "rel-flat-txn", core.logger)
+	secondary.flatAccumulatorSnapshotMinEntries = 1
 
 	txnBackend, ok := core.physical.(physical.TransactionalBackend)
 	if !ok {
@@ -3868,7 +3916,7 @@ func TestDRSecondaryStreamTxnPersistsFlatAccumulator(t *testing.T) {
 		OpType:    string(physical.DeleteOperation),
 		Key:       deleteKey,
 		RaftIndex: 14,
-	}}); err != nil {
+	}}, false); err != nil {
 		t.Fatalf("stream txn failed: %v", err)
 	}
 
@@ -3895,6 +3943,111 @@ func TestDRSecondaryStreamTxnPersistsFlatAccumulator(t *testing.T) {
 	assertDRFlatAccumulatorMatchesSet(t, reloaded.rangeAccumulator, 14, localSet)
 	if got := reloaded.lastAppliedIndex.Load(); got != 14 {
 		t.Fatalf("expected loaded lastAppliedIndex 14, got %d", got)
+	}
+}
+
+func TestDRSecondaryStreamTxnCadencePersistsCursorWithoutStaleSnapshotLoad(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	replSalt := bytes.Repeat([]byte{0x47}, 32)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-flat-cadence", core.logger)
+	secondary.flatAccumulatorSnapshotMinEntries = 1024
+	secondary.flatAccumulatorSnapshotMinInterval = time.Hour
+
+	txnBackend, ok := core.physical.(physical.TransactionalBackend)
+	if !ok {
+		t.Fatal("test core physical backend must support transactions")
+	}
+
+	key := "secret/flat-cadence"
+	oldEntry := &physical.Entry{Key: key, Value: []byte("old")}
+	if err := core.physical.Put(ctx, oldEntry); err != nil {
+		t.Fatalf("failed to seed physical entry: %v", err)
+	}
+	kid, oldVID := secondary.scanner.ComputeItemFromEntry(oldEntry)
+	localSet := &reconciler.ReconciliationSet{
+		KIDToVID: map[[32]byte][32]byte{kid: oldVID},
+	}
+	secondary.rangeAccumulator.resetFromSet(localSet, 10)
+	secondary.lastAppliedIndex.Store(10)
+	if err := secondary.resetAndPersistFlatAccumulatorFromSet(ctx, localSet, 10); err != nil {
+		t.Fatalf("failed to seed persisted accumulator: %v", err)
+	}
+
+	if err := secondary.applyStreamTxn(ctx, txnBackend, []*EntryChange{{
+		OpType:    string(physical.PutOperation),
+		Key:       key,
+		Value:     []byte("new"),
+		RaftIndex: 11,
+	}}, false); err != nil {
+		t.Fatalf("stream txn failed: %v", err)
+	}
+
+	localSet.KIDToVID[kid] = secondary.scanner.ComputeVIDWithSealWrap([]byte("new"), false)
+	assertDRFlatAccumulatorMatchesSet(t, secondary.rangeAccumulator, 11, localSet)
+	if got := secondary.flatAccumulatorSnapshotSkipped.Load(); got != 1 {
+		t.Fatalf("expected one skipped snapshot, got %d", got)
+	}
+	if got := secondary.flatAccumulatorCursorIndex.Load(); got != 11 {
+		t.Fatalf("expected cursor index 11, got %d", got)
+	}
+	if got := secondary.flatAccumulatorSnapshotIndex.Load(); got != 10 {
+		t.Fatalf("expected persisted snapshot index 10, got %d", got)
+	}
+
+	reloaded := newDRReplicationSecondary(core, replSalt, "rel-flat-cadence", core.logger)
+	reloaded.loadPersistentFlatAccumulator(ctx)
+	if reloaded.rangeAccumulator.isInitialized() {
+		t.Fatal("expected stale snapshot behind cursor to be ignored")
+	}
+	if got := reloaded.lastAppliedIndex.Load(); got != 11 {
+		t.Fatalf("expected cursor-loaded lastAppliedIndex 11, got %d", got)
+	}
+	if entry, err := core.physical.Get(ctx, drFlatAccumulatorStoragePath); err != nil {
+		t.Fatal(err)
+	} else if entry != nil {
+		t.Fatal("expected stale flat accumulator snapshot to be deleted")
+	}
+	if entry, err := core.physical.Get(ctx, drFlatAccumulatorCursorStoragePath); err != nil {
+		t.Fatal(err)
+	} else if entry == nil {
+		t.Fatal("expected flat accumulator cursor to remain")
+	}
+}
+
+func TestDRSecondaryApplyWorkerStopPersistsFinalFlatAccumulatorSnapshot(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	replSalt := bytes.Repeat([]byte{0x48}, 32)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-flat-final", core.logger)
+	secondary.flatAccumulatorSnapshotMinEntries = 1024
+	secondary.flatAccumulatorSnapshotMinInterval = time.Hour
+
+	key := "secret/flat-final"
+	entry := &physical.Entry{Key: key, Value: []byte("value")}
+	if err := core.physical.Put(ctx, entry); err != nil {
+		t.Fatalf("failed to seed physical entry: %v", err)
+	}
+	kid, vid := secondary.scanner.ComputeItemFromEntry(entry)
+	localSet := &reconciler.ReconciliationSet{
+		KIDToVID: map[[32]byte][32]byte{kid: vid},
+	}
+	secondary.rangeAccumulator.resetFromSet(localSet, 10)
+	secondary.lastAppliedIndex.Store(10)
+	secondary.flatAccumulatorSnapshotIndex.Store(5)
+
+	close(secondary.stopCh)
+	applyCh := make(chan []*EntryChange)
+	ackCh := make(chan uint64, 1)
+	if err := secondary.runStreamApplyWorker(ctx, applyCh, ackCh); err != nil {
+		t.Fatalf("stream apply worker failed: %v", err)
+	}
+
+	reloaded := newDRReplicationSecondary(core, replSalt, "rel-flat-final", core.logger)
+	reloaded.loadPersistentFlatAccumulator(ctx)
+	assertDRFlatAccumulatorMatchesSet(t, reloaded.rangeAccumulator, 10, localSet)
+	if got := reloaded.lastAppliedIndex.Load(); got != 10 {
+		t.Fatalf("expected final snapshot lastAppliedIndex 10, got %d", got)
 	}
 }
 

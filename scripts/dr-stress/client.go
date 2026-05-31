@@ -189,13 +189,17 @@ type DRStatusResponse struct {
 	StreamFlushMaxBytes      int64   `json:"stream_batch_flush_max_bytes_total"`
 	StreamFlushMaxWait       int64   `json:"stream_batch_flush_max_wait_total"`
 	StreamFlushShutdown      int64   `json:"stream_batch_flush_shutdown_total"`
+	FlatAccCursorWrites      int64   `json:"flat_accumulator_cursor_writes_total"`
+	FlatAccCursorIndex       int64   `json:"flat_accumulator_cursor_index"`
 	FlatAccSnapshotsTotal    int64   `json:"flat_accumulator_snapshot_persists_total"`
+	FlatAccSnapshotIndex     int64   `json:"flat_accumulator_snapshot_index"`
 	FlatAccSnapshotBytes     int64   `json:"flat_accumulator_snapshot_bytes_total"`
 	FlatAccSnapshotAvgBytes  float64 `json:"flat_accumulator_snapshot_bytes_average"`
 	FlatAccSnapshotLastBytes int64   `json:"flat_accumulator_snapshot_bytes_last"`
 	FlatAccPersistTotalMS    float64 `json:"flat_accumulator_snapshot_persist_milliseconds_total"`
 	FlatAccPersistAvgMS      float64 `json:"flat_accumulator_snapshot_persist_milliseconds_average"`
 	FlatAccPersistMaxMS      float64 `json:"flat_accumulator_snapshot_persist_milliseconds_max"`
+	FlatAccSnapshotSkipped   int64   `json:"flat_accumulator_snapshot_skipped_total"`
 	FallbackActive           bool    `json:"fallback_active"`
 	FallbackCount            int64   `json:"fallback_count"`
 	FallbackLastReason       string  `json:"fallback_last_reason"`

@@ -154,32 +154,34 @@ type DRConfig struct {
 	ReconcileIntegrityMode string `json:"reconcile_integrity_mode,omitempty"`
 
 	// Optional DR runtime tuning knobs. Zero values mean "use defaults".
-	CheckpointTTLSeconds        int64   `json:"checkpoint_ttl_seconds,omitempty"`
-	CheckpointGlobalBudgetBytes uint64  `json:"checkpoint_global_budget_bytes,omitempty"`
-	CheckpointPerRelBudgetBytes uint64  `json:"checkpoint_per_relationship_budget_bytes,omitempty"`
-	StreamBufferMaxEntries      int     `json:"stream_buffer_max_entries,omitempty"`
-	StreamBufferMaxBytes        uint64  `json:"stream_buffer_max_bytes,omitempty"`
-	ReconcileMaxRPCBytes        uint64  `json:"reconcile_max_rpc_bytes,omitempty"`
-	ReconcileMaxWallTimeSeconds int64   `json:"reconcile_max_wall_time_seconds,omitempty"`
-	ReconcileMaxInflightTasks   int     `json:"reconcile_max_inflight_tasks,omitempty"`
-	StreamBatchMaxEntries       int     `json:"stream_batch_max_entries,omitempty"`
-	StreamBatchMaxBytes         int     `json:"stream_batch_max_bytes,omitempty"`
-	StreamBatchMaxWaitMillis    int64   `json:"stream_batch_max_wait_milliseconds,omitempty"`
-	StreamJournalEnabled        bool    `json:"stream_journal_enabled,omitempty"`
-	StreamJournalMaxBytes       uint64  `json:"stream_journal_max_bytes,omitempty"`
-	StreamJournalSegmentBytes   uint64  `json:"stream_journal_segment_bytes,omitempty"`
-	StreamJournalRetentionSecs  int64   `json:"stream_journal_retention_seconds,omitempty"`
-	ReconcileApplyWorkers       int     `json:"reconcile_apply_workers,omitempty"`
-	ReconcilePutBatchMaxEntries int     `json:"reconcile_put_batch_max_entries,omitempty"`
-	ReconcilePutBatchMaxBytes   int     `json:"reconcile_put_batch_max_bytes,omitempty"`
-	ConvergenceMinRateRatio     float64 `json:"convergence_min_rate_ratio,omitempty"`
-	ConvergenceStallSeconds     int64   `json:"convergence_stall_seconds,omitempty"`
-	FallbackEnabled             bool    `json:"fallback_enabled,omitempty"`
-	FallbackStallSeconds        int64   `json:"fallback_stall_seconds,omitempty"`
-	FallbackFailureThreshold    int     `json:"fallback_failure_threshold,omitempty"`
-	FallbackMinLagEntries       uint64  `json:"fallback_min_lag_entries,omitempty"`
-	FallbackCooldownSeconds     int64   `json:"fallback_cooldown_seconds,omitempty"`
-	FallbackMaxPerHour          int     `json:"fallback_max_per_hour,omitempty"`
+	CheckpointTTLSeconds                     int64   `json:"checkpoint_ttl_seconds,omitempty"`
+	CheckpointGlobalBudgetBytes              uint64  `json:"checkpoint_global_budget_bytes,omitempty"`
+	CheckpointPerRelBudgetBytes              uint64  `json:"checkpoint_per_relationship_budget_bytes,omitempty"`
+	StreamBufferMaxEntries                   int     `json:"stream_buffer_max_entries,omitempty"`
+	StreamBufferMaxBytes                     uint64  `json:"stream_buffer_max_bytes,omitempty"`
+	ReconcileMaxRPCBytes                     uint64  `json:"reconcile_max_rpc_bytes,omitempty"`
+	ReconcileMaxWallTimeSeconds              int64   `json:"reconcile_max_wall_time_seconds,omitempty"`
+	ReconcileMaxInflightTasks                int     `json:"reconcile_max_inflight_tasks,omitempty"`
+	StreamBatchMaxEntries                    int     `json:"stream_batch_max_entries,omitempty"`
+	StreamBatchMaxBytes                      int     `json:"stream_batch_max_bytes,omitempty"`
+	StreamBatchMaxWaitMillis                 int64   `json:"stream_batch_max_wait_milliseconds,omitempty"`
+	FlatAccumulatorSnapshotMinEntries        uint64  `json:"flat_accumulator_snapshot_min_entries,omitempty"`
+	FlatAccumulatorSnapshotMinIntervalMillis int64   `json:"flat_accumulator_snapshot_min_interval_milliseconds,omitempty"`
+	StreamJournalEnabled                     bool    `json:"stream_journal_enabled,omitempty"`
+	StreamJournalMaxBytes                    uint64  `json:"stream_journal_max_bytes,omitempty"`
+	StreamJournalSegmentBytes                uint64  `json:"stream_journal_segment_bytes,omitempty"`
+	StreamJournalRetentionSecs               int64   `json:"stream_journal_retention_seconds,omitempty"`
+	ReconcileApplyWorkers                    int     `json:"reconcile_apply_workers,omitempty"`
+	ReconcilePutBatchMaxEntries              int     `json:"reconcile_put_batch_max_entries,omitempty"`
+	ReconcilePutBatchMaxBytes                int     `json:"reconcile_put_batch_max_bytes,omitempty"`
+	ConvergenceMinRateRatio                  float64 `json:"convergence_min_rate_ratio,omitempty"`
+	ConvergenceStallSeconds                  int64   `json:"convergence_stall_seconds,omitempty"`
+	FallbackEnabled                          bool    `json:"fallback_enabled,omitempty"`
+	FallbackStallSeconds                     int64   `json:"fallback_stall_seconds,omitempty"`
+	FallbackFailureThreshold                 int     `json:"fallback_failure_threshold,omitempty"`
+	FallbackMinLagEntries                    uint64  `json:"fallback_min_lag_entries,omitempty"`
+	FallbackCooldownSeconds                  int64   `json:"fallback_cooldown_seconds,omitempty"`
+	FallbackMaxPerHour                       int     `json:"fallback_max_per_hour,omitempty"`
 
 	CheckpointArtifactEnabled           bool    `json:"checkpoint_artifact_enabled,omitempty"`
 	CheckpointArtifactGlobalBudgetBytes uint64  `json:"checkpoint_artifact_global_budget_bytes,omitempty"`
@@ -602,6 +604,12 @@ func applyDRConfigDefaults(cfg *DRConfig) {
 	if cfg.ConvergenceStallSeconds <= 0 {
 		cfg.ConvergenceStallSeconds = int64(drDefaultConvergenceStall / time.Second)
 	}
+	if cfg.FlatAccumulatorSnapshotMinEntries == 0 {
+		cfg.FlatAccumulatorSnapshotMinEntries = drDefaultFlatAccumulatorSnapshotMinEntries
+	}
+	if cfg.FlatAccumulatorSnapshotMinIntervalMillis == 0 {
+		cfg.FlatAccumulatorSnapshotMinIntervalMillis = int64(drDefaultFlatAccumulatorSnapshotMinInterval / time.Millisecond)
+	}
 	if cfg.Mode != DRModeDisabled && !cfg.CheckpointArtifactEnabled {
 		cfg.CheckpointArtifactEnabled = true
 	}
@@ -713,6 +721,9 @@ func validateDRTuningConfig(cfg *DRConfig) error {
 		}
 	}
 	if err := millis("stream_batch_max_wait_milliseconds", cfg.StreamBatchMaxWaitMillis); err != nil {
+		return err
+	}
+	if err := millis("flat_accumulator_snapshot_min_interval_milliseconds", cfg.FlatAccumulatorSnapshotMinIntervalMillis); err != nil {
 		return err
 	}
 
@@ -1345,6 +1356,9 @@ func (m *drRelationshipManager) clearSecondaryCheckpointCursor(ctx context.Conte
 	if m.core.physical != nil {
 		if err := m.core.physical.Delete(ctx, drFlatAccumulatorStoragePath); err != nil {
 			return fmt.Errorf("failed to clear DR secondary flat accumulator: %w", err)
+		}
+		if err := m.core.physical.Delete(ctx, drFlatAccumulatorCursorStoragePath); err != nil {
+			return fmt.Errorf("failed to clear DR secondary flat accumulator cursor: %w", err)
 		}
 	}
 	return nil

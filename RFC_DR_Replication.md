@@ -522,10 +522,17 @@ hierarchical traversal state, and no persistent diff-sync state machine.
 During stream apply, the secondary computes the old and new VID for each
 replicated physical mutation, XORs the old contribution out of the bucket, and
 XORs the new contribution in. For transactional physical backends, the
-secondary writes the replicated storage mutations and the serialized flat
-accumulator snapshot in the same local transaction. The snapshot is stored under
-a never-replicated local DR path and is bound to the relationship ID, DR cluster
-ID, range version, checksum algorithm, and primary commit index.
+secondary writes the replicated storage mutations and a lightweight applied
+cursor in the same local transaction. The cursor is stored under a
+never-replicated local DR path and lets restart recover the physical applied
+index without trusting an accumulator snapshot.
+
+The full serialized accumulator snapshot is written on a bounded cadence and
+on graceful stream shutdown, rather than on every stream transaction. Snapshot
+cadence is controlled by applied-entry delta and elapsed-time tuning. A snapshot
+is also stored under a never-replicated local DR path and is bound to the
+relationship ID, DR cluster ID, range version, checksum algorithm, and primary
+commit index.
 
 When a streamed transaction contains multiple changes to the same key, the
 flat accumulator is updated from the pre-transaction value directly to the final
@@ -547,13 +554,16 @@ initial reconciliation merely because in-memory state was lost. If replay is no
 longer available, the primary explicitly requires reconciliation and the
 secondary enters the checkpoint-fenced reconciliation path.
 
-The persisted accumulator is fail-closed. Before any non-atomic reconciliation
-repair or resnapshot mutation is applied, the secondary deletes the persisted
-accumulator. If the process crashes mid-repair, restart cannot reload a stale
-accumulator for partially repaired storage; it must rebuild by scanning or by
-finishing a later proven reconciliation. After reconciliation or resnapshot
-finalizes successfully, the accumulator is reseeded from the verified local
-KID/VID set and persisted at the finalized checkpoint index.
+The persisted accumulator is fail-closed. If restart finds a cursor ahead of
+the full accumulator snapshot, it restores the applied cursor but discards the
+stale snapshot instead of trusting it. The next reconciliation must rebuild by
+scanning local storage or by finishing a later proven reconciliation. Before any
+non-atomic reconciliation repair or resnapshot mutation is applied, the
+secondary deletes the persisted accumulator. If the process crashes mid-repair,
+restart cannot reload a stale accumulator for partially repaired storage. After
+reconciliation or resnapshot finalizes successfully, the accumulator is reseeded
+from the verified local KID/VID set and persisted at the finalized checkpoint
+index.
 
 ### Range checksums
 
@@ -960,8 +970,8 @@ The status API should expose:
 - stream transaction batch counts, logical entries, materialized physical
   entries, coalesced entries, and apply/commit timing
 - stream batch flush reasons
-- flat accumulator snapshot count, byte volume, last snapshot size, and persist
-  timing
+- flat accumulator cursor writes/index, snapshot count/index, skipped snapshot
+  count, byte volume, last snapshot size, persist timing, and cadence tuning
 - range task counts
 - budget usage
 - journal replay health
@@ -1176,16 +1186,19 @@ The current conservative range-selection strategy verifies the complete
 top-level range partition for each checkpoint reconciliation. A transactionally
 persisted flat accumulator avoids the local O(N) scan when it is aligned with
 the checkpoint, but an absent, incompatible, or invalidated accumulator still
-requires a local scan before reconciliation can compare ranges.
+requires a local scan before reconciliation can compare ranges. The applied
+cursor is intentionally smaller and more frequently written than the full
+snapshot; it preserves restart replay correctness but is not enough to skip a
+local scan by itself.
 
 Transactional stream apply now coalesces repeated mutations to the same key
 within a batch. This reduces secondary write pressure for hot-key workloads, but
 it does not change the replay or reconciliation proof model. The secondary
 status response exposes transactional apply counters, flush-reason counters,
-apply and commit timing, and flat-accumulator snapshot size and persistence
-timing. This lets stress runs measure avoided physical writes, batch shape, and
-local snapshot write amplification directly instead of inferring the effect only
-from lag, buffer, and reconciliation-dwell signals.
+apply and commit timing, and flat-accumulator cursor/snapshot persistence
+timing. This lets stress runs measure avoided physical writes, batch shape,
+local snapshot write amplification, and snapshot cadence directly instead of
+inferring the effect only from lag, buffer, and reconciliation-dwell signals.
 
 Failover semantics deliberately avoid automatic merge or failback. This makes
 the protocol safer, but it shifts old-primary fencing, traffic routing, and
@@ -1516,25 +1529,27 @@ secondaries to `streaming` at lag 0, and exhaustively verified primary,
 secondary1, and secondary2 against the stress truth log.
 
 A targeted HA hot-key validation on 2026-05-31 exercised transactional stream
-coalescing with a rebuilt image, 48 workers, 80% hot-key traffic, and primary
-stepdowns every 100 seconds for 5 minutes. Primary, secondary1, and secondary2
-all passed exhaustive verification across 4,498 truth-log keys with zero
-missing keys, mismatches, or read errors. Both secondaries converged on the
-sentinel in 1.0s, ended at `lag_entries=0`, and reported zero journal drops or
-status failures. The status timeline observed a maximum secondary lag of
-826/826 entries, a stream-buffer high-water mark of 41,994 entries, and a
-maximum horizon of 220s, still below the configured journal cap.
+coalescing and flat-accumulator snapshot cadence with a rebuilt image, 48
+workers, 80% hot-key traffic, and primary stepdowns every 100 seconds for 5
+minutes. Primary, secondary1, and secondary2 all passed exhaustive verification
+across 4,544 truth-log keys with zero missing keys, mismatches, or read errors.
+Both secondaries converged on the sentinel in 4.0s and 1.0s, ended at
+`lag_entries=0`, and reported zero journal drops or status failures. The status
+timeline observed a maximum secondary lag of 668/668 entries, a stream-buffer
+high-water mark of 44,460 entries, and a maximum horizon of 247s, still below
+the configured journal cap.
 
-The same run recorded the secondary apply-path shape directly: both
-secondaries applied 6,800 stream transactions, averaging 9.22/9.16 logical
-entries per transaction with rare max-entry flushes, while most flushes were
-driven by the 10ms max-wait timer. Coalescing avoided 44/20 physical entries in
-this workload. Local apply work averaged about 0.24ms per transaction; storage
-commit averaged about 37ms and therefore dominated the measured apply path.
-Flat accumulator snapshots persisted on each stream transaction, averaged about
-44.3 KiB, and took about 0.05ms on average to persist. This suggests the next
-optimization target is storage transaction pressure and snapshot cadence, not
-hash projection or accumulator serialization cost.
+The same run recorded the secondary apply-path shape directly: the secondaries
+applied 6,940/6,970 stream transactions, averaging 9.27/9.28 logical entries
+per transaction with rare max-entry flushes, while most flushes were driven by
+the 10ms max-wait timer. Coalescing avoided 23/27 physical entries in this
+workload. Local apply work averaged about 0.14ms per transaction; storage commit
+averaged about 36.5ms and therefore dominated the measured apply path. Cursor
+writes tracked the transaction path at 6,955/6,983 writes, while full
+flat-accumulator snapshots dropped to 64/63 with 6,891/6,920 skipped snapshots.
+This suggests the cursor/snapshot split materially reduces full-snapshot write
+amplification without changing data-correctness outcomes; the next optimization
+target remains storage transaction pressure and apply scheduling.
 
 The main known gap is availability polish during primary HA active handoff
 under sustained write and DR backlog pressure; stress runs still observe
