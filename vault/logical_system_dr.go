@@ -748,6 +748,8 @@ func (b *SystemBackend) handleDRStatus(ctx context.Context, req *logical.Request
 		data["flat_accumulator_empty_repair_ranges_total"] = status.FlatAccumulatorEmptyRepairRanges
 		data["flat_accumulator_indexed_repair_total"] = status.FlatAccumulatorIndexedRepairTotal
 		data["flat_accumulator_indexed_repair_ranges_total"] = status.FlatAccumulatorIndexedRepairRanges
+		data["flat_accumulator_indexed_repair_full_bucket_fallback_total"] = status.FlatAccumulatorIndexedRepairFullBucketFallbacks
+		data["flat_accumulator_indexed_repair_full_bucket_ranges_total"] = status.FlatAccumulatorIndexedRepairFullBucketRanges
 		data["flat_accumulator_indexed_repair_proof_mismatches_total"] = status.FlatAccumulatorIndexedRepairProofMismatches
 		data["flat_accumulator_indexed_repair_proof_mismatch_range_last"] = status.FlatAccumulatorIndexedRepairProofMismatchRange
 		data["flat_accumulator_indexed_repair_proof_mismatch_local_count_last"] = status.FlatAccumulatorIndexedRepairProofMismatchLocal

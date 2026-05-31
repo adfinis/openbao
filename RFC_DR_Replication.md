@@ -445,6 +445,13 @@ The primary stores checkpoint artifacts so `FetchEntries` reads from the
 checkpoint view rather than live storage. This prevents live storage drift from
 corrupting reconciliation.
 
+If a key disappears while a checkpoint artifact is being materialized, the key
+is omitted from the checkpoint's live range set instead of being counted as a
+range-visible tombstone. Range reconciliation then deletes it as a local-only
+key after the remote span is proven complete. Tombstone responses remain valid
+for explicit point fetches by KID, but tombstones are not counted as live remote
+range members.
+
 ### Reconciliation overview
 
 Reconciliation repairs divergence when streaming cannot safely resume.
@@ -470,7 +477,7 @@ Reconciliation compares storage entries by:
 
 - KID: keyed identifier derived from the storage key and replication salt.
 - VID: value identifier derived from the ciphertext value and seal-wrap flag,
-  or a tombstone value for deletes.
+  or a tombstone value for explicit point-delete fetches.
 
 The primary and secondary compare KID/VID metadata first, then fetch concrete
 entries only for mismatched spans.
@@ -576,8 +583,12 @@ Indexed-bucket repair is an optimization, not a correctness proof by itself.
 After fetching and applying the primary entries for a divergent indexed bucket,
 the secondary recomputes that bucket's count and checksum. If the repaired
 bucket does not exactly match the checkpoint's remote checksum, the secondary
-invalidates the local KID index and flat accumulator and immediately falls back
-to the full local scan path for the same reconciliation attempt.
+performs a bounded full-bucket remote fetch for only the failed top-level
+bucket. That retry fetches all primary entries for the bucket under normal
+checkpoint proof validation and deletes local-only keys through the already
+validated local KID index. If the full-bucket retry still cannot prove the
+bucket, the secondary invalidates the local KID index and flat accumulator and
+falls back to the full local scan path for the same reconciliation attempt.
 
 This makes warm reconnects cheap in two ways:
 

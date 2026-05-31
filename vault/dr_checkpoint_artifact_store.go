@@ -383,16 +383,21 @@ func (s *drCheckpointArtifactStore) build(
 
 		rec := drCheckpointArtifactRecord{KID: kid, Key: key}
 		if entry == nil {
-			_, rec.VID = scanner.ComputeItemFromEntry(&physical.Entry{Key: key})
-			rec.Tombstone = true
-			records[kid] = rec
-			kidToVID[kid] = rec.VID
-			bytesTotal += uint64(len(key) + 96)
+			// A disappeared key is absence in the range set, not a live
+			// tombstone member. Explicit point fetches can still return a
+			// delete for this KID via readCheckpointEntryChange.
+			s.storageDriftHit.Add(1)
+			s.logger.Debug("checkpoint artifact key disappeared during materialization",
+				"checkpoint_id", cp.checkpoint.ID,
+				"key", key)
 			continue
 		}
 
 		rec.SealWrap = entry.SealWrap
 		rec.VID = scanner.ComputeVIDWithSealWrap(entry.Value, entry.SealWrap)
+		if expectedVID, ok := cp.kidToVID[kid]; ok && expectedVID != rec.VID {
+			s.storageDriftHit.Add(1)
+		}
 
 		h := sha256.New()
 		h.Write(entry.Value)
