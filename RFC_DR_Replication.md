@@ -410,6 +410,14 @@ index-advance marker instead of a storage mutation. The marker lets the
 secondary advance `lastAppliedIndex` for lag accounting without writing any
 replicated storage entry.
 
+For transactional physical backends, the secondary coalesces duplicate
+mutations for the same physical key within a single streamed transaction before
+writing to storage. Only the final `Put` or `Delete` for that key is materialized
+in the local transaction. This is safe because the batch is applied atomically:
+intermediate states are not externally visible, `lastAppliedIndex` still
+advances to the highest accepted Raft index, and keyring/root-key/runtime-state
+refresh hooks are preserved if any coalesced mutation touched those paths.
+
 Streaming fails closed. A lagging subscriber is disconnected instead of silently
 dropping entries. On reconnect, the primary tries journal and buffer replay from
 the secondary's last applied index. If replay coverage cannot be proven, the
@@ -518,6 +526,12 @@ secondary writes the replicated storage mutations and the serialized flat
 accumulator snapshot in the same local transaction. The snapshot is stored under
 a never-replicated local DR path and is bound to the relationship ID, DR cluster
 ID, range version, checksum algorithm, and primary commit index.
+
+When a streamed transaction contains multiple changes to the same key, the
+flat accumulator is updated from the pre-transaction value directly to the final
+coalesced value. A `Put` followed by a later `Delete` therefore removes the old
+contribution without adding an intermediate contribution, and repeated `Put`s
+add only the final value's contribution.
 
 This makes warm reconnects cheap in two ways:
 
@@ -1159,6 +1173,13 @@ persisted flat accumulator avoids the local O(N) scan when it is aligned with
 the checkpoint, but an absent, incompatible, or invalidated accumulator still
 requires a local scan before reconciliation can compare ranges.
 
+Transactional stream apply now coalesces repeated mutations to the same key
+within a batch. This reduces secondary write pressure for hot-key workloads, but
+it does not change the replay or reconciliation proof model. Future validation
+should expose explicit coalescing counters so avoided physical writes can be
+measured directly instead of inferred from lag, buffer, and reconciliation-dwell
+signals.
+
 Failover semantics deliberately avoid automatic merge or failback. This makes
 the protocol safer, but it shifts old-primary fencing, traffic routing, and
 site-rebuild decisions into operational runbooks.
@@ -1486,6 +1507,17 @@ A dynamic tuning HA load smoke on 2026-05-30 changed primary and secondary
 tuning while mixed load was running, forced HA handoffs, returned both
 secondaries to `streaming` at lag 0, and exhaustively verified primary,
 secondary1, and secondary2 against the stress truth log.
+
+A targeted HA hot-key validation on 2026-05-31 exercised transactional stream
+coalescing with a rebuilt image, 48 workers, 80% hot-key traffic, and primary
+stepdowns every 100 seconds for 5 minutes. Primary, secondary1, and secondary2
+all passed exhaustive verification across 4,188 truth-log keys with zero
+missing keys, mismatches, or read errors. Both secondaries converged on the
+sentinel in about 1 second and ended at `lag_entries=0`. Compared with the prior
+15-minute HA hard smoke, the run showed lower max lag, lower reconciliation
+dwell, and a lower stream-buffer high-water mark, while client-facing transient
+failures remained attributable to forced HA handoff behavior rather than DR data
+divergence.
 
 The main known gap is availability polish during primary HA active handoff
 under sustained write and DR backlog pressure; stress runs still observe

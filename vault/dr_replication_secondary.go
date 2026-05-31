@@ -2939,6 +2939,80 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 	}
 }
 
+type drStreamTxnCoalescedChange struct {
+	change   *EntryChange
+	position int
+}
+
+func coalesceDRStreamTxnBatch(batch []*EntryChange, current uint64) ([]*EntryChange, uint64, int, bool, bool, bool) {
+	if len(batch) == 0 {
+		return nil, 0, 0, false, false, false
+	}
+
+	byKey := make(map[string]int)
+	coalesced := make([]drStreamTxnCoalescedChange, 0, len(batch))
+	var lastIndex uint64
+	var affected int
+	var keyringTouched bool
+	var rootKeyTouched bool
+	var runtimeStateTouched bool
+
+	for i, change := range batch {
+		if change == nil || change.RaftIndex < current {
+			continue
+		}
+		if change.RaftIndex > lastIndex && change.Key == "" {
+			lastIndex = change.RaftIndex
+		}
+		if change.Key == "" || isDRNeverReplicatePath(change.Key) {
+			continue
+		}
+		if change.RaftIndex > lastIndex {
+			lastIndex = change.RaftIndex
+		}
+
+		op := physical.Operation(change.OpType)
+		switch op {
+		case physical.PutOperation:
+			switch change.Key {
+			case "core/keyring":
+				keyringTouched = true
+			case "core/root-key":
+				rootKeyTouched = true
+			}
+			if isDRRuntimeStatePath(change.Key) {
+				runtimeStateTouched = true
+			}
+		case physical.DeleteOperation:
+			if isDRRuntimeStatePath(change.Key) {
+				runtimeStateTouched = true
+			}
+		}
+
+		affected++
+		if op != physical.PutOperation && op != physical.DeleteOperation {
+			coalesced = append(coalesced, drStreamTxnCoalescedChange{change: change, position: i})
+			continue
+		}
+		if existing, ok := byKey[change.Key]; ok {
+			coalesced[existing] = drStreamTxnCoalescedChange{change: change, position: i}
+			continue
+		}
+		byKey[change.Key] = len(coalesced)
+		coalesced = append(coalesced, drStreamTxnCoalescedChange{change: change, position: i})
+	}
+
+	sort.SliceStable(coalesced, func(i, j int) bool {
+		return coalesced[i].position < coalesced[j].position
+	})
+
+	changes := make([]*EntryChange, 0, len(coalesced))
+	for _, entry := range coalesced {
+		changes = append(changes, entry.change)
+	}
+	return changes, lastIndex, affected, keyringTouched, rootKeyTouched, runtimeStateTouched
+}
+
 // applyStreamTxn attempts to apply a batch of changes in a single transaction.
 func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend physical.Transactional, batch []*EntryChange) error {
 	if err := s.ensureStreamApplyActive(ctx); err != nil {
@@ -2952,11 +3026,7 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 	defer txn.Rollback(ctx)
 
 	current := s.lastAppliedIndex.Load()
-	affected := 0
-	var lastIndex uint64
-	var keyringTouched bool
-	var rootKeyTouched bool
-	var runtimeStateTouched bool
+	batch, lastIndex, affected, keyringTouched, rootKeyTouched, runtimeStateTouched := coalesceDRStreamTxnBatch(batch, current)
 	var invalidateKeys []string
 	accumulatorWarm := s.rangeAccumulator != nil && s.rangeAccumulator.isInitialized()
 	var accumulatorBase [drRangeMaxTotalRanges]drFlatAccumulatorBucket
@@ -2980,23 +3050,6 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 	for _, change := range batch {
 		if err := s.ensureStreamApplyActive(ctx); err != nil {
 			return err
-		}
-		if change.RaftIndex < current {
-			continue
-		}
-
-		// Index-advance marker: empty key means the primary filtered
-		// all entries in a Raft batch. Track the index so
-		// lastAppliedIndex advances, but don't touch storage.
-		if change.Key == "" {
-			if change.RaftIndex > lastIndex {
-				lastIndex = change.RaftIndex
-			}
-			continue
-		}
-
-		if isDRNeverReplicatePath(change.Key) {
-			continue
 		}
 
 		op := physical.Operation(change.OpType)
@@ -3044,9 +3097,6 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 		default:
 			// Ignore unknown operations
 		}
-
-		affected++
-		lastIndex = change.RaftIndex
 	}
 
 	// If we only saw index-advance markers (no storage ops) we still

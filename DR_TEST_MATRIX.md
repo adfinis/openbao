@@ -52,7 +52,7 @@ This matrix defines manual and automated validation for DR replication in this r
 | A25 | DR fetch/reconcile resource bounds | `go test ./vault -run 'TestFetchEntriesRejectsOversizedAndMalformedRequests|TestFetchEntriesSplitsResponseBatchesByByteBudget|TestFetchEntriesRejectsSingleEntryOverResponseByteBudget|TestDRIntegration_RangeTaskEnforcesFetchedValueByteBudget' -count=1` | Pass |
 | A26 | DR checkpoint build admission | `go test ./vault -run 'TestDRPrimary_CheckpointBuildAdmissionLimitsCrossRelationshipConcurrency' -count=1` | Pass |
 | A27 | DR tuning validation and rollback | `go test ./vault -run 'TestDRRelationshipManager_UpdateTuning|TestDRSystemBackend_DRTuningRejectsInvalidInputs|TestDRPrimary_AllowWriteRequest_BackpressureRejectsNonExempt|TestDRBackpressureExemptPath' -count=1` | Pass |
-| A28 | DR flat accumulator persistence | `go test ./vault -run 'TestDR(FlatRangeAccumulator_ResetAndApplyDeltas|SecondaryFlatAccumulatorAdvancesOnStreamApply|SecondaryStreamTxnPersistsFlatAccumulator|RangeReconciliationSeedsFlatAccumulatorOnPhaseAMatch|RangeReconciliationSeedsFlatAccumulatorAfterRepair|SystemBackend_StatusIncludesFlatAccumulatorFastPathCounter)' -count=1` | Pass |
+| A28 | DR flat accumulator persistence and stream transaction coalescing | `go test ./vault -run 'TestDR(CoalesceStreamTxnBatch|FlatRangeAccumulator_ResetAndApplyDeltas|SecondaryFlatAccumulatorAdvancesOnStreamApply|SecondaryStreamTxnPersistsFlatAccumulator|RangeReconciliationSeedsFlatAccumulatorOnPhaseAMatch|RangeReconciliationSeedsFlatAccumulatorAfterRepair|SystemBackend_StatusIncludesFlatAccumulatorFastPathCounter)' -count=1` | Pass |
 
 Recommended compile pre-step:
 
@@ -243,6 +243,7 @@ scripts remain available under `/Users/roelc/projects/secretz/openbao/scripts`.
 | S11 | Dynamic tuning under HA load | `scripts/dr_local_test.sh --topology ha tuning-load-smoke` | Update primary and secondary DR tuning while mixed load is running, then force HA handoffs | Tuning writes succeed, new active nodes report the updated profile, workload exits cleanly, both secondaries return to `streaming` with lag 0, and exhaustive verification passes on primary and both secondaries |
 | S12 | HA quiescent reconnect optimization | `scripts/dr_local_test.sh --topology ha quiescent-reconnect-smoke` | Verify active primary handoff avoids scanned reconciliation when stream replay can resume | Both secondaries return to `streaming` lag 0, marker data remains visible, and either `reconcile_count` is unchanged or `flat_accumulator_fast_path_total` increments |
 | S13 | HA accumulator cold restart | `scripts/dr_local_test.sh --topology ha accumulator-cold-restart-smoke` | Verify a full secondary cluster restart reloads the persisted flat accumulator cursor and resumes stream replay without scanned reconciliation | Secondary #1 returns to `streaming` lag 0, marker data remains visible, restart logs show accumulator load, and post-restart `reconcile_count` remains 0 |
+| S14 | HA hot-key stream coalescing validation | `scripts/dr_local_test.sh --topology ha reset --build && scripts/dr_local_test.sh --topology ha smoke --duration 300 --concurrency 48 --stepdown-interval 100 --progress-interval 10 --monitor-interval 2 && scripts/dr_local_test.sh --topology ha verify <run-dir> --sample 0` | Measure secondary apply behavior after transactional stream coalescing under hot-key load and HA handoff pressure | Exhaustive verification passes on primary and both secondaries; sentinel convergence is near-immediate; both secondaries end `streaming` with `lag_entries=0`; no journal drops; compare max lag, stream-buffer high-water mark, and reconciliation dwell against the prior hard HA baseline |
 
 ### Stress Run Examples
 
@@ -268,6 +269,29 @@ scripts/dr_local_test.sh --topology ha smoke \
   --progress-interval 30
 scripts/dr_local_test.sh --topology ha verify <run-dir> --sample 0
 ```
+
+Repo-local HA hot-key coalescing validation:
+
+```bash
+scripts/dr_local_test.sh --topology ha reset --build
+scripts/dr_local_test.sh --topology ha smoke \
+  --duration 300 \
+  --concurrency 48 \
+  --stepdown-interval 100 \
+  --progress-interval 10 \
+  --monitor-interval 2
+scripts/dr_local_test.sh --topology ha verify <run-dir> --sample 0
+```
+
+Latest observed run: `/Users/roelc/projects/secretz/openbao/dr-stress-results/drmixed-20260531T081719Z`.
+The run completed 41,667 operations at 136.39 ops/s, had zero status failures,
+zero journal drops, 1.0s sentinel convergence on both secondaries, final
+`lag_entries=0`, and exhaustive verification passed on primary, secondary1,
+and secondary2 across 4,188 truth-log keys with zero missing keys, mismatches,
+or read errors. Compared with the prior 15-minute HA hard smoke, max lag dropped
+from 1,433/1,781 to 518/518, reconciliation dwell dropped from 21/26 timeline
+samples to 4/4, and the stream buffer high-water mark stayed below the 50,000
+entry cap.
 
 Single secondary:
 

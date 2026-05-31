@@ -3749,13 +3749,22 @@ func TestDRSecondaryStreamTxnPersistsFlatAccumulator(t *testing.T) {
 	}
 
 	key := "secret/flat-txn"
+	deleteKey := "secret/flat-txn-delete"
 	oldEntry := &physical.Entry{Key: key, Value: []byte("old")}
 	if err := core.physical.Put(ctx, oldEntry); err != nil {
 		t.Fatalf("failed to seed physical entry: %v", err)
 	}
+	deleteEntry := &physical.Entry{Key: deleteKey, Value: []byte("delete-old")}
+	if err := core.physical.Put(ctx, deleteEntry); err != nil {
+		t.Fatalf("failed to seed physical delete entry: %v", err)
+	}
 	kid, oldVID := secondary.scanner.ComputeItemFromEntry(oldEntry)
+	deleteKID, deleteOldVID := secondary.scanner.ComputeItemFromEntry(deleteEntry)
 	localSet := &reconciler.ReconciliationSet{
-		KIDToVID: map[[32]byte][32]byte{kid: oldVID},
+		KIDToVID: map[[32]byte][32]byte{
+			kid:       oldVID,
+			deleteKID: deleteOldVID,
+		},
 	}
 	secondary.rangeAccumulator.resetFromSet(localSet, 10)
 	secondary.lastAppliedIndex.Store(10)
@@ -3766,8 +3775,22 @@ func TestDRSecondaryStreamTxnPersistsFlatAccumulator(t *testing.T) {
 	if err := secondary.applyStreamTxn(ctx, txnBackend, []*EntryChange{{
 		OpType:    string(physical.PutOperation),
 		Key:       key,
-		Value:     []byte("new"),
+		Value:     []byte("intermediate"),
 		RaftIndex: 11,
+	}, {
+		OpType:    string(physical.PutOperation),
+		Key:       key,
+		Value:     []byte("new"),
+		RaftIndex: 12,
+	}, {
+		OpType:    string(physical.PutOperation),
+		Key:       deleteKey,
+		Value:     []byte("delete-intermediate"),
+		RaftIndex: 13,
+	}, {
+		OpType:    string(physical.DeleteOperation),
+		Key:       deleteKey,
+		RaftIndex: 14,
 	}}); err != nil {
 		t.Fatalf("stream txn failed: %v", err)
 	}
@@ -3779,14 +3802,68 @@ func TestDRSecondaryStreamTxnPersistsFlatAccumulator(t *testing.T) {
 	if entry == nil || !bytes.Equal(entry.Value, []byte("new")) {
 		t.Fatalf("expected new physical value, got %#v", entry)
 	}
+	entry, err = core.physical.Get(ctx, deleteKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry != nil {
+		t.Fatalf("expected delete key to be removed, got %#v", entry)
+	}
 	localSet.KIDToVID[kid] = secondary.scanner.ComputeVIDWithSealWrap([]byte("new"), false)
-	assertDRFlatAccumulatorMatchesSet(t, secondary.rangeAccumulator, 11, localSet)
+	delete(localSet.KIDToVID, deleteKID)
+	assertDRFlatAccumulatorMatchesSet(t, secondary.rangeAccumulator, 14, localSet)
 
 	reloaded := newDRReplicationSecondary(core, replSalt, "rel-flat-txn", core.logger)
 	reloaded.loadPersistentFlatAccumulator(ctx)
-	assertDRFlatAccumulatorMatchesSet(t, reloaded.rangeAccumulator, 11, localSet)
-	if got := reloaded.lastAppliedIndex.Load(); got != 11 {
-		t.Fatalf("expected loaded lastAppliedIndex 11, got %d", got)
+	assertDRFlatAccumulatorMatchesSet(t, reloaded.rangeAccumulator, 14, localSet)
+	if got := reloaded.lastAppliedIndex.Load(); got != 14 {
+		t.Fatalf("expected loaded lastAppliedIndex 14, got %d", got)
+	}
+}
+
+func TestDRCoalesceStreamTxnBatch(t *testing.T) {
+	batch := []*EntryChange{
+		{OpType: string(physical.PutOperation), Key: "secret/old", Value: []byte("skip"), RaftIndex: 9},
+		{Key: "", RaftIndex: 10},
+		{OpType: string(physical.PutOperation), Key: "secret/a", Value: []byte("a1"), RaftIndex: 11},
+		{OpType: string(physical.PutOperation), Key: "secret/b", Value: []byte("b1"), RaftIndex: 12},
+		{OpType: string(physical.DeleteOperation), Key: "secret/a", RaftIndex: 13},
+		{OpType: string(physical.PutOperation), Key: "core/keyring", Value: []byte("keyring"), RaftIndex: 14},
+		{OpType: string(physical.DeleteOperation), Key: "core/mounts/test", RaftIndex: 15},
+		{OpType: string(physical.PutOperation), Key: "core/local-mounts", Value: []byte("local"), RaftIndex: 16},
+		{OpType: "unknown", Key: "secret/unknown", RaftIndex: 17},
+	}
+
+	changes, lastIndex, affected, keyringTouched, rootKeyTouched, runtimeStateTouched := coalesceDRStreamTxnBatch(batch, 10)
+	if lastIndex != 17 {
+		t.Fatalf("expected lastIndex 17, got %d", lastIndex)
+	}
+	if affected != 6 {
+		t.Fatalf("expected 6 affected logical entries, got %d", affected)
+	}
+	if !keyringTouched {
+		t.Fatal("expected keyring touch to be preserved")
+	}
+	if rootKeyTouched {
+		t.Fatal("did not expect root-key touch")
+	}
+	if !runtimeStateTouched {
+		t.Fatal("expected runtime-state touch to be preserved")
+	}
+
+	got := make([]string, 0, len(changes))
+	for _, change := range changes {
+		got = append(got, fmt.Sprintf("%s:%s:%d", change.OpType, change.Key, change.RaftIndex))
+	}
+	want := []string{
+		fmt.Sprintf("%s:secret/b:12", physical.PutOperation),
+		fmt.Sprintf("%s:secret/a:13", physical.DeleteOperation),
+		fmt.Sprintf("%s:core/keyring:14", physical.PutOperation),
+		fmt.Sprintf("%s:core/mounts/test:15", physical.DeleteOperation),
+		"unknown:secret/unknown:17",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected coalesced changes\n got: %#v\nwant: %#v", got, want)
 	}
 }
 
