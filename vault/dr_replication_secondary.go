@@ -427,6 +427,8 @@ type drReplicationSecondary struct {
 	reconcileRangesFailed              atomic.Int64
 	reconcileBudgetRemainingByte       atomic.Int64
 	flatAccumulatorFastPathTotal       atomic.Uint64
+	flatAccumulatorEmptyRepairTotal    atomic.Uint64
+	flatAccumulatorEmptyRepairRanges   atomic.Uint64
 	streamTxnCoalescedEntries          atomic.Uint64
 	streamTxnBatches                   atomic.Uint64
 	streamTxnEntries                   atomic.Uint64
@@ -1594,31 +1596,33 @@ func (s *drReplicationSecondary) Status() DRSecondaryStatus {
 	flatAccumulatorSnapshotBytes := s.flatAccumulatorSnapshotBytes.Load()
 	flatAccumulatorSnapshotNanos := s.flatAccumulatorSnapshotNanos.Load()
 	return DRSecondaryStatus{
-		State:                          s.State().String(),
-		RelationshipID:                 s.relationshipID,
-		PrimaryIndex:                   s.primaryIndex.Load(),
-		LastAppliedIndex:               s.lastAppliedIndex.Load(),
-		EntriesApplied:                 s.entriesApplied.Load(),
-		ReconcileCount:                 s.reconcileCount.Load(),
-		LastReconcileAt:                time.Unix(s.lastReconcileAt.Load(), 0),
-		ConnectRetries:                 s.connectRetries.Load(),
-		ConnectFailures:                s.connectFailures.Load(),
-		ReconcileRangesInflight:        s.reconcileRangesInflight.Load(),
-		ReconcileRangesFailed:          s.reconcileRangesFailed.Load(),
-		ReconcileBudgetRemainingBytes:  uint64(remaining),
-		ReconcileActiveCheckpointID:    activeID,
-		ReconcileActiveCheckpointIndex: activeIndex,
-		ReconcileFailReasonLast:        failReason,
-		RangeManifestCount:             rangeManifestCount,
-		RangeSplitCount:                s.rangeSplitCount.Load(),
-		ReconcileRPCBytesUsed:          s.reconcileRPCBytesUsed.Load(),
-		FlatAccumulatorFastPathTotal:   s.flatAccumulatorFastPathTotal.Load(),
-		StreamTxnCoalescedEntriesTotal: s.streamTxnCoalescedEntries.Load(),
-		StreamTxnBatchesTotal:          streamTxnBatches,
-		StreamTxnEntriesTotal:          streamTxnEntries,
-		StreamTxnPhysicalEntriesTotal:  streamTxnPhysicalEntries,
-		StreamTxnAverageEntries:        averageUint64(streamTxnEntries, streamTxnBatches),
-		StreamTxnMaxEntries:            s.streamTxnMaxEntries.Load(),
+		State:                            s.State().String(),
+		RelationshipID:                   s.relationshipID,
+		PrimaryIndex:                     s.primaryIndex.Load(),
+		LastAppliedIndex:                 s.lastAppliedIndex.Load(),
+		EntriesApplied:                   s.entriesApplied.Load(),
+		ReconcileCount:                   s.reconcileCount.Load(),
+		LastReconcileAt:                  time.Unix(s.lastReconcileAt.Load(), 0),
+		ConnectRetries:                   s.connectRetries.Load(),
+		ConnectFailures:                  s.connectFailures.Load(),
+		ReconcileRangesInflight:          s.reconcileRangesInflight.Load(),
+		ReconcileRangesFailed:            s.reconcileRangesFailed.Load(),
+		ReconcileBudgetRemainingBytes:    uint64(remaining),
+		ReconcileActiveCheckpointID:      activeID,
+		ReconcileActiveCheckpointIndex:   activeIndex,
+		ReconcileFailReasonLast:          failReason,
+		RangeManifestCount:               rangeManifestCount,
+		RangeSplitCount:                  s.rangeSplitCount.Load(),
+		ReconcileRPCBytesUsed:            s.reconcileRPCBytesUsed.Load(),
+		FlatAccumulatorFastPathTotal:     s.flatAccumulatorFastPathTotal.Load(),
+		FlatAccumulatorEmptyRepairTotal:  s.flatAccumulatorEmptyRepairTotal.Load(),
+		FlatAccumulatorEmptyRepairRanges: s.flatAccumulatorEmptyRepairRanges.Load(),
+		StreamTxnCoalescedEntriesTotal:   s.streamTxnCoalescedEntries.Load(),
+		StreamTxnBatchesTotal:            streamTxnBatches,
+		StreamTxnEntriesTotal:            streamTxnEntries,
+		StreamTxnPhysicalEntriesTotal:    streamTxnPhysicalEntries,
+		StreamTxnAverageEntries:          averageUint64(streamTxnEntries, streamTxnBatches),
+		StreamTxnMaxEntries:              s.streamTxnMaxEntries.Load(),
 		StreamTxnAveragePhysicalEntries: averageUint64(
 			streamTxnPhysicalEntries,
 			streamTxnBatches,
@@ -1710,6 +1714,8 @@ type DRSecondaryStatus struct {
 	RangeSplitCount                                uint64
 	ReconcileRPCBytesUsed                          uint64
 	FlatAccumulatorFastPathTotal                   uint64
+	FlatAccumulatorEmptyRepairTotal                uint64
+	FlatAccumulatorEmptyRepairRanges               uint64
 	StreamTxnCoalescedEntriesTotal                 uint64
 	StreamTxnBatchesTotal                          uint64
 	StreamTxnEntriesTotal                          uint64
@@ -3915,16 +3921,26 @@ func (s *drReplicationSecondary) runReconciliation(ctx context.Context) error {
 	return nil
 }
 
+type drFlatAccumulatorMismatch struct {
+	rangeID uint64
+	local   drFlatAccumulatorBucket
+	remote  *RangeChecksum
+}
+
 func (s *drReplicationSecondary) tryFlatAccumulatorReconciliation(ctx context.Context, checkpoint *CheckpointResponse, startTime time.Time) (bool, error) {
 	if s.rangeAccumulator == nil || checkpoint == nil || checkpoint.CommitIndex == 0 {
 		return false, nil
 	}
-	localBuckets, ok := s.rangeAccumulator.snapshotExact(checkpoint.CommitIndex)
+	accumulatorIndex, localBuckets, ok := s.rangeAccumulator.snapshot()
 	if !ok {
+		return false, nil
+	}
+	if accumulatorIndex > checkpoint.CommitIndex {
 		return false, nil
 	}
 
 	rangesToVerify := buildCompleteRangeVerificationOrder(nil)
+	mismatches := make([]drFlatAccumulatorMismatch, 0)
 	const batchSize = 100
 	for i := 0; i < len(rangesToVerify); i += batchSize {
 		end := i + batchSize
@@ -3964,26 +3980,52 @@ func (s *drReplicationSecondary) tryFlatAccumulatorReconciliation(ctx context.Co
 			remote := remoteChecksums[rangeID]
 			if remote == nil {
 				if local.count != 0 {
-					s.logger.Info("flat accumulator mismatch; falling back to local scan",
-						"range_id", rangeID,
-						"local_count", local.count)
-					return false, nil
+					mismatches = append(mismatches, drFlatAccumulatorMismatch{
+						rangeID: rangeID,
+						local:   local,
+					})
 				}
 				continue
 			}
 			if remote.GetChecksum() != local.checksum || remote.GetCount() != local.count {
+				mismatches = append(mismatches, drFlatAccumulatorMismatch{
+					rangeID: rangeID,
+					local:   local,
+					remote:  remote,
+				})
+			}
+		}
+	}
+
+	if len(mismatches) > 0 {
+		for _, mismatch := range mismatches {
+			if mismatch.local.count != 0 {
+				remoteCount := uint64(0)
+				if mismatch.remote != nil {
+					remoteCount = mismatch.remote.GetCount()
+				}
 				s.logger.Info("flat accumulator mismatch; falling back to local scan",
-					"range_id", rangeID,
-					"local_count", local.count,
-					"remote_count", remote.GetCount())
+					"range_id", mismatch.rangeID,
+					"local_count", mismatch.local.count,
+					"remote_count", remoteCount)
 				return false, nil
 			}
 		}
+		if err := s.runFlatAccumulatorEmptyBucketRepair(ctx, checkpoint, localBuckets, mismatches, startTime); err != nil {
+			return true, err
+		}
+		return true, nil
 	}
 
 	s.setReconcilePhase(drReconcilePhaseFinalize)
 	if err := s.finalizeReconcileCheckpoint(checkpoint.CheckpointId, checkpoint.CommitIndex); err != nil {
 		return true, fmt.Errorf("range reconciliation finalize failed: %w", err)
+	}
+	if accumulatorIndex != checkpoint.CommitIndex {
+		s.rangeAccumulator.replace(checkpoint.CommitIndex, localBuckets)
+		if err := s.persistFlatAccumulatorState(ctx, s.core.physical, checkpoint.CommitIndex, localBuckets, true, nil); err != nil {
+			return true, fmt.Errorf("persist flat accumulator after phase-a match: %w", err)
+		}
 	}
 	s.reconcileBudgetRemainingByte.Store(int64(s.reconcileMaxRPCBytes))
 	s.reconcileCount.Add(1)
@@ -3991,9 +4033,126 @@ func (s *drReplicationSecondary) tryFlatAccumulatorReconciliation(ctx context.Co
 	s.lastReconcileAt.Store(time.Now().Unix())
 	s.logger.Info("range reconciliation: all ranges converged via flat accumulator",
 		"ranges_checked", len(rangesToVerify),
+		"accumulator_index", accumulatorIndex,
+		"checkpoint_index", checkpoint.CommitIndex,
 		"duration", time.Since(startTime))
 	metrics.IncrCounter([]string{"replication", "dr", "secondary", "flat_accumulator_fast_path_total"}, 1)
 	return true, nil
+}
+
+func (s *drReplicationSecondary) runFlatAccumulatorEmptyBucketRepair(
+	ctx context.Context,
+	checkpoint *CheckpointResponse,
+	baseBuckets [drRangeMaxTotalRanges]drFlatAccumulatorBucket,
+	mismatches []drFlatAccumulatorMismatch,
+	startTime time.Time,
+) error {
+	if len(mismatches) == 0 {
+		return nil
+	}
+
+	s.setReconcilePhase(drReconcilePhaseRangeTasks)
+	s.logger.Info("starting flat accumulator empty-bucket repair",
+		"checkpoint_id", checkpoint.CheckpointId,
+		"commit_index", checkpoint.CommitIndex,
+		"ranges", len(mismatches))
+
+	budget := &drRangeBudget{
+		start:       startTime,
+		maxRPCBytes: s.reconcileMaxRPCBytes,
+		maxWallTime: s.reconcileMaxWallTime,
+	}
+	localIndex := reconciler.NewRangeMapIndex(map[[32]byte][32]byte{}, nil)
+	kidToKey := make(map[[32]byte]string)
+	mutationTracker := newDRReconciliationSetMutationTracker(s)
+	applyPipeline := newDRPutApplyPipeline(ctx, s, kidToKey, s.markReconcileActivityNow, mutationTracker)
+	defer func() {
+		_ = applyPipeline.closeAndWait()
+	}()
+
+	nextBuckets := baseBuckets
+	for i, mismatch := range mismatches {
+		if err := budget.check(); err != nil {
+			return fmt.Errorf("reconcile failure [budget_exceeded]: %w", err)
+		}
+		task := drQueuedRangeTask{
+			id:       i + 1,
+			priority: 1,
+			task: drRangeTask{
+				rangeID: mismatch.rangeID,
+				span:    reconciler.SpanFromRangeID(mismatch.rangeID),
+			},
+		}
+		result := s.processRangeTask(ctx, checkpoint, localIndex, kidToKey, task)
+		if result.err != nil {
+			return result.err
+		}
+		if len(result.removedKeys) > 0 {
+			return fmt.Errorf("flat accumulator empty-bucket repair produced local-only deletes for empty range %d", mismatch.rangeID)
+		}
+		if err := budget.addRPC(result.rpcBytes); err != nil {
+			return fmt.Errorf("reconcile failure [budget_exceeded]: %w", err)
+		}
+		budget.rangesHandled++
+		if len(result.fetchedEntries) > 0 {
+			if err := applyPipeline.submit(result.fetchedEntries); err != nil {
+				return wrapReconcileFailure(drReconcileFailureApplyFailed, "queue fetched entries for apply", err)
+			}
+			for _, change := range result.fetchedEntries {
+				kid, vid, err := s.kidVIDFromFetchedChange(change)
+				if err != nil {
+					return err
+				}
+				rangeID := reconciler.RangeIDFromKID(kid)
+				if rangeID >= uint64(len(nextBuckets)) {
+					return fmt.Errorf("fetched kid %x maps outside flat accumulator range set", kid)
+				}
+				if rangeID != mismatch.rangeID {
+					return fmt.Errorf("fetched kid %x mapped to range %d outside requested empty range %d", kid, rangeID, mismatch.rangeID)
+				}
+				addFlatAccumulatorContribution(&nextBuckets[rangeID], kid, vid)
+			}
+		}
+		remoteCount := uint64(0)
+		remoteChecksum := uint64(0)
+		if mismatch.remote != nil {
+			remoteCount = mismatch.remote.GetCount()
+			remoteChecksum = mismatch.remote.GetChecksum()
+		}
+		if nextBuckets[mismatch.rangeID].count != remoteCount ||
+			nextBuckets[mismatch.rangeID].checksum != remoteChecksum {
+			return fmt.Errorf("flat accumulator empty-bucket repair proof mismatch: range=%d local_count=%d remote_count=%d",
+				mismatch.rangeID,
+				nextBuckets[mismatch.rangeID].count,
+				remoteCount)
+		}
+	}
+
+	s.setReconcilePhase(drReconcilePhaseApplyPuts)
+	if err := applyPipeline.closeAndWait(); err != nil {
+		return wrapReconcileFailure(drReconcileFailureStalled, "apply pipeline", err)
+	}
+
+	s.setReconcilePhase(drReconcilePhaseFinalize)
+	if err := s.finalizeReconcileCheckpoint(checkpoint.CheckpointId, checkpoint.CommitIndex); err != nil {
+		return fmt.Errorf("range reconciliation finalize failed: %w", err)
+	}
+	s.rangeAccumulator.replace(checkpoint.CommitIndex, nextBuckets)
+	if err := s.persistFlatAccumulatorState(ctx, s.core.physical, checkpoint.CommitIndex, nextBuckets, true, nil); err != nil {
+		return fmt.Errorf("persist flat accumulator after empty-bucket repair: %w", err)
+	}
+	s.reconcileBudgetRemainingByte.Store(int64(s.reconcileMaxRPCBytes))
+	s.reconcileCount.Add(1)
+	s.flatAccumulatorEmptyRepairTotal.Add(1)
+	s.flatAccumulatorEmptyRepairRanges.Add(uint64(len(mismatches)))
+	s.lastReconcileAt.Store(time.Now().Unix())
+	s.logger.Info("flat accumulator empty-bucket repair complete",
+		"ranges_handled", budget.rangesHandled,
+		"rpc_bytes", budget.rpcBytes,
+		"duration", time.Since(startTime))
+	metrics.IncrCounter([]string{"replication", "dr", "secondary", "flat_accumulator_empty_repair_total"}, 1)
+	metrics.IncrCounter([]string{"replication", "dr", "secondary", "flat_accumulator_empty_repair_ranges_total"}, float32(len(mismatches)))
+	return nil
 }
 
 type drRangeTask struct {

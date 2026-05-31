@@ -744,6 +744,8 @@ func (b *SystemBackend) handleDRStatus(ctx context.Context, req *logical.Request
 		data["range_split_count"] = status.RangeSplitCount
 		data["reconcile_rpc_bytes_used"] = status.ReconcileRPCBytesUsed
 		data["flat_accumulator_fast_path_total"] = status.FlatAccumulatorFastPathTotal
+		data["flat_accumulator_empty_repair_total"] = status.FlatAccumulatorEmptyRepairTotal
+		data["flat_accumulator_empty_repair_ranges_total"] = status.FlatAccumulatorEmptyRepairRanges
 		data["stream_txn_coalesced_entries_total"] = status.StreamTxnCoalescedEntriesTotal
 		data["stream_txn_batches_total"] = status.StreamTxnBatchesTotal
 		data["stream_txn_entries_total"] = status.StreamTxnEntriesTotal

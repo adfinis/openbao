@@ -553,9 +553,18 @@ This makes warm reconnects cheap in two ways:
 
 - If the primary stream journal still covers the secondary's last applied
   index, the secondary resumes streaming and performs no reconciliation.
-- If reconciliation is required and the persisted flat accumulator is exactly
-  aligned with the checkpoint commit index, the secondary can compare top-level
-  range checksums without scanning local storage.
+- If reconciliation is required and the persisted flat accumulator is at or
+  behind the checkpoint commit index, the secondary can compare top-level range
+  checksums without scanning local storage. If every range matches, the
+  secondary finalizes the checkpoint and advances the accumulator to that
+  checkpoint. If a mismatched range is provably empty locally, the secondary can
+  fetch and apply the primary's range contents directly because there are no
+  local-only keys to delete.
+- If a mismatched range has local entries, the secondary still falls back to the
+  full local scan. The flat accumulator can identify the divergent bucket, but
+  it does not contain the KID-to-key mapping needed to delete local-only keys
+  safely. Avoiding that scan for non-empty divergent buckets requires a separate
+  local bucketed KID-to-key/VID index, not just the flat checksums.
 
 On process restart, a secondary that has already completed keyring bootstrap
 and has a restored applied cursor attempts stream replay first. It does not run
@@ -985,7 +994,7 @@ The status API should expose:
 - stream batch flush reasons
 - flat accumulator cursor writes/index, snapshot count/index, skipped snapshot
   count, byte volume, last snapshot size, persist timing, delta batch counts,
-  delta replay counts/failures, and cadence tuning
+  delta replay counts/failures, empty-bucket repair counts, and cadence tuning
 - range task counts
 - budget usage
 - journal replay health
@@ -1198,23 +1207,28 @@ making delete inference safe.
 
 The current conservative range-selection strategy verifies the complete
 top-level range partition for each checkpoint reconciliation. A transactionally
-persisted flat accumulator avoids the local O(N) scan when it is aligned with
-the checkpoint, but an absent, incompatible, or invalidated accumulator still
-requires a local scan before reconciliation can compare ranges. The applied
-cursor is intentionally smaller and more frequently written than the full
-snapshot. Cursor-only recovery preserves restart replay correctness; snapshot
-plus delta replay additionally restores the flat accumulator without scanning
-when the delta coverage from snapshot to cursor is complete.
+persisted flat accumulator avoids the local O(N) scan when it is at or behind
+the checkpoint and all ranges match, or when all divergent ranges are locally
+empty and can be filled from primary range fetches. Non-empty divergent ranges
+still require a local scan because the flat accumulator does not carry the
+KID-to-key mapping needed for safe local-only deletes. An absent, incompatible,
+or invalidated accumulator also requires a local scan before reconciliation can
+compare ranges. The applied cursor is intentionally smaller and more frequently
+written than the full snapshot. Cursor-only recovery preserves restart replay
+correctness; snapshot plus delta replay additionally restores the flat
+accumulator without scanning when the delta coverage from snapshot to cursor is
+complete.
 
 Transactional stream apply now coalesces repeated mutations to the same key
 within a batch. This reduces secondary write pressure for hot-key workloads, but
 it does not change the replay or reconciliation proof model. The secondary
 status response exposes transactional apply counters, flush-reason counters,
-apply and commit timing, and flat-accumulator cursor/snapshot persistence
-timing, plus delta persistence and replay counters. This lets stress runs
-measure avoided physical writes, batch shape, local snapshot write amplification,
-snapshot cadence, and restart accumulator recovery directly instead of inferring
-the effect only from lag, buffer, and reconciliation-dwell signals.
+apply and commit timing, flat-accumulator cursor/snapshot persistence timing,
+delta persistence and replay counters, and empty-bucket repair counters. This
+lets stress runs measure avoided physical writes, batch shape, local snapshot
+write amplification, snapshot cadence, and restart accumulator recovery directly
+instead of inferring the effect only from lag, buffer, and
+reconciliation-dwell signals.
 
 Failover semantics deliberately avoid automatic merge or failback. This makes
 the protocol safer, but it shifts old-primary fencing, traffic routing, and

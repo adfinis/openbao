@@ -2771,6 +2771,8 @@ func TestDRSecondaryStatus(t *testing.T) {
 	sec.flatAccumulatorDeltaReplayBatches.Store(13)
 	sec.flatAccumulatorDeltaReplayEntries.Store(14)
 	sec.flatAccumulatorDeltaReplayFailures.Store(15)
+	sec.flatAccumulatorEmptyRepairTotal.Store(16)
+	sec.flatAccumulatorEmptyRepairRanges.Store(17)
 	sec.lastReconcileAt.Store(time.Now().Unix())
 
 	status := sec.Status()
@@ -2788,6 +2790,12 @@ func TestDRSecondaryStatus(t *testing.T) {
 	}
 	if status.FlatAccumulatorFastPathTotal != 1 {
 		t.Fatalf("expected flat accumulator fast path total 1, got %d", status.FlatAccumulatorFastPathTotal)
+	}
+	if status.FlatAccumulatorEmptyRepairTotal != 16 {
+		t.Fatalf("expected flat accumulator empty repair total 16, got %d", status.FlatAccumulatorEmptyRepairTotal)
+	}
+	if status.FlatAccumulatorEmptyRepairRanges != 17 {
+		t.Fatalf("expected flat accumulator empty repair ranges 17, got %d", status.FlatAccumulatorEmptyRepairRanges)
 	}
 	if status.StreamTxnCoalescedEntriesTotal != 3 {
 		t.Fatalf("expected stream txn coalesced entries total 3, got %d", status.StreamTxnCoalescedEntriesTotal)
@@ -2864,6 +2872,8 @@ func TestDRSystemBackend_StatusIncludesStreamOptimizationCounters(t *testing.T) 
 	}
 	secondary := newDRReplicationSecondary(core, make([]byte, drReplSaltLen), "rel-status-fast-path", log.NewNullLogger())
 	secondary.flatAccumulatorFastPathTotal.Store(7)
+	secondary.flatAccumulatorEmptyRepairTotal.Store(8)
+	secondary.flatAccumulatorEmptyRepairRanges.Store(9)
 	secondary.streamTxnCoalescedEntries.Store(11)
 	secondary.streamTxnBatches.Store(13)
 	secondary.streamTxnEntries.Store(39)
@@ -2899,6 +2909,12 @@ func TestDRSystemBackend_StatusIncludesStreamOptimizationCounters(t *testing.T) 
 	}
 	if got := resp.Data["flat_accumulator_fast_path_total"]; got != uint64(7) {
 		t.Fatalf("expected flat_accumulator_fast_path_total=7, got %#v", got)
+	}
+	if got := resp.Data["flat_accumulator_empty_repair_total"]; got != uint64(8) {
+		t.Fatalf("expected flat_accumulator_empty_repair_total=8, got %#v", got)
+	}
+	if got := resp.Data["flat_accumulator_empty_repair_ranges_total"]; got != uint64(9) {
+		t.Fatalf("expected flat_accumulator_empty_repair_ranges_total=9, got %#v", got)
 	}
 	if got := resp.Data["stream_txn_coalesced_entries_total"]; got != uint64(11) {
 		t.Fatalf("expected stream_txn_coalesced_entries_total=11, got %#v", got)
@@ -4364,6 +4380,145 @@ func TestDRSecondaryQuiescentReconnectUsesFlatAccumulatorFastPath(t *testing.T) 
 	}
 	if status.ScanFailuresTotal != 0 {
 		t.Fatalf("expected no scan failures, got %d", status.ScanFailuresTotal)
+	}
+}
+
+func TestDRFlatAccumulatorEmptyBucketRepairAvoidsLocalScan(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	replSalt := bytes.Repeat([]byte{0x27}, 32)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-flat-empty-repair", core.logger)
+	secondary.reconcileApplyWorkers = 1
+	secondary.checkpointHighWaterMarkPersistHook = func(uint64) error { return nil }
+
+	emptyLocalSet := &reconciler.ReconciliationSet{
+		KIDToVID: make(map[[32]byte][32]byte),
+	}
+	secondary.rangeAccumulator.resetFromSet(emptyLocalSet, 10)
+
+	key := "secret/flat-empty-repair"
+	value := []byte("remote")
+	kid := secondary.scanner.ComputeKID(key)
+	vid := secondary.scanner.ComputeVIDWithSealWrap(value, false)
+	checkpoint := &CheckpointResponse{CheckpointId: "cp-flat-empty-repair", CommitIndex: 11}
+	remoteSet := &reconciler.ReconciliationSet{
+		Checkpoint: reconciler.Checkpoint{ID: checkpoint.CheckpointId, CommitIndex: checkpoint.CommitIndex},
+		KeyCount:   1,
+		KIDToVID:   map[[32]byte][32]byte{kid: vid},
+		KIDToKey:   map[[32]byte]string{kid: key},
+	}
+	remoteIndex := reconciler.NewRangeMapIndex(remoteSet.KIDToVID, nil)
+
+	secondary.client = &drTestClient{
+		requestCheckpointFn: func(_ context.Context, req *CheckpointRequest, _ ...grpc.CallOption) (*CheckpointResponse, error) {
+			if req.GetRelationshipId() != secondary.relationshipID {
+				return nil, fmt.Errorf("unexpected relationship id %q", req.GetRelationshipId())
+			}
+			return checkpoint, nil
+		},
+		exchangeRangeChecksumsFn: func(_ context.Context, req *RangeChecksumRequest, _ ...grpc.CallOption) (*RangeChecksumResponse, error) {
+			if req.GetRelationshipId() != secondary.relationshipID {
+				return nil, fmt.Errorf("unexpected relationship id %q", req.GetRelationshipId())
+			}
+			resp := &RangeChecksumResponse{Checksums: make([]*RangeChecksum, 0, len(req.GetRangeIds()))}
+			for _, rangeID := range req.GetRangeIds() {
+				checksum, count := reconciler.ComputeRangeChecksum(remoteIndex, rangeID)
+				resp.Checksums = append(resp.Checksums, &RangeChecksum{
+					RangeId:  rangeID,
+					Checksum: checksum,
+					Count:    count,
+				})
+			}
+			return resp, nil
+		},
+		exchangeRangeDigestsFn: func(_ context.Context, req *RangeDigestRequest, _ ...grpc.CallOption) (*RangeDigestResponse, error) {
+			parent, _, err := protoToRangeSpan(req.GetParentSpan())
+			if err != nil {
+				return nil, err
+			}
+			left, right, ok := reconciler.SplitRange(parent)
+			if !ok {
+				return &RangeDigestResponse{
+					Digests: []*RangeDigest{drRangeDigestForTest(parent, remoteIndex)},
+				}, nil
+			}
+			return &RangeDigestResponse{
+				Digests: []*RangeDigest{
+					drRangeDigestForTest(left, remoteIndex),
+					drRangeDigestForTest(right, remoteIndex),
+				},
+			}, nil
+		},
+		fetchEntriesFn: func(streamCtx context.Context, req *FetchEntriesRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[EntryBatch], error) {
+			if req.GetRelationshipId() != secondary.relationshipID {
+				return nil, fmt.Errorf("unexpected relationship id %q", req.GetRelationshipId())
+			}
+			if req.GetCheckpointId() != checkpoint.CheckpointId || req.GetCheckpointIndex() != checkpoint.CommitIndex {
+				return nil, fmt.Errorf("unexpected checkpoint tuple %q/%d", req.GetCheckpointId(), req.GetCheckpointIndex())
+			}
+			matched := false
+			for _, protoSpan := range req.GetRanges() {
+				span, _, err := protoToRangeSpan(protoSpan)
+				if err != nil {
+					return nil, err
+				}
+				if span.Contains(kid) {
+					matched = true
+				}
+			}
+			if !matched {
+				return nil, fmt.Errorf("expected fetch request to include remote-only kid range")
+			}
+			return &drTestEntryBatchStream{
+				ctx: streamCtx,
+				batches: []*EntryBatch{{
+					CheckpointId:    checkpoint.CheckpointId,
+					CheckpointIndex: checkpoint.CommitIndex,
+					Entries: []*EntryChange{{
+						OpType: string(physical.PutOperation),
+						Key:    key,
+						Value:  append([]byte(nil), value...),
+						Kid:    append([]byte(nil), kid[:]...),
+					}},
+				}},
+			}, nil
+		},
+	}
+
+	if err := secondary.runReconciliation(ctx); err != nil {
+		t.Fatalf("runReconciliation failed: %v", err)
+	}
+	entry, err := core.physical.Get(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry == nil || !bytes.Equal(entry.Value, value) {
+		t.Fatalf("expected repaired value %q, got %#v", value, entry)
+	}
+	assertDRFlatAccumulatorMatchesSet(t, secondary.rangeAccumulator, checkpoint.CommitIndex, remoteSet)
+	status := secondary.Status()
+	if status.FlatAccumulatorEmptyRepairTotal != 1 {
+		t.Fatalf("expected flat accumulator empty repair total 1, got %d", status.FlatAccumulatorEmptyRepairTotal)
+	}
+	if status.FlatAccumulatorEmptyRepairRanges != 1 {
+		t.Fatalf("expected flat accumulator empty repair ranges 1, got %d", status.FlatAccumulatorEmptyRepairRanges)
+	}
+	if status.ReconcileCount != 1 {
+		t.Fatalf("expected reconcile count 1, got %d", status.ReconcileCount)
+	}
+	if status.ScanFailuresTotal != 0 {
+		t.Fatalf("expected no scan failures, got %d", status.ScanFailuresTotal)
+	}
+
+	// Prove the repaired accumulator is checkpoint-aligned enough for the
+	// next reconnect to stay on the no-scan fast path.
+	secondary.scanner = nil
+	if err := secondary.runReconciliation(ctx); err != nil {
+		t.Fatalf("runReconciliation fast path after empty-bucket repair failed: %v", err)
+	}
+	status = secondary.Status()
+	if status.FlatAccumulatorFastPathTotal != 1 {
+		t.Fatalf("expected flat accumulator fast path total 1, got %d", status.FlatAccumulatorFastPathTotal)
 	}
 }
 
