@@ -3424,6 +3424,64 @@ func TestDRSecondaryStreamApplyStopsWithoutFlushingOnStepdown(t *testing.T) {
 	}
 }
 
+func TestDRSecondaryStreamApplyMaxWaitStartsWithBatch(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	replSalt := bytes.Repeat([]byte{0x6d}, drReplSaltLen)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-batch-local-wait", log.NewNullLogger())
+	secondary.streamBatchMaxEntries = 128
+	secondary.streamBatchMaxBytes = 1 << 20
+	secondary.streamBatchMaxWait = 100 * time.Millisecond
+
+	applyCh := make(chan []*EntryChange)
+	creditCh := make(chan uint64, 8)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- secondary.runStreamApplyWorker(ctx, applyCh, creditCh)
+	}()
+
+	time.Sleep(90 * time.Millisecond)
+	applyCh <- []*EntryChange{{
+		OpType:    string(physical.PutOperation),
+		Key:       "secret/dr-batch-local-wait/a",
+		Value:     []byte("a"),
+		RaftIndex: 1,
+	}}
+	time.Sleep(30 * time.Millisecond)
+	applyCh <- []*EntryChange{{
+		OpType:    string(physical.PutOperation),
+		Key:       "secret/dr-batch-local-wait/b",
+		Value:     []byte("b"),
+		RaftIndex: 2,
+	}}
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) && secondary.streamTxnEntries.Load() < 2 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := secondary.streamTxnEntries.Load(); got != 2 {
+		t.Fatalf("expected two stream entries to apply, got %d", got)
+	}
+	if got := secondary.streamTxnBatches.Load(); got != 1 {
+		t.Fatalf("expected both entries in one batch-local max-wait transaction, got %d batches", got)
+	}
+	if got := secondary.streamBatchFlushMaxWait.Load(); got != 1 {
+		t.Fatalf("expected one max-wait flush, got %d", got)
+	}
+
+	close(applyCh)
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("stream apply worker returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for stream apply worker")
+	}
+}
+
 func TestDRSecondaryAppliedInvalidationSkipsDuringCoreTeardown(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	replSalt := make([]byte, drReplSaltLen)

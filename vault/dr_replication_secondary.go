@@ -3152,8 +3152,34 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 
 	batch := make([]*EntryChange, 0, maxEntries)
 	batchBytes := 0
-	ticker := time.NewTicker(maxWait)
-	defer ticker.Stop()
+	maxWaitTimer := time.NewTimer(maxWait)
+	if !maxWaitTimer.Stop() {
+		select {
+		case <-maxWaitTimer.C:
+		default:
+		}
+	}
+	var maxWaitC <-chan time.Time
+	stopMaxWaitTimer := func() {
+		if maxWaitC == nil {
+			return
+		}
+		if !maxWaitTimer.Stop() {
+			select {
+			case <-maxWaitTimer.C:
+			default:
+			}
+		}
+		maxWaitC = nil
+	}
+	startMaxWaitTimer := func() {
+		if maxWaitC != nil {
+			return
+		}
+		maxWaitTimer.Reset(maxWait)
+		maxWaitC = maxWaitTimer.C
+	}
+	defer stopMaxWaitTimer()
 
 	// pendingCredits accumulates credit counts that could not be sent
 	// to the credit-sender goroutine because creditReplenishCh was full.
@@ -3208,6 +3234,7 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 	discardBatch := func() {
 		batch = batch[:0]
 		batchBytes = 0
+		stopMaxWaitTimer()
 	}
 
 	// Flush consumes the current batch. It optimistically tries a transaction,
@@ -3296,7 +3323,8 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 			s.persistCurrentFlatAccumulatorSnapshot(persistCtx)
 			cancel()
 			return nil
-		case <-ticker.C:
+		case <-maxWaitC:
+			maxWaitC = nil
 			if err := flush(drStreamBatchFlushMaxWait); err != nil {
 				return err
 			}
@@ -3310,10 +3338,14 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 				cancel()
 				return nil
 			}
+			wasEmpty := len(batch) == 0
 			for _, change := range incoming {
 				batch = append(batch, change)
 				// Rough estimate of memory size: key + value + overhead
 				batchBytes += len(change.Key) + len(change.Value) + 48
+			}
+			if wasEmpty && len(batch) > 0 {
+				startMaxWaitTimer()
 			}
 			if len(batch) >= maxEntries || batchBytes >= maxBytes {
 				reason := drStreamBatchFlushMaxBytes

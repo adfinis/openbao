@@ -1269,6 +1269,10 @@ cursor is complete.
 Transactional stream apply now coalesces repeated mutations to the same key
 within a batch. This reduces secondary write pressure for hot-key workloads, but
 it does not change the replay or reconciliation proof model. The secondary
+starts `stream_batch_max_wait` when the first entry enters an empty apply batch
+rather than from a free-running wall-clock ticker; this preserves the configured
+maximum batch dwell time while avoiding accidental tiny transactions when entries
+arrive just before a global tick. The secondary
 status response exposes transactional apply counters, flush-reason counters,
 apply and commit timing, flat-accumulator cursor/snapshot persistence timing,
 delta persistence and replay counters, and empty-bucket repair counters. This
@@ -1658,6 +1662,14 @@ seconds. Primary, secondary1, and secondary2 passed exhaustive verification
 across 4,202 truth-log keys with zero missing keys, mismatches, or read errors.
 Secondary2 converged on the sentinel in 13.0s after reconciliation repaired one
 indexed-bucket proof mismatch through the fail-closed full-scan fallback.
+
+A later 5-minute HA hard smoke on 2026-05-31 validated batch-local
+`stream_batch_max_wait` timing. Compared with the previous 5-minute hard smoke,
+the run processed 10.2% fewer total operations and saw more client-facing HA
+handoff churn, but secondary stream transaction counts still dropped by about
+29-30% and average stream entries per transaction rose by about 24-26%.
+Primary, secondary1, and secondary2 passed exhaustive verification across 3,709
+truth-log keys with zero missing keys, mismatches, or read errors.
 
 The main known gap is availability polish during primary HA active handoff
 under sustained write and DR backlog pressure; stress runs still observe

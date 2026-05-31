@@ -349,6 +349,23 @@ also recorded one indexed repair proof mismatch, invalidated the indexed fast
 path with reason `indexed_repair_proof_mismatch`, fell back to a full local
 scan, and converged cleanly.
 
+Latest observed batch-local max-wait run:
+`/Users/roelc/projects/secretz/openbao/dr-stress-results/drmixed-20260531T163224Z`.
+The run used the same 5-minute HA hard-smoke shape with 48 workers and primary
+stepdowns every 100 seconds. It completed 36,033 operations at 114.54 ops/s,
+had zero status failures and zero dropped stress events, converged sentinels in
+7.0s/3.0s, and exhaustive verification passed on primary, secondary1, and
+secondary2 across 3,709 truth-log keys with zero missing keys, mismatches, or
+read errors. Client-facing transient failures (`put_fail=291`, `get_fail=190`)
+occurred during forced HA disruption and did not produce replicated data
+divergence.
+
+Compared with `drmixed-20260531T155536Z`, this run processed 10.2% fewer total
+operations but reduced secondary stream transaction batches by 30.1%/29.3% and
+increased average entries per transaction by 26.3%/23.8%. Both secondaries ended
+`streaming` with `lag_entries=0`; each recorded one indexed repair proof
+mismatch and took the fail-closed local-scan fallback.
+
 Single secondary:
 
 ```bash
