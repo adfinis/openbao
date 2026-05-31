@@ -1360,6 +1360,9 @@ func (m *drRelationshipManager) clearSecondaryCheckpointCursor(ctx context.Conte
 		if err := m.core.physical.Delete(ctx, drFlatAccumulatorCursorStoragePath); err != nil {
 			return fmt.Errorf("failed to clear DR secondary flat accumulator cursor: %w", err)
 		}
+		if err := deletePersistedStreamAppliedIndex(ctx, m.core.physical); err != nil {
+			return fmt.Errorf("failed to clear DR secondary stream applied index: %w", err)
+		}
 		keys, err := m.core.physical.List(ctx, drFlatAccumulatorDeltaStoragePath)
 		if err != nil {
 			return fmt.Errorf("failed to list DR secondary flat accumulator deltas: %w", err)

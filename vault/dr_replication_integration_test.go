@@ -3610,7 +3610,7 @@ func TestDRIntegration_PrimaryStreamReplayIncludesLastAppliedIndex(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	rel.State = DRRelationshipStateRegistered
+	rel.State = DRRelationshipStateActive
 	rel.SecondaryCertFingerprint = fingerprint
 	if err := mgr.saveRelationship(context.Background(), rel); err != nil {
 		t.Fatal(err)

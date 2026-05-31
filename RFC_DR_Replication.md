@@ -525,10 +525,11 @@ hierarchical traversal state, and no persistent diff-sync state machine.
 During stream apply, the secondary computes the old and new VID for each
 replicated physical mutation, XORs the old contribution out of the bucket, and
 XORs the new contribution in. For transactional physical backends, the
-secondary writes the replicated storage mutations and a lightweight applied
-cursor in the same local transaction. The cursor is stored under a
-never-replicated local DR path and lets restart recover the physical applied
-index without trusting an accumulator snapshot.
+secondary writes the replicated storage mutations and a first-class
+stream-applied index marker in the same local transaction. The marker is stored
+under a never-replicated local DR path and is bound to relationship and cluster
+identity, so restart can recover the physical applied index without trusting an
+accumulator snapshot.
 
 The full serialized accumulator snapshot is written on a bounded cadence and
 on graceful stream shutdown, rather than on every stream transaction. Snapshot
@@ -539,10 +540,11 @@ commit index.
 
 When a full snapshot is skipped by cadence, the secondary writes a local-only
 delta batch in the same transaction as the replicated storage mutations and the
-applied cursor. Each delta batch records the commit index, the snapshot index it
-extends, and the KID/old-VID/new-VID contribution changes needed to advance the
-flat accumulator. Empty delta batches are still written for cursor-only
-advances, so restart can prove coverage up to the durable cursor. When a later
+stream-applied index marker. Each delta batch records the flat-accumulator
+cursor index, the snapshot index it extends, and the KID/old-VID/new-VID
+contribution changes needed to advance the flat accumulator. Empty delta
+batches are still written for cursor-only advances, so restart can prove
+accumulator coverage up to the durable flat-accumulator cursor. When a later
 full snapshot is persisted, delta batches at or below that snapshot index are
 pruned.
 
@@ -560,15 +562,15 @@ lookup index that lets the secondary build a local `RangeMapIndex` for only the
 top-level buckets that the flat accumulator already proved divergent.
 
 For transactional physical backends, stream apply updates replicated storage,
-the flat accumulator cursor/deltas, and the local KID index in the same local
-transaction. Verified reconciliation resets the index for the repaired ranges
-or for the full scanned set. If the local KID index is absent, stale,
-relationship-mismatched, cluster-mismatched, or inconsistent with the flat
-accumulator bucket count/checksum, the secondary invalidates the index metadata
-and falls back to the full local scan. Existing bucket entries without current
-metadata are inert and must not be trusted. Non-atomic repair paths invalidate
-the index metadata before mutating storage so restart cannot trust a partially
-updated mapping.
+the stream-applied index marker, the flat accumulator cursor/deltas, and the
+local KID index in the same local transaction. Verified reconciliation resets
+the index for the repaired ranges or for the full scanned set. If the local KID
+index is absent, stale, relationship-mismatched, cluster-mismatched, or
+inconsistent with the flat accumulator bucket count/checksum, the secondary
+invalidates the index metadata and falls back to the full local scan. Existing
+bucket entries without current metadata are inert and must not be trusted.
+Non-atomic repair paths invalidate the index metadata before mutating storage
+so restart cannot trust a partially updated mapping.
 
 Indexed-bucket repair is an optimization, not a correctness proof by itself.
 After fetching and applying the primary entries for a divergent indexed bucket,
@@ -597,18 +599,20 @@ This makes warm reconnects cheap in two ways:
   still falls back to the full local scan.
 
 On process restart, a secondary that has already completed keyring bootstrap
-and has a restored applied cursor attempts stream replay first. It does not run
-initial reconciliation merely because in-memory state was lost. If replay is no
-longer available, the primary explicitly requires reconciliation and the
-secondary enters the checkpoint-fenced reconciliation path.
+and has a valid persisted stream-applied index marker attempts stream replay
+first. It does not run initial reconciliation merely because in-memory state
+was lost. If replay is no longer available, the primary explicitly requires
+reconciliation and the secondary enters the checkpoint-fenced reconciliation
+path.
 
 The persisted accumulator is fail-closed. If restart finds a cursor ahead of
 the full accumulator snapshot, it replays persisted delta batches from the
 snapshot index to the cursor index. If coverage is complete and all deltas
 validate, the secondary restores the accumulator at the cursor without scanning
 local storage. If any delta batch is missing, incompatible, corrupt, or fails
-the accumulator apply checks, restart restores only the applied cursor and
-deletes the stale accumulator state instead of trusting it. The next
+the accumulator apply checks, restart keeps only the relationship-bound
+stream-applied index marker and deletes the stale accumulator state instead of
+trusting it. The next
 reconciliation must then rebuild by scanning local storage or by finishing a
 later proven reconciliation. Before any non-atomic reconciliation repair or
 resnapshot mutation is applied, the secondary deletes the persisted accumulator.

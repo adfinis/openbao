@@ -704,6 +704,7 @@ func (s *drReplicationSecondary) Connect(ctx context.Context, primaryAddr string
 	if !s.highestCommittedCheckpointIndexSet {
 		s.loadCheckpointHighWaterMark()
 	}
+	s.loadPersistentStreamAppliedIndex(ctx)
 	if s.rangeAccumulator != nil && !s.rangeAccumulator.isInitialized() {
 		s.loadPersistentFlatAccumulator(ctx)
 	}
@@ -3237,8 +3238,12 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 		stopMaxWaitTimer()
 	}
 
-	// Flush consumes the current batch. It optimistically tries a transaction,
-	// and falls back to sequential application on error.
+	// Flush consumes the current batch. Transaction-capable backends must use
+	// the transactional path so replicated writes, accumulator state, the
+	// local KID index, and the accumulator cursor commit atomically. If that
+	// path fails after bounded commit-conflict retries, tear down the stream
+	// and let reconciliation decide how to recover instead of falling back to
+	// the non-atomic single-change path.
 	flush := func(reason drStreamBatchFlushReason) error {
 		if len(batch) == 0 {
 			return nil
@@ -3251,10 +3256,8 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 		flushedCount := len(batch)
 		applyStart := time.Now()
 
-		// Optimization: Try to apply as a transaction if supported
 		if txnSupported {
-			if err := s.applyStreamTxn(ctx, txnBackend, batch, reason == drStreamBatchFlushShutdown); err == nil {
-				// Transaction succeeded
+			if err := s.applyStreamTxnWithRetry(ctx, txnBackend, batch, reason == drStreamBatchFlushShutdown); err == nil {
 				txnLogOnce.Do(func() {
 					s.logger.Info("stream apply using transactional batching",
 						"batch_max_entries", maxEntries,
@@ -3275,14 +3278,17 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 					discardBatch()
 					return nil
 				}
-				// Transaction failed; log warning and fall back to sequential
-				metrics.IncrCounter([]string{"replication", "dr", "secondary", "stream_txn_fallback"}, 1)
-				s.logger.Warn("transactional batch apply failed, falling back to sequential",
+				metrics.IncrCounter([]string{"replication", "dr", "secondary", "stream_txn_failures_total"}, 1)
+				s.logger.Warn("transactional stream apply failed; reconnecting for reconciliation",
 					"error", err, "batch_size", flushedCount)
+				return fmt.Errorf("transactional stream apply failed; reconciliation required: %w", err)
 			}
 		}
 
-		// Fallback: apply sequentially
+		// Fallback for non-transactional backends only. This path cannot
+		// provide crash-atomic accumulator/cursor persistence, so production
+		// DR deployments should use a transactional physical backend.
+		metrics.IncrCounter([]string{"replication", "dr", "secondary", "stream_nontransactional_fallback_total"}, 1)
 		for _, change := range batch {
 			if applyStopped() {
 				discardBatch()
@@ -3294,6 +3300,9 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 			}
 			if err := s.applyStreamChange(ctx, change); err != nil {
 				return fmt.Errorf("failed to apply change sequentially: %w", err)
+			}
+			if err := s.persistStreamAppliedIndex(ctx, s.core.physical, change.RaftIndex); err != nil {
+				return fmt.Errorf("persist stream applied index sequentially: %w", err)
 			}
 			s.setLastAppliedIndex(change.RaftIndex)
 			s.entriesApplied.Add(1)
@@ -3539,6 +3548,9 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 			if err := s.advanceLocalKIDIndexMetaIfCurrent(ctx, txn, current, lastIndex); err != nil {
 				return fmt.Errorf("advance local kid index marker: %w", err)
 			}
+			if err := s.persistStreamAppliedIndex(ctx, txn, lastIndex); err != nil {
+				return fmt.Errorf("persist stream applied index marker: %w", err)
+			}
 			if err := txn.Commit(ctx); err != nil {
 				return err
 			}
@@ -3549,6 +3561,9 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 			}
 			if err := s.persistFlatAccumulatorCursor(ctx, txn, lastIndex, s.flatAccumulatorSnapshotIndex.Load()); err != nil {
 				return fmt.Errorf("persist flat accumulator marker cursor: %w", err)
+			}
+			if err := s.persistStreamAppliedIndex(ctx, txn, lastIndex); err != nil {
+				return fmt.Errorf("persist stream applied index marker: %w", err)
 			}
 			if err := txn.Commit(ctx); err != nil {
 				return err
@@ -3584,6 +3599,9 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 		return fmt.Errorf("invalidate stale local kid index: %w", err)
 	} else if err := s.persistFlatAccumulatorCursor(ctx, txn, lastIndex, s.flatAccumulatorSnapshotIndex.Load()); err != nil {
 		return fmt.Errorf("persist flat accumulator cursor: %w", err)
+	}
+	if err := s.persistStreamAppliedIndex(ctx, txn, lastIndex); err != nil {
+		return fmt.Errorf("persist stream applied index: %w", err)
 	}
 
 	commitStart := time.Now()
@@ -3644,6 +3662,44 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 	metrics.SetGauge([]string{"replication", "dr", "secondary", "last_applied_index"}, float32(lastIndex))
 
 	return nil
+}
+
+func (s *drReplicationSecondary) applyStreamTxnWithRetry(ctx context.Context, backend physical.Transactional, batch []*EntryChange, forceAccumulatorSnapshot bool) error {
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		select {
+		case <-s.stopCh:
+			return errDRSecondaryApplyStopped
+		default:
+		}
+
+		err := s.applyStreamTxn(ctx, backend, batch, forceAccumulatorSnapshot)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, physical.ErrTransactionCommitFailure) || attempt >= drDefaultReconcileTxnCommitRetries {
+			return err
+		}
+
+		s.logger.Debug("retrying DR stream transaction after commit conflict",
+			"entries", len(batch),
+			"attempt", attempt+1,
+			"max_attempts", drDefaultReconcileTxnCommitRetries,
+			"error", err)
+		delay := time.Duration(attempt+1) * drDefaultReconcileTxnCommitRetryDelay
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-s.stopCh:
+			timer.Stop()
+			return errDRSecondaryApplyStopped
+		case <-timer.C:
+		}
+	}
 }
 
 func (s *drReplicationSecondary) ensureStreamApplyActive(ctx context.Context) error {

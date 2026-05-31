@@ -232,6 +232,12 @@ func TestDRRelationshipManager_EnableSecondaryClearsStaleCheckpointCursor(t *tes
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := core.physical.Put(ctx, &physical.Entry{
+		Key:   drStreamAppliedIndexStoragePath,
+		Value: []byte(`{"version":1,"relationship_id":"old-rel","commit_index":6685}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	token := &DRActivationToken{
 		ClusterID:      "new-promoted-primary",
@@ -257,6 +263,11 @@ func TestDRRelationshipManager_EnableSecondaryClearsStaleCheckpointCursor(t *tes
 		t.Fatal(err)
 	} else if entry != nil {
 		t.Fatalf("expected stale flat accumulator to be cleared on secondary enable, got %q", string(entry.Value))
+	}
+	if entry, err := core.physical.Get(ctx, drStreamAppliedIndexStoragePath); err != nil {
+		t.Fatal(err)
+	} else if entry != nil {
+		t.Fatalf("expected stale stream applied index to be cleared on secondary enable, got %q", string(entry.Value))
 	}
 	if mgr.Secondary() == nil {
 		t.Fatal("expected secondary runtime")
@@ -3424,6 +3435,133 @@ func TestDRSecondaryStreamApplyStopsWithoutFlushingOnStepdown(t *testing.T) {
 	}
 }
 
+type drCommitFailingTransactionalBackend struct {
+	physical.Backend
+	txn physical.Transactional
+
+	mu          sync.Mutex
+	failCommits int
+}
+
+func (b *drCommitFailingTransactionalBackend) BeginReadOnlyTx(ctx context.Context) (physical.Transaction, error) {
+	return b.txn.BeginReadOnlyTx(ctx)
+}
+
+func (b *drCommitFailingTransactionalBackend) BeginTx(ctx context.Context) (physical.Transaction, error) {
+	tx, err := b.txn.BeginTx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &drCommitFailingTransaction{
+		Transaction: tx,
+		parent:      b,
+	}, nil
+}
+
+type drCommitFailingTransaction struct {
+	physical.Transaction
+	parent *drCommitFailingTransactionalBackend
+}
+
+func (t *drCommitFailingTransaction) Commit(ctx context.Context) error {
+	t.parent.mu.Lock()
+	if t.parent.failCommits > 0 {
+		t.parent.failCommits--
+		t.parent.mu.Unlock()
+		return physical.ErrTransactionCommitFailure
+	}
+	t.parent.mu.Unlock()
+	return t.Transaction.Commit(ctx)
+}
+
+func TestDRSecondaryStreamApplyWorkerRetriesTransactionalCommitFailure(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+
+	txnBackend, ok := core.physical.(physical.Transactional)
+	if !ok {
+		t.Fatal("test core physical backend must support transactions")
+	}
+	core.physical = &drCommitFailingTransactionalBackend{
+		Backend:     core.physical,
+		txn:         txnBackend,
+		failCommits: 2,
+	}
+
+	replSalt := bytes.Repeat([]byte{0x52}, drReplSaltLen)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-stream-retry", log.NewNullLogger())
+
+	applyCh := make(chan []*EntryChange, 1)
+	applyCh <- []*EntryChange{{
+		OpType:    string(physical.PutOperation),
+		Key:       "sys/policy/dr-stream-retry",
+		Value:     []byte("policy"),
+		RaftIndex: 10,
+	}}
+	close(applyCh)
+
+	creditCh := make(chan uint64, 1)
+	if err := secondary.runStreamApplyWorker(ctx, applyCh, creditCh); err != nil {
+		t.Fatal(err)
+	}
+	entry, err := core.physical.Get(ctx, "sys/policy/dr-stream-retry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry == nil || !bytes.Equal(entry.Value, []byte("policy")) {
+		t.Fatalf("expected retried transaction to apply entry, got %#v", entry)
+	}
+	if got := secondary.lastAppliedIndex.Load(); got != 10 {
+		t.Fatalf("expected lastAppliedIndex=10, got %d", got)
+	}
+}
+
+func TestDRSecondaryStreamApplyWorkerTransactionalFailureDoesNotFallbackSequentially(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+
+	txnBackend, ok := core.physical.(physical.Transactional)
+	if !ok {
+		t.Fatal("test core physical backend must support transactions")
+	}
+	core.physical = &drCommitFailingTransactionalBackend{
+		Backend:     core.physical,
+		txn:         txnBackend,
+		failCommits: drDefaultReconcileTxnCommitRetries + 1,
+	}
+
+	replSalt := bytes.Repeat([]byte{0x53}, drReplSaltLen)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-stream-no-seq", log.NewNullLogger())
+
+	applyCh := make(chan []*EntryChange, 1)
+	applyCh <- []*EntryChange{{
+		OpType:    string(physical.PutOperation),
+		Key:       "sys/policy/dr-stream-no-seq",
+		Value:     []byte("policy"),
+		RaftIndex: 10,
+	}}
+	close(applyCh)
+
+	creditCh := make(chan uint64, 1)
+	err := secondary.runStreamApplyWorker(ctx, applyCh, creditCh)
+	if err == nil {
+		t.Fatal("expected stream apply worker to fail after exhausted transaction retries")
+	}
+	if !strings.Contains(err.Error(), "transactional stream apply failed") {
+		t.Fatalf("expected transactional stream apply error, got %v", err)
+	}
+	entry, getErr := core.physical.Get(ctx, "sys/policy/dr-stream-no-seq")
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if entry != nil {
+		t.Fatalf("expected failed transaction not to fall back to sequential apply, got %#v", entry)
+	}
+	if got := secondary.lastAppliedIndex.Load(); got != 0 {
+		t.Fatalf("expected lastAppliedIndex to remain unchanged, got %d", got)
+	}
+}
+
 func TestDRSecondaryStreamApplyMaxWaitStartsWithBatch(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -4207,12 +4345,54 @@ func TestDRSecondaryStreamTxnPersistsFlatAccumulator(t *testing.T) {
 	localSet.KIDToVID[kid] = secondary.scanner.ComputeVIDWithSealWrap([]byte("new"), false)
 	delete(localSet.KIDToVID, deleteKID)
 	assertDRFlatAccumulatorMatchesSet(t, secondary.rangeAccumulator, 14, localSet)
+	streamIndexEntry, err := core.physical.Get(ctx, drStreamAppliedIndexStoragePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if streamIndexEntry == nil {
+		t.Fatal("expected persisted stream applied index")
+	}
+	var streamIndex drPersistedStreamAppliedIndex
+	if err := json.Unmarshal(streamIndexEntry.Value, &streamIndex); err != nil {
+		t.Fatal(err)
+	}
+	if streamIndex.RelationshipID != "rel-flat-txn" || streamIndex.CommitIndex != 14 {
+		t.Fatalf("unexpected stream applied index: %#v", streamIndex)
+	}
 
 	reloaded := newDRReplicationSecondary(core, replSalt, "rel-flat-txn", core.logger)
 	reloaded.loadPersistentFlatAccumulator(ctx)
 	assertDRFlatAccumulatorMatchesSet(t, reloaded.rangeAccumulator, 14, localSet)
 	if got := reloaded.lastAppliedIndex.Load(); got != 14 {
 		t.Fatalf("expected loaded lastAppliedIndex 14, got %d", got)
+	}
+}
+
+func TestDRSecondaryLoadsPersistentStreamAppliedIndex(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	replSalt := bytes.Repeat([]byte{0x47}, 32)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-stream-index", core.logger)
+
+	if err := secondary.persistStreamAppliedIndex(ctx, core.physical, 31); err != nil {
+		t.Fatalf("failed to persist stream applied index: %v", err)
+	}
+
+	reloaded := newDRReplicationSecondary(core, replSalt, "rel-stream-index", core.logger)
+	reloaded.loadPersistentStreamAppliedIndex(ctx)
+	if got := reloaded.lastAppliedIndex.Load(); got != 31 {
+		t.Fatalf("expected loaded stream applied index 31, got %d", got)
+	}
+
+	wrongRelationship := newDRReplicationSecondary(core, replSalt, "rel-stream-index-other", core.logger)
+	wrongRelationship.loadPersistentStreamAppliedIndex(ctx)
+	if got := wrongRelationship.lastAppliedIndex.Load(); got != 0 {
+		t.Fatalf("expected incompatible stream applied index to be ignored, got %d", got)
+	}
+	if entry, err := core.physical.Get(ctx, drStreamAppliedIndexStoragePath); err != nil {
+		t.Fatal(err)
+	} else if entry != nil {
+		t.Fatal("expected incompatible persisted stream applied index to be deleted")
 	}
 }
 

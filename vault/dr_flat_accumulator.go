@@ -24,9 +24,11 @@ const (
 	drFlatAccumulatorStoragePath       = "core/cluster/local/dr/flat-accumulator"
 	drFlatAccumulatorCursorStoragePath = "core/cluster/local/dr/flat-accumulator-cursor"
 	drFlatAccumulatorDeltaStoragePath  = "core/cluster/local/dr/flat-accumulator-deltas/"
+	drStreamAppliedIndexStoragePath    = "core/cluster/local/dr/stream-applied-index"
 	drFlatAccumulatorSnapshotVersion   = 1
 	drFlatAccumulatorCursorVersion     = 1
 	drFlatAccumulatorDeltaVersion      = 1
+	drStreamAppliedIndexVersion        = 1
 	drFlatAccumulatorRangeBits         = 10
 	drFlatAccumulatorChecksumAlgorithm = "crc64-iso-xor-kid-vid-v1"
 )
@@ -77,6 +79,13 @@ type drFlatAccumulatorPersistedDeltaItem struct {
 	OldVID    []byte `json:"old_vid,omitempty"`
 	NewExists bool   `json:"new_exists,omitempty"`
 	NewVID    []byte `json:"new_vid,omitempty"`
+}
+
+type drPersistedStreamAppliedIndex struct {
+	Version        int    `json:"version"`
+	RelationshipID string `json:"relationship_id"`
+	ClusterID      string `json:"cluster_id,omitempty"`
+	CommitIndex    uint64 `json:"commit_index"`
 }
 
 type drFlatAccumulatorDelta struct {
@@ -347,6 +356,26 @@ func (s *drReplicationSecondary) persistFlatAccumulatorCursor(
 	return nil
 }
 
+func (s *drReplicationSecondary) persistStreamAppliedIndex(ctx context.Context, writer physical.Backend, index uint64) error {
+	if s == nil || writer == nil || index == 0 {
+		return nil
+	}
+	marker := drPersistedStreamAppliedIndex{
+		Version:        drStreamAppliedIndexVersion,
+		RelationshipID: s.relationshipID,
+		ClusterID:      s.flatAccumulatorClusterID(),
+		CommitIndex:    index,
+	}
+	data, err := json.Marshal(marker)
+	if err != nil {
+		return err
+	}
+	return writer.Put(ctx, &physical.Entry{
+		Key:   drStreamAppliedIndexStoragePath,
+		Value: data,
+	})
+}
+
 func drFlatAccumulatorDeltaPath(index uint64) string {
 	return fmt.Sprintf("%s%020d", drFlatAccumulatorDeltaStoragePath, index)
 }
@@ -593,6 +622,9 @@ func (s *drReplicationSecondary) deletePersistedFlatAccumulatorState(ctx context
 	if s == nil || writer == nil {
 		return nil
 	}
+	if err := s.deletePersistedStreamAppliedIndex(ctx, writer); err != nil {
+		return err
+	}
 	if err := s.deletePersistedLocalKIDIndex(ctx, writer); err != nil {
 		return err
 	}
@@ -616,7 +648,40 @@ func (s *drReplicationSecondary) resetAndPersistFlatAccumulatorFromSet(ctx conte
 	if err := s.resetLocalKIDIndexFromSet(ctx, s.core.physical, index, rs); err != nil {
 		return err
 	}
+	if err := s.persistStreamAppliedIndex(ctx, s.core.physical, index); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (s *drReplicationSecondary) loadPersistentStreamAppliedIndex(ctx context.Context) {
+	if s == nil || s.core == nil || s.core.physical == nil {
+		return
+	}
+	entry, err := s.core.physical.Get(ctx, drStreamAppliedIndexStoragePath)
+	if err != nil {
+		s.logger.Warn("failed to load DR stream applied index", "error", err)
+		return
+	}
+	if entry == nil || len(entry.Value) == 0 {
+		return
+	}
+
+	var marker drPersistedStreamAppliedIndex
+	if err := json.Unmarshal(entry.Value, &marker); err != nil {
+		s.logger.Warn("discarding unreadable DR stream applied index", "error", err)
+		_ = s.deletePersistedStreamAppliedIndex(ctx, s.core.physical)
+		return
+	}
+	if err := s.validateStreamAppliedIndex(&marker); err != nil {
+		s.logger.Warn("discarding incompatible DR stream applied index", "error", err)
+		_ = s.deletePersistedStreamAppliedIndex(ctx, s.core.physical)
+		return
+	}
+	if marker.CommitIndex > s.lastAppliedIndex.Load() {
+		s.setLastAppliedIndex(marker.CommitIndex)
+	}
+	s.logger.Info("loaded DR stream applied index", "commit_index", marker.CommitIndex)
 }
 
 func (s *drReplicationSecondary) loadPersistentFlatAccumulator(ctx context.Context) {
@@ -859,6 +924,25 @@ func (s *drReplicationSecondary) validateFlatAccumulatorCursor(cursor *drFlatAcc
 	return nil
 }
 
+func (s *drReplicationSecondary) validateStreamAppliedIndex(marker *drPersistedStreamAppliedIndex) error {
+	if marker == nil {
+		return fmt.Errorf("stream applied index is nil")
+	}
+	if marker.Version != drStreamAppliedIndexVersion {
+		return fmt.Errorf("unsupported stream applied index version %d", marker.Version)
+	}
+	if marker.RelationshipID == "" || marker.RelationshipID != s.relationshipID {
+		return fmt.Errorf("relationship_id mismatch")
+	}
+	if clusterID := s.flatAccumulatorClusterID(); clusterID != "" && marker.ClusterID != "" && marker.ClusterID != clusterID {
+		return fmt.Errorf("cluster_id mismatch")
+	}
+	if marker.CommitIndex == 0 {
+		return fmt.Errorf("commit_index is zero")
+	}
+	return nil
+}
+
 func (s *drReplicationSecondary) validateFlatAccumulatorDeltaBatch(batch *drFlatAccumulatorPersistedDeltaBatch) error {
 	if batch == nil {
 		return fmt.Errorf("delta batch is nil")
@@ -888,6 +972,17 @@ func (s *drReplicationSecondary) validateFlatAccumulatorDeltaBatch(batch *drFlat
 		return err
 	}
 	return nil
+}
+
+func (s *drReplicationSecondary) deletePersistedStreamAppliedIndex(ctx context.Context, writer physical.Backend) error {
+	return deletePersistedStreamAppliedIndex(ctx, writer)
+}
+
+func deletePersistedStreamAppliedIndex(ctx context.Context, writer physical.Backend) error {
+	if writer == nil {
+		return nil
+	}
+	return writer.Delete(ctx, drStreamAppliedIndexStoragePath)
 }
 
 func (s *drReplicationSecondary) deletePersistedFlatAccumulatorDeltas(ctx context.Context, writer physical.Backend, throughIndex uint64) error {
