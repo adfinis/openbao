@@ -561,9 +561,18 @@ the flat accumulator cursor/deltas, and the local KID index in the same local
 transaction. Verified reconciliation resets the index for the repaired ranges
 or for the full scanned set. If the local KID index is absent, stale,
 relationship-mismatched, cluster-mismatched, or inconsistent with the flat
-accumulator bucket count/checksum, the secondary deletes the stale index and
-falls back to the full local scan. Non-atomic repair paths delete the index
-before mutating storage so restart cannot trust a partially updated mapping.
+accumulator bucket count/checksum, the secondary invalidates the index metadata
+and falls back to the full local scan. Existing bucket entries without current
+metadata are inert and must not be trusted. Non-atomic repair paths invalidate
+the index metadata before mutating storage so restart cannot trust a partially
+updated mapping.
+
+Indexed-bucket repair is an optimization, not a correctness proof by itself.
+After fetching and applying the primary entries for a divergent indexed bucket,
+the secondary recomputes that bucket's count and checksum. If the repaired
+bucket does not exactly match the checkpoint's remote checksum, the secondary
+invalidates the local KID index and flat accumulator and immediately falls back
+to the full local scan path for the same reconciliation attempt.
 
 This makes warm reconnects cheap in two ways:
 
@@ -602,8 +611,11 @@ later proven reconciliation. Before any non-atomic reconciliation repair or
 resnapshot mutation is applied, the secondary deletes the persisted accumulator.
 If the process crashes mid-repair, restart cannot reload a stale accumulator for
 partially repaired storage. After reconciliation or resnapshot finalizes
-successfully, the accumulator is reseeded from the verified local KID/VID set
-and persisted at the finalized checkpoint index.
+successfully, the secondary attempts to reseed the accumulator and local KID
+index from the verified local KID/VID set at the finalized checkpoint index.
+That optimizer persistence is best-effort: failure invalidates optimizer
+metadata and logs a warning, but it must not roll back or block the
+already-finalized storage checkpoint.
 
 ### Range checksums
 
@@ -1240,7 +1252,10 @@ resolved from KID back to physical key for the divergent bucket. An absent,
 incompatible, or invalidated accumulator still requires a local scan before
 reconciliation can compare ranges. An absent, stale, or bucket-inconsistent
 local KID index falls back to that same full scan before repairing non-empty
-divergent buckets. The applied cursor is intentionally smaller and more
+divergent buckets. A current index can also be invalidated if indexed repair
+cannot prove that the repaired bucket exactly matches the checkpoint; the
+secondary then retries through the full scan path rather than trusting partial
+local index state. The applied cursor is intentionally smaller and more
 frequently written than the full snapshot. Cursor-only recovery preserves
 restart replay correctness; snapshot plus delta replay additionally restores
 the flat accumulator without scanning when the delta coverage from snapshot to
@@ -1607,6 +1622,18 @@ flat-accumulator snapshots dropped to 64/63 with 6,891/6,920 skipped snapshots.
 This suggests the cursor/snapshot split materially reduces full-snapshot write
 amplification without changing data-correctness outcomes; the next optimization
 target remains storage transaction pressure and apply scheduling.
+
+A 15-minute HA hard smoke on 2026-05-31 exercised the optimized local KID-index
+repair path under 48 workers, primary stepdowns every 300 seconds, and sustained
+hot-key pressure. The run completed 107,870 operations at 119.08 ops/s,
+observed client-facing transient failures during HA disruption (`put_fail=338`,
+`get_fail=203`), zero status failures, and zero stream drops. Both secondaries
+entered reconciliation during the run, hit indexed-bucket proof mismatches,
+invalidated the indexed fast path, fell back to full local scan, and returned
+to `streaming` with `reconcile_phase=idle`. Final sentinel convergence was
+1.0s for both secondaries. Exhaustive verification passed on primary,
+secondary1, and secondary2 across 9,104 truth-log keys with zero missing keys,
+mismatches, or read errors.
 
 A targeted HA accumulator cold-restart smoke on 2026-05-31 stopped a full
 secondary cluster after it had advanced from accumulator snapshot index 41 to

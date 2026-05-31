@@ -52,7 +52,7 @@ This matrix defines manual and automated validation for DR replication in this r
 | A25 | DR fetch/reconcile resource bounds | `go test ./vault -run 'TestFetchEntriesRejectsOversizedAndMalformedRequests|TestFetchEntriesSplitsResponseBatchesByByteBudget|TestFetchEntriesRejectsSingleEntryOverResponseByteBudget|TestDRIntegration_RangeTaskEnforcesFetchedValueByteBudget' -count=1` | Pass |
 | A26 | DR checkpoint build admission | `go test ./vault -run 'TestDRPrimary_CheckpointBuildAdmissionLimitsCrossRelationshipConcurrency' -count=1` | Pass |
 | A27 | DR tuning validation and rollback | `go test ./vault -run 'TestDRRelationshipManager_UpdateTuning|TestDRSystemBackend_DRTuningRejectsInvalidInputs|TestDRPrimary_AllowWriteRequest_BackpressureRejectsNonExempt|TestDRBackpressureExemptPath' -count=1` | Pass |
-| A28 | DR flat accumulator persistence, delta replay, local KID index repair, and stream transaction coalescing | `go test ./vault -run 'TestDR(CoalesceStreamTxnBatch|FlatRangeAccumulator_ResetAndApplyDeltas|SecondaryFlatAccumulatorAdvancesOnStreamApply|SecondaryStreamTxnPersistsFlatAccumulator|SecondaryStreamTxnCadenceReplaysPersistedAccumulatorDeltas|SecondaryStreamTxnCadenceMissingDeltasFailsClosed|SecondaryApplyWorkerStopPersistsFinalFlatAccumulatorSnapshot|SecondaryQuiescentReconnectUsesFlatAccumulatorFastPath|FlatAccumulatorEmptyBucketRepairAvoidsLocalScan|FlatAccumulatorIndexedBucketRepairAvoidsLocalScan|RangeReconciliationSeedsFlatAccumulatorOnPhaseAMatch|RangeReconciliationSeedsFlatAccumulatorAfterRepair|SystemBackend_StatusIncludesStreamOptimizationCounters)' -count=1` | Pass |
+| A28 | DR flat accumulator persistence, delta replay, local KID index repair, and stream transaction coalescing | `go test ./vault -run 'TestDR(CoalesceStreamTxnBatch|FlatRangeAccumulator_ResetAndApplyDeltas|SecondaryFlatAccumulatorAdvancesOnStreamApply|SecondaryStreamTxnPersistsFlatAccumulator|LocalKIDIndexChangesRequireCompleteBaseline|SecondaryStreamTxnCadenceReplaysPersistedAccumulatorDeltas|SecondaryStreamTxnCadenceMissingDeltasFailsClosed|SecondaryApplyWorkerStopPersistsFinalFlatAccumulatorSnapshot|SecondaryQuiescentReconnectUsesFlatAccumulatorFastPath|FlatAccumulatorEmptyBucketRepairAvoidsLocalScan|FlatAccumulatorIndexedBucketRepairAvoidsLocalScan|RangeReconciliationSeedsFlatAccumulatorOnPhaseAMatch|RangeReconciliationSeedsFlatAccumulatorAfterRepair|SystemBackend_StatusIncludesStreamOptimizationCounters)' -count=1` | Pass |
 
 Recommended compile pre-step:
 
@@ -244,6 +244,7 @@ scripts remain available under `/Users/roelc/projects/secretz/openbao/scripts`.
 | S12 | HA quiescent reconnect optimization | `scripts/dr_local_test.sh --topology ha quiescent-reconnect-smoke` | Verify active primary handoff avoids scanned reconciliation when stream replay can resume | Both secondaries return to `streaming` lag 0, marker data remains visible, and either `reconcile_count` is unchanged or `flat_accumulator_fast_path_total` increments |
 | S13 | HA accumulator cold restart | `scripts/dr_local_test.sh --topology ha accumulator-cold-restart-smoke` | Verify a full secondary cluster restart reloads the persisted flat accumulator cursor and resumes stream replay without scanned reconciliation | Secondary #1 returns to `streaming` lag 0, marker data remains visible, post-restart cursor covers the pre-restart `last_applied_index`, `reconcile_count=0`, `scan_failures_total=0`, and restart logs show no local scan or reconciliation. With cadence-delayed snapshots, status should show either full snapshot load, snapshot+delta replay, or cursor-only fail-closed recovery |
 | S14 | HA hot-key stream coalescing validation | `scripts/dr_local_test.sh --topology ha reset --build && scripts/dr_local_test.sh --topology ha smoke --duration 300 --concurrency 48 --stepdown-interval 100 --progress-interval 10 --monitor-interval 2 && scripts/dr_local_test.sh --topology ha verify <run-dir> --sample 0` | Measure secondary apply behavior after transactional stream coalescing and flat-accumulator snapshot cadence under hot-key load and HA handoff pressure | Exhaustive verification passes on primary and both secondaries; sentinel convergence is near-immediate; both secondaries end `streaming` with `lag_entries=0`; no journal drops; status timelines expose stream transaction counts, coalesced physical-entry counts, flush reasons, apply/commit timing, flat-accumulator cursor writes, skipped snapshots, and snapshot persist counters |
+| S15 | HA local KID-index fallback validation | `scripts/dr_local_test.sh --topology ha reset --build && scripts/dr_local_test.sh --topology ha smoke --duration 900 --concurrency 48 --stepdown-interval 300 --progress-interval 30 --monitor-interval 5 && scripts/dr_local_test.sh --topology ha verify <run-dir> --sample 0` | Exercise indexed-bucket repair under sustained HA disruption and prove proof-mismatch fallback does not strand reconciliation finalize | Indexed repair proof mismatches invalidate the optimizer and fall back to full local scan; both secondaries return to `streaming` with `reconcile_phase=idle`, sentinel convergence succeeds, no stream events are dropped, and exhaustive verification passes on primary and both secondaries |
 
 ### Stress Run Examples
 
@@ -297,7 +298,7 @@ delta replay (`flat_accumulator_delta_replay_total=1`,
 (`reconcile_count=0`), reported no scan failures, and both secondaries returned
 to `streaming` with `lag_entries=0`.
 
-Latest observed run: `/Users/roelc/projects/secretz/openbao/dr-stress-results/drmixed-20260531T112327Z`.
+Latest observed hot-key coalescing run: `/Users/roelc/projects/secretz/openbao/dr-stress-results/drmixed-20260531T112327Z`.
 The run completed 44,930 operations at 145.57 ops/s, had zero status failures,
 zero journal drops, 4.0s/1.0s sentinel convergence, final `lag_entries=0`, and
 exhaustive verification passed on primary, secondary1, and secondary2 across
@@ -316,6 +317,21 @@ flushes were not observed. Cursor writes tracked the transaction path
 (6,955/6,983), while full flat-accumulator snapshots dropped to 64/63 with
 6,891/6,920 skipped snapshots. Apply work averaged 0.14/0.14ms per transaction,
 commit averaged 36.51/36.51ms, and persisted snapshots averaged about 44.1 KiB.
+
+Latest observed local KID-index fallback run: `/Users/roelc/projects/secretz/openbao/dr-stress-results/drmixed-20260531T145022Z`.
+The run completed 107,870 operations at 119.08 ops/s over 15 minutes with
+48 workers and primary stepdowns every 300 seconds. It had zero status failures,
+zero stream drops, 1.0s/1.0s sentinel convergence, final `lag_entries=0`, and
+exhaustive verification passed on primary, secondary1, and secondary2 across
+9,104 truth-log keys with zero missing keys, mismatches, or read errors.
+Client-facing transient failures (`put_fail=338`, `get_fail=203`) occurred
+during forced HA disruption and did not produce replicated data divergence.
+
+This run explicitly exercised indexed-bucket repair proof mismatch fallback:
+secondary2 reported `range=5 local_count=16 remote_count=17`, secondary1
+reported `range=158 local_count=22 remote_count=23`, both invalidated the
+indexed optimizer path, fell back to full local scan, and ended in
+`secondary_state=streaming` with `reconcile_phase=idle`.
 
 Single secondary:
 

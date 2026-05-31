@@ -612,10 +612,10 @@ func (s *drReplicationSecondary) resetAndPersistFlatAccumulatorFromSet(ctx conte
 	if err := s.persistFlatAccumulatorState(ctx, s.core.physical, index, buckets, true, nil); err != nil {
 		return err
 	}
+	s.rangeAccumulator.replace(index, buckets)
 	if err := s.resetLocalKIDIndexFromSet(ctx, s.core.physical, index, rs); err != nil {
 		return err
 	}
-	s.rangeAccumulator.replace(index, buckets)
 	return nil
 }
 

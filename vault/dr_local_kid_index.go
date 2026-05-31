@@ -82,10 +82,10 @@ func (s *drReplicationSecondary) advanceLocalKIDIndexMetaIfCurrent(ctx context.C
 	}
 	var meta drLocalKIDIndexMeta
 	if err := json.Unmarshal(entry.Value, &meta); err != nil {
-		return s.deletePersistedLocalKIDIndex(ctx, writer)
+		return s.invalidatePersistedLocalKIDIndex(ctx, writer)
 	}
 	if err := s.validateLocalKIDIndexMeta(&meta); err != nil {
-		return s.deletePersistedLocalKIDIndex(ctx, writer)
+		return s.invalidatePersistedLocalKIDIndex(ctx, writer)
 	}
 	if meta.CommitIndex != fromIndex {
 		return nil
@@ -97,6 +97,24 @@ func (s *drReplicationSecondary) persistLocalKIDIndexChanges(ctx context.Context
 	if s == nil || writer == nil || index == 0 {
 		return nil
 	}
+	entry, err := writer.Get(ctx, drLocalKIDIndexMetaPath)
+	if err != nil {
+		return err
+	}
+	if entry == nil {
+		return nil
+	}
+	var meta drLocalKIDIndexMeta
+	if err := json.Unmarshal(entry.Value, &meta); err != nil {
+		return s.invalidatePersistedLocalKIDIndex(ctx, writer)
+	}
+	if err := s.validateLocalKIDIndexMeta(&meta); err != nil {
+		return s.invalidatePersistedLocalKIDIndex(ctx, writer)
+	}
+	if meta.CommitIndex > index {
+		return nil
+	}
+
 	updates := 0
 	for _, change := range changes {
 		if change == nil || change.Key == "" || isDRNeverReplicatePath(change.Key) {
@@ -126,10 +144,7 @@ func (s *drReplicationSecondary) persistLocalKIDIndexChanges(ctx context.Context
 	return s.persistLocalKIDIndexMeta(ctx, writer, index)
 }
 
-func (s *drReplicationSecondary) putLocalKIDIndexEntry(ctx context.Context, writer physical.Backend, kid, vid [32]byte, key string) error {
-	if key == "" {
-		return nil
-	}
+func (s *drReplicationSecondary) localKIDIndexEntryData(kid, vid [32]byte, key string) ([]byte, error) {
 	entry := drLocalKIDIndexEntry{
 		Version:        drLocalKIDIndexEntryVersion,
 		RelationshipID: s.relationshipID,
@@ -138,7 +153,14 @@ func (s *drReplicationSecondary) putLocalKIDIndexEntry(ctx context.Context, writ
 		VID:            append([]byte(nil), vid[:]...),
 		Key:            key,
 	}
-	data, err := json.Marshal(entry)
+	return json.Marshal(entry)
+}
+
+func (s *drReplicationSecondary) putLocalKIDIndexEntry(ctx context.Context, writer physical.Backend, kid, vid [32]byte, key string) error {
+	if key == "" {
+		return nil
+	}
+	data, err := s.localKIDIndexEntryData(kid, vid, key)
 	if err != nil {
 		return err
 	}
@@ -164,7 +186,7 @@ func (s *drReplicationSecondary) resetLocalKIDIndexRangesFromSet(ctx context.Con
 		return fmt.Errorf("local kid index reset requires reconciliation set")
 	}
 	if len(rs.KIDToVID) > 0 && rs.KIDToKey == nil {
-		return s.deletePersistedLocalKIDIndex(ctx, writer)
+		return s.invalidatePersistedLocalKIDIndex(ctx, writer)
 	}
 	rangeSet := make(map[uint64]struct{}, len(ranges))
 	for _, rangeID := range ranges {
@@ -173,11 +195,7 @@ func (s *drReplicationSecondary) resetLocalKIDIndexRangesFromSet(ctx context.Con
 		}
 		rangeSet[rangeID] = struct{}{}
 	}
-	for rangeID := range rangeSet {
-		if err := s.deleteLocalKIDIndexRange(ctx, writer, rangeID); err != nil {
-			return err
-		}
-	}
+
 	kids := make([][32]byte, 0, len(rs.KIDToVID))
 	for kid := range rs.KIDToVID {
 		if _, ok := rangeSet[reconciler.RangeIDFromKID(kid)]; ok {
@@ -187,6 +205,23 @@ func (s *drReplicationSecondary) resetLocalKIDIndexRangesFromSet(ctx context.Con
 	sort.Slice(kids, func(i, j int) bool {
 		return hex.EncodeToString(kids[i][:]) < hex.EncodeToString(kids[j][:])
 	})
+
+	if err := s.invalidatePersistedLocalKIDIndex(ctx, writer); err != nil {
+		return err
+	}
+	if txnBackend, ok := writer.(physical.TransactionalBackend); ok {
+		if err := s.resetLocalKIDIndexRangesFromSetTxn(ctx, txnBackend, index, rs, rangeSet, kids); err != nil {
+			return err
+		}
+		s.localKIDIndexResets.Add(1)
+		return s.persistLocalKIDIndexMeta(ctx, writer, index)
+	}
+
+	for rangeID := range rangeSet {
+		if err := s.deleteLocalKIDIndexRange(ctx, writer, rangeID); err != nil {
+			return err
+		}
+	}
 	for _, kid := range kids {
 		vid := rs.KIDToVID[kid]
 		key := ""
@@ -205,6 +240,101 @@ func (s *drReplicationSecondary) resetLocalKIDIndexRangesFromSet(ctx context.Con
 	}
 	s.localKIDIndexResets.Add(1)
 	return s.persistLocalKIDIndexMeta(ctx, writer, index)
+}
+
+func (s *drReplicationSecondary) resetLocalKIDIndexRangesFromSetTxn(ctx context.Context, writer physical.TransactionalBackend, index uint64, rs *reconciler.ReconciliationSet, rangeSet map[uint64]struct{}, kids [][32]byte) error {
+	batchSize := s.reconcilePutBatchEntries
+	if batchSize <= 0 {
+		batchSize = drDefaultReconcilePutBatchEntries
+	}
+
+	deletePaths := make([]string, 0)
+	for rangeID := range rangeSet {
+		prefix := drLocalKIDIndexRangePrefix(rangeID)
+		keys, err := writer.List(ctx, prefix)
+		if err != nil {
+			return err
+		}
+		for _, key := range keys {
+			deletePaths = append(deletePaths, prefix+key)
+		}
+	}
+	for i := 0; i < len(deletePaths); i += batchSize {
+		end := i + batchSize
+		if end > len(deletePaths) {
+			end = len(deletePaths)
+		}
+		if err := s.applyLocalKIDIndexDeleteBatch(ctx, writer, deletePaths[i:end]); err != nil {
+			return err
+		}
+	}
+
+	entries := make([]*physical.Entry, 0, len(kids))
+	for _, kid := range kids {
+		vid := rs.KIDToVID[kid]
+		key := ""
+		if rs.KIDToKey != nil {
+			key = rs.KIDToKey[kid]
+		}
+		if key == "" {
+			return fmt.Errorf("local kid index reset missing key for kid %x", kid)
+		}
+		if isDRNeverReplicatePath(key) {
+			continue
+		}
+		data, err := s.localKIDIndexEntryData(kid, vid, key)
+		if err != nil {
+			return err
+		}
+		entries = append(entries, &physical.Entry{
+			Key:   drLocalKIDIndexEntryStoragePath(kid),
+			Value: data,
+		})
+	}
+	for i := 0; i < len(entries); i += batchSize {
+		end := i + batchSize
+		if end > len(entries) {
+			end = len(entries)
+		}
+		if err := s.applyLocalKIDIndexPutBatch(ctx, writer, entries[i:end]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *drReplicationSecondary) applyLocalKIDIndexDeleteBatch(ctx context.Context, writer physical.TransactionalBackend, keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	tx, err := writer.BeginTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	for _, key := range keys {
+		if err := tx.Delete(ctx, key); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *drReplicationSecondary) applyLocalKIDIndexPutBatch(ctx context.Context, writer physical.TransactionalBackend, entries []*physical.Entry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	tx, err := writer.BeginTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	for _, entry := range entries {
+		if err := tx.Put(ctx, entry); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *drReplicationSecondary) deleteLocalKIDIndexRange(ctx context.Context, writer physical.Backend, rangeID uint64) error {
@@ -227,6 +357,13 @@ func deleteLocalKIDIndexRange(ctx context.Context, writer physical.Backend, rang
 
 func (s *drReplicationSecondary) deletePersistedLocalKIDIndex(ctx context.Context, writer physical.Backend) error {
 	return deletePersistedLocalKIDIndex(ctx, writer)
+}
+
+func (s *drReplicationSecondary) invalidatePersistedLocalKIDIndex(ctx context.Context, writer physical.Backend) error {
+	if writer == nil {
+		return nil
+	}
+	return writer.Delete(ctx, drLocalKIDIndexMetaPath)
 }
 
 func deletePersistedLocalKIDIndex(ctx context.Context, writer physical.Backend) error {

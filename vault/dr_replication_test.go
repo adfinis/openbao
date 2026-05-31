@@ -4082,6 +4082,105 @@ func TestDRSecondaryStreamTxnPersistsFlatAccumulator(t *testing.T) {
 	}
 }
 
+func TestDRLocalKIDIndexChangesRequireCompleteBaseline(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	replSalt := bytes.Repeat([]byte{0x48}, 32)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-local-index-baseline", core.logger)
+
+	key := "secret/local-index-baseline"
+	newValue := []byte("new")
+	kid := secondary.scanner.ComputeKID(key)
+	change := &EntryChange{
+		OpType: string(physical.PutOperation),
+		Key:    key,
+		Value:  newValue,
+	}
+
+	if err := secondary.persistLocalKIDIndexChanges(ctx, core.physical, 11, []*EntryChange{change}); err != nil {
+		t.Fatalf("unexpected stream-delta persist error without baseline: %v", err)
+	}
+	if entry, err := core.physical.Get(ctx, drLocalKIDIndexMetaPath); err != nil {
+		t.Fatal(err)
+	} else if entry != nil {
+		t.Fatalf("expected no local KID index meta without baseline, got %q", string(entry.Value))
+	}
+	if entry, err := core.physical.Get(ctx, drLocalKIDIndexEntryStoragePath(kid)); err != nil {
+		t.Fatal(err)
+	} else if entry != nil {
+		t.Fatalf("expected no local KID index entry without baseline, got %q", string(entry.Value))
+	}
+	if got := secondary.localKIDIndexUpdates.Load(); got != 0 {
+		t.Fatalf("expected no local KID index updates without baseline, got %d", got)
+	}
+
+	if err := core.physical.Put(ctx, &physical.Entry{
+		Key:   drLocalKIDIndexMetaPath,
+		Value: []byte(`{"version":999}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := secondary.persistLocalKIDIndexChanges(ctx, core.physical, 11, []*EntryChange{change}); err != nil {
+		t.Fatalf("unexpected stream-delta persist error with invalid baseline: %v", err)
+	}
+	if entry, err := core.physical.Get(ctx, drLocalKIDIndexMetaPath); err != nil {
+		t.Fatal(err)
+	} else if entry != nil {
+		t.Fatalf("expected invalid local KID index meta to be removed, got %q", string(entry.Value))
+	}
+	if entry, err := core.physical.Get(ctx, drLocalKIDIndexEntryStoragePath(kid)); err != nil {
+		t.Fatal(err)
+	} else if entry != nil {
+		t.Fatalf("expected invalid baseline not to write local KID index entry, got %q", string(entry.Value))
+	}
+
+	oldValue := []byte("old")
+	oldVID := secondary.scanner.ComputeVIDWithSealWrap(oldValue, false)
+	localSet := &reconciler.ReconciliationSet{
+		KIDToVID: map[[32]byte][32]byte{kid: oldVID},
+		KIDToKey: map[[32]byte]string{kid: key},
+	}
+	if err := secondary.resetLocalKIDIndexFromSet(ctx, core.physical, 10, localSet); err != nil {
+		t.Fatalf("failed to seed complete local KID index baseline: %v", err)
+	}
+	if err := secondary.persistLocalKIDIndexChanges(ctx, core.physical, 11, []*EntryChange{change}); err != nil {
+		t.Fatalf("failed to apply local KID index stream delta: %v", err)
+	}
+
+	metaEntry, err := core.physical.Get(ctx, drLocalKIDIndexMetaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metaEntry == nil {
+		t.Fatal("expected local KID index meta after complete baseline delta")
+	}
+	var meta drLocalKIDIndexMeta
+	if err := json.Unmarshal(metaEntry.Value, &meta); err != nil {
+		t.Fatal(err)
+	}
+	if meta.CommitIndex != 11 {
+		t.Fatalf("expected local KID index meta at index 11, got %d", meta.CommitIndex)
+	}
+	indexEntry, err := core.physical.Get(ctx, drLocalKIDIndexEntryStoragePath(kid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if indexEntry == nil {
+		t.Fatal("expected local KID index entry after complete baseline delta")
+	}
+	item, err := secondary.decodeLocalKIDIndexEntry(indexEntry.Value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.key != key {
+		t.Fatalf("expected indexed key %q, got %q", key, item.key)
+	}
+	expectedVID := secondary.scanner.ComputeVIDWithSealWrap(newValue, false)
+	if item.vid != expectedVID {
+		t.Fatalf("expected updated indexed VID %x, got %x", expectedVID, item.vid)
+	}
+}
+
 func TestDRSecondaryStreamTxnCadenceReplaysPersistedAccumulatorDeltas(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	ctx := context.Background()

@@ -50,7 +50,10 @@ func (e *errDRRedirect) Error() string {
 	return fmt.Sprintf("DR redirect to leader at %s", e.LeaderAddr)
 }
 
-var errDRSecondaryApplyStopped = errors.New("DR secondary stream apply stopped")
+var (
+	errDRSecondaryApplyStopped            = errors.New("DR secondary stream apply stopped")
+	errDRIndexedBucketRepairProofMismatch = errors.New("flat accumulator indexed-bucket repair proof mismatch")
+)
 
 func atomicMaxUint64(target *atomic.Uint64, value uint64) {
 	for {
@@ -285,6 +288,9 @@ const (
 	drDefaultReconcileApplyWorkers              = 16
 	drDefaultReconcilePutBatchEntries           = 512
 	drDefaultReconcilePutBatchBytes             = 2 << 20 // 2 MiB
+	drDefaultReconcileTxnCommitRetries          = 8
+	drDefaultReconcileTxnCommitRetryDelay       = 10 * time.Millisecond
+	drDefaultReconcileOptimizerPersistTimeout   = 30 * time.Second
 	drDefaultConvergenceMinRateRatio            = 0.8
 	drDefaultConvergenceStall                   = 180 * time.Second
 
@@ -2350,7 +2356,10 @@ func (s *drReplicationSecondary) performResnapshot(ctx context.Context, reason s
 
 	remoteKeys := make(map[string]struct{}, 1024)
 	applied := 0
-	applyPipeline := newDRPutApplyPipeline(fetchCtx, s, nil, markProgress, nil)
+	applyPipeline, err := newDRPutApplyPipeline(fetchCtx, s, nil, markProgress, nil, false)
+	if err != nil {
+		return wrapReconcileFailure(drReconcileFailureApplyFailed, "prepare resnapshot apply pipeline", err)
+	}
 	pipelineClosed := false
 	defer func() {
 		if !pipelineClosed {
@@ -2476,9 +2485,7 @@ func (s *drReplicationSecondary) performResnapshot(ctx context.Context, reason s
 	if err := s.finalizeReconcileCheckpoint(checkpoint.CheckpointId, checkpoint.CommitIndex); err != nil {
 		return fmt.Errorf("resnapshot finalize failed: %w", err)
 	}
-	if err := s.resetAndPersistFlatAccumulatorFromSet(ctx, localSet, checkpoint.CommitIndex); err != nil {
-		return fmt.Errorf("persist flat accumulator after resnapshot: %w", err)
-	}
+	s.persistReconcileOptimizerStateBestEffort(ctx, localSet, checkpoint.CommitIndex, "resnapshot")
 	s.entriesApplied.Add(uint64(applied))
 	s.reconcileCount.Add(1)
 	s.lastReconcileAt.Store(time.Now().Unix())
@@ -3402,8 +3409,8 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 			}
 			s.rangeAccumulator.replace(lastIndex, accumulatorNext)
 		} else {
-			if err := s.deletePersistedLocalKIDIndex(ctx, txn); err != nil {
-				return fmt.Errorf("delete stale local kid index marker: %w", err)
+			if err := s.invalidatePersistedLocalKIDIndex(ctx, txn); err != nil {
+				return fmt.Errorf("invalidate stale local kid index marker: %w", err)
 			}
 			if err := s.persistFlatAccumulatorCursor(ctx, txn, lastIndex, s.flatAccumulatorSnapshotIndex.Load()); err != nil {
 				return fmt.Errorf("persist flat accumulator marker cursor: %w", err)
@@ -3438,8 +3445,8 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 		}
 	} else if err := s.deletePersistedFlatAccumulator(ctx, txn); err != nil {
 		return fmt.Errorf("delete stale flat accumulator: %w", err)
-	} else if err := s.deletePersistedLocalKIDIndex(ctx, txn); err != nil {
-		return fmt.Errorf("delete stale local kid index: %w", err)
+	} else if err := s.invalidatePersistedLocalKIDIndex(ctx, txn); err != nil {
+		return fmt.Errorf("invalidate stale local kid index: %w", err)
 	} else if err := s.persistFlatAccumulatorCursor(ctx, txn, lastIndex, s.flatAccumulatorSnapshotIndex.Load()); err != nil {
 		return fmt.Errorf("persist flat accumulator cursor: %w", err)
 	}
@@ -3602,8 +3609,8 @@ func (s *drReplicationSecondary) applyStreamChange(ctx context.Context, change *
 	if err := s.deletePersistedFlatAccumulator(ctx, s.core.physical); err != nil {
 		return fmt.Errorf("delete stale flat accumulator: %w", err)
 	}
-	if err := s.deletePersistedLocalKIDIndex(ctx, s.core.physical); err != nil {
-		return fmt.Errorf("delete stale local kid index: %w", err)
+	if err := s.invalidatePersistedLocalKIDIndex(ctx, s.core.physical); err != nil {
+		return fmt.Errorf("invalidate stale local kid index: %w", err)
 	}
 
 	switch physical.Operation(change.OpType) {
@@ -3825,8 +3832,8 @@ func (s *drReplicationSecondary) applyFetchedChangeWithKIDMapAndLocalKIDIndexMod
 		return fmt.Errorf("delete stale flat accumulator: %w", err)
 	}
 	if !preserveLocalKIDIndex {
-		if err := s.deletePersistedLocalKIDIndex(ctx, s.core.physical); err != nil {
-			return fmt.Errorf("delete stale local kid index: %w", err)
+		if err := s.invalidatePersistedLocalKIDIndex(ctx, s.core.physical); err != nil {
+			return fmt.Errorf("invalidate stale local kid index: %w", err)
 		}
 	}
 
@@ -4062,8 +4069,8 @@ func (s *drReplicationSecondary) tryFlatAccumulatorReconciliation(ctx context.Co
 			if err != nil {
 				s.localKIDIndexLoadFailures.Add(1)
 				s.logger.Warn("local KID index could not be loaded; falling back to local scan", "error", err)
-				if deleteErr := s.deletePersistedLocalKIDIndex(ctx, s.core.physical); deleteErr != nil {
-					return true, fmt.Errorf("delete stale local KID index after load failure: %w", deleteErr)
+				if deleteErr := s.invalidatePersistedLocalKIDIndex(ctx, s.core.physical); deleteErr != nil {
+					return true, fmt.Errorf("invalidate stale local KID index after load failure: %w", deleteErr)
 				}
 				return false, nil
 			}
@@ -4076,6 +4083,19 @@ func (s *drReplicationSecondary) tryFlatAccumulatorReconciliation(ctx context.Co
 			localSet = indexSet
 		}
 		if err := s.runFlatAccumulatorIndexedBucketRepair(ctx, checkpoint, localBuckets, mismatches, localSet, startTime); err != nil {
+			if errors.Is(err, errDRIndexedBucketRepairProofMismatch) {
+				s.logger.Warn("flat accumulator indexed-bucket repair could not prove completeness; falling back to full local scan",
+					"checkpoint_id", checkpoint.CheckpointId,
+					"checkpoint_index", checkpoint.CommitIndex,
+					"error", err)
+				if invalidateErr := s.invalidatePersistedLocalKIDIndex(ctx, s.core.physical); invalidateErr != nil {
+					return true, fmt.Errorf("invalidate stale local KID index after indexed repair proof failure: %w", invalidateErr)
+				}
+				if s.rangeAccumulator != nil {
+					s.rangeAccumulator.invalidate()
+				}
+				return false, nil
+			}
 			return true, err
 		}
 		return true, nil
@@ -4088,10 +4108,19 @@ func (s *drReplicationSecondary) tryFlatAccumulatorReconciliation(ctx context.Co
 	if accumulatorIndex != checkpoint.CommitIndex {
 		s.rangeAccumulator.replace(checkpoint.CommitIndex, localBuckets)
 		if err := s.persistFlatAccumulatorState(ctx, s.core.physical, checkpoint.CommitIndex, localBuckets, true, nil); err != nil {
-			return true, fmt.Errorf("persist flat accumulator after phase-a match: %w", err)
+			s.logger.Warn("failed to persist flat accumulator after phase-a match",
+				"checkpoint_id", checkpoint.CheckpointId,
+				"checkpoint_index", checkpoint.CommitIndex,
+				"error", err)
 		}
 		if err := s.advanceLocalKIDIndexMetaIfCurrent(ctx, s.core.physical, accumulatorIndex, checkpoint.CommitIndex); err != nil {
-			return true, fmt.Errorf("advance local KID index after phase-a match: %w", err)
+			s.logger.Warn("failed to advance local KID index after phase-a match",
+				"from_index", accumulatorIndex,
+				"to_index", checkpoint.CommitIndex,
+				"error", err)
+			if invalidateErr := s.invalidatePersistedLocalKIDIndex(ctx, s.core.physical); invalidateErr != nil {
+				s.logger.Warn("failed to invalidate local KID index after metadata advance failure", "error", invalidateErr)
+			}
 		}
 	}
 	s.reconcileBudgetRemainingByte.Store(int64(s.reconcileMaxRPCBytes))
@@ -4141,8 +4170,10 @@ func (s *drReplicationSecondary) runFlatAccumulatorIndexedBucketRepair(
 	}
 	localIndex := reconciler.NewRangeMapIndex(localSet.KIDToVID, nil)
 	mutationTracker := newDRReconciliationSetMutationTracker(s)
-	applyPipeline := newDRPutApplyPipeline(ctx, s, localSet.KIDToKey, s.markReconcileActivityNow, mutationTracker)
-	applyPipeline.preserveLocalKIDIndex = true
+	applyPipeline, err := newDRPutApplyPipeline(ctx, s, localSet.KIDToKey, s.markReconcileActivityNow, mutationTracker, true)
+	if err != nil {
+		return wrapReconcileFailure(drReconcileFailureApplyFailed, "prepare indexed repair apply pipeline", err)
+	}
 	defer func() {
 		_ = applyPipeline.closeAndWait()
 	}()
@@ -4150,6 +4181,7 @@ func (s *drReplicationSecondary) runFlatAccumulatorIndexedBucketRepair(
 	if s.rangeAccumulator != nil {
 		s.rangeAccumulator.invalidate()
 	}
+	appliedFetchedEntries := make([]*EntryChange, 0)
 	pendingDeletes := make(map[string]struct{})
 	for i, mismatch := range mismatches {
 		if err := budget.check(); err != nil {
@@ -4180,6 +4212,7 @@ func (s *drReplicationSecondary) runFlatAccumulatorIndexedBucketRepair(
 			if err := applyPipeline.submit(result.fetchedEntries); err != nil {
 				return wrapReconcileFailure(drReconcileFailureApplyFailed, "queue fetched entries for apply", err)
 			}
+			appliedFetchedEntries = append(appliedFetchedEntries, result.fetchedEntries...)
 			for _, change := range result.fetchedEntries {
 				kid, _, err := s.kidVIDFromFetchedChange(change)
 				if err != nil {
@@ -4195,6 +4228,9 @@ func (s *drReplicationSecondary) runFlatAccumulatorIndexedBucketRepair(
 	s.setReconcilePhase(drReconcilePhaseApplyPuts)
 	if err := applyPipeline.closeAndWait(); err != nil {
 		return wrapReconcileFailure(drReconcileFailureStalled, "apply pipeline", err)
+	}
+	if err := mutationTracker.recordFetchedChanges(appliedFetchedEntries); err != nil {
+		return wrapReconcileFailure(drReconcileFailureApplyFailed, "record indexed repair fetched entries", err)
 	}
 	if len(pendingDeletes) > 0 {
 		s.setReconcilePhase(drReconcilePhaseApplyDeletes)
@@ -4229,7 +4265,8 @@ func (s *drReplicationSecondary) runFlatAccumulatorIndexedBucketRepair(
 			remoteChecksum = mismatch.remote.GetChecksum()
 		}
 		if nextBuckets[mismatch.rangeID].count != remoteCount || nextBuckets[mismatch.rangeID].checksum != remoteChecksum {
-			return fmt.Errorf("flat accumulator indexed-bucket repair proof mismatch: range=%d local_count=%d remote_count=%d",
+			return fmt.Errorf("%w: range=%d local_count=%d remote_count=%d",
+				errDRIndexedBucketRepairProofMismatch,
 				mismatch.rangeID,
 				nextBuckets[mismatch.rangeID].count,
 				remoteCount)
@@ -4242,10 +4279,23 @@ func (s *drReplicationSecondary) runFlatAccumulatorIndexedBucketRepair(
 	}
 	s.rangeAccumulator.replace(checkpoint.CommitIndex, nextBuckets)
 	if err := s.persistFlatAccumulatorState(ctx, s.core.physical, checkpoint.CommitIndex, nextBuckets, true, nil); err != nil {
-		return fmt.Errorf("persist flat accumulator after indexed-bucket repair: %w", err)
+		s.logger.Warn("failed to persist flat accumulator after indexed-bucket repair",
+			"checkpoint_id", checkpoint.CheckpointId,
+			"checkpoint_index", checkpoint.CommitIndex,
+			"error", err)
 	}
-	if err := s.resetLocalKIDIndexRangesFromSet(ctx, s.core.physical, checkpoint.CommitIndex, localSet, repairedRanges); err != nil {
-		return fmt.Errorf("persist local KID index after indexed-bucket repair: %w", err)
+	indexCtx, indexCancel := context.WithTimeout(ctx, s.reconcileOptimizerPersistTimeout())
+	err = s.resetLocalKIDIndexRangesFromSet(indexCtx, s.core.physical, checkpoint.CommitIndex, localSet, repairedRanges)
+	indexCancel()
+	if err != nil {
+		s.logger.Warn("failed to persist local KID index after indexed-bucket repair",
+			"checkpoint_id", checkpoint.CheckpointId,
+			"checkpoint_index", checkpoint.CommitIndex,
+			"ranges", len(repairedRanges),
+			"error", err)
+		if invalidateErr := s.invalidatePersistedLocalKIDIndex(ctx, s.core.physical); invalidateErr != nil {
+			s.logger.Warn("failed to invalidate local KID index after indexed repair persist failure", "error", invalidateErr)
+		}
 	}
 	s.reconcileBudgetRemainingByte.Store(int64(s.reconcileMaxRPCBytes))
 	s.reconcileCount.Add(1)
@@ -4505,7 +4555,60 @@ type drPutApplyPipeline struct {
 	closed bool
 }
 
-func newDRPutApplyPipeline(ctx context.Context, secondary *drReplicationSecondary, kidToKey map[[32]byte]string, onApply func(), mutations *drReconciliationSetMutationTracker) *drPutApplyPipeline {
+func (s *drReplicationSecondary) clearPersistedReconcileOptimizationState(ctx context.Context, preserveLocalKIDIndex bool) error {
+	if s == nil || s.core == nil || s.core.physical == nil {
+		return nil
+	}
+	if err := s.deletePersistedFlatAccumulator(ctx, s.core.physical); err != nil {
+		return fmt.Errorf("delete stale flat accumulator: %w", err)
+	}
+	if !preserveLocalKIDIndex {
+		if err := s.invalidatePersistedLocalKIDIndex(ctx, s.core.physical); err != nil {
+			return fmt.Errorf("invalidate stale local kid index: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *drReplicationSecondary) reconcileOptimizerPersistTimeout() time.Duration {
+	timeout := s.reconcileStallAbort
+	if timeout <= 0 || timeout > drDefaultReconcileOptimizerPersistTimeout {
+		timeout = drDefaultReconcileOptimizerPersistTimeout
+	}
+	if timeout < 5*time.Second {
+		timeout = 5 * time.Second
+	}
+	return timeout
+}
+
+func (s *drReplicationSecondary) persistReconcileOptimizerStateBestEffort(ctx context.Context, localSet *reconciler.ReconciliationSet, checkpointIndex uint64, reason string) {
+	if s == nil || localSet == nil || checkpointIndex == 0 {
+		return
+	}
+	timeout := s.reconcileOptimizerPersistTimeout()
+	persistCtx, cancel := context.WithTimeout(ctx, timeout)
+	err := s.resetAndPersistFlatAccumulatorFromSet(persistCtx, localSet, checkpointIndex)
+	cancel()
+	if err == nil {
+		return
+	}
+
+	s.logger.Warn("failed to persist DR reconciliation optimizer state; continuing with storage checkpoint committed",
+		"reason", reason,
+		"checkpoint_index", checkpointIndex,
+		"timeout", timeout,
+		"error", err)
+	if s.rangeAccumulator != nil {
+		s.rangeAccumulator.invalidate()
+	}
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cleanupCancel()
+	if invalidateErr := s.invalidatePersistedLocalKIDIndex(cleanupCtx, s.core.physical); invalidateErr != nil {
+		s.logger.Warn("failed to invalidate local KID index after optimizer persist failure", "error", invalidateErr)
+	}
+}
+
+func newDRPutApplyPipeline(ctx context.Context, secondary *drReplicationSecondary, kidToKey map[[32]byte]string, onApply func(), mutations *drReconciliationSetMutationTracker, preserveLocalKIDIndex bool) (*drPutApplyPipeline, error) {
 	workers := secondary.reconcileApplyWorkers
 	if workers <= 0 {
 		workers = 1
@@ -4521,16 +4624,23 @@ func newDRPutApplyPipeline(ctx context.Context, secondary *drReplicationSecondar
 	if tb, ok := secondary.core.physical.(physical.TransactionalBackend); ok {
 		txnBackend = tb
 	}
+	if txnBackend != nil {
+		if err := secondary.clearPersistedReconcileOptimizationState(ctx, preserveLocalKIDIndex); err != nil {
+			cancel()
+			return nil, err
+		}
+	}
 
 	p := &drPutApplyPipeline{
-		secondary:  secondary,
-		ctx:        workerCtx,
-		cancel:     cancel,
-		kidToKey:   kidToKey,
-		onApply:    onApply,
-		mutations:  mutations,
-		txnBackend: txnBackend,
-		shards:     make([]chan *EntryChange, workers),
+		secondary:             secondary,
+		ctx:                   workerCtx,
+		cancel:                cancel,
+		kidToKey:              kidToKey,
+		onApply:               onApply,
+		mutations:             mutations,
+		preserveLocalKIDIndex: preserveLocalKIDIndex,
+		txnBackend:            txnBackend,
+		shards:                make([]chan *EntryChange, workers),
 	}
 	for i := 0; i < workers; i++ {
 		ch := make(chan *EntryChange, queueDepth/workers+1)
@@ -4538,7 +4648,7 @@ func newDRPutApplyPipeline(ctx context.Context, secondary *drReplicationSecondar
 		p.wg.Add(1)
 		go p.runWorker(ch)
 	}
-	return p
+	return p, nil
 }
 
 func (p *drPutApplyPipeline) runWorker(ch <-chan *EntryChange) {
@@ -4666,7 +4776,6 @@ func (p *drPutApplyPipeline) applyBatchTxn(entries []*EntryChange) error {
 	var keyringEntries []*EntryChange
 	normalEntries := make([]*EntryChange, 0, len(entries))
 	var runtimeStateTouched bool
-	var invalidateKeys []string
 
 	for _, change := range entries {
 		if change == nil {
@@ -4687,80 +4796,93 @@ func (p *drPutApplyPipeline) applyBatchTxn(entries []*EntryChange) error {
 
 	// Batch-commit normal entries in a single Raft round.
 	if len(normalEntries) > 0 {
-		tx, err := p.txnBackend.BeginTx(p.ctx)
-		if err != nil {
-			return fmt.Errorf("begin batch txn: %w", err)
-		}
-		appliedNormalEntries := make([]*EntryChange, 0, len(normalEntries))
-		if err := p.secondary.deletePersistedFlatAccumulator(p.ctx, tx); err != nil {
-			_ = tx.Rollback(p.ctx)
-			return fmt.Errorf("delete stale flat accumulator: %w", err)
-		}
-		if !p.preserveLocalKIDIndex {
-			if err := p.secondary.deletePersistedLocalKIDIndex(p.ctx, tx); err != nil {
-				_ = tx.Rollback(p.ctx)
-				return fmt.Errorf("delete stale local kid index: %w", err)
+		for attempt := 0; ; attempt++ {
+			if err := p.ctx.Err(); err != nil {
+				return err
 			}
-		}
+			tx, err := p.txnBackend.BeginTx(p.ctx)
+			if err != nil {
+				return fmt.Errorf("begin batch txn: %w", err)
+			}
+			appliedNormalEntries := make([]*EntryChange, 0, len(normalEntries))
+			invalidateKeys := make([]string, 0, len(normalEntries))
 
-		for _, change := range normalEntries {
-			appliedKey := change.Key
-			switch physical.Operation(change.OpType) {
-			case physical.PutOperation:
-				if err := tx.Put(p.ctx, &physical.Entry{
-					Key:      change.Key,
-					Value:    change.Value,
-					SealWrap: change.SealWrap,
-				}); err != nil {
-					_ = tx.Rollback(p.ctx)
-					return fmt.Errorf("batch txn put %q: %w", change.Key, err)
-				}
-
-			case physical.DeleteOperation:
-				key := change.Key
-				if key == "" && len(change.Kid) == 32 && p.kidToKey != nil {
-					var kid [32]byte
-					copy(kid[:], change.Kid)
-					if k, ok := p.kidToKey[kid]; ok {
-						if isDRNeverReplicatePath(k) {
-							continue
-						}
-						key = k
-					}
-				}
-				if key != "" {
-					if err := tx.Delete(p.ctx, key); err != nil {
+			for _, change := range normalEntries {
+				appliedKey := change.Key
+				switch physical.Operation(change.OpType) {
+				case physical.PutOperation:
+					if err := tx.Put(p.ctx, &physical.Entry{
+						Key:      change.Key,
+						Value:    change.Value,
+						SealWrap: change.SealWrap,
+					}); err != nil {
 						_ = tx.Rollback(p.ctx)
-						return fmt.Errorf("batch txn delete %q: %w", key, err)
+						return fmt.Errorf("batch txn put %q: %w", change.Key, err)
 					}
-				} else {
+
+				case physical.DeleteOperation:
+					key := change.Key
+					if key == "" && len(change.Kid) == 32 && p.kidToKey != nil {
+						var kid [32]byte
+						copy(kid[:], change.Kid)
+						if k, ok := p.kidToKey[kid]; ok {
+							if isDRNeverReplicatePath(k) {
+								continue
+							}
+							key = k
+						}
+					}
+					if key != "" {
+						if err := tx.Delete(p.ctx, key); err != nil {
+							_ = tx.Rollback(p.ctx)
+							return fmt.Errorf("batch txn delete %q: %w", key, err)
+						}
+					} else {
+						continue
+					}
+					appliedKey = key
+
+				default:
+					_ = tx.Rollback(p.ctx)
+					return fmt.Errorf("unknown operation type in fetched change: op_type=%s key=%s", change.OpType, change.Key)
+				}
+				if appliedKey != "" {
+					invalidateKeys = append(invalidateKeys, appliedKey)
+				}
+				appliedNormalEntries = append(appliedNormalEntries, change)
+			}
+
+			if err := tx.Commit(p.ctx); err != nil {
+				if errors.Is(err, physical.ErrTransactionCommitFailure) && attempt < drDefaultReconcileTxnCommitRetries {
+					p.secondary.logger.Debug("retrying DR reconcile transaction after commit conflict",
+						"entries", len(normalEntries),
+						"attempt", attempt+1,
+						"max_attempts", drDefaultReconcileTxnCommitRetries,
+						"error", err)
+					delay := time.Duration(attempt+1) * drDefaultReconcileTxnCommitRetryDelay
+					timer := time.NewTimer(delay)
+					select {
+					case <-p.ctx.Done():
+						timer.Stop()
+						return p.ctx.Err()
+					case <-timer.C:
+					}
 					continue
 				}
-				appliedKey = key
-
-			default:
-				_ = tx.Rollback(p.ctx)
-				return fmt.Errorf("unknown operation type in fetched change: op_type=%s key=%s", change.OpType, change.Key)
+				return fmt.Errorf("commit batch txn (%d entries): %w", len(normalEntries), err)
 			}
-			if appliedKey != "" {
-				invalidateKeys = append(invalidateKeys, appliedKey)
+			if runtimeStateTouched {
+				if err := p.secondary.refreshRuntimeStateAfterApply(p.ctx, "fetch transaction batch", false); err != nil {
+					return err
+				}
 			}
-			appliedNormalEntries = append(appliedNormalEntries, change)
-		}
-
-		if err := tx.Commit(p.ctx); err != nil {
-			return fmt.Errorf("commit batch txn (%d entries): %w", len(normalEntries), err)
-		}
-		if runtimeStateTouched {
-			if err := p.secondary.refreshRuntimeStateAfterApply(p.ctx, "fetch transaction batch", false); err != nil {
-				return err
+			p.secondary.invalidateAppliedStorageKeys(p.ctx, invalidateKeys)
+			if p.mutations != nil {
+				if err := p.mutations.recordFetchedChanges(appliedNormalEntries); err != nil {
+					return err
+				}
 			}
-		}
-		p.secondary.invalidateAppliedStorageKeys(p.ctx, invalidateKeys)
-		if p.mutations != nil {
-			if err := p.mutations.recordFetchedChanges(appliedNormalEntries); err != nil {
-				return err
-			}
+			break
 		}
 	}
 
@@ -5054,9 +5176,7 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 		if err := s.finalizeReconcileCheckpoint(checkpoint.CheckpointId, checkpoint.CommitIndex); err != nil {
 			return fmt.Errorf("range reconciliation finalize failed: %w", err)
 		}
-		if err := s.resetAndPersistFlatAccumulatorFromSet(ctx, localSet, checkpoint.CommitIndex); err != nil {
-			return fmt.Errorf("persist flat accumulator after phase-a match: %w", err)
-		}
+		s.persistReconcileOptimizerStateBestEffort(ctx, localSet, checkpoint.CommitIndex, "phase-a match")
 		s.reconcileBudgetRemainingByte.Store(int64(s.reconcileMaxRPCBytes))
 		s.reconcileCount.Add(1)
 		s.lastReconcileAt.Store(time.Now().Unix())
@@ -5112,10 +5232,15 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 	inflight := 0
 
 	mutationTracker := newDRReconciliationSetMutationTracker(s)
-	applyPipeline := newDRPutApplyPipeline(ctx, s, localSet.KIDToKey, s.markReconcileActivityNow, mutationTracker)
+	applyPipeline, err := newDRPutApplyPipeline(ctx, s, localSet.KIDToKey, s.markReconcileActivityNow, mutationTracker, false)
+	if err != nil {
+		workerCancel()
+		return wrapReconcileFailure(drReconcileFailureApplyFailed, "prepare range repair apply pipeline", err)
+	}
 	defer func() {
 		_ = applyPipeline.closeAndWait()
 	}()
+	appliedFetchedEntries := make([]*EntryChange, 0)
 	pendingDeletes := make(map[string]struct{})
 
 	for queue.Len() > 0 || inflight > 0 {
@@ -5166,6 +5291,7 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 				workerCancel()
 				return wrapReconcileFailure(drReconcileFailureApplyFailed, "queue fetched entries for apply", err)
 			}
+			appliedFetchedEntries = append(appliedFetchedEntries, res.fetchedEntries...)
 		}
 		// Range fetch streams primary-present entries; the worker also
 		// reports local-only keys so deletes are applied after puts settle.
@@ -5179,6 +5305,9 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 	s.setReconcilePhase(drReconcilePhaseApplyPuts)
 	if err := applyPipeline.closeAndWait(); err != nil {
 		return wrapReconcileFailure(drReconcileFailureStalled, "apply pipeline", err)
+	}
+	if err := mutationTracker.recordFetchedChanges(appliedFetchedEntries); err != nil {
+		return wrapReconcileFailure(drReconcileFailureApplyFailed, "record range repair fetched entries", err)
 	}
 	if len(pendingDeletes) > 0 {
 		s.setReconcilePhase(drReconcilePhaseApplyDeletes)
@@ -5200,9 +5329,7 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 		return fmt.Errorf("range reconciliation finalize failed: %w", err)
 	}
 	mutationTracker.applyToSet(localSet)
-	if err := s.resetAndPersistFlatAccumulatorFromSet(ctx, localSet, checkpoint.CommitIndex); err != nil {
-		return fmt.Errorf("persist flat accumulator after range repair: %w", err)
-	}
+	s.persistReconcileOptimizerStateBestEffort(ctx, localSet, checkpoint.CommitIndex, "range repair")
 	s.reconcileCount.Add(1)
 	s.lastReconcileAt.Store(time.Now().Unix())
 	s.logger.Info("range-first reconciliation complete",
@@ -5573,6 +5700,9 @@ func (s *drReplicationSecondary) applyRemovedKeysWithLocalKIDIndexMode(ctx conte
 	if len(filtered) == 0 {
 		return nil
 	}
+	if err := s.clearPersistedReconcileOptimizationState(ctx, preserveLocalKIDIndex); err != nil {
+		return err
+	}
 
 	// Batch deletes using transactions when supported, mirroring the
 	// batch PUT path in applyBatchTxn.
@@ -5588,28 +5718,40 @@ func (s *drReplicationSecondary) applyRemovedKeysWithLocalKIDIndexMode(ctx conte
 			}
 			batch := filtered[i:end]
 
-			tx, err := txnBackend.BeginTx(ctx)
-			if err != nil {
-				return fmt.Errorf("begin delete txn: %w", err)
-			}
-			if err := s.deletePersistedFlatAccumulator(ctx, tx); err != nil {
-				_ = tx.Rollback(ctx)
-				return fmt.Errorf("delete stale flat accumulator: %w", err)
-			}
-			if !preserveLocalKIDIndex {
-				if err := s.deletePersistedLocalKIDIndex(ctx, tx); err != nil {
-					_ = tx.Rollback(ctx)
-					return fmt.Errorf("delete stale local kid index: %w", err)
+			for attempt := 0; ; attempt++ {
+				if err := ctx.Err(); err != nil {
+					return err
 				}
-			}
-			for _, key := range batch {
-				if err := tx.Delete(ctx, key); err != nil {
-					_ = tx.Rollback(ctx)
-					return fmt.Errorf("batch txn delete %q: %w", key, err)
+				tx, err := txnBackend.BeginTx(ctx)
+				if err != nil {
+					return fmt.Errorf("begin delete txn: %w", err)
 				}
-			}
-			if err := tx.Commit(ctx); err != nil {
-				return fmt.Errorf("commit delete txn (%d keys): %w", len(batch), err)
+				for _, key := range batch {
+					if err := tx.Delete(ctx, key); err != nil {
+						_ = tx.Rollback(ctx)
+						return fmt.Errorf("batch txn delete %q: %w", key, err)
+					}
+				}
+				if err := tx.Commit(ctx); err != nil {
+					if errors.Is(err, physical.ErrTransactionCommitFailure) && attempt < drDefaultReconcileTxnCommitRetries {
+						s.logger.Debug("retrying DR reconcile delete transaction after commit conflict",
+							"keys", len(batch),
+							"attempt", attempt+1,
+							"max_attempts", drDefaultReconcileTxnCommitRetries,
+							"error", err)
+						delay := time.Duration(attempt+1) * drDefaultReconcileTxnCommitRetryDelay
+						timer := time.NewTimer(delay)
+						select {
+						case <-ctx.Done():
+							timer.Stop()
+							return ctx.Err()
+						case <-timer.C:
+						}
+						continue
+					}
+					return fmt.Errorf("commit delete txn (%d keys): %w", len(batch), err)
+				}
+				break
 			}
 		}
 		return nil
@@ -5618,14 +5760,6 @@ func (s *drReplicationSecondary) applyRemovedKeysWithLocalKIDIndexMode(ctx conte
 	// Fallback: sequential deletes.
 	failures := 0
 	examples := make([]string, 0, 5)
-	if err := s.deletePersistedFlatAccumulator(ctx, s.core.physical); err != nil {
-		return fmt.Errorf("delete stale flat accumulator: %w", err)
-	}
-	if !preserveLocalKIDIndex {
-		if err := s.deletePersistedLocalKIDIndex(ctx, s.core.physical); err != nil {
-			return fmt.Errorf("delete stale local kid index: %w", err)
-		}
-	}
 	for _, key := range filtered {
 		if err := s.core.physical.Delete(ctx, key); err != nil {
 			failures++
