@@ -51,6 +51,7 @@ Detailed design notes are split out of this RFC:
 Validation evidence and reproducibility live separately:
 
 - [DR_VALIDATION_RESULTS.md](DR_VALIDATION_RESULTS.md)
+- [DR_VALIDATION_RUNS.json](DR_VALIDATION_RUNS.json)
 - [DR_TEST_MATRIX.md](DR_TEST_MATRIX.md)
 - [DR_BUG_TRACKER.md](DR_BUG_TRACKER.md)
 
@@ -433,6 +434,7 @@ promoted-authority reseed, and engine/runtime lifecycle checks.
 Current validation summary:
 
 - [DR_VALIDATION_RESULTS.md](DR_VALIDATION_RESULTS.md)
+- [DR_VALIDATION_RUNS.json](DR_VALIDATION_RUNS.json)
 
 Current reproducibility matrix:
 

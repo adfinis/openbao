@@ -1,0 +1,266 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-06-01",
+  "purpose": "Curated DR replication validation evidence. This manifest intentionally references selected runs; it is not a latest-run index and is not a benchmark leaderboard.",
+  "artifact_schema": {
+    "dr_stress_run": [
+      "config.json",
+      "result.json",
+      "events.ndjson",
+      "writes.ndjson",
+      "status_timeline.ndjson",
+      "progress.log",
+      "verify-primary.json",
+      "verify-secondary1.json",
+      "verify-secondary2.json"
+    ],
+    "orchestrated_smoke": [
+      "orchestrator.log",
+      "before-*-status.json",
+      "after-*-status.json",
+      "final-*-status.json",
+      "harness.out",
+      "harness.err",
+      "scenario-specific artifacts"
+    ],
+    "matrix_run": [
+      "engine-matrix-summary.json",
+      "engine-lifecycle-summary.json",
+      "engine-specific output artifacts"
+    ]
+  },
+  "runs": [
+    {
+      "scenario_id": "S10",
+      "scenario": "HA steady-state soak",
+      "run_id": "drsoak-20260530T115719Z",
+      "path": "dr-stress-results/drsoak-20260530T115719Z",
+      "topology": "ha-primary-plus-two-secondaries",
+      "command_shape": "scripts/dr_local_test.sh --topology ha smoke --duration 7200 --concurrency 24 --put-percent 55 --get-primary-percent 25 --status-s1-percent 10 --status-s2-percent 10 --max-wait-seconds 600 --progress-interval 30 && verify --sample 0",
+      "result": "pass",
+      "duration_seconds": 7200,
+      "concurrency": 24,
+      "operations_total": 855321,
+      "operations_per_second": 118.7232998853605,
+      "put_fail": 0,
+      "get_fail": 0,
+      "status_fail": 0,
+      "events_dropped": 0,
+      "sentinel_converged": {
+        "secondary1_seconds": 1.0,
+        "secondary2_seconds": 1.0
+      },
+      "verification": {
+        "primary": { "pass": true, "sampled": 20024, "missing": 0, "mismatches": 0, "errors": 0 },
+        "secondary1": { "pass": true, "sampled": 20024, "missing": 0, "mismatches": 0, "errors": 0 },
+        "secondary2": { "pass": true, "sampled": 20024, "missing": 0, "mismatches": 0, "errors": 0 }
+      },
+      "notes": "Long steady-state correctness and convergence baseline. This run predates some later status counters, so it should not be used for current accumulator micro-metrics."
+    },
+    {
+      "scenario_id": "S14",
+      "scenario": "HA mixed load with primary handoff pressure",
+      "run_id": "drmixed-20260531T214747Z",
+      "path": "dr-stress-results/drmixed-20260531T214747Z",
+      "topology": "ha-primary-plus-two-secondaries",
+      "command_shape": "scripts/dr_local_test.sh --topology ha smoke --duration 900 --concurrency 48 --stepdown-interval 300 --progress-interval 30 --monitor-interval 5 && verify --sample 0",
+      "result": "pass_with_expected_client_transients",
+      "duration_seconds": 900,
+      "concurrency": 48,
+      "operations_total": 88023,
+      "operations_per_second": 97.2798595999527,
+      "put_fail": 382,
+      "get_fail": 210,
+      "status_fail": 0,
+      "events_dropped": 0,
+      "sentinel_converged": {
+        "secondary1_seconds": 1.001099292,
+        "secondary2_seconds": 1.002921084
+      },
+      "verification": {
+        "primary": { "pass": true, "sampled": 7744, "missing": 0, "mismatches": 0, "errors": 0 },
+        "secondary1": { "pass": true, "sampled": 7744, "missing": 0, "mismatches": 0, "errors": 0 },
+        "secondary2": { "pass": true, "sampled": 7744, "missing": 0, "mismatches": 0, "errors": 0 }
+      },
+      "notes": "Adversarial HA handoff load. Client-facing PUT/GET failures occurred during active movement; status, stream drops, sentinel convergence, and exhaustive verification remained clean."
+    },
+    {
+      "scenario_id": "S15",
+      "scenario": "HA indexed repair beyond journal horizon",
+      "run_id": "indexed-repair-20260531T224314Z",
+      "path": "dr-stress-results/indexed-repair-20260531T224314Z",
+      "topology": "ha-primary-plus-two-secondaries",
+      "command_shape": "scripts/dr_local_test.sh --topology ha indexed-repair-smoke",
+      "result": "pass_with_expected_client_transients",
+      "duration_seconds": 180,
+      "concurrency": 48,
+      "operations_total": 23680,
+      "operations_per_second": 118.13832361319677,
+      "put_fail": 0,
+      "get_fail": 15,
+      "status_fail": 0,
+      "events_dropped": 0,
+      "sentinel_converged": {
+        "secondary1_seconds": 17.0037605,
+        "secondary2_seconds": 1.002398083
+      },
+      "validation_counters": {
+        "primary_journal_range_too_old_total": 2,
+        "secondary1_reconcile_count_after": 2,
+        "secondary1_indexed_repair_total_after": 2,
+        "secondary1_indexed_repair_ranges_after": 1825,
+        "secondary1_local_kid_index_bucket_loads_after": 1773,
+        "secondary1_local_kid_index_entries_loaded_after": 9867,
+        "secondary1_local_kid_index_fallback_scans_after": 0,
+        "secondary1_full_bucket_fallback_after": 0,
+        "secondary1_indexed_proof_mismatches_after": 0,
+        "secondary1_local_kid_index_load_failures_after": 0
+      },
+      "verification": {
+        "primary": { "pass": true, "sampled": 3261, "missing": 0, "mismatches": 0, "errors": 0 },
+        "secondary1": { "pass": true, "sampled": 3261, "missing": 0, "mismatches": 0, "errors": 0 },
+        "secondary2": { "pass": true, "sampled": 3261, "missing": 0, "mismatches": 0, "errors": 0 }
+      },
+      "notes": "Current representative run for indexed-bucket reconciliation. The earlier 15-minute stepdown-only indexed smoke is intentionally excluded because it stayed within journal replay and did not exercise indexed repair."
+    },
+    {
+      "scenario_id": "S16",
+      "scenario": "HA secondary outage within journal horizon",
+      "run_id": "secondary-outage-20260531T211438Z",
+      "path": "dr-stress-results/secondary-outage-20260531T211438Z",
+      "topology": "ha-primary-plus-two-secondaries",
+      "command_shape": "scripts/dr_local_test.sh --topology ha secondary-outage-smoke --duration 120 --concurrency 32 --outage-after 20 --outage-seconds 40 --progress-interval 10 --monitor-interval 2",
+      "result": "pass_with_expected_client_transients",
+      "duration_seconds": 120,
+      "concurrency": 32,
+      "operations_total": 14292,
+      "operations_per_second": 115.12715380091993,
+      "put_fail": 0,
+      "get_fail": 7,
+      "status_fail": 0,
+      "events_dropped": 0,
+      "sentinel_converged": {
+        "secondary1_seconds": 1.0,
+        "secondary2_seconds": 1.0
+      },
+      "validation_counters": {
+        "secondary1_reconcile_count_after": 0,
+        "secondary1_flat_accumulator_cursor_index_after": 10242,
+        "secondary1_local_kid_index_fallback_scans_after": 0,
+        "primary_journal_range_too_old_total_after": 0
+      },
+      "verification": {
+        "primary": { "pass": true, "sampled": 2143, "missing": 0, "mismatches": 0, "errors": 0 },
+        "secondary1": { "pass": true, "sampled": 2143, "missing": 0, "mismatches": 0, "errors": 0 },
+        "secondary2": { "pass": true, "sampled": 2143, "missing": 0, "mismatches": 0, "errors": 0 }
+      },
+      "notes": "Representative replay catch-up run. Secondary #1 restarted before the primary journal horizon expired and recovered without reconciliation."
+    },
+    {
+      "scenario_id": "S13",
+      "scenario": "HA accumulator cold restart",
+      "run_id": "accumulator-cold-restart-20260531T205052Z",
+      "path": "dr-stress-results/accumulator-cold-restart-20260531T205052Z",
+      "topology": "ha-primary-plus-two-secondaries",
+      "command_shape": "scripts/dr_local_test.sh --topology ha accumulator-cold-restart-smoke",
+      "result": "pass",
+      "duration_seconds": null,
+      "concurrency": null,
+      "validation_counters": {
+        "secondary1_last_applied_before": 56113,
+        "secondary1_last_applied_after": 56113,
+        "secondary1_flat_accumulator_cursor_after": 56113,
+        "secondary1_flat_accumulator_snapshot_after": 56113,
+        "secondary1_reconcile_count_after": 0,
+        "secondary1_scan_failures_after": 0,
+        "secondary1_local_kid_index_fallback_scans_after": 0,
+        "secondary1_full_bucket_fallback_after": 0,
+        "secondary1_indexed_proof_mismatches_after": 0
+      },
+      "notes": "Confirms persisted flat accumulator reload after full secondary #1 restart. This is an orchestrated smoke, not a workload throughput artifact."
+    },
+    {
+      "scenario_id": "S12",
+      "scenario": "HA quiescent reconnect",
+      "run_id": "quiescent-reconnect-20260531T204826Z",
+      "path": "dr-stress-results/quiescent-reconnect-20260531T204826Z",
+      "topology": "ha-primary-plus-two-secondaries",
+      "command_shape": "scripts/dr_local_test.sh --topology ha quiescent-reconnect-smoke",
+      "result": "pass",
+      "duration_seconds": null,
+      "concurrency": null,
+      "validation_counters": {
+        "primary_active_before": "http://localhost:8800",
+        "primary_active_after": "http://localhost:8802",
+        "secondary1_reconcile_count_before": 2,
+        "secondary1_reconcile_count_after": 2,
+        "secondary1_lag_entries_after": 0,
+        "secondary2_lag_entries_after": 0
+      },
+      "notes": "Confirms active handoff under quiescent conditions does not force scanned reconciliation."
+    },
+    {
+      "scenario_id": "E15",
+      "scenario": "Engine/runtime lifecycle matrix",
+      "run_id": "engine-matrix-20260530161139",
+      "path": "dr-stress-results/engine-matrix-20260530161139",
+      "topology": "ha-primary-plus-two-secondaries",
+      "command_shape": "scripts/dr_local_test.sh --topology ha engine-lifecycle-matrix",
+      "result": "pass",
+      "coverage": {
+        "namespaces": true,
+        "secret_engines": ["kv-v2", "kv-v1", "transit", "pki", "ssh", "totp", "database"],
+        "auth_engines": ["userpass", "approle", "cert", "jwt"],
+        "identity": true,
+        "token_roles": true,
+        "policy": true,
+        "lifecycle_checks": ["pre_failover_primary_and_secondaries", "promoted_secondary1_after_failover", "secondary2_after_promoted_reseed"]
+      },
+      "notes": "Current representative broad runtime feature parity check."
+    },
+    {
+      "scenario_id": "E12",
+      "scenario": "Failover under load lifecycle",
+      "run_id": "failover-load-20260530T114237Z",
+      "path": "dr-stress-results/failover-load-20260530T114237Z",
+      "topology": "ha-primary-plus-two-secondaries",
+      "command_shape": "scripts/dr_local_test.sh --topology ha failover-load-lifecycle",
+      "result": "pass_with_expected_primary_loss",
+      "duration_seconds": 150,
+      "concurrency": 48,
+      "operations_total": 24009,
+      "operations_per_second": 149.59251320905193,
+      "put_fail": 6963,
+      "get_fail": 2046,
+      "status_fail": 0,
+      "events_dropped": 0,
+      "promotion": {
+        "promotion_class": "forced",
+        "forced_promotion_requires_acknowledgement": true,
+        "data_loss_accepted": true,
+        "estimated_data_loss_entries": 0,
+        "estimated_data_loss_entries_basis": "observed_primary_applied_index_gap"
+      },
+      "verification": {
+        "promoted_secondary1": { "pass": true, "sampled": 1946, "missing": 0, "mismatches": 0, "errors": 0, "uncertain_missing": 127 }
+      },
+      "followups": [
+        "dr-stress-results/promoted-durability-20260530T114539Z-after-load.log",
+        "dr-stress-results/reseed-secondary-20260530T114612Z-after-load.log"
+      ],
+      "notes": "Hard-stops the old primary mid-run. Client failures are expected after the authority is removed; the evidence is promotion semantics, promoted-cluster verification, durability, and reseed behavior."
+    }
+  ],
+  "historical_non_representative_runs": [
+    {
+      "run_id": "drmixed-indexed-repair-20260531T222252Z",
+      "path": "dr-stress-results/drmixed-indexed-repair-20260531T222252Z",
+      "reason": "This 15-minute HA stepdown-only run was DR-correct but did not exercise indexed repair because journal replay succeeded. It is useful as a replay/HA datapoint, not as indexed-repair evidence."
+    },
+    {
+      "run_id": "drmixed-20260531T145022Z",
+      "path": "dr-stress-results/drmixed-20260531T145022Z",
+      "reason": "Historical proof-mismatch fallback run from before the current indexed-repair hardening. Keep as regression context, not as the current expected indexed-repair behavior."
+    }
+  ]
+}

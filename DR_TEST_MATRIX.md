@@ -4,7 +4,7 @@ This matrix defines manual and automated validation for DR replication in this r
 
 ## Scope
 
-- Unit and integration tests under `/Users/roelc/projects/secretz/openbao`.
+- Unit and integration tests under the repository root.
 - End-to-end validation against a local multi-cluster Docker test environment.
 - Failure-path checks: reconnect/reconcile, revoke, failover, and sustained load.
 
@@ -52,7 +52,7 @@ flowchart TD
 
 ## Environment Assumptions
 
-- OpenBao repo root: `/Users/roelc/projects/secretz/openbao`
+- Run commands from the OpenBao repository root.
 - Tools available: `docker`, `jq`, `bao`, `rg`.
 - Local compose topology: `docker-compose.dr-test.yml`
 - Local HA compose topology: `docker-compose.dr-ha-test.yml`
@@ -109,7 +109,7 @@ go test ./... -run '^$' -count=1
 Set shell environment:
 
 ```bash
-OPENBAO_REPO_DIR="/Users/roelc/projects/secretz/openbao"
+OPENBAO_REPO_DIR="${OPENBAO_REPO_DIR:-$(pwd)}"
 DR_RESULTS_DIR="$OPENBAO_REPO_DIR/dr-stress-results"
 cd "$OPENBAO_REPO_DIR"
 ```
@@ -272,7 +272,7 @@ docker logs --since=10m bao-primary-1 | rg 'dr-replication|checkpoint|change str
 ## 5. Stress Test Matrix
 
 Use `scripts/dr_local_test.sh` for local compose runs. Lower-level stress
-scripts remain available under `/Users/roelc/projects/secretz/openbao/scripts`.
+scripts remain available under `scripts/`.
 
 | ID | Profile | Command Flags | Goal | Pass Criteria |
 |---|---|---|---|---|
@@ -338,204 +338,15 @@ Repo-local HA accumulator cold restart:
 scripts/dr_local_test.sh --topology ha accumulator-cold-restart-smoke
 ```
 
-Latest observed quiescent reconnect run:
-`/Users/roelc/projects/secretz/openbao/dr-stress-results/quiescent-reconnect-20260531T204826Z`.
-It ran against the post-15-minute HA stress topology, forced an active primary
-handoff from `http://localhost:8800` to `http://localhost:8802`, and both
-secondaries returned to `streaming` with `lag_entries=0` without increasing
-`reconcile_count`.
-
-Latest observed cold restart run:
-`/Users/roelc/projects/secretz/openbao/dr-stress-results/accumulator-cold-restart-20260531T205052Z`.
-It ran against the same post-stress topology. Secondary #1 restarted from
-pre-restart `last_applied_index=56113`, restored
-`flat_accumulator_cursor_index=56113` and
-`flat_accumulator_snapshot_index=56113`, observed the accumulator restart log,
-reported no scan failures, no local KID-index fallback scans, no full-bucket
-fallback, and no indexed proof mismatches, and both secondaries returned to
-`streaming` with `lag_entries=0`.
-
-Latest observed secondary outage run:
-`/Users/roelc/projects/secretz/openbao/dr-stress-results/secondary-outage-20260531T211438Z`.
-The run stopped all secondary #1 nodes for a configured 40-second outage while
-32 workers continued writing to primary. Secondary #1 came back with active node
-`http://localhost:8904`, caught up through stream replay, and both secondaries
-converged in 1.0s/1.0s with final `last_applied_index=primary_index=10242`.
-The workload completed 14,292 operations at 115.13 ops/s with zero PUT failures,
-zero status failures, and zero dropped stress events; the 7 GET failures were
-client-facing transient reads during disruption and did not produce replicated
-data divergence.
-
-The outage run ended with secondary #1 `reconcile_count=0`,
-`flat_accumulator_cursor_index=10242`, `flat_accumulator_snapshot_index=10184`,
-no scan failures, no local KID-index fallback scans, no full-bucket indexed
-repair fallback, no indexed proof mismatches, and no primary
-`journal_range_too_old_total` increment. Exhaustive verification passed on
-primary, secondary1, and secondary2 across 2,143 truth-log keys with zero
-missing keys, mismatches, or read errors.
-
-Latest observed out-of-horizon secondary outage run:
-`/Users/roelc/projects/secretz/openbao/dr-stress-results/secondary-outage-reconcile-20260531T213024Z`.
-The run applied the `out-of-horizon` tuning profile
-(`stream_buffer_max_entries=1024`, `stream_journal_max_bytes=262144`,
-`stream_journal_segment_bytes=32768`, retention 30s), stopped all secondary #1
-nodes for 90 seconds, and kept 48 workers writing to primary. The primary
-reported `journal_range_too_old_total=4`, secondary #1 ran reconciliation
-(`reconcile_count=4`) and returned to `streaming` with
-`last_applied_index=primary_index=14954`; sentinel convergence was 6.0s/1.0s.
-
-Secondary #1 repaired via indexed accumulator reconciliation:
-`flat_accumulator_indexed_repair_total=4`,
-`flat_accumulator_indexed_repair_ranges_total=3288`,
-`flat_accumulator_cursor_index=14954`,
-`flat_accumulator_snapshot_index=14869`, with no scan failures, no local
-KID-index fallback scans, no full-bucket fallback, and no indexed proof
-mismatches. The workload completed 21,333 operations at 112.51 ops/s with zero
-PUT failures, zero status failures, and zero dropped stress events; 7
-client-facing GET failures occurred during the disruption window. Exhaustive
-verification passed on primary, secondary1, and secondary2 across 2,972
-truth-log keys with zero missing keys, mismatches, or read errors.
-
-Latest observed hot-key coalescing run: `/Users/roelc/projects/secretz/openbao/dr-stress-results/drmixed-20260531T112327Z`.
-The run completed 44,930 operations at 145.57 ops/s, had zero status failures,
-zero journal drops, 4.0s/1.0s sentinel convergence, final `lag_entries=0`, and
-exhaustive verification passed on primary, secondary1, and secondary2 across
-4,544 truth-log keys with zero missing keys, mismatches, or read errors.
-Client-facing transient failures (`put_fail=291`, `get_fail=186`) occurred
-during forced HA handoffs and did not produce replicated data divergence.
-
-The status timeline recorded max secondary lag of 668/668, stream-buffer
-high-water mark of 44,460 entries, and maximum horizon of 247s. Final secondary
-status recorded 6,940/6,970 stream transactions, 64,303/64,666 logical stream
-entries, 64,280/64,639 materialized physical entries,
-`stream_txn_coalesced_entries_total=23/27`, average transaction size of
-9.27/9.28 entries, and max transaction size of 256 entries. Max-wait flushes
-dominated (6,947/6,976), max-entry flushes were rare (1/1), and max-byte
-flushes were not observed. Cursor writes tracked the transaction path
-(6,955/6,983), while full flat-accumulator snapshots dropped to 64/63 with
-6,891/6,920 skipped snapshots. Apply work averaged 0.14/0.14ms per transaction,
-commit averaged 36.51/36.51ms, and persisted snapshots averaged about 44.1 KiB.
-
-Latest observed local KID-index fallback run: `/Users/roelc/projects/secretz/openbao/dr-stress-results/drmixed-20260531T145022Z`.
-The run completed 107,870 operations at 119.08 ops/s over 15 minutes with
-48 workers and primary stepdowns every 300 seconds. It had zero status failures,
-zero stream drops, 1.0s/1.0s sentinel convergence, final `lag_entries=0`, and
-exhaustive verification passed on primary, secondary1, and secondary2 across
-9,104 truth-log keys with zero missing keys, mismatches, or read errors.
-Client-facing transient failures (`put_fail=338`, `get_fail=203`) occurred
-during forced HA disruption and did not produce replicated data divergence.
-
-This run explicitly exercised indexed-bucket repair proof mismatch fallback:
-secondary2 reported `range=5 local_count=16 remote_count=17`, secondary1
-reported `range=158 local_count=22 remote_count=23`, both invalidated the
-indexed optimizer path, fell back to full local scan, and ended in
-`secondary_state=streaming` with `reconcile_phase=idle`.
-
-Latest observed HA journal catch-up rerun after the empty-buffer leader-handoff
-fix: `/Users/roelc/projects/secretz/openbao/dr-stress-results/drmixed-20260531T155536Z`.
-The run completed 40,147 operations at 126.26 ops/s over 5 minutes with
-48 workers and primary stepdowns every 100 seconds. It had zero status failures,
-zero stream drops, 1.0s/13.0s sentinel convergence, and exhaustive verification
-passed on primary, secondary1, and secondary2 across 4,202 truth-log keys with
-zero missing keys, mismatches, or read errors. Client-facing transient failures
-(`put_fail=94`, `get_fail=106`) occurred during forced HA disruption and did not
-produce replicated data divergence.
-
-The rerun validated that a new active primary can replay follower-maintained
-journal entries even when its in-memory stream buffer starts empty. Secondary2
-also recorded one indexed repair proof mismatch, invalidated the indexed fast
-path with reason `indexed_repair_proof_mismatch`, fell back to a full local
-scan, and converged cleanly.
-
-Latest observed batch-local max-wait run:
-`/Users/roelc/projects/secretz/openbao/dr-stress-results/drmixed-20260531T163224Z`.
-The run used the same 5-minute HA hard-smoke shape with 48 workers and primary
-stepdowns every 100 seconds. It completed 36,033 operations at 114.54 ops/s,
-had zero status failures and zero dropped stress events, converged sentinels in
-7.0s/3.0s, and exhaustive verification passed on primary, secondary1, and
-secondary2 across 3,709 truth-log keys with zero missing keys, mismatches, or
-read errors. Client-facing transient failures (`put_fail=291`, `get_fail=190`)
-occurred during forced HA disruption and did not produce replicated data
-divergence.
-
-Compared with `drmixed-20260531T155536Z`, this run processed 10.2% fewer total
-operations but reduced secondary stream transaction batches by 30.1%/29.3% and
-increased average entries per transaction by 26.3%/23.8%. Both secondaries ended
-`streaming` with `lag_entries=0`; each recorded one indexed repair proof
-mismatch and took the fail-closed local-scan fallback.
-
-Controlled no-stepdown stream apply tuning comparison:
-
-- Historical default 10ms wait: `/Users/roelc/projects/secretz/openbao/dr-stress-results/drmixed-20260531T164804Z`.
-  The run completed 37,920 operations at 124.21 ops/s with zero put/status
-  failures, 26 get misses, 1.0s/1.0s sentinel convergence, no dropped stress
-  events, and exhaustive verification passed on primary, secondary1, and
-  secondary2 across 3,999 truth-log keys. Final secondary stream transactions
-  averaged 12.09/12.05 entries with 51.45ms/51.37ms average commit time.
-- Tuned 25ms wait: `/Users/roelc/projects/secretz/openbao/dr-stress-results/drmixed-20260531T165458Z`.
-  The run completed 43,860 operations at 144.01 ops/s with zero put/status
-  failures, 26 get misses, 1.0s/1.0s sentinel convergence, no dropped stress
-  events, and exhaustive verification passed on primary, secondary1, and
-  secondary2 across 4,556 truth-log keys. Final secondary stream transactions
-  averaged 12.63/12.62 entries with 44.41ms/44.29ms average commit time.
-
-The 25ms wait-only tuning processed 15.7% more operations and 17.2% more stream
-entries while lowering average commit time by about 13.7% and total measured
-commit time by about 3.2%/3.5%. Neither run flushed due to the 256-entry cap, so
-raising `stream_batch_max_entries` is not the next tuning target for this
-profile. The prototype default moved to 25ms while leaving the entry and byte
-caps unchanged. Both runs filled the primary in-memory stream ring to its 50k
-retained entry cap without dropping stress events; journal horizon sizing
-remains a separate reconnect-retention concern.
-
-Latest observed 1-hour no-stepdown steady-state run with the 25ms wait:
-`/Users/roelc/projects/secretz/openbao/dr-stress-results/drmixed-20260531T170624Z`.
-The run completed 410,078 operations at 113.75 ops/s with zero put, get, or
-status failures, zero dropped stress events, and 1.0s/1.0s sentinel convergence.
-Exhaustive verification passed on primary, secondary1, and secondary2 across
-18,127 truth-log keys with zero missing keys, mismatches, or read errors. The
-primary in-memory stream ring stayed full at p50/p90/p99/max 50,000 entries,
-but no stream drops were observed. The stream-buffer horizon ranged from 162s to
-595s, with p50 287s, p90 398s, and p99 519s. Secondary lag remained bounded:
-secondary1 max lag 20 entries with p99 4, and secondary2 max lag 231 entries
-with p99 22. Final secondary stream transactions averaged 13.35/13.34 entries
-and 61.40ms/61.40ms commit time. Live primary journal status after the run
-reported about 886 MiB retained across 14 segments, `journal_range_too_old_total=0`,
-backpressure `healthy`, and zero backpressure rejections.
-
-Latest observed 15-minute HA hard smoke with the compiled 25ms default:
-`/Users/roelc/projects/secretz/openbao/dr-stress-results/drmixed-20260531T182008Z`.
-The run used 48 workers and primary stepdowns every 300 seconds. It completed
-109,998 operations at 121.57 ops/s, had zero status failures, zero dropped
-stress events, and 1.0s/1.0s sentinel convergence. Exhaustive verification
-passed on primary, secondary1, and secondary2 across 9,182 truth-log keys with
-zero missing keys, mismatches, or read errors. Client-facing transient failures
-(`put_fail=290`, `get_fail=177`) occurred during forced HA disruption and did
-not produce replicated data divergence.
-
-Compared with the earlier 15-minute HA hard smoke
-`drmixed-20260531T145022Z`, this run processed about 2.0% more operations and
-reduced client-facing transient failures. Secondary stream transaction batches
-dropped by 35.7%/35.8%, average entries per stream transaction rose from about
-10.7 to about 17.0, and total measured stream commit time dropped by
-26.1%/26.5%, despite average commit time rising to 58.58ms/59.05ms because
-each transaction carried more entries. Both secondaries reconciled twice,
-recorded one indexed-repair proof mismatch, took the fail-closed local-scan
-fallback once, and ended `streaming` with `lag_entries=0`.
-
-The status timeline recorded p50 stream-buffer occupancy of 27,766 entries,
-p90/p99/max occupancy at the 50,000-entry in-memory ring cap, maximum
-stream-buffer horizon of 491s, and p99 horizon of 432s. Secondary lag was low
-outside reconcile windows: p90 lag was 3/4 entries, while p99 lag rose to
-1,740/1,620 entries during the bounded reconcile periods. Live primary journal
-status after the run reported about 212 MiB retained across 4 segments,
-`journal_range_too_old_total=0`, backpressure `healthy`, zero backpressure
-rejections, and two active stream subscribers.
+Curated validation evidence lives in [DR_VALIDATION_RESULTS.md](DR_VALIDATION_RESULTS.md)
+and [DR_VALIDATION_RUNS.json](DR_VALIDATION_RUNS.json). Keep this matrix focused
+on scenario coverage and pass criteria; do not add "latest observed" result
+claims here.
 
 Single secondary:
 
 ```bash
-bash /Users/roelc/projects/secretz/openbao/scripts/dr_stress_test.sh run \
+bash scripts/dr_stress_test.sh run \
   --primary-addr "$DR_PRIMARY_ADDR" \
   --primary-token "$DR_PRIMARY_TOKEN" \
   --secondary-addr "$DR_SECONDARY1_ADDR" \
@@ -549,7 +360,7 @@ bash /Users/roelc/projects/secretz/openbao/scripts/dr_stress_test.sh run \
 Dual secondary:
 
 ```bash
-bash /Users/roelc/projects/secretz/openbao/scripts/dr_stress_dual_secondary.sh run \
+bash scripts/dr_stress_dual_secondary.sh run \
   --primary-addr "$DR_PRIMARY_ADDR" \
   --primary-token "$DR_PRIMARY_TOKEN" \
   --secondary1-addr "$DR_SECONDARY1_ADDR" \
@@ -568,9 +379,9 @@ bash /Users/roelc/projects/secretz/openbao/scripts/dr_stress_dual_secondary.sh r
 Analyze all runs:
 
 ```bash
-bash /Users/roelc/projects/secretz/openbao/scripts/dr_stress_test.sh analyze --output-dir "$DR_RESULTS_DIR"
-bash /Users/roelc/projects/secretz/openbao/scripts/dr_stress_dual_secondary.sh analyze --output-dir "$DR_RESULTS_DIR"
-bash /Users/roelc/projects/secretz/openbao/scripts/dr_stress_mixed_workload.sh analyze --output-dir "$DR_RESULTS_DIR"
+bash scripts/dr_stress_test.sh analyze --output-dir "$DR_RESULTS_DIR"
+bash scripts/dr_stress_dual_secondary.sh analyze --output-dir "$DR_RESULTS_DIR"
+bash scripts/dr_stress_mixed_workload.sh analyze --output-dir "$DR_RESULTS_DIR"
 ```
 
 Quick convergence signal check:
@@ -583,7 +394,7 @@ BAO_ADDR="$DR_SECONDARY1_ADDR" BAO_TOKEN="$DR_PRIMARY_TOKEN" bao read -format=js
 Mixed workload example:
 
 ```bash
-bash /Users/roelc/projects/secretz/openbao/scripts/dr_stress_mixed_workload.sh run \
+bash scripts/dr_stress_mixed_workload.sh run \
   --primary-addr "$DR_PRIMARY_ADDR" \
   --primary-token "$DR_PRIMARY_TOKEN" \
   --secondary1-addr "$DR_SECONDARY1_ADDR" \
