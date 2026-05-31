@@ -39,7 +39,7 @@ Usage:
   scripts/dr_local_test.sh --topology ha accumulator-cold-restart-smoke [--no-reset] [--build] [--stop-seconds N]
   scripts/dr_local_test.sh --topology ha secondary-outage-smoke [--duration N] [--concurrency N] [--outage-after N] [--outage-seconds N] [--no-reset] [--build]
   scripts/dr_local_test.sh --topology ha secondary-outage-reconcile-smoke [--duration N] [--concurrency N] [--outage-after N] [--outage-seconds N] [--no-reset] [--build]
-  scripts/dr_local_test.sh --topology ha indexed-repair-smoke [--duration N] [--concurrency N] [--stepdown-interval N] [--no-reset] [--build]
+  scripts/dr_local_test.sh --topology ha indexed-repair-smoke [--duration N] [--concurrency N] [--outage-after N] [--outage-seconds N] [--no-reset] [--build]
   scripts/dr_local_test.sh --topology ha tuning-load-smoke [--duration N] [--concurrency N] [--no-reset]
   scripts/dr_local_test.sh --topology ha failover-load-lifecycle [--duration N] [--concurrency N] [--hard-stop-after N] [--no-reset]
   scripts/dr_local_test.sh [--topology single|ha] down
@@ -381,15 +381,6 @@ dr_uint_field_from_file() {
   local value
   value="$(jq -r --arg field "$field" '.data[$field] // 0' "$file")"
   [[ "$value" =~ ^[0-9]+$ ]] || die "invalid ${field} in ${file}: ${value}"
-  printf "%s" "$value"
-}
-
-dr_sum_uint_field_from_files() {
-  local field="$1"
-  shift
-  local value
-  value="$(jq -s --arg field "$field" '[.[].data[$field] // 0] | add' "$@")"
-  [[ "$value" =~ ^[0-9]+$ ]] || die "invalid ${field} sum: ${value}"
   printf "%s" "$value"
 }
 
@@ -2297,8 +2288,10 @@ cmd_secondary_outage_smoke() {
   ensure_dr_stress
 
   local run_id run_dir stress_pid stress_rc restart_since primary_active secondary1_active secondary2_active secondary1_addrs_csv secondary2_addrs_csv
-  local before_last before_reconcile before_scan_failures before_local_kid_fallback before_full_bucket before_proof_mismatch before_range_too_old
-  local after_last after_reconcile after_cursor after_snapshot after_scan_failures after_local_kid_fallback after_full_bucket after_proof_mismatch after_range_too_old
+  local before_last before_reconcile before_scan_failures before_local_kid_fallback before_full_bucket before_proof_mismatch before_load_failures before_range_too_old
+  local before_indexed_repair before_indexed_ranges before_bucket_loads before_entries_loaded
+  local after_last after_reconcile after_cursor after_snapshot after_scan_failures after_local_kid_fallback after_full_bucket after_proof_mismatch after_load_failures after_range_too_old
+  local after_indexed_repair after_indexed_ranges after_bucket_loads after_entries_loaded
   local services=(secondary1-1 secondary1-2 secondary1-3)
 
   run_id="${run_prefix}-$(date -u +%Y%m%dT%H%M%SZ)"
@@ -2343,6 +2336,11 @@ cmd_secondary_outage_smoke() {
   before_local_kid_fallback="$(dr_uint_field_from_file "$run_dir/before-secondary1-status.json" "local_kid_index_fallback_scans_total")"
   before_full_bucket="$(dr_uint_field_from_file "$run_dir/before-secondary1-status.json" "flat_accumulator_indexed_repair_full_bucket_fallback_total")"
   before_proof_mismatch="$(dr_uint_field_from_file "$run_dir/before-secondary1-status.json" "flat_accumulator_indexed_repair_proof_mismatches_total")"
+  before_load_failures="$(dr_uint_field_from_file "$run_dir/before-secondary1-status.json" "local_kid_index_load_failures_total")"
+  before_indexed_repair="$(dr_uint_field_from_file "$run_dir/before-secondary1-status.json" "flat_accumulator_indexed_repair_total")"
+  before_indexed_ranges="$(dr_uint_field_from_file "$run_dir/before-secondary1-status.json" "flat_accumulator_indexed_repair_ranges_total")"
+  before_bucket_loads="$(dr_uint_field_from_file "$run_dir/before-secondary1-status.json" "local_kid_index_bucket_loads_total")"
+  before_entries_loaded="$(dr_uint_field_from_file "$run_dir/before-secondary1-status.json" "local_kid_index_entries_loaded_total")"
   before_range_too_old="$(dr_uint_field_from_file "$run_dir/before-primary-status.json" "journal_range_too_old_total")"
   echo "last_applied_before_secondary1=${before_last}" | tee -a "$run_dir/orchestrator.log"
   echo "reconcile_count_before_secondary1=${before_reconcile}" | tee -a "$run_dir/orchestrator.log"
@@ -2350,6 +2348,11 @@ cmd_secondary_outage_smoke() {
   echo "local_kid_index_fallback_scans_before_secondary1=${before_local_kid_fallback}" | tee -a "$run_dir/orchestrator.log"
   echo "full_bucket_fallback_before_secondary1=${before_full_bucket}" | tee -a "$run_dir/orchestrator.log"
   echo "indexed_proof_mismatch_before_secondary1=${before_proof_mismatch}" | tee -a "$run_dir/orchestrator.log"
+  echo "local_kid_index_load_failures_before_secondary1=${before_load_failures}" | tee -a "$run_dir/orchestrator.log"
+  echo "indexed_repair_before_secondary1=${before_indexed_repair}" | tee -a "$run_dir/orchestrator.log"
+  echo "indexed_repair_ranges_before_secondary1=${before_indexed_ranges}" | tee -a "$run_dir/orchestrator.log"
+  echo "local_kid_index_bucket_loads_before_secondary1=${before_bucket_loads}" | tee -a "$run_dir/orchestrator.log"
+  echo "local_kid_index_entries_loaded_before_secondary1=${before_entries_loaded}" | tee -a "$run_dir/orchestrator.log"
   echo "journal_range_too_old_before_primary=${before_range_too_old}" | tee -a "$run_dir/orchestrator.log"
 
   "$DR_STRESS_BIN" run \
@@ -2417,6 +2420,11 @@ cmd_secondary_outage_smoke() {
   after_local_kid_fallback="$(dr_uint_field_from_file "$run_dir/after-secondary1-status.json" "local_kid_index_fallback_scans_total")"
   after_full_bucket="$(dr_uint_field_from_file "$run_dir/after-secondary1-status.json" "flat_accumulator_indexed_repair_full_bucket_fallback_total")"
   after_proof_mismatch="$(dr_uint_field_from_file "$run_dir/after-secondary1-status.json" "flat_accumulator_indexed_repair_proof_mismatches_total")"
+  after_load_failures="$(dr_uint_field_from_file "$run_dir/after-secondary1-status.json" "local_kid_index_load_failures_total")"
+  after_indexed_repair="$(dr_uint_field_from_file "$run_dir/after-secondary1-status.json" "flat_accumulator_indexed_repair_total")"
+  after_indexed_ranges="$(dr_uint_field_from_file "$run_dir/after-secondary1-status.json" "flat_accumulator_indexed_repair_ranges_total")"
+  after_bucket_loads="$(dr_uint_field_from_file "$run_dir/after-secondary1-status.json" "local_kid_index_bucket_loads_total")"
+  after_entries_loaded="$(dr_uint_field_from_file "$run_dir/after-secondary1-status.json" "local_kid_index_entries_loaded_total")"
   after_range_too_old="$(dr_uint_field_from_file "$run_dir/after-primary-status.json" "journal_range_too_old_total")"
   echo "last_applied_after_secondary1=${after_last}" | tee -a "$run_dir/orchestrator.log"
   echo "reconcile_count_after_secondary1=${after_reconcile}" | tee -a "$run_dir/orchestrator.log"
@@ -2426,6 +2434,11 @@ cmd_secondary_outage_smoke() {
   echo "local_kid_index_fallback_scans_after_secondary1=${after_local_kid_fallback}" | tee -a "$run_dir/orchestrator.log"
   echo "full_bucket_fallback_after_secondary1=${after_full_bucket}" | tee -a "$run_dir/orchestrator.log"
   echo "indexed_proof_mismatch_after_secondary1=${after_proof_mismatch}" | tee -a "$run_dir/orchestrator.log"
+  echo "local_kid_index_load_failures_after_secondary1=${after_load_failures}" | tee -a "$run_dir/orchestrator.log"
+  echo "indexed_repair_after_secondary1=${after_indexed_repair}" | tee -a "$run_dir/orchestrator.log"
+  echo "indexed_repair_ranges_after_secondary1=${after_indexed_ranges}" | tee -a "$run_dir/orchestrator.log"
+  echo "local_kid_index_bucket_loads_after_secondary1=${after_bucket_loads}" | tee -a "$run_dir/orchestrator.log"
+  echo "local_kid_index_entries_loaded_after_secondary1=${after_entries_loaded}" | tee -a "$run_dir/orchestrator.log"
   echo "journal_range_too_old_after_primary=${after_range_too_old}" | tee -a "$run_dir/orchestrator.log"
 
   if (( after_last < before_last )); then
@@ -2434,12 +2447,12 @@ cmd_secondary_outage_smoke() {
   if (( after_cursor < before_last )); then
     die "secondary1 flat accumulator cursor did not cover the pre-outage applied index: cursor=${after_cursor}, before=${before_last}"
   fi
-  if (( after_scan_failures != 0 )); then
-    die "secondary1 reported scan failures after outage: ${after_scan_failures}"
+  if (( after_scan_failures > before_scan_failures )); then
+    die "secondary1 reported new scan failures after outage: ${before_scan_failures} -> ${after_scan_failures}"
   fi
   if [[ "$expect_reconcile" == "true" ]]; then
-    if (( after_reconcile == 0 )); then
-      die "secondary1 did not run reconciliation after out-of-horizon outage"
+    if (( after_reconcile <= before_reconcile )); then
+      die "secondary1 did not run reconciliation after out-of-horizon outage: ${before_reconcile} -> ${after_reconcile}"
     fi
     if (( after_range_too_old <= before_range_too_old )); then
       die "primary did not report journal range too old during out-of-horizon outage: ${before_range_too_old} -> ${after_range_too_old}"
@@ -2447,18 +2460,45 @@ cmd_secondary_outage_smoke() {
     if (( after_cursor < after_last )); then
       die "secondary1 flat accumulator cursor did not cover final applied index after reconciliation: cursor=${after_cursor}, applied=${after_last}"
     fi
+    if (( after_indexed_repair <= before_indexed_repair )); then
+      die "secondary1 did not use indexed repair during out-of-horizon reconciliation: ${before_indexed_repair} -> ${after_indexed_repair}"
+    fi
+    if (( after_indexed_ranges <= before_indexed_ranges )); then
+      die "secondary1 indexed repair did not process any ranges: ${before_indexed_ranges} -> ${after_indexed_ranges}"
+    fi
+    if (( after_bucket_loads <= before_bucket_loads )); then
+      die "secondary1 local KID index did not load any repair buckets: ${before_bucket_loads} -> ${after_bucket_loads}"
+    fi
+    if (( after_entries_loaded <= before_entries_loaded )); then
+      die "secondary1 local KID index did not load any repair entries: ${before_entries_loaded} -> ${after_entries_loaded}"
+    fi
+    if (( after_local_kid_fallback > before_local_kid_fallback )); then
+      die "secondary1 ran local KID-index fallback scan during indexed repair: ${before_local_kid_fallback} -> ${after_local_kid_fallback}"
+    fi
+    if (( after_full_bucket > before_full_bucket )); then
+      die "secondary1 ran full-bucket indexed repair fallback: ${before_full_bucket} -> ${after_full_bucket}"
+    fi
+    if (( after_proof_mismatch > before_proof_mismatch )); then
+      die "secondary1 recorded indexed repair proof mismatch: ${before_proof_mismatch} -> ${after_proof_mismatch}"
+    fi
+    if (( after_load_failures > before_load_failures )); then
+      die "secondary1 local KID-index load failures increased: ${before_load_failures} -> ${after_load_failures}"
+    fi
   else
-    if (( after_reconcile != 0 )); then
-      die "secondary1 ran reconciliation after within-horizon outage: ${after_reconcile}"
+    if (( after_reconcile != before_reconcile )); then
+      die "secondary1 ran reconciliation after within-horizon outage: ${before_reconcile} -> ${after_reconcile}"
     fi
-    if (( after_local_kid_fallback != 0 )); then
-      die "secondary1 ran local KID-index fallback scan after outage: ${after_local_kid_fallback}"
+    if (( after_local_kid_fallback > before_local_kid_fallback )); then
+      die "secondary1 ran local KID-index fallback scan after outage: ${before_local_kid_fallback} -> ${after_local_kid_fallback}"
     fi
-    if (( after_full_bucket != 0 )); then
-      die "secondary1 ran full-bucket indexed repair fallback after outage: ${after_full_bucket}"
+    if (( after_full_bucket > before_full_bucket )); then
+      die "secondary1 ran full-bucket indexed repair fallback after outage: ${before_full_bucket} -> ${after_full_bucket}"
     fi
-    if (( after_proof_mismatch != 0 )); then
-      die "secondary1 recorded indexed repair proof mismatch after outage: ${after_proof_mismatch}"
+    if (( after_proof_mismatch > before_proof_mismatch )); then
+      die "secondary1 recorded indexed repair proof mismatch after outage: ${before_proof_mismatch} -> ${after_proof_mismatch}"
+    fi
+    if (( after_load_failures > before_load_failures )); then
+      die "secondary1 local KID-index load failures increased after outage: ${before_load_failures} -> ${after_load_failures}"
     fi
     if (( after_range_too_old > before_range_too_old )); then
       die "primary reported journal range too old during within-horizon outage: ${before_range_too_old} -> ${after_range_too_old}"
@@ -2503,254 +2543,16 @@ cmd_secondary_outage_reconcile_smoke() {
 }
 
 cmd_indexed_repair_smoke() {
-  [[ "$TOPOLOGY" == "ha" ]] || die "indexed-repair-smoke requires --topology ha"
-  need_bin jq
-
-  local duration=900
-  local concurrency=48
-  local stepdown_interval=300
-  local progress_interval=30
-  local monitor_interval=5
-  local max_wait_seconds=900
-  local do_reset=true
-  local do_build=false
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --duration)
-        duration="${2:?missing value for --duration}"
-        shift 2
-        ;;
-      --concurrency)
-        concurrency="${2:?missing value for --concurrency}"
-        shift 2
-        ;;
-      --stepdown-interval)
-        stepdown_interval="${2:?missing value for --stepdown-interval}"
-        shift 2
-        ;;
-      --progress-interval)
-        progress_interval="${2:?missing value for --progress-interval}"
-        shift 2
-        ;;
-      --monitor-interval)
-        monitor_interval="${2:?missing value for --monitor-interval}"
-        shift 2
-        ;;
-      --max-wait-seconds)
-        max_wait_seconds="${2:?missing value for --max-wait-seconds}"
-        shift 2
-        ;;
-      --no-reset)
-        do_reset=false
-        shift
-        ;;
-      --build)
-        do_build=true
-        shift
-        ;;
-      *)
-        die "unknown indexed-repair-smoke option: $1"
-        ;;
-    esac
-  done
-
-  [[ "$duration" =~ ^[0-9]+$ ]] || die "--duration must be an integer"
-  [[ "$concurrency" =~ ^[0-9]+$ ]] || die "--concurrency must be an integer"
-  [[ "$stepdown_interval" =~ ^[0-9]+$ ]] || die "--stepdown-interval must be an integer"
-  [[ "$progress_interval" =~ ^[0-9]+$ ]] || die "--progress-interval must be an integer"
-  [[ "$monitor_interval" =~ ^[0-9]+$ ]] || die "--monitor-interval must be an integer"
-  [[ "$max_wait_seconds" =~ ^[0-9]+$ ]] || die "--max-wait-seconds must be an integer"
-  (( duration > 0 )) || die "--duration must be > 0"
-  (( concurrency > 0 )) || die "--concurrency must be > 0"
-  (( stepdown_interval > 0 && stepdown_interval < duration )) || die "--stepdown-interval must be > 0 and less than --duration"
-  (( progress_interval > 0 )) || die "--progress-interval must be > 0"
-  (( monitor_interval > 0 )) || die "--monitor-interval must be > 0"
-  (( max_wait_seconds > 0 )) || die "--max-wait-seconds must be > 0"
-  if [[ "$do_reset" == "false" && "$do_build" == "true" ]]; then
-    die "--build cannot be used with --no-reset"
-  fi
-
-  if [[ "$do_reset" == "true" ]]; then
-    if [[ "$do_build" == "true" ]]; then
-      cmd_reset --build
-    else
-      cmd_reset
-    fi
-  else
-    load_env
-    wait_secondary_ready "secondary1 pre-indexed-repair" "$DR_SECONDARY1_ADDR"
-    wait_secondary_ready "secondary2 pre-indexed-repair" "$DR_SECONDARY2_ADDR"
-  fi
-
-  ensure_dr_stress
-
-  local run_id run_dir stress_rc
-  local primary_active secondary1_active secondary2_active secondary1_addrs_csv secondary2_addrs_csv
-  local indexed_before indexed_after indexed_delta indexed_ranges_before indexed_ranges_after indexed_ranges_delta
-  local bucket_loads_before bucket_loads_after bucket_loads_delta entries_loaded_before entries_loaded_after entries_loaded_delta
-  local scan_failures_before scan_failures_after scan_failures_delta local_kid_fallback_before local_kid_fallback_after local_kid_fallback_delta
-  local full_bucket_before full_bucket_after full_bucket_delta proof_mismatch_before proof_mismatch_after proof_mismatch_delta
-  local load_failures_before load_failures_after load_failures_delta
-
-  run_id="drmixed-indexed-repair-$(date -u +%Y%m%dT%H%M%SZ)"
-  run_dir="${RESULTS_DIR}/${run_id}"
-  mkdir -p "$run_dir"
-
-  {
-    echo "run_id=${run_id}"
-    echo "run_dir=${run_dir}"
-    echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    echo "duration=${duration}"
-    echo "concurrency=${concurrency}"
-    echo "stepdown_interval=${stepdown_interval}"
-  } | tee "$run_dir/orchestrator.log"
-
-  primary_active="$(wait_cluster_active_addr "primary pre-indexed-repair" 120 "${PRIMARY_NODE_ADDRS[@]}")"
-  secondary1_active="$(wait_cluster_active_addr "secondary1 pre-indexed-repair" 120 "${SECONDARY1_NODE_ADDRS[@]}")"
-  secondary2_active="$(wait_cluster_active_addr "secondary2 pre-indexed-repair" 120 "${SECONDARY2_NODE_ADDRS[@]}")"
-  secondary1_addrs_csv="$(join_csv "${SECONDARY1_NODE_ADDRS[@]}")"
-  secondary2_addrs_csv="$(join_csv "${SECONDARY2_NODE_ADDRS[@]}")"
-  echo "primary_active_before=${primary_active}" | tee -a "$run_dir/orchestrator.log"
-  echo "secondary1_active_before=${secondary1_active}" | tee -a "$run_dir/orchestrator.log"
-  echo "secondary2_active_before=${secondary2_active}" | tee -a "$run_dir/orchestrator.log"
-  echo "secondary1_addrs=${secondary1_addrs_csv}" | tee -a "$run_dir/orchestrator.log"
-  echo "secondary2_addrs=${secondary2_addrs_csv}" | tee -a "$run_dir/orchestrator.log"
-
-  dr_status_json "$secondary1_active" "$DR_PRIMARY_TOKEN" >"$run_dir/before-secondary1-status.json"
-  dr_status_json "$secondary2_active" "$DR_PRIMARY_TOKEN" >"$run_dir/before-secondary2-status.json"
-  indexed_before="$(dr_sum_uint_field_from_files "flat_accumulator_indexed_repair_total" "$run_dir/before-secondary1-status.json" "$run_dir/before-secondary2-status.json")"
-  indexed_ranges_before="$(dr_sum_uint_field_from_files "flat_accumulator_indexed_repair_ranges_total" "$run_dir/before-secondary1-status.json" "$run_dir/before-secondary2-status.json")"
-  bucket_loads_before="$(dr_sum_uint_field_from_files "local_kid_index_bucket_loads_total" "$run_dir/before-secondary1-status.json" "$run_dir/before-secondary2-status.json")"
-  entries_loaded_before="$(dr_sum_uint_field_from_files "local_kid_index_entries_loaded_total" "$run_dir/before-secondary1-status.json" "$run_dir/before-secondary2-status.json")"
-  scan_failures_before="$(dr_sum_uint_field_from_files "scan_failures_total" "$run_dir/before-secondary1-status.json" "$run_dir/before-secondary2-status.json")"
-  local_kid_fallback_before="$(dr_sum_uint_field_from_files "local_kid_index_fallback_scans_total" "$run_dir/before-secondary1-status.json" "$run_dir/before-secondary2-status.json")"
-  full_bucket_before="$(dr_sum_uint_field_from_files "flat_accumulator_indexed_repair_full_bucket_fallback_total" "$run_dir/before-secondary1-status.json" "$run_dir/before-secondary2-status.json")"
-  proof_mismatch_before="$(dr_sum_uint_field_from_files "flat_accumulator_indexed_repair_proof_mismatches_total" "$run_dir/before-secondary1-status.json" "$run_dir/before-secondary2-status.json")"
-  load_failures_before="$(dr_sum_uint_field_from_files "local_kid_index_load_failures_total" "$run_dir/before-secondary1-status.json" "$run_dir/before-secondary2-status.json")"
-
-  set +e
-  "$DR_STRESS_BIN" run \
-    -run-id "$run_id" \
-    -output-dir "$RESULTS_DIR" \
-    -primary-addr "$DR_PRIMARY_ADDR" \
-    -primary-token "$DR_PRIMARY_TOKEN" \
-    -secondary1-addr "$secondary1_addrs_csv" \
-    -secondary1-token "$DR_PRIMARY_TOKEN" \
-    -secondary2-addr "$secondary2_addrs_csv" \
-    -secondary2-token "$DR_PRIMARY_TOKEN" \
-    -ensure-kv \
-    -duration "$duration" \
-    -concurrency "$concurrency" \
-    -stepdown-interval "$stepdown_interval" \
-    -test-class ha_correctness_stress \
-    -topology-label primary+2-secondary-ha \
-    -disruption-profile primary_active_stepdown_indexed_repair \
-    -max-wait-seconds "$max_wait_seconds" \
-    -progress-interval "$progress_interval" \
-    -monitor-interval "$monitor_interval" \
-    2>&1 | tee "$run_dir/harness.log"
-  stress_rc=${PIPESTATUS[0]}
-  set -e
-  echo "stress_rc=${stress_rc}" | tee -a "$run_dir/orchestrator.log"
-  if [[ "$stress_rc" -ne 0 ]]; then
-    die "dr-stress exited non-zero; artifacts preserved in ${run_dir}"
-  fi
-
-  primary_active="$(wait_cluster_active_addr "primary final" 120 "${PRIMARY_NODE_ADDRS[@]}")"
-  secondary1_active="$(wait_cluster_active_addr "secondary1 final" 120 "${SECONDARY1_NODE_ADDRS[@]}")"
-  secondary2_active="$(wait_cluster_active_addr "secondary2 final" 120 "${SECONDARY2_NODE_ADDRS[@]}")"
-  wait_secondary_ready "secondary1 final" "$secondary1_active" "$max_wait_seconds"
-  wait_secondary_ready "secondary2 final" "$secondary2_active" "$max_wait_seconds"
-  dr_status_json "$primary_active" "$DR_PRIMARY_TOKEN" >"$run_dir/final-primary-status.json"
-  dr_status_json "$secondary1_active" "$DR_PRIMARY_TOKEN" >"$run_dir/final-secondary1-status.json"
-  dr_status_json "$secondary2_active" "$DR_PRIMARY_TOKEN" >"$run_dir/final-secondary2-status.json"
-
-  indexed_after="$(dr_sum_uint_field_from_files "flat_accumulator_indexed_repair_total" "$run_dir/final-secondary1-status.json" "$run_dir/final-secondary2-status.json")"
-  indexed_ranges_after="$(dr_sum_uint_field_from_files "flat_accumulator_indexed_repair_ranges_total" "$run_dir/final-secondary1-status.json" "$run_dir/final-secondary2-status.json")"
-  bucket_loads_after="$(dr_sum_uint_field_from_files "local_kid_index_bucket_loads_total" "$run_dir/final-secondary1-status.json" "$run_dir/final-secondary2-status.json")"
-  entries_loaded_after="$(dr_sum_uint_field_from_files "local_kid_index_entries_loaded_total" "$run_dir/final-secondary1-status.json" "$run_dir/final-secondary2-status.json")"
-  scan_failures_after="$(dr_sum_uint_field_from_files "scan_failures_total" "$run_dir/final-secondary1-status.json" "$run_dir/final-secondary2-status.json")"
-  local_kid_fallback_after="$(dr_sum_uint_field_from_files "local_kid_index_fallback_scans_total" "$run_dir/final-secondary1-status.json" "$run_dir/final-secondary2-status.json")"
-  full_bucket_after="$(dr_sum_uint_field_from_files "flat_accumulator_indexed_repair_full_bucket_fallback_total" "$run_dir/final-secondary1-status.json" "$run_dir/final-secondary2-status.json")"
-  proof_mismatch_after="$(dr_sum_uint_field_from_files "flat_accumulator_indexed_repair_proof_mismatches_total" "$run_dir/final-secondary1-status.json" "$run_dir/final-secondary2-status.json")"
-  load_failures_after="$(dr_sum_uint_field_from_files "local_kid_index_load_failures_total" "$run_dir/final-secondary1-status.json" "$run_dir/final-secondary2-status.json")"
-  indexed_delta=$(( indexed_after - indexed_before ))
-  indexed_ranges_delta=$(( indexed_ranges_after - indexed_ranges_before ))
-  bucket_loads_delta=$(( bucket_loads_after - bucket_loads_before ))
-  entries_loaded_delta=$(( entries_loaded_after - entries_loaded_before ))
-  scan_failures_delta=$(( scan_failures_after - scan_failures_before ))
-  local_kid_fallback_delta=$(( local_kid_fallback_after - local_kid_fallback_before ))
-  full_bucket_delta=$(( full_bucket_after - full_bucket_before ))
-  proof_mismatch_delta=$(( proof_mismatch_after - proof_mismatch_before ))
-  load_failures_delta=$(( load_failures_after - load_failures_before ))
-
-  jq -n \
-    --argjson indexed_repair_delta "$indexed_delta" \
-    --argjson indexed_repair_ranges_delta "$indexed_ranges_delta" \
-    --argjson local_kid_index_bucket_loads_delta "$bucket_loads_delta" \
-    --argjson local_kid_index_entries_loaded_delta "$entries_loaded_delta" \
-    --argjson scan_failures_delta "$scan_failures_delta" \
-    --argjson local_kid_index_fallback_scans_delta "$local_kid_fallback_delta" \
-    --argjson full_bucket_fallback_delta "$full_bucket_delta" \
-    --argjson proof_mismatch_delta "$proof_mismatch_delta" \
-    --argjson local_kid_index_load_failures_delta "$load_failures_delta" \
-    '{
-      indexed_repair_delta: $indexed_repair_delta,
-      indexed_repair_ranges_delta: $indexed_repair_ranges_delta,
-      local_kid_index_bucket_loads_delta: $local_kid_index_bucket_loads_delta,
-      local_kid_index_entries_loaded_delta: $local_kid_index_entries_loaded_delta,
-      scan_failures_delta: $scan_failures_delta,
-      local_kid_index_fallback_scans_delta: $local_kid_index_fallback_scans_delta,
-      full_bucket_fallback_delta: $full_bucket_fallback_delta,
-      proof_mismatch_delta: $proof_mismatch_delta,
-      local_kid_index_load_failures_delta: $local_kid_index_load_failures_delta
-    }' >"$run_dir/indexed-repair-summary.json"
-  jq '.' "$run_dir/indexed-repair-summary.json" | tee -a "$run_dir/orchestrator.log"
-
-  jq -e '
-    .workload.events_dropped == 0 and
-    .workload.status_fail == 0 and
-    .replication.sentinel_secondary1.converged == true and
-    .replication.sentinel_secondary2.converged == true
-  ' "$run_dir/result.json" >/dev/null || die "stress result did not satisfy indexed-repair smoke invariants"
-
-  jq -e '
-    .data.mode == "secondary" and
-    .data.secondary_state == "streaming" and
-    (.data.lag_entries // 0) == 0 and
-    (.data.primary_index // 0) > 0 and
-    (.data.last_applied_index // 0) >= (.data.primary_index // 0) and
-    (.data.reconcile_phase // "") == "idle" and
-    (.data.reconcile_fail_reason_last // "") == ""
-  ' "$run_dir/final-secondary1-status.json" >/dev/null || die "secondary1 did not finish cleanly after indexed-repair smoke"
-  jq -e '
-    .data.mode == "secondary" and
-    .data.secondary_state == "streaming" and
-    (.data.lag_entries // 0) == 0 and
-    (.data.primary_index // 0) > 0 and
-    (.data.last_applied_index // 0) >= (.data.primary_index // 0) and
-    (.data.reconcile_phase // "") == "idle" and
-    (.data.reconcile_fail_reason_last // "") == ""
-  ' "$run_dir/final-secondary2-status.json" >/dev/null || die "secondary2 did not finish cleanly after indexed-repair smoke"
-
-  (( indexed_delta > 0 )) || die "indexed repair was not exercised"
-  (( indexed_ranges_delta > 0 )) || die "indexed repair did not load any ranges"
-  (( bucket_loads_delta > 0 )) || die "local KID-index bucket loads did not occur"
-  (( entries_loaded_delta > 0 )) || die "local KID-index entries were not loaded"
-  (( scan_failures_delta == 0 )) || die "scan failures increased during indexed-repair smoke"
-  (( local_kid_fallback_delta == 0 )) || die "local KID-index fallback scan occurred during indexed-repair smoke"
-  (( full_bucket_delta == 0 )) || die "full-bucket indexed repair fallback occurred during indexed-repair smoke"
-  (( proof_mismatch_delta == 0 )) || die "indexed repair proof mismatch occurred during indexed-repair smoke"
-  (( load_failures_delta == 0 )) || die "local KID-index load failures occurred during indexed-repair smoke"
-
-  verify_one "primary" "$primary_active" "$run_dir" 0
-  verify_one "secondary1" "$secondary1_active" "$run_dir" 0
-  verify_one "secondary2" "$secondary2_active" "$run_dir" 0
-
-  echo "completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$run_dir/orchestrator.log"
-  echo "Indexed repair HA smoke passed."
-  echo "Run: ${run_dir}"
+  cmd_secondary_outage_smoke \
+    --expect-reconcile \
+    --tuning-profile out-of-horizon \
+    --run-prefix indexed-repair \
+    --duration 180 \
+    --concurrency 48 \
+    --outage-after 20 \
+    --outage-seconds 90 \
+    --max-wait-seconds 900 \
+    "$@"
 }
 
 cmd_tuning_load_smoke() {
