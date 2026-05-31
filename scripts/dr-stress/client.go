@@ -221,6 +221,8 @@ type DRStatusResponse struct {
 	FlatAccIndexedProofLocalLast    int64   `json:"flat_accumulator_indexed_repair_proof_mismatch_local_count_last"`
 	FlatAccIndexedProofRemoteLast   int64   `json:"flat_accumulator_indexed_repair_proof_mismatch_remote_count_last"`
 	FlatAccIndexedProofChecksumLast bool    `json:"flat_accumulator_indexed_repair_proof_mismatch_checksum_last"`
+	FlatAccIndexedFullBucketTotal   int64   `json:"flat_accumulator_indexed_repair_full_bucket_fallback_total"`
+	FlatAccIndexedFullBucketRanges  int64   `json:"flat_accumulator_indexed_repair_full_bucket_ranges_total"`
 	LocalKIDIndexBucketLoads        int64   `json:"local_kid_index_bucket_loads_total"`
 	LocalKIDIndexEntriesLoaded      int64   `json:"local_kid_index_entries_loaded_total"`
 	LocalKIDIndexLoadFailures       int64   `json:"local_kid_index_load_failures_total"`
@@ -233,6 +235,7 @@ type DRStatusResponse struct {
 	FallbackActive                  bool    `json:"fallback_active"`
 	FallbackCount                   int64   `json:"fallback_count"`
 	FallbackLastReason              string  `json:"fallback_last_reason"`
+	CheckpointStorageDrift          int64   `json:"checkpoint_conflicts_storage_drift_total"`
 }
 
 // drStatusEnvelope wraps the API response { "data": { ... } }.
@@ -263,9 +266,15 @@ func (c *BaoClient) DRStatus(ctx context.Context) (*DRStatusResponse, int, error
 }
 
 // StepDown requests a leader stepdown on the node.
-func (c *BaoClient) StepDown(ctx context.Context) error {
-	_, _, err := c.do(ctx, http.MethodPost, "/v1/sys/step-down", nil)
-	return err
+func (c *BaoClient) StepDown(ctx context.Context) (int, error) {
+	code, _, err := c.do(ctx, http.MethodPost, "/v1/sys/step-down", nil)
+	if err != nil {
+		return code, err
+	}
+	if code < 200 || code >= 300 {
+		return code, fmt.Errorf("step-down returned %d", code)
+	}
+	return code, nil
 }
 
 // secretsListEnvelope wraps the LIST response.

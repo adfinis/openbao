@@ -48,6 +48,14 @@ type Config struct {
 	Concurrency  int           `json:"concurrency"`
 	WriteRetries int           `json:"write_retries"`
 
+	// Test classification. These labels make result artifacts comparable
+	// across correctness, performance, and disruption test classes.
+	TestClass         string `json:"test_class"`
+	TopologyLabel     string `json:"topology_label"`
+	BaselineMode      string `json:"baseline_mode,omitempty"`
+	DisruptionProfile string `json:"disruption_profile"`
+	WorkloadProfile   string `json:"workload_profile,omitempty"`
+
 	// Intervals
 	MonitorInterval            time.Duration `json:"monitor_interval_seconds"`
 	ProgressInterval           time.Duration `json:"progress_interval_seconds"`
@@ -101,6 +109,12 @@ func DefaultConfig() *Config {
 		Duration:     15 * time.Minute,
 		Concurrency:  24,
 		WriteRetries: 2,
+
+		TestClass:         "",
+		TopologyLabel:     "",
+		BaselineMode:      "",
+		DisruptionProfile: "",
+		WorkloadProfile:   "",
 
 		MonitorInterval:            2 * time.Second,
 		ProgressInterval:           2 * time.Second,
@@ -180,7 +194,52 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	c.inferTestMetadata()
+
 	return nil
+}
+
+func (c *Config) inferTestMetadata() {
+	if c.TopologyLabel == "" {
+		switch {
+		case c.Secondary1.Configured() && c.Secondary2.Configured():
+			c.TopologyLabel = "primary+2-secondary"
+		case c.Secondary1.Configured() || c.Secondary2.Configured():
+			c.TopologyLabel = "primary+1-secondary"
+		default:
+			c.TopologyLabel = "primary-only"
+		}
+	}
+
+	if c.TestClass == "" {
+		switch {
+		case c.StepdownInterval > 0:
+			c.TestClass = "ha_correctness_stress"
+		case c.Secondary1.Configured() || c.Secondary2.Configured():
+			c.TestClass = "steady_state_dr_smoke"
+		default:
+			c.TestClass = "baseline_overhead"
+		}
+	}
+
+	if c.DisruptionProfile == "" {
+		if c.StepdownInterval > 0 {
+			c.DisruptionProfile = fmt.Sprintf("primary_stepdown_every_%ds", int(c.StepdownInterval.Seconds()))
+		} else {
+			c.DisruptionProfile = "none"
+		}
+	}
+
+	if c.WorkloadProfile == "" {
+		c.WorkloadProfile = fmt.Sprintf(
+			"put%d_get%d_status%d_hot%d_large%d",
+			c.PutPercent,
+			c.GetPrimaryPercent,
+			c.StatusS1Percent+c.StatusS2Percent,
+			c.HotPercent,
+			c.LargePayloadPercent,
+		)
+	}
 }
 
 // ConfigSnapshot holds all config plus environment metadata for config.json.

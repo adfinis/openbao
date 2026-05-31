@@ -82,6 +82,11 @@ func runMode(args []string) {
 
 	// Workload.
 	fs.StringVar(&cfg.Workload, "workload", cfg.Workload, "Workload type (kv)")
+	fs.StringVar(&cfg.TestClass, "test-class", cfg.TestClass, "Test class label (for example ha_correctness_stress, baseline_overhead, recovery_disruption)")
+	fs.StringVar(&cfg.TopologyLabel, "topology-label", cfg.TopologyLabel, "Topology label for result classification")
+	fs.StringVar(&cfg.BaselineMode, "baseline-mode", cfg.BaselineMode, "Baseline mode label (for example no_dr, primary_only, one_secondary)")
+	fs.StringVar(&cfg.DisruptionProfile, "disruption-profile", cfg.DisruptionProfile, "Disruption profile label")
+	fs.StringVar(&cfg.WorkloadProfile, "workload-profile", cfg.WorkloadProfile, "Workload profile label")
 
 	// Duration and concurrency.
 	var durationSec int
@@ -243,7 +248,7 @@ func executeRun(cfg *Config) error {
 	// Start background goroutines.
 	go mon.Run(ctx)
 	go progress.Run(ctx)
-	go RunStepdownLoop(ctx, clients.Primary, cfg.StepdownInterval)
+	go RunStepdownLoop(ctx, clients.Primary, cfg.StepdownInterval, rec)
 
 	// Run workers (blocks until all done).
 	log.Printf("starting %d workers for %s (seed=%d, workload=%s)",
@@ -297,6 +302,13 @@ func executeRun(cfg *Config) error {
 			"sentinel_write_retry_interval": int(cfg.SentinelWriteRetryInterval / time.Millisecond),
 			"seed":                          cfg.Seed,
 			"workload":                      cfg.Workload,
+		},
+		"test_context": map[string]interface{}{
+			"test_class":         cfg.TestClass,
+			"topology_label":     cfg.TopologyLabel,
+			"baseline_mode":      cfg.BaselineMode,
+			"disruption_profile": cfg.DisruptionProfile,
+			"workload_profile":   cfg.WorkloadProfile,
 		},
 		"workload": map[string]interface{}{
 			"duration_ms":           durationMS,

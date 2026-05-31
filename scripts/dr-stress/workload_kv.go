@@ -190,6 +190,8 @@ func classifyError(err error) string {
 		return "ctx_canceled"
 	case strings.Contains(s, "context deadline exceeded"):
 		return "ctx_deadline"
+	case strings.Contains(s, "dial tcp") || strings.Contains(s, "lookup ") || strings.Contains(s, "no such host"):
+		return "transport_error"
 	default:
 		// Truncate to keep NDJSON compact.
 		if len(s) > 80 {

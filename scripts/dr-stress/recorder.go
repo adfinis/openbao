@@ -22,6 +22,7 @@ type Event struct {
 	LatencyNS int64     `json:"latency_ns"`
 	Code      int       `json:"code"`
 	Err       string    `json:"err,omitempty"`
+	Control   bool      `json:"control,omitempty"`
 }
 
 // Recorder consumes events from a buffered channel and writes NDJSON to
@@ -65,9 +66,20 @@ func (r *Recorder) Send(ev Event) {
 		r.Dropped.Add(1)
 	}
 
+	if ev.Control {
+		return
+	}
+
 	// Update atomic counters regardless of channel drop so progress is accurate.
 	r.TotalOps.Add(1)
 	r.updateCounters(ev)
+}
+
+// SendControl records a harness control event, such as a requested primary
+// stepdown, without counting it as workload throughput.
+func (r *Recorder) SendControl(ev Event) {
+	ev.Control = true
+	r.Send(ev)
 }
 
 func (r *Recorder) updateCounters(ev Event) {
