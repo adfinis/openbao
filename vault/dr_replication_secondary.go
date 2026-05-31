@@ -314,6 +314,10 @@ type drReplicationSecondary struct {
 	// scanner builds reconciliation sets from local storage.
 	scanner *reconciler.Scanner
 
+	// rangeAccumulator maintains a secondary-local flat projection cache for
+	// fast reconciliation when it is warm and index-aligned.
+	rangeAccumulator *drFlatRangeAccumulator
+
 	// client is the gRPC client connection to the primary.
 	client DRReplicationClient
 
@@ -383,6 +387,7 @@ type drReplicationSecondary struct {
 	reconcileRangesInflight      atomic.Int64
 	reconcileRangesFailed        atomic.Int64
 	reconcileBudgetRemainingByte atomic.Int64
+	flatAccumulatorFastPathTotal atomic.Uint64
 	rangeSplitCount              atomic.Uint64
 	reconcileRPCBytesUsed        atomic.Uint64
 	reconcileQueueDepth          atomic.Int64
@@ -500,6 +505,7 @@ func newDRReplicationSecondary(core *Core, replSalt []byte, relationshipID strin
 		logger:                     logger.Named("dr-secondary"),
 		core:                       core,
 		scanner:                    reconciler.NewScanner(config),
+		rangeAccumulator:           newDRFlatRangeAccumulator(),
 		relationshipID:             relationshipID,
 		replSalt:                   replSalt,
 		stopCh:                     make(chan struct{}),
@@ -577,6 +583,9 @@ func (s *drReplicationSecondary) Connect(ctx context.Context, primaryAddr string
 	if !s.highestCommittedCheckpointIndexSet {
 		s.loadCheckpointHighWaterMark()
 	}
+	if s.rangeAccumulator != nil && !s.rangeAccumulator.isInitialized() {
+		s.loadPersistentFlatAccumulator(ctx)
+	}
 
 	// Strip the scheme (https://) from the address -- gRPC expects host:port only.
 	primaryAddr = strings.TrimPrefix(primaryAddr, "https://")
@@ -638,10 +647,23 @@ func (s *drReplicationSecondary) Connect(ctx context.Context, primaryAddr string
 	}
 	s.conn = conn
 	s.client = NewDRReplicationClient(conn)
-	s.setState(DRSecondaryBootstrapping)
+	s.prepareStateForConnect()
 
 	s.logger.Info("connected to primary", "addr", primaryAddr)
 	return nil
+}
+
+func (s *drReplicationSecondary) prepareStateForConnect() {
+	switch s.State() {
+	case DRSecondaryIdle:
+		if s.keyringBootstrapped.Load() && s.lastAppliedIndex.Load() > 0 {
+			s.setState(DRSecondaryStreaming)
+			return
+		}
+		s.setState(DRSecondaryBootstrapping)
+	case DRSecondaryBootstrapping, DRSecondaryInitialSync:
+		s.setState(DRSecondaryBootstrapping)
+	}
 }
 
 // Start begins the replication loop: stream changes from the primary,
@@ -1507,6 +1529,7 @@ func (s *drReplicationSecondary) Status() DRSecondaryStatus {
 		RangeManifestCount:             rangeManifestCount,
 		RangeSplitCount:                s.rangeSplitCount.Load(),
 		ReconcileRPCBytesUsed:          s.reconcileRPCBytesUsed.Load(),
+		FlatAccumulatorFastPathTotal:   s.flatAccumulatorFastPathTotal.Load(),
 		ScanFailuresTotal:              s.scanFailures.Load(),
 		CheckpointConflictsTotal:       s.checkpointConflicts.Load(),
 		ReconcileRetriesTotal:          s.reconcileRetries.Load(),
@@ -1558,6 +1581,7 @@ type DRSecondaryStatus struct {
 	RangeManifestCount             int
 	RangeSplitCount                uint64
 	ReconcileRPCBytesUsed          uint64
+	FlatAccumulatorFastPathTotal   uint64
 	ScanFailuresTotal              uint64
 	CheckpointConflictsTotal       uint64
 	ReconcileRetriesTotal          uint64
@@ -2126,7 +2150,7 @@ func (s *drReplicationSecondary) performResnapshot(ctx context.Context, reason s
 
 	remoteKeys := make(map[string]struct{}, 1024)
 	applied := 0
-	applyPipeline := newDRPutApplyPipeline(fetchCtx, s, nil, markProgress)
+	applyPipeline := newDRPutApplyPipeline(fetchCtx, s, nil, markProgress, nil)
 	pipelineClosed := false
 	defer func() {
 		if !pipelineClosed {
@@ -2239,12 +2263,21 @@ func (s *drReplicationSecondary) performResnapshot(ctx context.Context, reason s
 		if err != nil {
 			return fmt.Errorf("resnapshot delete phase failed: %w", err)
 		}
+		for _, key := range removeKeys {
+			kid := s.scanner.ComputeKID(key)
+			delete(localSet.KIDToVID, kid)
+			delete(localSet.KIDToKey, kid)
+			delete(localSet.Entries, kid)
+		}
 		markProgress()
 	}
 
 	s.setReconcilePhase(drReconcilePhaseFinalize)
 	if err := s.finalizeReconcileCheckpoint(checkpoint.CheckpointId, checkpoint.CommitIndex); err != nil {
 		return fmt.Errorf("resnapshot finalize failed: %w", err)
+	}
+	if err := s.resetAndPersistFlatAccumulatorFromSet(ctx, localSet, checkpoint.CommitIndex); err != nil {
+		return fmt.Errorf("persist flat accumulator after resnapshot: %w", err)
 	}
 	s.entriesApplied.Add(uint64(applied))
 	s.reconcileCount.Add(1)
@@ -2925,6 +2958,24 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 	var rootKeyTouched bool
 	var runtimeStateTouched bool
 	var invalidateKeys []string
+	accumulatorWarm := s.rangeAccumulator != nil && s.rangeAccumulator.isInitialized()
+	var accumulatorBase [drRangeMaxTotalRanges]drFlatAccumulatorBucket
+	var accumulatorNext [drRangeMaxTotalRanges]drFlatAccumulatorBucket
+	if accumulatorWarm {
+		accumulatorIndex, buckets, ok := s.rangeAccumulator.snapshot()
+		if !ok || accumulatorIndex != current {
+			s.logger.Warn("disabling DR flat accumulator because stream transaction is not index-aligned",
+				"accumulator_index", accumulatorIndex,
+				"last_applied_index", current)
+			s.rangeAccumulator.invalidate()
+			accumulatorWarm = false
+		} else {
+			accumulatorBase = buckets
+			accumulatorNext = buckets
+		}
+	}
+	accumulatorPending := make(map[string]drFlatAccumulatorPendingState)
+	var accumulatorDeltas []drFlatAccumulatorDelta
 
 	for _, change := range batch {
 		if err := s.ensureStreamApplyActive(ctx); err != nil {
@@ -2949,6 +3000,18 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 		}
 
 		op := physical.Operation(change.OpType)
+		if accumulatorWarm {
+			delta, ok, err := s.accumulatorDeltaForChange(ctx, txn, change, "", accumulatorPending)
+			if err != nil {
+				s.logger.Warn("disabling DR flat accumulator after stream transaction read failure", "key", change.Key, "error", err)
+				s.rangeAccumulator.invalidate()
+				accumulatorWarm = false
+				accumulatorDeltas = nil
+				accumulatorNext = accumulatorBase
+			} else if ok {
+				accumulatorDeltas = append(accumulatorDeltas, delta)
+			}
+		}
 		switch op {
 		case physical.DeleteOperation:
 			if err := txn.Delete(ctx, change.Key); err != nil {
@@ -2992,6 +3055,15 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 		if err := s.ensureStreamApplyActive(ctx); err != nil {
 			return err
 		}
+		if accumulatorWarm {
+			if err := s.persistFlatAccumulatorSnapshot(ctx, txn, lastIndex, accumulatorNext); err != nil {
+				return fmt.Errorf("persist flat accumulator marker: %w", err)
+			}
+			if err := txn.Commit(ctx); err != nil {
+				return err
+			}
+			s.rangeAccumulator.replace(lastIndex, accumulatorNext)
+		}
 		s.setLastAppliedIndex(lastIndex)
 		metrics.SetGauge([]string{"replication", "dr", "secondary", "last_applied_index"}, float32(lastIndex))
 		return nil
@@ -3001,28 +3073,62 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 		return nil
 	}
 
+	if accumulatorWarm {
+		if !applyFlatAccumulatorDeltasToBuckets(&accumulatorNext, accumulatorDeltas) {
+			s.logger.Warn("disabling DR flat accumulator after stream transaction delta preflight failed", "last_index", lastIndex)
+			s.rangeAccumulator.invalidate()
+			accumulatorWarm = false
+			accumulatorNext = accumulatorBase
+		}
+	}
+	if accumulatorWarm {
+		if err := s.persistFlatAccumulatorSnapshot(ctx, txn, lastIndex, accumulatorNext); err != nil {
+			return fmt.Errorf("persist flat accumulator: %w", err)
+		}
+	} else if err := s.deletePersistedFlatAccumulator(ctx, txn); err != nil {
+		return fmt.Errorf("delete stale flat accumulator: %w", err)
+	}
+
 	if err := txn.Commit(ctx); err != nil {
 		return err
 	}
 	if err := s.ensureStreamApplyActive(ctx); err != nil {
+		if s.rangeAccumulator != nil {
+			s.rangeAccumulator.invalidate()
+		}
 		return err
+	}
+	if accumulatorWarm {
+		s.rangeAccumulator.replace(lastIndex, accumulatorNext)
 	}
 
 	if rootKeyTouched {
 		if err := s.handleReplicatedKeyringUpdate(ctx, "transaction batch", "core/root-key", true); err != nil {
+			if s.rangeAccumulator != nil {
+				s.rangeAccumulator.invalidate()
+			}
 			return err
 		}
 	} else if keyringTouched {
 		if err := s.handleReplicatedKeyringUpdate(ctx, "transaction batch", "core/keyring", false); err != nil {
+			if s.rangeAccumulator != nil {
+				s.rangeAccumulator.invalidate()
+			}
 			return err
 		}
 	}
 	if runtimeStateTouched {
 		if err := s.refreshRuntimeStateAfterApply(ctx, "stream transaction batch", false); err != nil {
+			if s.rangeAccumulator != nil {
+				s.rangeAccumulator.invalidate()
+			}
 			return err
 		}
 	}
 	if err := s.ensureStreamApplyActive(ctx); err != nil {
+		if s.rangeAccumulator != nil {
+			s.rangeAccumulator.invalidate()
+		}
 		return err
 	}
 	s.invalidateAppliedStorageKeys(ctx, invalidateKeys)
@@ -3061,13 +3167,73 @@ func (s *drReplicationSecondary) applyStreamChange(ctx context.Context, change *
 	// nothing to apply to storage; the caller advances lastAppliedIndex
 	// using the marker's RaftIndex so lag reporting stays accurate.
 	if change.Key == "" {
+		if s.rangeAccumulator != nil {
+			if _, buckets, ok := s.rangeAccumulator.snapshot(); ok {
+				if err := s.persistFlatAccumulatorSnapshot(ctx, s.core.physical, change.RaftIndex, buckets); err != nil {
+					s.logger.Warn("failed to persist DR flat accumulator marker", "raft_index", change.RaftIndex, "error", err)
+				} else {
+					s.rangeAccumulator.replace(change.RaftIndex, buckets)
+				}
+			}
+		}
 		return nil
 	}
 
 	// Skip cluster-local paths that should never be replicated.
 	if isDRNeverReplicatePath(change.Key) {
 		s.logger.Debug("skipping cluster-local path in stream", "key", change.Key)
+		if s.rangeAccumulator != nil {
+			if _, buckets, ok := s.rangeAccumulator.snapshot(); ok {
+				if err := s.persistFlatAccumulatorSnapshot(ctx, s.core.physical, change.RaftIndex, buckets); err != nil {
+					s.logger.Warn("failed to persist DR flat accumulator skip marker", "raft_index", change.RaftIndex, "key", change.Key, "error", err)
+				} else {
+					s.rangeAccumulator.replace(change.RaftIndex, buckets)
+				}
+			}
+		}
 		return nil
+	}
+
+	accumulatorWarm := s.rangeAccumulator != nil && s.rangeAccumulator.isInitialized()
+	var accumulatorBase [drRangeMaxTotalRanges]drFlatAccumulatorBucket
+	var accumulatorNext [drRangeMaxTotalRanges]drFlatAccumulatorBucket
+	var accumulatorDelta drFlatAccumulatorDelta
+	accumulatorDeltaOK := false
+	if accumulatorWarm {
+		accumulatorIndex, buckets, ok := s.rangeAccumulator.snapshot()
+		if !ok || accumulatorIndex > change.RaftIndex {
+			s.logger.Warn("disabling DR flat accumulator because stream apply is not index-aligned",
+				"accumulator_index", accumulatorIndex,
+				"raft_index", change.RaftIndex)
+			s.rangeAccumulator.invalidate()
+			accumulatorWarm = false
+		} else {
+			accumulatorBase = buckets
+			accumulatorNext = buckets
+		}
+	}
+	if accumulatorWarm {
+		pending := make(map[string]drFlatAccumulatorPendingState, 1)
+		delta, ok, err := s.accumulatorDeltaForChange(ctx, s.core.physical, change, "", pending)
+		if err != nil {
+			s.logger.Warn("disabling DR flat accumulator after stream apply read failure", "key", change.Key, "error", err)
+			s.rangeAccumulator.invalidate()
+			accumulatorWarm = false
+		} else {
+			accumulatorDelta = delta
+			accumulatorDeltaOK = ok
+		}
+	}
+	if accumulatorWarm && accumulatorDeltaOK {
+		if !applyFlatAccumulatorDeltasToBuckets(&accumulatorNext, []drFlatAccumulatorDelta{accumulatorDelta}) {
+			s.logger.Warn("disabling DR flat accumulator after stream apply delta preflight failed", "raft_index", change.RaftIndex)
+			s.rangeAccumulator.invalidate()
+			accumulatorWarm = false
+			accumulatorNext = accumulatorBase
+		}
+	}
+	if err := s.deletePersistedFlatAccumulator(ctx, s.core.physical); err != nil {
+		return fmt.Errorf("delete stale flat accumulator: %w", err)
 	}
 
 	switch physical.Operation(change.OpType) {
@@ -3096,15 +3262,27 @@ func (s *drReplicationSecondary) applyStreamChange(ctx context.Context, change *
 		// arrives next, both steps succeed. Failures are non-fatal.
 		if change.Key == "core/keyring" || change.Key == "core/root-key" {
 			if err := s.handleReplicatedKeyringUpdate(ctx, "stream", change.Key, change.Key == "core/root-key"); err != nil {
+				if s.rangeAccumulator != nil {
+					s.rangeAccumulator.invalidate()
+				}
 				return err
 			}
 		}
 		if isDRRuntimeStatePath(change.Key) {
 			if err := s.refreshRuntimeStateAfterApply(ctx, "stream", false); err != nil {
+				if s.rangeAccumulator != nil {
+					s.rangeAccumulator.invalidate()
+				}
 				return err
 			}
 		}
 		s.invalidateAppliedStorageKey(ctx, change.Key)
+		if accumulatorWarm {
+			s.rangeAccumulator.replace(change.RaftIndex, accumulatorNext)
+			if err := s.persistFlatAccumulatorSnapshot(ctx, s.core.physical, change.RaftIndex, accumulatorNext); err != nil {
+				s.logger.Warn("failed to persist DR flat accumulator after stream put", "raft_index", change.RaftIndex, "error", err)
+			}
+		}
 		return nil
 
 	case physical.DeleteOperation:
@@ -3113,15 +3291,27 @@ func (s *drReplicationSecondary) applyStreamChange(ctx context.Context, change *
 		}
 		if isDRRuntimeStatePath(change.Key) {
 			if err := s.refreshRuntimeStateAfterApply(ctx, "stream", false); err != nil {
+				if s.rangeAccumulator != nil {
+					s.rangeAccumulator.invalidate()
+				}
 				return err
 			}
 		}
 		s.invalidateAppliedStorageKey(ctx, change.Key)
+		if accumulatorWarm {
+			s.rangeAccumulator.replace(change.RaftIndex, accumulatorNext)
+			if err := s.persistFlatAccumulatorSnapshot(ctx, s.core.physical, change.RaftIndex, accumulatorNext); err != nil {
+				s.logger.Warn("failed to persist DR flat accumulator after stream delete", "raft_index", change.RaftIndex, "error", err)
+			}
+		}
 		return nil
 
 	default:
 		s.logger.Warn("unknown operation type in change stream",
 			"op_type", change.OpType, "key", change.Key)
+		if s.rangeAccumulator != nil {
+			s.rangeAccumulator.advanceIndex(change.RaftIndex)
+		}
 		return nil
 	}
 }
@@ -3241,6 +3431,9 @@ func (s *drReplicationSecondary) applyFetchedChangeWithKIDMap(ctx context.Contex
 		s.logger.Debug("skipping cluster-local path in fetch", "key", change.Key)
 		return nil
 	}
+	if err := s.deletePersistedFlatAccumulator(ctx, s.core.physical); err != nil {
+		return fmt.Errorf("delete stale flat accumulator: %w", err)
+	}
 
 	switch physical.Operation(change.OpType) {
 	case physical.PutOperation:
@@ -3359,6 +3552,10 @@ func (s *drReplicationSecondary) runReconciliation(ctx context.Context) error {
 	}
 	defer s.endReconcileSession()
 
+	if done, err := s.tryFlatAccumulatorReconciliation(reconcileCtx, checkpoint, startTime); done || err != nil {
+		return err
+	}
+
 	// Step 2: Build local reconciliation set.
 	localCheckpoint := reconciler.Checkpoint{
 		ID:          checkpoint.CheckpointId,
@@ -3375,6 +3572,87 @@ func (s *drReplicationSecondary) runReconciliation(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+func (s *drReplicationSecondary) tryFlatAccumulatorReconciliation(ctx context.Context, checkpoint *CheckpointResponse, startTime time.Time) (bool, error) {
+	if s.rangeAccumulator == nil || checkpoint == nil || checkpoint.CommitIndex == 0 {
+		return false, nil
+	}
+	localBuckets, ok := s.rangeAccumulator.snapshotExact(checkpoint.CommitIndex)
+	if !ok {
+		return false, nil
+	}
+
+	rangesToVerify := buildCompleteRangeVerificationOrder(nil)
+	const batchSize = 100
+	for i := 0; i < len(rangesToVerify); i += batchSize {
+		end := i + batchSize
+		if end > len(rangesToVerify) {
+			end = len(rangesToVerify)
+		}
+		batchIDs := rangesToVerify[i:end]
+
+		rpcCtx, cancel := s.rpcContext(ctx)
+		csumResp, err := s.client.ExchangeRangeChecksums(rpcCtx, &RangeChecksumRequest{
+			RelationshipId:  s.relationshipID,
+			CheckpointId:    checkpoint.CheckpointId,
+			CheckpointIndex: checkpoint.CommitIndex,
+			RangeIds:        batchIDs,
+		})
+		cancel()
+		if err != nil {
+			return true, fmt.Errorf("reconcile failure [rpc_failed]: flat accumulator exchange range checksums: %w", err)
+		}
+		if csumResp == nil {
+			return true, fmt.Errorf("reconcile failure [rpc_failed]: flat accumulator exchange range checksums returned nil response")
+		}
+
+		remoteChecksums := make(map[uint64]*RangeChecksum, len(csumResp.GetChecksums()))
+		for _, rc := range csumResp.GetChecksums() {
+			if rc == nil {
+				continue
+			}
+			remoteChecksums[rc.GetRangeId()] = rc
+		}
+
+		for _, rangeID := range batchIDs {
+			if rangeID >= uint64(len(localBuckets)) {
+				return false, nil
+			}
+			local := localBuckets[rangeID]
+			remote := remoteChecksums[rangeID]
+			if remote == nil {
+				if local.count != 0 {
+					s.logger.Info("flat accumulator mismatch; falling back to local scan",
+						"range_id", rangeID,
+						"local_count", local.count)
+					return false, nil
+				}
+				continue
+			}
+			if remote.GetChecksum() != local.checksum || remote.GetCount() != local.count {
+				s.logger.Info("flat accumulator mismatch; falling back to local scan",
+					"range_id", rangeID,
+					"local_count", local.count,
+					"remote_count", remote.GetCount())
+				return false, nil
+			}
+		}
+	}
+
+	s.setReconcilePhase(drReconcilePhaseFinalize)
+	if err := s.finalizeReconcileCheckpoint(checkpoint.CheckpointId, checkpoint.CommitIndex); err != nil {
+		return true, fmt.Errorf("range reconciliation finalize failed: %w", err)
+	}
+	s.reconcileBudgetRemainingByte.Store(int64(s.reconcileMaxRPCBytes))
+	s.reconcileCount.Add(1)
+	s.flatAccumulatorFastPathTotal.Add(1)
+	s.lastReconcileAt.Store(time.Now().Unix())
+	s.logger.Info("range reconciliation: all ranges converged via flat accumulator",
+		"ranges_checked", len(rangesToVerify),
+		"duration", time.Since(startTime))
+	metrics.IncrCounter([]string{"replication", "dr", "secondary", "flat_accumulator_fast_path_total"}, 1)
+	return true, nil
 }
 
 type drRangeTask struct {
@@ -3414,6 +3692,125 @@ type drRangeTaskResult struct {
 	fetchedEntries []*EntryChange
 	removedKeys    []string
 	err            error
+}
+
+type drReconciliationSetPutMutation struct {
+	vid   [32]byte
+	key   string
+	entry *physical.Entry
+}
+
+type drReconciliationSetMutationTracker struct {
+	secondary *drReplicationSecondary
+
+	mu      sync.Mutex
+	puts    map[[32]byte]drReconciliationSetPutMutation
+	deletes map[[32]byte]struct{}
+}
+
+func newDRReconciliationSetMutationTracker(secondary *drReplicationSecondary) *drReconciliationSetMutationTracker {
+	return &drReconciliationSetMutationTracker{
+		secondary: secondary,
+		puts:      make(map[[32]byte]drReconciliationSetPutMutation),
+		deletes:   make(map[[32]byte]struct{}),
+	}
+}
+
+func (m *drReconciliationSetMutationTracker) recordFetchedChanges(changes []*EntryChange) error {
+	if m == nil || m.secondary == nil {
+		return nil
+	}
+	for _, change := range changes {
+		if change == nil {
+			continue
+		}
+		if change.Key != "" && isDRNeverReplicatePath(change.Key) {
+			continue
+		}
+		kid, ok := m.secondary.kidFromEntryChange(change)
+		if !ok {
+			return fmt.Errorf("cannot update reconciliation set for change without resolvable kid")
+		}
+
+		switch physical.Operation(change.OpType) {
+		case physical.PutOperation:
+			vid := m.secondary.scanner.ComputeVIDWithSealWrap(change.Value, change.SealWrap)
+			mutation := drReconciliationSetPutMutation{
+				vid: vid,
+				key: change.Key,
+			}
+			if change.Key != "" {
+				mutation.entry = &physical.Entry{
+					Key:      change.Key,
+					Value:    append([]byte(nil), change.Value...),
+					SealWrap: change.SealWrap,
+				}
+			}
+
+			m.mu.Lock()
+			delete(m.deletes, kid)
+			m.puts[kid] = mutation
+			m.mu.Unlock()
+
+		case physical.DeleteOperation:
+			m.mu.Lock()
+			delete(m.puts, kid)
+			m.deletes[kid] = struct{}{}
+			m.mu.Unlock()
+
+		default:
+			return fmt.Errorf("unknown operation type in fetched change: op_type=%s key=%s", change.OpType, change.Key)
+		}
+	}
+	return nil
+}
+
+func (m *drReconciliationSetMutationTracker) recordRemovedKeys(keys []string) {
+	if m == nil || m.secondary == nil {
+		return
+	}
+	for _, key := range keys {
+		if key == "" || isDRNeverReplicatePath(key) {
+			continue
+		}
+		kid := m.secondary.scanner.ComputeKID(key)
+		m.mu.Lock()
+		delete(m.puts, kid)
+		m.deletes[kid] = struct{}{}
+		m.mu.Unlock()
+	}
+}
+
+func (m *drReconciliationSetMutationTracker) applyToSet(rs *reconciler.ReconciliationSet) {
+	if m == nil || rs == nil {
+		return
+	}
+	if rs.KIDToVID == nil {
+		rs.KIDToVID = make(map[[32]byte][32]byte)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for kid := range m.deletes {
+		delete(rs.KIDToVID, kid)
+		if rs.KIDToKey != nil {
+			delete(rs.KIDToKey, kid)
+		}
+		if rs.Entries != nil {
+			delete(rs.Entries, kid)
+		}
+	}
+	for kid, mutation := range m.puts {
+		rs.KIDToVID[kid] = mutation.vid
+		if rs.KIDToKey != nil && mutation.key != "" {
+			rs.KIDToKey[kid] = mutation.key
+		}
+		if rs.Entries != nil && mutation.entry != nil {
+			rs.Entries[kid] = mutation.entry
+		}
+	}
+	rs.KeyCount = len(rs.KIDToVID)
 }
 
 type drRangeTaskQueue []drQueuedRangeTask
@@ -3481,6 +3878,7 @@ type drPutApplyPipeline struct {
 	cancel     context.CancelFunc
 	kidToKey   map[[32]byte]string
 	onApply    func()
+	mutations  *drReconciliationSetMutationTracker
 	txnBackend physical.TransactionalBackend // nil if physical backend doesn't support transactions
 	submitted  atomic.Int64                  // total entries submitted (for diagnostics)
 
@@ -3492,7 +3890,7 @@ type drPutApplyPipeline struct {
 	closed bool
 }
 
-func newDRPutApplyPipeline(ctx context.Context, secondary *drReplicationSecondary, kidToKey map[[32]byte]string, onApply func()) *drPutApplyPipeline {
+func newDRPutApplyPipeline(ctx context.Context, secondary *drReplicationSecondary, kidToKey map[[32]byte]string, onApply func(), mutations *drReconciliationSetMutationTracker) *drPutApplyPipeline {
 	workers := secondary.reconcileApplyWorkers
 	if workers <= 0 {
 		workers = 1
@@ -3515,6 +3913,7 @@ func newDRPutApplyPipeline(ctx context.Context, secondary *drReplicationSecondar
 		cancel:     cancel,
 		kidToKey:   kidToKey,
 		onApply:    onApply,
+		mutations:  mutations,
 		txnBackend: txnBackend,
 		shards:     make([]chan *EntryChange, workers),
 	}
@@ -3594,6 +3993,12 @@ func (p *drPutApplyPipeline) runWorker(ch <-chan *EntryChange) {
 					p.setErr(fmt.Errorf("reconcile apply worker failed: %w", err))
 					return
 				}
+				if p.mutations != nil && drFetchedChangeAppliesToStorage(change, p.kidToKey) {
+					if err := p.mutations.recordFetchedChanges([]*EntryChange{change}); err != nil {
+						p.setErr(fmt.Errorf("reconcile apply worker failed: %w", err))
+						return
+					}
+				}
 			}
 		}
 
@@ -3665,6 +4070,11 @@ func (p *drPutApplyPipeline) applyBatchTxn(entries []*EntryChange) error {
 		if err != nil {
 			return fmt.Errorf("begin batch txn: %w", err)
 		}
+		appliedNormalEntries := make([]*EntryChange, 0, len(normalEntries))
+		if err := p.secondary.deletePersistedFlatAccumulator(p.ctx, tx); err != nil {
+			_ = tx.Rollback(p.ctx)
+			return fmt.Errorf("delete stale flat accumulator: %w", err)
+		}
 
 		for _, change := range normalEntries {
 			appliedKey := change.Key
@@ -3696,6 +4106,8 @@ func (p *drPutApplyPipeline) applyBatchTxn(entries []*EntryChange) error {
 						_ = tx.Rollback(p.ctx)
 						return fmt.Errorf("batch txn delete %q: %w", key, err)
 					}
+				} else {
+					continue
 				}
 				appliedKey = key
 
@@ -3706,6 +4118,7 @@ func (p *drPutApplyPipeline) applyBatchTxn(entries []*EntryChange) error {
 			if appliedKey != "" {
 				invalidateKeys = append(invalidateKeys, appliedKey)
 			}
+			appliedNormalEntries = append(appliedNormalEntries, change)
 		}
 
 		if err := tx.Commit(p.ctx); err != nil {
@@ -3717,6 +4130,11 @@ func (p *drPutApplyPipeline) applyBatchTxn(entries []*EntryChange) error {
 			}
 		}
 		p.secondary.invalidateAppliedStorageKeys(p.ctx, invalidateKeys)
+		if p.mutations != nil {
+			if err := p.mutations.recordFetchedChanges(appliedNormalEntries); err != nil {
+				return err
+			}
+		}
 	}
 
 	// Apply keyring / root-key entries individually so that the barrier
@@ -3724,6 +4142,11 @@ func (p *drPutApplyPipeline) applyBatchTxn(entries []*EntryChange) error {
 	for _, change := range keyringEntries {
 		if err := p.secondary.applyFetchedChange(p.ctx, change, p.kidToKey); err != nil {
 			return err
+		}
+		if p.mutations != nil && drFetchedChangeAppliesToStorage(change, p.kidToKey) {
+			if err := p.mutations.recordFetchedChanges([]*EntryChange{change}); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -3818,6 +4241,22 @@ func hashEntryShard(change *EntryChange, shards int) int {
 		_, _ = h.Write(change.Kid)
 	}
 	return int(h.Sum32() % uint32(shards))
+}
+
+func drFetchedChangeAppliesToStorage(change *EntryChange, kidToKey map[[32]byte]string) bool {
+	if change == nil {
+		return false
+	}
+	if change.Key != "" {
+		return !isDRNeverReplicatePath(change.Key)
+	}
+	if physical.Operation(change.OpType) != physical.DeleteOperation || len(change.Kid) != 32 || kidToKey == nil {
+		return physical.Operation(change.OpType) == physical.PutOperation
+	}
+	var kid [32]byte
+	copy(kid[:], change.Kid)
+	key, ok := kidToKey[kid]
+	return ok && key != "" && !isDRNeverReplicatePath(key)
 }
 
 func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, checkpoint *CheckpointResponse, localSet *reconciler.ReconciliationSet, startTime time.Time) error {
@@ -3982,6 +4421,9 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 		if err := s.finalizeReconcileCheckpoint(checkpoint.CheckpointId, checkpoint.CommitIndex); err != nil {
 			return fmt.Errorf("range reconciliation finalize failed: %w", err)
 		}
+		if err := s.resetAndPersistFlatAccumulatorFromSet(ctx, localSet, checkpoint.CommitIndex); err != nil {
+			return fmt.Errorf("persist flat accumulator after phase-a match: %w", err)
+		}
 		s.reconcileBudgetRemainingByte.Store(int64(s.reconcileMaxRPCBytes))
 		s.reconcileCount.Add(1)
 		s.lastReconcileAt.Store(time.Now().Unix())
@@ -3992,6 +4434,9 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 	}
 
 	s.logger.Info("ranges mismatched", "count", queue.Len())
+	if s.rangeAccumulator != nil {
+		s.rangeAccumulator.invalidate()
+	}
 
 	// 3. Process Mismatches (FetchEntries)
 	maxWorkers := s.reconcileMaxInflightTasks
@@ -4033,7 +4478,8 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 
 	inflight := 0
 
-	applyPipeline := newDRPutApplyPipeline(ctx, s, localSet.KIDToKey, s.markReconcileActivityNow)
+	mutationTracker := newDRReconciliationSetMutationTracker(s)
+	applyPipeline := newDRPutApplyPipeline(ctx, s, localSet.KIDToKey, s.markReconcileActivityNow, mutationTracker)
 	defer func() {
 		_ = applyPipeline.closeAndWait()
 	}()
@@ -4113,11 +4559,16 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 		if err != nil {
 			return wrapReconcileFailure(drReconcileFailureApplyFailed, "apply removed keys", err)
 		}
+		mutationTracker.recordRemovedKeys(keys)
 	}
 	s.setReconcilePhase(drReconcilePhaseFinalize)
 
 	if err := s.finalizeReconcileCheckpoint(checkpoint.CheckpointId, checkpoint.CommitIndex); err != nil {
 		return fmt.Errorf("range reconciliation finalize failed: %w", err)
+	}
+	mutationTracker.applyToSet(localSet)
+	if err := s.resetAndPersistFlatAccumulatorFromSet(ctx, localSet, checkpoint.CommitIndex); err != nil {
+		return fmt.Errorf("persist flat accumulator after range repair: %w", err)
 	}
 	s.reconcileCount.Add(1)
 	s.lastReconcileAt.Store(time.Now().Unix())
@@ -4500,6 +4951,10 @@ func (s *drReplicationSecondary) applyRemovedKeys(ctx context.Context, checkpoin
 			if err != nil {
 				return fmt.Errorf("begin delete txn: %w", err)
 			}
+			if err := s.deletePersistedFlatAccumulator(ctx, tx); err != nil {
+				_ = tx.Rollback(ctx)
+				return fmt.Errorf("delete stale flat accumulator: %w", err)
+			}
 			for _, key := range batch {
 				if err := tx.Delete(ctx, key); err != nil {
 					_ = tx.Rollback(ctx)
@@ -4516,6 +4971,9 @@ func (s *drReplicationSecondary) applyRemovedKeys(ctx context.Context, checkpoin
 	// Fallback: sequential deletes.
 	failures := 0
 	examples := make([]string, 0, 5)
+	if err := s.deletePersistedFlatAccumulator(ctx, s.core.physical); err != nil {
+		return fmt.Errorf("delete stale flat accumulator: %w", err)
+	}
 	for _, key := range filtered {
 		if err := s.core.physical.Delete(ctx, key); err != nil {
 			failures++

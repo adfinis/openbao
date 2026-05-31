@@ -1342,6 +1342,11 @@ func (m *drRelationshipManager) clearSecondaryCheckpointCursor(ctx context.Conte
 	if err := m.core.barrier.Delete(ctx, drCheckpointHWMPath); err != nil {
 		return fmt.Errorf("failed to clear DR secondary checkpoint cursor: %w", err)
 	}
+	if m.core.physical != nil {
+		if err := m.core.physical.Delete(ctx, drFlatAccumulatorStoragePath); err != nil {
+			return fmt.Errorf("failed to clear DR secondary flat accumulator: %w", err)
+		}
+	}
 	return nil
 }
 

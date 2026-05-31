@@ -504,6 +504,43 @@ is a key/value table projected into a sorted hash space. Hashing keys into KID
 space keeps range distribution independent of OpenBao's path prefixes, while
 VIDs represent the value state for each KID.
 
+### Flat accumulator materialized view
+
+The secondary maintains a flat accumulator over the top-level KID ranges. Each
+bucket stores the count and checksum for the KID/VID pairs that fall into that
+range. This is not a tree: there are no persisted parent/child nodes, no
+hierarchical traversal state, and no persistent diff-sync state machine.
+
+During stream apply, the secondary computes the old and new VID for each
+replicated physical mutation, XORs the old contribution out of the bucket, and
+XORs the new contribution in. For transactional physical backends, the
+secondary writes the replicated storage mutations and the serialized flat
+accumulator snapshot in the same local transaction. The snapshot is stored under
+a never-replicated local DR path and is bound to the relationship ID, DR cluster
+ID, range version, checksum algorithm, and primary commit index.
+
+This makes warm reconnects cheap in two ways:
+
+- If the primary stream journal still covers the secondary's last applied
+  index, the secondary resumes streaming and performs no reconciliation.
+- If reconciliation is required and the persisted flat accumulator is exactly
+  aligned with the checkpoint commit index, the secondary can compare top-level
+  range checksums without scanning local storage.
+
+On process restart, a secondary that has already completed keyring bootstrap
+and has a restored applied cursor attempts stream replay first. It does not run
+initial reconciliation merely because in-memory state was lost. If replay is no
+longer available, the primary explicitly requires reconciliation and the
+secondary enters the checkpoint-fenced reconciliation path.
+
+The persisted accumulator is fail-closed. Before any non-atomic reconciliation
+repair or resnapshot mutation is applied, the secondary deletes the persisted
+accumulator. If the process crashes mid-repair, restart cannot reload a stale
+accumulator for partially repaired storage; it must rebuild by scanning or by
+finishing a later proven reconciliation. After reconciliation or resnapshot
+finalizes successfully, the accumulator is reseeded from the verified local
+KID/VID set and persisted at the finalized checkpoint index.
+
 ### Range checksums
 
 Top-level range checksums are a coarse filter. They identify likely mismatched
@@ -1024,14 +1061,15 @@ single-primary warm-standby DR are likewise standard, widely-implemented
 patterns.
 
 The one deliberate divergence from the most common implementations is that
-OpenBao builds range descriptors on demand, fenced to an immutable checkpoint,
-rather than maintaining a persistent Merkle or diff index between
-reconciliations. This trades persistent index state and its maintenance failure
-modes for a bounded full-range verification pass per checkpoint reconciliation,
-and it is the reason the protocol must prove fetch completeness before inferring
-deletes (see "Why digest proof before deletes"). It is an engineering tradeoff
-over how to schedule and bound comparison work, not a new reconciliation
-algorithm.
+OpenBao does not maintain a persistent Merkle or hierarchical diff index between
+reconciliations. Range descriptors are still checkpoint-fenced, and the only
+persisted comparison cache is a flat local accumulator over top-level KID
+ranges. This trades hierarchical index state and its maintenance failure modes
+for a simpler materialized view plus a bounded full-range verification pass when
+the accumulator is absent or not checkpoint-aligned. It is also the reason the
+protocol must prove fetch completeness before inferring deletes (see "Why digest
+proof before deletes"). This is an engineering tradeoff over how to schedule and
+bound comparison work, not a new reconciliation algorithm.
 
 These techniques are general prior art that predates and is independent of any
 specific vendor's replication product. This subsection describes the technical
@@ -1116,9 +1154,10 @@ Proof validation adds CPU cost during reconciliation. This is the cost of
 making delete inference safe.
 
 The current conservative range-selection strategy verifies the complete
-top-level range partition for each checkpoint reconciliation. That is simpler
-and safer than trusting dirty bitmaps, but it adds predictable checksum-scan
-cost during reconnect and stress recovery.
+top-level range partition for each checkpoint reconciliation. A transactionally
+persisted flat accumulator avoids the local O(N) scan when it is aligned with
+the checkpoint, but an absent, incompatible, or invalidated accumulator still
+requires a local scan before reconciliation can compare ranges.
 
 Failover semantics deliberately avoid automatic merge or failback. This makes
 the protocol safer, but it shifts old-primary fencing, traffic routing, and

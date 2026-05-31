@@ -35,6 +35,8 @@ Usage:
   scripts/dr_local_test.sh [--topology single|ha] failover-smoke
   scripts/dr_local_test.sh --topology ha promoted-durability-smoke
   scripts/dr_local_test.sh --topology ha reseed-secondary-smoke
+  scripts/dr_local_test.sh --topology ha quiescent-reconnect-smoke [--no-reset] [--build]
+  scripts/dr_local_test.sh --topology ha accumulator-cold-restart-smoke [--no-reset] [--build] [--stop-seconds N]
   scripts/dr_local_test.sh --topology ha tuning-load-smoke [--duration N] [--concurrency N] [--no-reset]
   scripts/dr_local_test.sh --topology ha failover-load-lifecycle [--duration N] [--concurrency N] [--hard-stop-after N] [--no-reset]
   scripts/dr_local_test.sh [--topology single|ha] down
@@ -57,6 +59,8 @@ HA topology:
   scripts/dr_local_test.sh --topology ha reset
   scripts/dr_local_test.sh --topology ha engine-lifecycle-matrix
   scripts/dr_local_test.sh --topology ha smoke --duration 900 --concurrency 48 --stepdown-interval 300
+  scripts/dr_local_test.sh --topology ha quiescent-reconnect-smoke
+  scripts/dr_local_test.sh --topology ha accumulator-cold-restart-smoke
   scripts/dr_local_test.sh --topology ha tuning-load-smoke
   scripts/dr_local_test.sh --topology ha failover-load-lifecycle
 USAGE
@@ -320,6 +324,36 @@ dr_status() {
   bao_for "$addr" "$token" read -format=json sys/replication/dr/status | jq '.data'
 }
 
+dr_status_json() {
+  local addr="$1"
+  local token="$2"
+  bao_for "$addr" "$token" read -format=json sys/replication/dr/status
+}
+
+dr_fast_path_total_from_file() {
+  local file="$1"
+  local value
+  value="$(jq -r '.data.flat_accumulator_fast_path_total // 0' "$file")"
+  [[ "$value" =~ ^[0-9]+$ ]] || die "invalid flat_accumulator_fast_path_total in ${file}: ${value}"
+  printf "%s" "$value"
+}
+
+dr_reconcile_count_from_file() {
+  local file="$1"
+  local value
+  value="$(jq -r '.data.reconcile_count // 0' "$file")"
+  [[ "$value" =~ ^[0-9]+$ ]] || die "invalid reconcile_count in ${file}: ${value}"
+  printf "%s" "$value"
+}
+
+dr_last_applied_index_from_file() {
+  local file="$1"
+  local value
+  value="$(jq -r '.data.last_applied_index // 0' "$file")"
+  [[ "$value" =~ ^[0-9]+$ ]] || die "invalid last_applied_index in ${file}: ${value}"
+  printf "%s" "$value"
+}
+
 wait_secondary_ready() {
   local name="$1"
   local addr="$2"
@@ -339,6 +373,74 @@ wait_secondary_ready() {
     if (( $(date +%s) >= deadline )); then
       echo "$out" | jq '.data // {}' >&2 || true
       die "timed out waiting for ${name} to reach streaming lag=0"
+    fi
+    sleep 2
+  done
+}
+
+wait_flat_accumulator_fast_path_increment() {
+  local name="$1"
+  local addr="$2"
+  local before="$3"
+  local timeout="${4:-240}"
+  local out_file="$5"
+  local deadline=$(( $(date +%s) + timeout ))
+  local out after state lag
+
+  while true; do
+    out="$(dr_status_json "$addr" "$DR_PRIMARY_TOKEN" 2>/dev/null || true)"
+    after="$(jq -r '.data.flat_accumulator_fast_path_total // 0' <<<"$out" 2>/dev/null || printf "0")"
+    state="$(jq -r '.data.secondary_state // ""' <<<"$out" 2>/dev/null || true)"
+    lag="$(jq -r '.data.lag_entries // 0' <<<"$out" 2>/dev/null || printf "0")"
+
+    if [[ "$after" =~ ^[0-9]+$ && "$state" == "streaming" && "$lag" == "0" && "$after" -gt "$before" ]]; then
+      printf "%s\n" "$out" >"$out_file"
+      echo "${name} flat accumulator fast path incremented: ${before} -> ${after}"
+      return 0
+    fi
+    if (( $(date +%s) >= deadline )); then
+      printf "%s\n" "$out" >"$out_file" || true
+      echo "$out" | jq '.data // {}' >&2 || true
+      die "timed out waiting for ${name} flat accumulator fast path counter to increment beyond ${before}"
+    fi
+    sleep 2
+  done
+}
+
+wait_quiescent_reconnect_optimized() {
+  local name="$1"
+  local addr="$2"
+  local before_fast="$3"
+  local before_reconcile="$4"
+  local timeout="${5:-240}"
+  local out_file="$6"
+  local deadline=$(( $(date +%s) + timeout ))
+  local out after_fast after_reconcile state lag
+
+  while true; do
+    out="$(dr_status_json "$addr" "$DR_PRIMARY_TOKEN" 2>/dev/null || true)"
+    after_fast="$(jq -r '.data.flat_accumulator_fast_path_total // 0' <<<"$out" 2>/dev/null || printf "0")"
+    after_reconcile="$(jq -r '.data.reconcile_count // 0' <<<"$out" 2>/dev/null || printf "0")"
+    state="$(jq -r '.data.secondary_state // ""' <<<"$out" 2>/dev/null || true)"
+    lag="$(jq -r '.data.lag_entries // 0' <<<"$out" 2>/dev/null || printf "0")"
+
+    if [[ "$after_fast" =~ ^[0-9]+$ && "$after_reconcile" =~ ^[0-9]+$ && "$state" == "streaming" && "$lag" == "0" ]]; then
+      printf "%s\n" "$out" >"$out_file"
+      if [[ "$after_fast" -gt "$before_fast" ]]; then
+        echo "${name} optimized reconnect: flat accumulator fast path ${before_fast} -> ${after_fast}"
+        return 0
+      fi
+      if [[ "$after_reconcile" -eq "$before_reconcile" ]]; then
+        echo "${name} optimized reconnect: stream resumed without reconciliation"
+        return 0
+      fi
+      echo "$out" | jq '.data // {}' >&2 || true
+      die "${name} reconnected via scanned reconciliation: reconcile_count ${before_reconcile} -> ${after_reconcile}, flat_accumulator_fast_path_total ${before_fast} -> ${after_fast}"
+    fi
+    if (( $(date +%s) >= deadline )); then
+      printf "%s\n" "$out" >"$out_file" || true
+      echo "$out" | jq '.data // {}' >&2 || true
+      die "timed out waiting for ${name} optimized quiescent reconnect"
     fi
     sleep 2
   done
@@ -1105,11 +1207,26 @@ kv_put() {
   local key_name="$3"
   local phase="$4"
   local run_id="$5"
+  local deadline=$(( $(date +%s) + 60 ))
+  local out
 
-  bao_for "$addr" "$token" kv put "kv/${key_name}" \
-    phase="$phase" \
-    run_id="$run_id" \
-    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)" >/dev/null
+  while true; do
+    if out="$(bao_for "$addr" "$token" kv put "kv/${key_name}" \
+      phase="$phase" \
+      run_id="$run_id" \
+      ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>&1)"; then
+      return 0
+    fi
+    if ! grep -qi "Upgrading from non-versioned to versioned data" <<<"$out"; then
+      printf "%s\n" "$out" >&2
+      return 1
+    fi
+    if (( $(date +%s) >= deadline )); then
+      printf "%s\n" "$out" >&2
+      return 1
+    fi
+    sleep 2
+  done
 }
 
 kv_present() {
@@ -1676,6 +1793,247 @@ force_ha_handoff_for_tuning_load() {
   wait_secondary_ready "secondary2 after handoff" "$DR_SECONDARY2_ADDR" 240
 }
 
+cmd_quiescent_reconnect_smoke() {
+  [[ "$TOPOLOGY" == "ha" ]] || die "quiescent-reconnect-smoke requires --topology ha"
+  need_bin jq
+
+  local do_reset=true
+  local do_build=false
+  local timeout=240
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --timeout)
+        timeout="${2:?missing value for --timeout}"
+        shift 2
+        ;;
+      --no-reset)
+        do_reset=false
+        shift
+        ;;
+      --build)
+        do_build=true
+        shift
+        ;;
+      *)
+        die "unknown quiescent-reconnect-smoke option: $1"
+        ;;
+    esac
+  done
+
+  [[ "$timeout" =~ ^[0-9]+$ ]] || die "--timeout must be an integer"
+  (( timeout > 0 )) || die "--timeout must be > 0"
+  if [[ "$do_reset" == "false" && "$do_build" == "true" ]]; then
+    die "--build cannot be used with --no-reset"
+  fi
+
+  if [[ "$do_reset" == "true" ]]; then
+    if [[ "$do_build" == "true" ]]; then
+      cmd_reset --build
+    else
+      cmd_reset
+    fi
+  else
+    load_env
+    wait_secondary_ready "secondary1 pre-handoff" "$DR_SECONDARY1_ADDR" "$timeout"
+    wait_secondary_ready "secondary2 pre-handoff" "$DR_SECONDARY2_ADDR" "$timeout"
+  fi
+
+  local run_id run_dir marker_key primary_active primary_after before_fast1 before_fast2 before_reconcile1 before_reconcile2
+  run_id="quiescent-reconnect-$(date -u +%Y%m%dT%H%M%SZ)"
+  run_dir="${RESULTS_DIR}/${run_id}"
+  marker_key="${run_id}/marker"
+  mkdir -p "$run_dir"
+
+  {
+    echo "run_id=${run_id}"
+    echo "run_dir=${run_dir}"
+    echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "timeout=${timeout}"
+  } | tee "$run_dir/orchestrator.log"
+
+  primary_active="$(wait_cluster_active_addr "primary" 120 "${PRIMARY_NODE_ADDRS[@]}")"
+  echo "primary_active_before=${primary_active}" | tee -a "$run_dir/orchestrator.log"
+
+  ensure_kv_mount_on "$primary_active" "$DR_PRIMARY_TOKEN"
+  kv_put "$primary_active" "$DR_PRIMARY_TOKEN" "$marker_key" "pre-handoff" "$run_id"
+  wait_secondary_ready "secondary1 pre-handoff" "$DR_SECONDARY1_ADDR" "$timeout"
+  wait_secondary_ready "secondary2 pre-handoff" "$DR_SECONDARY2_ADDR" "$timeout"
+  assert_kv_present "secondary1 pre-handoff" "$DR_SECONDARY1_ADDR" "$DR_PRIMARY_TOKEN" "$marker_key"
+  assert_kv_present "secondary2 pre-handoff" "$DR_SECONDARY2_ADDR" "$DR_PRIMARY_TOKEN" "$marker_key"
+
+  dr_status_json "$DR_SECONDARY1_ADDR" "$DR_PRIMARY_TOKEN" >"$run_dir/before-secondary1-status.json"
+  dr_status_json "$DR_SECONDARY2_ADDR" "$DR_PRIMARY_TOKEN" >"$run_dir/before-secondary2-status.json"
+  before_fast1="$(dr_fast_path_total_from_file "$run_dir/before-secondary1-status.json")"
+  before_fast2="$(dr_fast_path_total_from_file "$run_dir/before-secondary2-status.json")"
+  before_reconcile1="$(dr_reconcile_count_from_file "$run_dir/before-secondary1-status.json")"
+  before_reconcile2="$(dr_reconcile_count_from_file "$run_dir/before-secondary2-status.json")"
+  echo "fast_path_before_secondary1=${before_fast1}" | tee -a "$run_dir/orchestrator.log"
+  echo "fast_path_before_secondary2=${before_fast2}" | tee -a "$run_dir/orchestrator.log"
+  echo "reconcile_count_before_secondary1=${before_reconcile1}" | tee -a "$run_dir/orchestrator.log"
+  echo "reconcile_count_before_secondary2=${before_reconcile2}" | tee -a "$run_dir/orchestrator.log"
+
+  echo "forcing_primary_handoff_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$run_dir/orchestrator.log"
+  bao_for "$primary_active" "$DR_PRIMARY_TOKEN" write -f sys/step-down >"$run_dir/stepdown-primary.out" 2>"$run_dir/stepdown-primary.err" || true
+  primary_after="$(wait_cluster_active_addr "primary after handoff" 120 "${PRIMARY_NODE_ADDRS[@]}")"
+  echo "primary_active_after=${primary_after}" | tee -a "$run_dir/orchestrator.log"
+
+  wait_secondary_ready "secondary1 after handoff" "$DR_SECONDARY1_ADDR" "$timeout"
+  wait_secondary_ready "secondary2 after handoff" "$DR_SECONDARY2_ADDR" "$timeout"
+  wait_quiescent_reconnect_optimized "secondary1" "$DR_SECONDARY1_ADDR" "$before_fast1" "$before_reconcile1" "$timeout" "$run_dir/after-secondary1-status.json"
+  wait_quiescent_reconnect_optimized "secondary2" "$DR_SECONDARY2_ADDR" "$before_fast2" "$before_reconcile2" "$timeout" "$run_dir/after-secondary2-status.json"
+
+  assert_kv_present "primary after handoff" "$primary_after" "$DR_PRIMARY_TOKEN" "$marker_key"
+  assert_kv_present "secondary1 after handoff" "$DR_SECONDARY1_ADDR" "$DR_PRIMARY_TOKEN" "$marker_key"
+  assert_kv_present "secondary2 after handoff" "$DR_SECONDARY2_ADDR" "$DR_PRIMARY_TOKEN" "$marker_key"
+
+  echo "completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$run_dir/orchestrator.log"
+  echo "Quiescent reconnect fast-path smoke passed."
+  echo "Run: ${run_dir}"
+}
+
+cmd_accumulator_cold_restart_smoke() {
+  [[ "$TOPOLOGY" == "ha" ]] || die "accumulator-cold-restart-smoke requires --topology ha"
+  need_bin jq
+  need_bin rg
+
+  local do_reset=true
+  local do_build=false
+  local timeout=240
+  local stop_seconds=10
+  local secondary1_active=""
+  local secondary2_active=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --timeout)
+        timeout="${2:?missing value for --timeout}"
+        shift 2
+        ;;
+      --stop-seconds)
+        stop_seconds="${2:?missing value for --stop-seconds}"
+        shift 2
+        ;;
+      --no-reset)
+        do_reset=false
+        shift
+        ;;
+      --build)
+        do_build=true
+        shift
+        ;;
+      *)
+        die "unknown accumulator-cold-restart-smoke option: $1"
+        ;;
+    esac
+  done
+
+  [[ "$timeout" =~ ^[0-9]+$ ]] || die "--timeout must be an integer"
+  [[ "$stop_seconds" =~ ^[0-9]+$ ]] || die "--stop-seconds must be an integer"
+  (( timeout > 0 )) || die "--timeout must be > 0"
+  (( stop_seconds >= 0 )) || die "--stop-seconds must be >= 0"
+  if [[ "$do_reset" == "false" && "$do_build" == "true" ]]; then
+    die "--build cannot be used with --no-reset"
+  fi
+
+  if [[ "$do_reset" == "true" ]]; then
+    if [[ "$do_build" == "true" ]]; then
+      cmd_reset --build
+    else
+      cmd_reset
+    fi
+  else
+    load_env
+    secondary1_active="$(wait_cluster_active_addr "secondary1 pre-restart" 120 "${SECONDARY1_NODE_ADDRS[@]}")"
+    secondary2_active="$(wait_cluster_active_addr "secondary2 pre-restart" 120 "${SECONDARY2_NODE_ADDRS[@]}")"
+    wait_secondary_ready "secondary1 pre-restart" "$secondary1_active" "$timeout"
+    wait_secondary_ready "secondary2 pre-restart" "$secondary2_active" "$timeout"
+  fi
+
+  local run_id run_dir marker_key primary_active before_last after_last after_reconcile restart_since
+  local services=(secondary1-1 secondary1-2 secondary1-3)
+
+  run_id="accumulator-cold-restart-$(date -u +%Y%m%dT%H%M%SZ)"
+  run_dir="${RESULTS_DIR}/${run_id}"
+  marker_key="${run_id}/marker"
+  mkdir -p "$run_dir"
+
+  {
+    echo "run_id=${run_id}"
+    echo "run_dir=${run_dir}"
+    echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "timeout=${timeout}"
+    echo "stop_seconds=${stop_seconds}"
+  } | tee "$run_dir/orchestrator.log"
+
+  primary_active="$(wait_cluster_active_addr "primary" 120 "${PRIMARY_NODE_ADDRS[@]}")"
+  echo "primary_active=${primary_active}" | tee -a "$run_dir/orchestrator.log"
+
+  ensure_kv_mount_on "$primary_active" "$DR_PRIMARY_TOKEN"
+  kv_put "$primary_active" "$DR_PRIMARY_TOKEN" "$marker_key" "pre-cold-restart" "$run_id"
+  secondary1_active="$(wait_cluster_active_addr "secondary1 pre-restart" 120 "${SECONDARY1_NODE_ADDRS[@]}")"
+  secondary2_active="$(wait_cluster_active_addr "secondary2 pre-restart" 120 "${SECONDARY2_NODE_ADDRS[@]}")"
+  echo "secondary1_active_before=${secondary1_active}" | tee -a "$run_dir/orchestrator.log"
+  echo "secondary2_active_before=${secondary2_active}" | tee -a "$run_dir/orchestrator.log"
+  wait_secondary_ready "secondary1 pre-restart" "$secondary1_active" "$timeout"
+  wait_secondary_ready "secondary2 pre-restart" "$secondary2_active" "$timeout"
+  assert_kv_present "secondary1 pre-restart" "$secondary1_active" "$DR_PRIMARY_TOKEN" "$marker_key"
+  assert_kv_present "secondary2 pre-restart" "$secondary2_active" "$DR_PRIMARY_TOKEN" "$marker_key"
+
+  dr_status_json "$secondary1_active" "$DR_PRIMARY_TOKEN" >"$run_dir/before-secondary1-status.json"
+  before_last="$(dr_last_applied_index_from_file "$run_dir/before-secondary1-status.json")"
+  echo "last_applied_before_secondary1=${before_last}" | tee -a "$run_dir/orchestrator.log"
+
+  restart_since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "stopping_secondary1_at=${restart_since}" | tee -a "$run_dir/orchestrator.log"
+  compose stop "${services[@]}" >"$run_dir/secondary1-stop.out" 2>"$run_dir/secondary1-stop.err"
+  if (( stop_seconds > 0 )); then
+    sleep "$stop_seconds"
+  fi
+  echo "starting_secondary1_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$run_dir/orchestrator.log"
+  compose start "${services[@]}" >"$run_dir/secondary1-start.out" 2>"$run_dir/secondary1-start.err"
+
+  for i in "${!SECONDARY1_NODE_ADDRS[@]}"; do
+    unseal_with_key "secondary1-$((i + 1))" "${SECONDARY1_NODE_ADDRS[$i]}" "$DR_SECONDARY1_UNSEAL_KEY"
+  done
+  wait_raft_peers "secondary1 restarted" "$DR_SECONDARY1_ADDR" "$DR_PRIMARY_TOKEN" "$EXPECTED_RAFT_PEERS" "$timeout"
+  secondary1_active="$(wait_cluster_active_addr "secondary1 after cold restart" 120 "${SECONDARY1_NODE_ADDRS[@]}")"
+  secondary2_active="$(wait_cluster_active_addr "secondary2 after secondary1 restart" 120 "${SECONDARY2_NODE_ADDRS[@]}")"
+  echo "secondary1_active_after=${secondary1_active}" | tee -a "$run_dir/orchestrator.log"
+  echo "secondary2_active_after=${secondary2_active}" | tee -a "$run_dir/orchestrator.log"
+  wait_secondary_ready "secondary1 after cold restart" "$secondary1_active" "$timeout"
+  wait_secondary_ready "secondary2 after secondary1 restart" "$secondary2_active" "$timeout"
+
+  dr_status_json "$secondary1_active" "$DR_PRIMARY_TOKEN" >"$run_dir/after-secondary1-status.json"
+  after_last="$(dr_last_applied_index_from_file "$run_dir/after-secondary1-status.json")"
+  after_reconcile="$(dr_reconcile_count_from_file "$run_dir/after-secondary1-status.json")"
+  echo "last_applied_after_secondary1=${after_last}" | tee -a "$run_dir/orchestrator.log"
+  echo "reconcile_count_after_secondary1=${after_reconcile}" | tee -a "$run_dir/orchestrator.log"
+
+  if (( after_last < before_last )); then
+    die "secondary1 last_applied_index moved backwards after cold restart: ${before_last} -> ${after_last}"
+  fi
+  if (( after_reconcile != 0 )); then
+    die "secondary1 ran reconciliation after cold restart; expected stream replay from persisted accumulator cursor"
+  fi
+
+  compose logs --no-color --since "$restart_since" "${services[@]}" >"$run_dir/secondary1-restart.log" 2>"$run_dir/secondary1-restart.log.err" || true
+  if ! rg -q "loaded DR flat accumulator snapshot" "$run_dir/secondary1-restart.log"; then
+    die "secondary1 restart logs did not show persisted flat accumulator load"
+  fi
+  if rg -q "local scan complete|starting reconciliation" "$run_dir/secondary1-restart.log"; then
+    die "secondary1 restart logs show scanned reconciliation during cold restart"
+  fi
+
+  assert_kv_present "primary after secondary1 restart" "$primary_active" "$DR_PRIMARY_TOKEN" "$marker_key"
+  assert_kv_present "secondary1 after cold restart" "$secondary1_active" "$DR_PRIMARY_TOKEN" "$marker_key"
+  assert_kv_present "secondary2 after secondary1 restart" "$secondary2_active" "$DR_PRIMARY_TOKEN" "$marker_key"
+
+  echo "completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$run_dir/orchestrator.log"
+  echo "Accumulator cold-restart smoke passed."
+  echo "Run: ${run_dir}"
+}
+
 cmd_tuning_load_smoke() {
   [[ "$TOPOLOGY" == "ha" ]] || die "tuning-load-smoke requires --topology ha"
   need_bin jq
@@ -2100,6 +2458,8 @@ main() {
     failover-smoke) cmd_failover_smoke "$@" ;;
     promoted-durability-smoke) cmd_promoted_durability_smoke "$@" ;;
     reseed-secondary-smoke) cmd_reseed_secondary_smoke "$@" ;;
+    quiescent-reconnect-smoke) cmd_quiescent_reconnect_smoke "$@" ;;
+    accumulator-cold-restart-smoke) cmd_accumulator_cold_restart_smoke "$@" ;;
     tuning-load-smoke) cmd_tuning_load_smoke "$@" ;;
     failover-load-lifecycle) cmd_failover_load_lifecycle "$@" ;;
     down) cmd_down "$@" ;;

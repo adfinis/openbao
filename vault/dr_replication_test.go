@@ -226,6 +226,12 @@ func TestDRRelationshipManager_EnableSecondaryClearsStaleCheckpointCursor(t *tes
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := core.physical.Put(ctx, &physical.Entry{
+		Key:   drFlatAccumulatorStoragePath,
+		Value: []byte(`{"version":1}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	token := &DRActivationToken{
 		ClusterID:      "new-promoted-primary",
@@ -246,6 +252,11 @@ func TestDRRelationshipManager_EnableSecondaryClearsStaleCheckpointCursor(t *tes
 	}
 	if entry != nil {
 		t.Fatalf("expected stale checkpoint cursor to be cleared on secondary enable, got %q", string(entry.Value))
+	}
+	if entry, err := core.physical.Get(ctx, drFlatAccumulatorStoragePath); err != nil {
+		t.Fatal(err)
+	} else if entry != nil {
+		t.Fatalf("expected stale flat accumulator to be cleared on secondary enable, got %q", string(entry.Value))
 	}
 	if mgr.Secondary() == nil {
 		t.Fatal("expected secondary runtime")
@@ -2728,6 +2739,7 @@ func TestDRSecondaryStatus(t *testing.T) {
 	sec.lastAppliedIndex.Store(42)
 	sec.entriesApplied.Store(100)
 	sec.reconcileCount.Store(2)
+	sec.flatAccumulatorFastPathTotal.Store(1)
 	sec.lastReconcileAt.Store(time.Now().Unix())
 
 	status := sec.Status()
@@ -2742,6 +2754,35 @@ func TestDRSecondaryStatus(t *testing.T) {
 	}
 	if status.ReconcileCount != 2 {
 		t.Fatalf("expected 2, got %d", status.ReconcileCount)
+	}
+	if status.FlatAccumulatorFastPathTotal != 1 {
+		t.Fatalf("expected flat accumulator fast path total 1, got %d", status.FlatAccumulatorFastPathTotal)
+	}
+}
+
+func TestDRSystemBackend_StatusIncludesFlatAccumulatorFastPathCounter(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	mgr.config = &DRConfig{
+		Mode:      DRModeSecondary,
+		ClusterID: "status-fast-path-cluster",
+	}
+	secondary := newDRReplicationSecondary(core, make([]byte, drReplSaltLen), "rel-status-fast-path", log.NewNullLogger())
+	secondary.flatAccumulatorFastPathTotal.Store(7)
+	mgr.secondary = secondary
+	core.drManager = mgr
+
+	req := logical.TestRequest(t, logical.ReadOperation, "replication/dr/status")
+	resp, err := core.systemBackend.HandleRequest(namespace.RootContext(t.Context()), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp == nil || resp.IsError() {
+		t.Fatalf("expected status response, got %#v", resp)
+	}
+	if got := resp.Data["flat_accumulator_fast_path_total"]; got != uint64(7) {
+		t.Fatalf("expected flat_accumulator_fast_path_total=7, got %#v", got)
 	}
 }
 
@@ -3592,6 +3633,443 @@ func TestDRReconciliation_BuildSet(t *testing.T) {
 	}
 
 	t.Logf("reconciliation set built: %d keys", set.KeyCount)
+}
+
+func TestDRFlatRangeAccumulator_ResetAndApplyDeltas(t *testing.T) {
+	replSalt := bytes.Repeat([]byte{0x42}, 32)
+	scanner := reconciler.NewScanner(reconciler.DefaultScanConfig(replSalt))
+
+	kidA := scanner.ComputeKID("secret/a")
+	vidA1 := scanner.ComputeVIDWithSealWrap([]byte("a1"), false)
+	vidA2 := scanner.ComputeVIDWithSealWrap([]byte("a2"), false)
+	kidB := scanner.ComputeKID("secret/b")
+	vidB := scanner.ComputeVIDWithSealWrap([]byte("b1"), false)
+
+	rs := &reconciler.ReconciliationSet{
+		KIDToVID: map[[32]byte][32]byte{
+			kidA: vidA1,
+			kidB: vidB,
+		},
+	}
+
+	accumulator := newDRFlatRangeAccumulator()
+	accumulator.resetFromSet(rs, 10)
+	assertDRFlatAccumulatorMatchesSet(t, accumulator, 10, rs)
+
+	if ok := accumulator.applyDeltas(11, []drFlatAccumulatorDelta{
+		{kid: kidA, oldExists: true, oldVID: vidA1, newExists: true, newVID: vidA2},
+		{kid: kidB, oldExists: true, oldVID: vidB},
+	}); !ok {
+		t.Fatal("expected accumulator delta apply to succeed")
+	}
+	rs.KIDToVID[kidA] = vidA2
+	delete(rs.KIDToVID, kidB)
+	assertDRFlatAccumulatorMatchesSet(t, accumulator, 11, rs)
+
+	if _, ok := accumulator.snapshotExact(10); ok {
+		t.Fatal("expected stale accumulator index to be unavailable")
+	}
+}
+
+func TestDRSecondaryFlatAccumulatorAdvancesOnStreamApply(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	replSalt := bytes.Repeat([]byte{0x43}, 32)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-flat-stream", core.logger)
+
+	key := "secret/flat-stream"
+	oldEntry := &physical.Entry{Key: key, Value: []byte("old")}
+	if err := core.physical.Put(ctx, oldEntry); err != nil {
+		t.Fatalf("failed to seed physical entry: %v", err)
+	}
+
+	kid, oldVID := secondary.scanner.ComputeItemFromEntry(oldEntry)
+	localSet := &reconciler.ReconciliationSet{
+		KIDToVID: map[[32]byte][32]byte{kid: oldVID},
+	}
+	secondary.rangeAccumulator.resetFromSet(localSet, 10)
+
+	if err := secondary.applyStreamChange(ctx, &EntryChange{
+		OpType:    string(physical.PutOperation),
+		Key:       key,
+		Value:     []byte("new"),
+		RaftIndex: 11,
+	}); err != nil {
+		t.Fatalf("stream put failed: %v", err)
+	}
+	localSet.KIDToVID[kid] = secondary.scanner.ComputeVIDWithSealWrap([]byte("new"), false)
+	assertDRFlatAccumulatorMatchesSet(t, secondary.rangeAccumulator, 11, localSet)
+
+	if err := secondary.applyStreamChange(ctx, &EntryChange{
+		OpType:    string(physical.DeleteOperation),
+		Key:       key,
+		RaftIndex: 12,
+	}); err != nil {
+		t.Fatalf("stream delete failed: %v", err)
+	}
+	delete(localSet.KIDToVID, kid)
+	assertDRFlatAccumulatorMatchesSet(t, secondary.rangeAccumulator, 12, localSet)
+
+	persisted, err := core.physical.Get(ctx, drFlatAccumulatorStoragePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted == nil {
+		t.Fatal("expected persisted flat accumulator snapshot")
+	}
+
+	reloaded := newDRReplicationSecondary(core, replSalt, "rel-flat-stream", core.logger)
+	reloaded.loadPersistentFlatAccumulator(ctx)
+	assertDRFlatAccumulatorMatchesSet(t, reloaded.rangeAccumulator, 12, localSet)
+	if got := reloaded.lastAppliedIndex.Load(); got != 12 {
+		t.Fatalf("expected loaded lastAppliedIndex 12, got %d", got)
+	}
+
+	wrongRelationship := newDRReplicationSecondary(core, replSalt, "rel-flat-stream-other", core.logger)
+	wrongRelationship.loadPersistentFlatAccumulator(ctx)
+	if wrongRelationship.rangeAccumulator.isInitialized() {
+		t.Fatal("expected incompatible relationship snapshot to be ignored")
+	}
+	if entry, err := core.physical.Get(ctx, drFlatAccumulatorStoragePath); err != nil {
+		t.Fatal(err)
+	} else if entry != nil {
+		t.Fatal("expected incompatible persisted accumulator to be deleted")
+	}
+}
+
+func TestDRSecondaryStreamTxnPersistsFlatAccumulator(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	replSalt := bytes.Repeat([]byte{0x46}, 32)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-flat-txn", core.logger)
+
+	txnBackend, ok := core.physical.(physical.TransactionalBackend)
+	if !ok {
+		t.Fatal("test core physical backend must support transactions")
+	}
+
+	key := "secret/flat-txn"
+	oldEntry := &physical.Entry{Key: key, Value: []byte("old")}
+	if err := core.physical.Put(ctx, oldEntry); err != nil {
+		t.Fatalf("failed to seed physical entry: %v", err)
+	}
+	kid, oldVID := secondary.scanner.ComputeItemFromEntry(oldEntry)
+	localSet := &reconciler.ReconciliationSet{
+		KIDToVID: map[[32]byte][32]byte{kid: oldVID},
+	}
+	secondary.rangeAccumulator.resetFromSet(localSet, 10)
+	secondary.lastAppliedIndex.Store(10)
+	if err := secondary.persistFlatAccumulatorSnapshot(ctx, core.physical, 10, drFlatAccumulatorBucketsFromSet(localSet)); err != nil {
+		t.Fatalf("failed to seed persisted accumulator: %v", err)
+	}
+
+	if err := secondary.applyStreamTxn(ctx, txnBackend, []*EntryChange{{
+		OpType:    string(physical.PutOperation),
+		Key:       key,
+		Value:     []byte("new"),
+		RaftIndex: 11,
+	}}); err != nil {
+		t.Fatalf("stream txn failed: %v", err)
+	}
+
+	entry, err := core.physical.Get(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry == nil || !bytes.Equal(entry.Value, []byte("new")) {
+		t.Fatalf("expected new physical value, got %#v", entry)
+	}
+	localSet.KIDToVID[kid] = secondary.scanner.ComputeVIDWithSealWrap([]byte("new"), false)
+	assertDRFlatAccumulatorMatchesSet(t, secondary.rangeAccumulator, 11, localSet)
+
+	reloaded := newDRReplicationSecondary(core, replSalt, "rel-flat-txn", core.logger)
+	reloaded.loadPersistentFlatAccumulator(ctx)
+	assertDRFlatAccumulatorMatchesSet(t, reloaded.rangeAccumulator, 11, localSet)
+	if got := reloaded.lastAppliedIndex.Load(); got != 11 {
+		t.Fatalf("expected loaded lastAppliedIndex 11, got %d", got)
+	}
+}
+
+func TestDRRangeReconciliationSeedsFlatAccumulatorOnPhaseAMatch(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := bytes.Repeat([]byte{0x44}, 32)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-flat-seed", core.logger)
+	secondary.checkpointHighWaterMarkPersistHook = func(uint64) error { return nil }
+
+	kidA := secondary.scanner.ComputeKID("secret/a")
+	vidA := secondary.scanner.ComputeVIDWithSealWrap([]byte("a"), false)
+	kidB := secondary.scanner.ComputeKID("secret/b")
+	vidB := secondary.scanner.ComputeVIDWithSealWrap([]byte("b"), false)
+	localSet := &reconciler.ReconciliationSet{
+		KIDToVID: map[[32]byte][32]byte{
+			kidA: vidA,
+			kidB: vidB,
+		},
+	}
+	rangeIndex := reconciler.NewRangeMapIndex(localSet.KIDToVID, nil)
+	checkpoint := &CheckpointResponse{CheckpointId: "cp-flat-seed", CommitIndex: 73}
+
+	secondary.client = &drTestClient{
+		exchangeRangeChecksumsFn: func(_ context.Context, req *RangeChecksumRequest, _ ...grpc.CallOption) (*RangeChecksumResponse, error) {
+			resp := &RangeChecksumResponse{Checksums: make([]*RangeChecksum, 0, len(req.GetRangeIds()))}
+			for _, rangeID := range req.GetRangeIds() {
+				checksum, count := reconciler.ComputeRangeChecksum(rangeIndex, rangeID)
+				resp.Checksums = append(resp.Checksums, &RangeChecksum{
+					RangeId:  rangeID,
+					Checksum: checksum,
+					Count:    count,
+				})
+			}
+			return resp, nil
+		},
+	}
+
+	if err := secondary.runRangeReconciliation(context.Background(), checkpoint, localSet, time.Now()); err != nil {
+		t.Fatalf("runRangeReconciliation failed: %v", err)
+	}
+	assertDRFlatAccumulatorMatchesSet(t, secondary.rangeAccumulator, checkpoint.CommitIndex, localSet)
+}
+
+func TestDRSecondaryQuiescentReconnectUsesFlatAccumulatorFastPath(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := bytes.Repeat([]byte{0x24}, 32)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-flat-fast-path", core.logger)
+	secondary.checkpointHighWaterMarkPersistHook = func(index uint64) error {
+		if index != 42 {
+			t.Fatalf("expected checkpoint high-water mark 42, got %d", index)
+		}
+		return nil
+	}
+
+	kidA := secondary.scanner.ComputeKID("secret/a")
+	vidA := secondary.scanner.ComputeVIDWithSealWrap([]byte("a"), false)
+	kidB := secondary.scanner.ComputeKID("secret/b")
+	vidB := secondary.scanner.ComputeVIDWithSealWrap([]byte("b"), false)
+	localSet := &reconciler.ReconciliationSet{
+		KIDToVID: map[[32]byte][32]byte{
+			kidA: vidA,
+			kidB: vidB,
+		},
+	}
+	secondary.rangeAccumulator.resetFromSet(localSet, 42)
+	localBuckets, ok := secondary.rangeAccumulator.snapshotExact(42)
+	if !ok {
+		t.Fatal("expected warm accumulator snapshot")
+	}
+
+	var checksumRanges int
+	secondary.client = &drTestClient{
+		requestCheckpointFn: func(_ context.Context, req *CheckpointRequest, _ ...grpc.CallOption) (*CheckpointResponse, error) {
+			if req.GetRelationshipId() != secondary.relationshipID {
+				t.Fatalf("unexpected relationship id %q", req.GetRelationshipId())
+			}
+			return &CheckpointResponse{CheckpointId: "cp-flat-fast-path", CommitIndex: 42}, nil
+		},
+		exchangeRangeChecksumsFn: func(_ context.Context, req *RangeChecksumRequest, _ ...grpc.CallOption) (*RangeChecksumResponse, error) {
+			if req.GetRelationshipId() != secondary.relationshipID {
+				t.Fatalf("unexpected relationship id %q", req.GetRelationshipId())
+			}
+			if req.GetCheckpointId() != "cp-flat-fast-path" || req.GetCheckpointIndex() != 42 {
+				t.Fatalf("unexpected checkpoint tuple %q/%d", req.GetCheckpointId(), req.GetCheckpointIndex())
+			}
+			resp := &RangeChecksumResponse{Checksums: make([]*RangeChecksum, 0, len(req.GetRangeIds()))}
+			for _, rangeID := range req.GetRangeIds() {
+				if rangeID >= uint64(len(localBuckets)) {
+					t.Fatalf("unexpected range id %d", rangeID)
+				}
+				checksumRanges++
+				bucket := localBuckets[rangeID]
+				resp.Checksums = append(resp.Checksums, &RangeChecksum{
+					RangeId:  rangeID,
+					Checksum: bucket.checksum,
+					Count:    bucket.count,
+				})
+			}
+			return resp, nil
+		},
+	}
+
+	// Prove the fast path does not fall back to the O(N) local scanner.
+	secondary.scanner = nil
+	if err := secondary.runReconciliation(context.Background()); err != nil {
+		t.Fatalf("runReconciliation failed: %v", err)
+	}
+	if checksumRanges != drRangeMaxTotalRanges {
+		t.Fatalf("expected %d checksum ranges, got %d", drRangeMaxTotalRanges, checksumRanges)
+	}
+	if got := secondary.lastAppliedIndex.Load(); got != 42 {
+		t.Fatalf("expected lastAppliedIndex 42, got %d", got)
+	}
+	status := secondary.Status()
+	if status.FlatAccumulatorFastPathTotal != 1 {
+		t.Fatalf("expected flat accumulator fast path total 1, got %d", status.FlatAccumulatorFastPathTotal)
+	}
+	if status.ScanFailuresTotal != 0 {
+		t.Fatalf("expected no scan failures, got %d", status.ScanFailuresTotal)
+	}
+}
+
+func TestDRRangeReconciliationSeedsFlatAccumulatorAfterRepair(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	replSalt := bytes.Repeat([]byte{0x25}, 32)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-flat-repair", core.logger)
+	secondary.reconcileMaxInflightTasks = 1
+	secondary.reconcileApplyWorkers = 1
+	secondary.checkpointHighWaterMarkPersistHook = func(uint64) error { return nil }
+
+	key := "secret/flat-repair"
+	oldValue := []byte("old")
+	newValue := []byte("new")
+	if err := core.physical.Put(ctx, &physical.Entry{Key: key, Value: oldValue}); err != nil {
+		t.Fatalf("failed to seed old physical entry: %v", err)
+	}
+
+	kid := secondary.scanner.ComputeKID(key)
+	oldVID := secondary.scanner.ComputeVIDWithSealWrap(oldValue, false)
+	newVID := secondary.scanner.ComputeVIDWithSealWrap(newValue, false)
+	checkpoint := &CheckpointResponse{CheckpointId: "cp-flat-repair", CommitIndex: 88}
+	localSet := &reconciler.ReconciliationSet{
+		Checkpoint: reconciler.Checkpoint{ID: checkpoint.CheckpointId, CommitIndex: checkpoint.CommitIndex},
+		KeyCount:   1,
+		KIDToVID:   map[[32]byte][32]byte{kid: oldVID},
+		KIDToKey:   map[[32]byte]string{kid: key},
+	}
+	remoteSet := &reconciler.ReconciliationSet{
+		Checkpoint: reconciler.Checkpoint{ID: checkpoint.CheckpointId, CommitIndex: checkpoint.CommitIndex},
+		KeyCount:   1,
+		KIDToVID:   map[[32]byte][32]byte{kid: newVID},
+		KIDToKey:   map[[32]byte]string{kid: key},
+	}
+	remoteIndex := reconciler.NewRangeMapIndex(remoteSet.KIDToVID, nil)
+
+	secondary.client = &drTestClient{
+		requestCheckpointFn: func(_ context.Context, req *CheckpointRequest, _ ...grpc.CallOption) (*CheckpointResponse, error) {
+			if req.GetRelationshipId() != secondary.relationshipID {
+				return nil, fmt.Errorf("unexpected relationship id %q", req.GetRelationshipId())
+			}
+			return checkpoint, nil
+		},
+		exchangeRangeChecksumsFn: func(_ context.Context, req *RangeChecksumRequest, _ ...grpc.CallOption) (*RangeChecksumResponse, error) {
+			if req.GetRelationshipId() != secondary.relationshipID {
+				return nil, fmt.Errorf("unexpected relationship id %q", req.GetRelationshipId())
+			}
+			resp := &RangeChecksumResponse{Checksums: make([]*RangeChecksum, 0, len(req.GetRangeIds()))}
+			for _, rangeID := range req.GetRangeIds() {
+				checksum, count := reconciler.ComputeRangeChecksum(remoteIndex, rangeID)
+				resp.Checksums = append(resp.Checksums, &RangeChecksum{
+					RangeId:  rangeID,
+					Checksum: checksum,
+					Count:    count,
+				})
+			}
+			return resp, nil
+		},
+		exchangeRangeDigestsFn: func(_ context.Context, req *RangeDigestRequest, _ ...grpc.CallOption) (*RangeDigestResponse, error) {
+			parent, _, err := protoToRangeSpan(req.GetParentSpan())
+			if err != nil {
+				return nil, err
+			}
+			left, right, ok := reconciler.SplitRange(parent)
+			if !ok {
+				return &RangeDigestResponse{
+					Digests: []*RangeDigest{drRangeDigestForTest(parent, remoteIndex)},
+				}, nil
+			}
+			return &RangeDigestResponse{
+				Digests: []*RangeDigest{
+					drRangeDigestForTest(left, remoteIndex),
+					drRangeDigestForTest(right, remoteIndex),
+				},
+			}, nil
+		},
+		fetchEntriesFn: func(streamCtx context.Context, req *FetchEntriesRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[EntryBatch], error) {
+			if req.GetRelationshipId() != secondary.relationshipID {
+				return nil, fmt.Errorf("unexpected relationship id %q", req.GetRelationshipId())
+			}
+			if req.GetCheckpointId() != checkpoint.CheckpointId || req.GetCheckpointIndex() != checkpoint.CommitIndex {
+				return nil, fmt.Errorf("unexpected checkpoint tuple %q/%d", req.GetCheckpointId(), req.GetCheckpointIndex())
+			}
+			matched := false
+			for _, protoSpan := range req.GetRanges() {
+				span, _, err := protoToRangeSpan(protoSpan)
+				if err != nil {
+					return nil, err
+				}
+				if span.Contains(kid) {
+					matched = true
+				}
+			}
+			if !matched {
+				return nil, fmt.Errorf("expected fetch request to include the repaired kid range")
+			}
+			return &drTestEntryBatchStream{
+				ctx: streamCtx,
+				batches: []*EntryBatch{{
+					CheckpointId:    checkpoint.CheckpointId,
+					CheckpointIndex: checkpoint.CommitIndex,
+					Entries: []*EntryChange{{
+						OpType: string(physical.PutOperation),
+						Key:    key,
+						Value:  append([]byte(nil), newValue...),
+						Kid:    append([]byte(nil), kid[:]...),
+					}},
+				}},
+			}, nil
+		},
+	}
+
+	if err := secondary.runRangeReconciliation(ctx, checkpoint, localSet, time.Now()); err != nil {
+		t.Fatalf("runRangeReconciliation failed: %v", err)
+	}
+	entry, err := core.physical.Get(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry == nil || !bytes.Equal(entry.Value, newValue) {
+		t.Fatalf("expected repaired value %q, got %#v", newValue, entry)
+	}
+	assertDRFlatAccumulatorMatchesSet(t, secondary.rangeAccumulator, checkpoint.CommitIndex, remoteSet)
+
+	// Prove the repaired reconciliation left enough state for the next
+	// quiescent reconnect to take the fast path without scanning.
+	secondary.scanner = nil
+	if err := secondary.runReconciliation(ctx); err != nil {
+		t.Fatalf("runReconciliation fast path after repair failed: %v", err)
+	}
+	status := secondary.Status()
+	if status.FlatAccumulatorFastPathTotal != 1 {
+		t.Fatalf("expected flat accumulator fast path total 1, got %d", status.FlatAccumulatorFastPathTotal)
+	}
+}
+
+func drRangeDigestForTest(span reconciler.RangeSpan, index *reconciler.RangeMapIndex) *RangeDigest {
+	desc := reconciler.BuildRangeDigestFromIndex(index, span)
+	return &RangeDigest{
+		Span:             rangeSpanToProto(span),
+		Count:            desc.Count,
+		XorKeyHash:       append([]byte(nil), desc.XORKeyHash[:]...),
+		XorValueHash:     append([]byte(nil), desc.XORValueHash[:]...),
+		ApproxValueBytes: desc.ApproxValueBytes,
+	}
+}
+
+func assertDRFlatAccumulatorMatchesSet(t *testing.T, accumulator *drFlatRangeAccumulator, index uint64, rs *reconciler.ReconciliationSet) {
+	t.Helper()
+
+	buckets, ok := accumulator.snapshotExact(index)
+	if !ok {
+		t.Fatalf("expected accumulator snapshot at index %d", index)
+	}
+	rangeIndex := reconciler.NewRangeMapIndex(rs.KIDToVID, nil)
+	for rangeID := uint64(0); rangeID < drRangeMaxTotalRanges; rangeID++ {
+		wantChecksum, wantCount := reconciler.ComputeRangeChecksum(rangeIndex, rangeID)
+		got := buckets[rangeID]
+		if got.checksum != wantChecksum || got.count != wantCount {
+			t.Fatalf("range %d mismatch: got checksum=%d count=%d, want checksum=%d count=%d",
+				rangeID, got.checksum, got.count, wantChecksum, wantCount)
+		}
+	}
 }
 
 // --- Integration Test: Two-Side Reconciliation ---
@@ -6433,6 +6911,28 @@ func (c *drTestClient) SyncKeyring(ctx context.Context, in *SyncKeyringRequest, 
 	return c.syncKeyringFn(ctx, in, opts...)
 }
 
+type drTestEntryBatchStream struct {
+	ctx     context.Context
+	batches []*EntryBatch
+	idx     int
+}
+
+func (s *drTestEntryBatchStream) Header() (metadata.MD, error) { return nil, nil }
+func (s *drTestEntryBatchStream) Trailer() metadata.MD         { return nil }
+func (s *drTestEntryBatchStream) CloseSend() error             { return nil }
+func (s *drTestEntryBatchStream) Context() context.Context     { return s.ctx }
+func (s *drTestEntryBatchStream) SendMsg(any) error            { return nil }
+func (s *drTestEntryBatchStream) RecvMsg(any) error            { return nil }
+
+func (s *drTestEntryBatchStream) Recv() (*EntryBatch, error) {
+	if s.idx >= len(s.batches) {
+		return nil, io.EOF
+	}
+	batch := cloneEntryBatchForTest(s.batches[s.idx])
+	s.idx++
+	return batch, nil
+}
+
 type blockingEntryBatchBidiClient struct {
 	ctx context.Context
 }
@@ -7142,6 +7642,40 @@ func TestDRPrimaryAddrRing_AddHintAndSelect(t *testing.T) {
 	}
 	if ring.Current() != "https://127.0.0.9:8201" {
 		t.Fatalf("unexpected current after Use: %q", ring.Current())
+	}
+}
+
+func TestDRSecondaryPrepareStateForConnectPreservesReconnectState(t *testing.T) {
+	tests := []struct {
+		name           string
+		from           DRSecondaryState
+		keyringReady   bool
+		lastAppliedIdx uint64
+		want           DRSecondaryState
+	}{
+		{"first connect", DRSecondaryIdle, false, 0, DRSecondaryBootstrapping},
+		{"restored cursor", DRSecondaryIdle, true, 42, DRSecondaryStreaming},
+		{"restored keyring without cursor", DRSecondaryIdle, true, 0, DRSecondaryBootstrapping},
+		{"bootstrapping", DRSecondaryBootstrapping, false, 0, DRSecondaryBootstrapping},
+		{"initial sync", DRSecondaryInitialSync, false, 0, DRSecondaryBootstrapping},
+		{"streaming", DRSecondaryStreaming, false, 0, DRSecondaryStreaming},
+		{"reconciling", DRSecondaryReconciling, false, 0, DRSecondaryReconciling},
+		{"resnapshotting", DRSecondaryResnapshotting, false, 0, DRSecondaryResnapshotting},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			secondary := &drReplicationSecondary{logger: log.NewNullLogger()}
+			secondary.state.Store(int32(tt.from))
+			secondary.keyringBootstrapped.Store(tt.keyringReady)
+			secondary.lastAppliedIndex.Store(tt.lastAppliedIdx)
+
+			secondary.prepareStateForConnect()
+
+			if got := secondary.State(); got != tt.want {
+				t.Fatalf("prepareStateForConnect() state = %s, want %s", got, tt.want)
+			}
+		})
 	}
 }
 
