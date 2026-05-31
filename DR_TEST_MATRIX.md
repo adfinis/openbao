@@ -283,15 +283,16 @@ scripts/dr_local_test.sh --topology ha smoke \
 scripts/dr_local_test.sh --topology ha verify <run-dir> --sample 0
 ```
 
-Latest observed run: `/Users/roelc/projects/secretz/openbao/dr-stress-results/drmixed-20260531T081719Z`.
-The run completed 41,667 operations at 136.39 ops/s, had zero status failures,
-zero journal drops, 1.0s sentinel convergence on both secondaries, final
+Latest observed run: `/Users/roelc/projects/secretz/openbao/dr-stress-results/drmixed-20260531T083841Z`.
+The run completed 44,662 operations at 144.33 ops/s, had zero status failures,
+zero journal drops, 3.0s/2.0s sentinel convergence, final
 `lag_entries=0`, and exhaustive verification passed on primary, secondary1,
-and secondary2 across 4,188 truth-log keys with zero missing keys, mismatches,
-or read errors. Compared with the prior 15-minute HA hard smoke, max lag dropped
-from 1,433/1,781 to 518/518, reconciliation dwell dropped from 21/26 timeline
-samples to 4/4, and the stream buffer high-water mark stayed below the 50,000
-entry cap.
+and secondary2 across 4,538 truth-log keys with zero missing keys, mismatches,
+or read errors. Final status recorded `stream_txn_coalesced_entries_total=73`
+on secondary1 and `50` on secondary2. Compared with the prior 15-minute HA hard
+smoke, max lag dropped from 1,433/1,781 to 878/878, reconciliation dwell dropped
+from 21/26 timeline samples to 4/4, and the stream buffer high-water mark stayed
+below the 50,000 entry cap.
 
 Single secondary:
 

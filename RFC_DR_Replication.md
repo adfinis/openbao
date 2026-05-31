@@ -1511,13 +1511,14 @@ secondary1, and secondary2 against the stress truth log.
 A targeted HA hot-key validation on 2026-05-31 exercised transactional stream
 coalescing with a rebuilt image, 48 workers, 80% hot-key traffic, and primary
 stepdowns every 100 seconds for 5 minutes. Primary, secondary1, and secondary2
-all passed exhaustive verification across 4,188 truth-log keys with zero
+all passed exhaustive verification across 4,538 truth-log keys with zero
 missing keys, mismatches, or read errors. Both secondaries converged on the
-sentinel in about 1 second and ended at `lag_entries=0`. Compared with the prior
-15-minute HA hard smoke, the run showed lower max lag, lower reconciliation
-dwell, and a lower stream-buffer high-water mark, while client-facing transient
-failures remained attributable to forced HA handoff behavior rather than DR data
-divergence.
+sentinel in 3.0s and 2.0s respectively, ended at `lag_entries=0`, and reported
+`stream_txn_coalesced_entries_total` values of 73 and 50. Compared with the
+prior 15-minute HA hard smoke, the run showed lower max lag, lower
+reconciliation dwell, and a lower stream-buffer high-water mark, while
+client-facing transient failures remained attributable to forced HA handoff
+behavior rather than DR data divergence.
 
 The main known gap is availability polish during primary HA active handoff
 under sustained write and DR backlog pressure; stress runs still observe
