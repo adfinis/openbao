@@ -55,9 +55,9 @@ func runMode(args []string) {
 	// Node connection flags.
 	fs.StringVar(&cfg.Primary.Addr, "primary-addr", cfg.Primary.Addr, "Primary BAO_ADDR (required)")
 	fs.StringVar(&cfg.Primary.Token, "primary-token", cfg.Primary.Token, "Primary BAO_TOKEN (required)")
-	fs.StringVar(&cfg.Secondary1.Addr, "secondary1-addr", cfg.Secondary1.Addr, "Secondary #1 BAO_ADDR")
+	fs.StringVar(&cfg.Secondary1.Addr, "secondary1-addr", cfg.Secondary1.Addr, "Secondary #1 BAO_ADDR or comma-separated HA node addresses")
 	fs.StringVar(&cfg.Secondary1.Token, "secondary1-token", cfg.Secondary1.Token, "Secondary #1 BAO_TOKEN")
-	fs.StringVar(&cfg.Secondary2.Addr, "secondary2-addr", cfg.Secondary2.Addr, "Secondary #2 BAO_ADDR")
+	fs.StringVar(&cfg.Secondary2.Addr, "secondary2-addr", cfg.Secondary2.Addr, "Secondary #2 BAO_ADDR or comma-separated HA node addresses")
 	fs.StringVar(&cfg.Secondary2.Token, "secondary2-token", cfg.Secondary2.Token, "Secondary #2 BAO_TOKEN")
 
 	// TLS flags.

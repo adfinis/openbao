@@ -68,6 +68,18 @@ func TestWriteSentinelWithRetryDoesNotRetryPermanentFailure(t *testing.T) {
 	}
 }
 
+func TestStatusConvergedRequiresPrimaryIndex(t *testing.T) {
+	if statusConverged(&DRStatusResponse{LagEntries: 0, LastAppliedIndex: 100, PrimaryIndex: 0}) {
+		t.Fatal("status with primary_index=0 must not be treated as converged")
+	}
+	if statusConverged(&DRStatusResponse{LagEntries: 1, LastAppliedIndex: 100, PrimaryIndex: 100}) {
+		t.Fatal("status with nonzero lag must not be treated as converged")
+	}
+	if !statusConverged(&DRStatusResponse{LagEntries: 0, LastAppliedIndex: 101, PrimaryIndex: 100}) {
+		t.Fatal("status with lag=0 and last_applied >= primary_index should converge")
+	}
+}
+
 func sentinelTestConfig(addr string) *Config {
 	return &Config{
 		Primary: NodeConfig{

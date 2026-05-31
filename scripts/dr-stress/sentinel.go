@@ -150,7 +150,7 @@ func waitForConvergence(ctx context.Context, role string, client *BaoClient, tim
 		result.FinalApplied = status.LastAppliedIndex
 		result.FinalPrimaryIdx = status.PrimaryIndex
 
-		if status.LagEntries == 0 || (status.LastAppliedIndex >= status.PrimaryIndex && status.PrimaryIndex > 0) {
+		if statusConverged(status) {
 			elapsed := time.Since(start).Seconds()
 			result.Converged = true
 			result.ConvergeSeconds = elapsed
@@ -173,4 +173,8 @@ func waitForConvergence(ctx context.Context, role string, client *BaoClient, tim
 				int(time.Since(start).Seconds()), result.Polls)
 		}
 	}
+}
+
+func statusConverged(status *DRStatusResponse) bool {
+	return status != nil && status.PrimaryIndex > 0 && status.LastAppliedIndex >= status.PrimaryIndex && status.LagEntries == 0
 }

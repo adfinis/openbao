@@ -37,6 +37,7 @@ Usage:
   scripts/dr_local_test.sh --topology ha reseed-secondary-smoke
   scripts/dr_local_test.sh --topology ha quiescent-reconnect-smoke [--no-reset] [--build]
   scripts/dr_local_test.sh --topology ha accumulator-cold-restart-smoke [--no-reset] [--build] [--stop-seconds N]
+  scripts/dr_local_test.sh --topology ha secondary-outage-smoke [--duration N] [--concurrency N] [--outage-after N] [--outage-seconds N] [--no-reset] [--build]
   scripts/dr_local_test.sh --topology ha tuning-load-smoke [--duration N] [--concurrency N] [--no-reset]
   scripts/dr_local_test.sh --topology ha failover-load-lifecycle [--duration N] [--concurrency N] [--hard-stop-after N] [--no-reset]
   scripts/dr_local_test.sh [--topology single|ha] down
@@ -61,6 +62,7 @@ HA topology:
   scripts/dr_local_test.sh --topology ha smoke --duration 900 --concurrency 48 --stepdown-interval 300
   scripts/dr_local_test.sh --topology ha quiescent-reconnect-smoke
   scripts/dr_local_test.sh --topology ha accumulator-cold-restart-smoke
+  scripts/dr_local_test.sh --topology ha secondary-outage-smoke
   scripts/dr_local_test.sh --topology ha tuning-load-smoke
   scripts/dr_local_test.sh --topology ha failover-load-lifecycle
 USAGE
@@ -73,6 +75,11 @@ die() {
 
 need_bin() {
   command -v "$1" >/dev/null 2>&1 || die "missing required binary: $1"
+}
+
+join_csv() {
+  local IFS=,
+  printf "%s" "$*"
 }
 
 configure_topology() {
@@ -234,6 +241,40 @@ unseal_with_key() {
   fi
 }
 
+unseal_with_any_key() {
+  local name="$1"
+  local addr="$2"
+  shift 2
+  local status sealed key tmp_err
+
+  wait_status "$name" "$addr" 180
+  status="$(status_json "$addr")"
+  sealed="$(jq -r '.sealed' <<<"$status")"
+  if [[ "$sealed" != "true" ]]; then
+    return 0
+  fi
+
+  tmp_err="$(mktemp)"
+  for key in "$@"; do
+    [[ -n "$key" ]] || continue
+    if bao_for "$addr" "" operator unseal "$key" >/dev/null 2>"$tmp_err"; then
+      rm -f "$tmp_err"
+      return 0
+    fi
+  done
+
+  echo "failed to unseal ${name} with any configured local DR key" >&2
+  cat "$tmp_err" >&2 || true
+  rm -f "$tmp_err"
+  return 1
+}
+
+unseal_secondary1_dr() {
+  local name="$1"
+  local addr="$2"
+  unseal_with_any_key "$name" "$addr" "${DR_SECONDARY1_UNSEAL_KEY:-}" "${DR_PRIMARY_UNSEAL_KEY:-}"
+}
+
 wait_raft_peers() {
   local name="$1"
   local addr="$2"
@@ -368,20 +409,22 @@ wait_secondary_ready() {
   local addr="$2"
   local timeout="${3:-240}"
   local deadline=$(( $(date +%s) + timeout ))
-  local out mode state lag
+  local out mode state lag primary_index last_applied
 
   while true; do
     out="$(bao_for "$addr" "$DR_PRIMARY_TOKEN" read -format=json sys/replication/dr/status 2>/dev/null || true)"
     mode="$(jq -r '.data.mode // ""' <<<"$out" 2>/dev/null || true)"
     state="$(jq -r '.data.secondary_state // ""' <<<"$out" 2>/dev/null || true)"
     lag="$(jq -r '.data.lag_entries // 0' <<<"$out" 2>/dev/null || echo 0)"
-    if [[ "$mode" == "secondary" && "$state" == "streaming" && "$lag" == "0" ]]; then
-      echo "${name} ready: state=${state} lag=${lag}"
+    primary_index="$(jq -r '.data.primary_index // 0' <<<"$out" 2>/dev/null || echo 0)"
+    last_applied="$(jq -r '.data.last_applied_index // 0' <<<"$out" 2>/dev/null || echo 0)"
+    if [[ "$mode" == "secondary" && "$state" == "streaming" && "$lag" == "0" && "$primary_index" =~ ^[0-9]+$ && "$last_applied" =~ ^[0-9]+$ && "$primary_index" -gt 0 && "$last_applied" -ge "$primary_index" ]]; then
+      echo "${name} ready: state=${state} lag=${lag} applied=${last_applied} primary=${primary_index}"
       return 0
     fi
     if (( $(date +%s) >= deadline )); then
       echo "$out" | jq '.data // {}' >&2 || true
-      die "timed out waiting for ${name} to reach streaming lag=0"
+      die "timed out waiting for ${name} to reach streaming lag=0 with a current primary index"
     fi
     sleep 2
   done
@@ -749,9 +792,19 @@ cmd_reset() {
 
 cmd_status() {
   load_env
-  dr_status "primary" "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN"
-  dr_status "secondary1" "$DR_SECONDARY1_ADDR" "$DR_PRIMARY_TOKEN"
-  dr_status "secondary2" "$DR_SECONDARY2_ADDR" "$DR_PRIMARY_TOKEN"
+  local primary_addr="$DR_PRIMARY_ADDR"
+  local secondary1_addr="$DR_SECONDARY1_ADDR"
+  local secondary2_addr="$DR_SECONDARY2_ADDR"
+
+  if [[ "$TOPOLOGY" == "ha" ]]; then
+    primary_addr="$(cluster_active_addr "${PRIMARY_NODE_ADDRS[@]}" || printf "%s" "$DR_PRIMARY_ADDR")"
+    secondary1_addr="$(cluster_active_addr "${SECONDARY1_NODE_ADDRS[@]}" || printf "%s" "$DR_SECONDARY1_ADDR")"
+    secondary2_addr="$(cluster_active_addr "${SECONDARY2_NODE_ADDRS[@]}" || printf "%s" "$DR_SECONDARY2_ADDR")"
+  fi
+
+  dr_status "primary" "$primary_addr" "$DR_PRIMARY_TOKEN"
+  dr_status "secondary1" "$secondary1_addr" "$DR_PRIMARY_TOKEN"
+  dr_status "secondary2" "$secondary2_addr" "$DR_PRIMARY_TOKEN"
 }
 
 ensure_dr_stress() {
@@ -1546,7 +1599,7 @@ cmd_promoted_durability_smoke() {
   compose restart secondary1-1 secondary1-2 secondary1-3
   local i
   for i in "${!SECONDARY1_NODE_ADDRS[@]}"; do
-    unseal_with_key "secondary1-$((i + 1))" "${SECONDARY1_NODE_ADDRS[$i]}" "$DR_SECONDARY1_UNSEAL_KEY"
+    unseal_secondary1_dr "secondary1-$((i + 1))" "${SECONDARY1_NODE_ADDRS[$i]}"
   done
   wait_promoted_secondary1_ready "$promotion_id" 300
   active_after_restart="$(wait_secondary1_active_addr 120)"
@@ -2014,7 +2067,7 @@ cmd_accumulator_cold_restart_smoke() {
   compose start "${services[@]}" >"$run_dir/secondary1-start.out" 2>"$run_dir/secondary1-start.err"
 
   for i in "${!SECONDARY1_NODE_ADDRS[@]}"; do
-    unseal_with_key "secondary1-$((i + 1))" "${SECONDARY1_NODE_ADDRS[$i]}" "$DR_SECONDARY1_UNSEAL_KEY"
+    unseal_secondary1_dr "secondary1-$((i + 1))" "${SECONDARY1_NODE_ADDRS[$i]}"
   done
   wait_raft_peers "secondary1 restarted" "$DR_SECONDARY1_ADDR" "$DR_PRIMARY_TOKEN" "$EXPECTED_RAFT_PEERS" "$timeout"
   secondary1_active="$(wait_cluster_active_addr "secondary1 after cold restart" 120 "${SECONDARY1_NODE_ADDRS[@]}")"
@@ -2048,20 +2101,20 @@ cmd_accumulator_cold_restart_smoke() {
   if (( after_cursor < before_last )); then
     die "secondary1 flat accumulator cursor did not cover the pre-restart applied index: cursor=${after_cursor}, before=${before_last}"
   fi
-  if (( after_reconcile > before_reconcile )); then
-    die "secondary1 ran reconciliation after cold restart; expected stream replay from persisted accumulator cursor: ${before_reconcile} -> ${after_reconcile}"
+  if (( after_reconcile != 0 )); then
+    die "secondary1 ran reconciliation after cold restart; expected stream replay from persisted accumulator cursor: ${after_reconcile}"
   fi
-  if (( after_scan_failures > before_scan_failures )); then
-    die "secondary1 reported new scan failures after cold restart: ${before_scan_failures} -> ${after_scan_failures}"
+  if (( after_scan_failures != 0 )); then
+    die "secondary1 reported scan failures after cold restart: ${after_scan_failures}"
   fi
-  if (( after_local_kid_fallback > before_local_kid_fallback )); then
-    die "secondary1 ran local KID-index fallback scan after cold restart: ${before_local_kid_fallback} -> ${after_local_kid_fallback}"
+  if (( after_local_kid_fallback != 0 )); then
+    die "secondary1 ran local KID-index fallback scan after cold restart: ${after_local_kid_fallback}"
   fi
-  if (( after_full_bucket > before_full_bucket )); then
-    die "secondary1 ran full-bucket indexed repair fallback after cold restart: ${before_full_bucket} -> ${after_full_bucket}"
+  if (( after_full_bucket != 0 )); then
+    die "secondary1 ran full-bucket indexed repair fallback after cold restart: ${after_full_bucket}"
   fi
-  if (( after_proof_mismatch > before_proof_mismatch )); then
-    die "secondary1 recorded indexed repair proof mismatch after cold restart: ${before_proof_mismatch} -> ${after_proof_mismatch}"
+  if (( after_proof_mismatch != 0 )); then
+    die "secondary1 recorded indexed repair proof mismatch after cold restart: ${after_proof_mismatch}"
   fi
 
   compose logs --no-color --since "$restart_since" "${services[@]}" >"$run_dir/secondary1-restart.log" 2>"$run_dir/secondary1-restart.log.err" || true
@@ -2080,6 +2133,259 @@ cmd_accumulator_cold_restart_smoke() {
 
   echo "completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$run_dir/orchestrator.log"
   echo "Accumulator cold-restart smoke passed."
+  echo "Run: ${run_dir}"
+}
+
+cmd_secondary_outage_smoke() {
+  [[ "$TOPOLOGY" == "ha" ]] || die "secondary-outage-smoke requires --topology ha"
+  need_bin jq
+  need_bin rg
+
+  local duration=180
+  local concurrency=36
+  local outage_after=30
+  local outage_seconds=60
+  local progress_interval=10
+  local monitor_interval=2
+  local max_wait_seconds=300
+  local do_reset=true
+  local do_build=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --duration)
+        duration="${2:?missing value for --duration}"
+        shift 2
+        ;;
+      --concurrency)
+        concurrency="${2:?missing value for --concurrency}"
+        shift 2
+        ;;
+      --outage-after)
+        outage_after="${2:?missing value for --outage-after}"
+        shift 2
+        ;;
+      --outage-seconds)
+        outage_seconds="${2:?missing value for --outage-seconds}"
+        shift 2
+        ;;
+      --progress-interval)
+        progress_interval="${2:?missing value for --progress-interval}"
+        shift 2
+        ;;
+      --monitor-interval)
+        monitor_interval="${2:?missing value for --monitor-interval}"
+        shift 2
+        ;;
+      --max-wait-seconds)
+        max_wait_seconds="${2:?missing value for --max-wait-seconds}"
+        shift 2
+        ;;
+      --no-reset)
+        do_reset=false
+        shift
+        ;;
+      --build)
+        do_build=true
+        shift
+        ;;
+      *)
+        die "unknown secondary-outage-smoke option: $1"
+        ;;
+    esac
+  done
+
+  [[ "$duration" =~ ^[0-9]+$ ]] || die "--duration must be an integer"
+  [[ "$concurrency" =~ ^[0-9]+$ ]] || die "--concurrency must be an integer"
+  [[ "$outage_after" =~ ^[0-9]+$ ]] || die "--outage-after must be an integer"
+  [[ "$outage_seconds" =~ ^[0-9]+$ ]] || die "--outage-seconds must be an integer"
+  [[ "$progress_interval" =~ ^[0-9]+$ ]] || die "--progress-interval must be an integer"
+  [[ "$monitor_interval" =~ ^[0-9]+$ ]] || die "--monitor-interval must be an integer"
+  [[ "$max_wait_seconds" =~ ^[0-9]+$ ]] || die "--max-wait-seconds must be an integer"
+  (( duration > 0 )) || die "--duration must be > 0"
+  (( concurrency > 0 )) || die "--concurrency must be > 0"
+  (( outage_after > 0 && outage_after < duration )) || die "--outage-after must be > 0 and less than --duration"
+  (( outage_seconds > 0 )) || die "--outage-seconds must be > 0"
+  (( outage_after + outage_seconds + 15 < duration )) || die "--duration must leave at least 15s after secondary restart"
+  if [[ "$do_reset" == "false" && "$do_build" == "true" ]]; then
+    die "--build cannot be used with --no-reset"
+  fi
+
+  if [[ "$do_reset" == "true" ]]; then
+    if [[ "$do_build" == "true" ]]; then
+      cmd_reset --build
+    else
+      cmd_reset
+    fi
+  else
+    load_env
+    wait_secondary_ready "secondary1 pre-outage" "$DR_SECONDARY1_ADDR"
+    wait_secondary_ready "secondary2 pre-outage" "$DR_SECONDARY2_ADDR"
+  fi
+
+  ensure_dr_stress
+
+  local run_id run_dir stress_pid stress_rc restart_since primary_active secondary1_active secondary2_active secondary1_addrs_csv secondary2_addrs_csv
+  local before_last before_reconcile before_scan_failures before_local_kid_fallback before_full_bucket before_proof_mismatch before_range_too_old
+  local after_last after_reconcile after_cursor after_snapshot after_scan_failures after_local_kid_fallback after_full_bucket after_proof_mismatch after_range_too_old
+  local services=(secondary1-1 secondary1-2 secondary1-3)
+
+  run_id="secondary-outage-$(date -u +%Y%m%dT%H%M%SZ)"
+  run_dir="${RESULTS_DIR}/${run_id}"
+  mkdir -p "$run_dir"
+
+  {
+    echo "run_id=${run_id}"
+    echo "run_dir=${run_dir}"
+    echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "duration=${duration}"
+    echo "concurrency=${concurrency}"
+    echo "outage_after=${outage_after}"
+    echo "outage_seconds=${outage_seconds}"
+  } | tee "$run_dir/orchestrator.log"
+
+  primary_active="$(wait_cluster_active_addr "primary pre-outage" 120 "${PRIMARY_NODE_ADDRS[@]}")"
+  secondary1_active="$(wait_cluster_active_addr "secondary1 pre-outage" 120 "${SECONDARY1_NODE_ADDRS[@]}")"
+  secondary2_active="$(wait_cluster_active_addr "secondary2 pre-outage" 120 "${SECONDARY2_NODE_ADDRS[@]}")"
+  secondary1_addrs_csv="$(join_csv "${SECONDARY1_NODE_ADDRS[@]}")"
+  secondary2_addrs_csv="$(join_csv "${SECONDARY2_NODE_ADDRS[@]}")"
+  echo "primary_active_before=${primary_active}" | tee -a "$run_dir/orchestrator.log"
+  echo "secondary1_active_before=${secondary1_active}" | tee -a "$run_dir/orchestrator.log"
+  echo "secondary2_active_before=${secondary2_active}" | tee -a "$run_dir/orchestrator.log"
+  echo "secondary1_addrs=${secondary1_addrs_csv}" | tee -a "$run_dir/orchestrator.log"
+  echo "secondary2_addrs=${secondary2_addrs_csv}" | tee -a "$run_dir/orchestrator.log"
+  wait_secondary_ready "secondary1 pre-outage" "$secondary1_active"
+  wait_secondary_ready "secondary2 pre-outage" "$secondary2_active"
+
+  dr_status_json "$secondary1_active" "$DR_PRIMARY_TOKEN" >"$run_dir/before-secondary1-status.json"
+  dr_status_json "$primary_active" "$DR_PRIMARY_TOKEN" >"$run_dir/before-primary-status.json"
+  before_last="$(dr_last_applied_index_from_file "$run_dir/before-secondary1-status.json")"
+  before_reconcile="$(dr_reconcile_count_from_file "$run_dir/before-secondary1-status.json")"
+  before_scan_failures="$(dr_uint_field_from_file "$run_dir/before-secondary1-status.json" "scan_failures_total")"
+  before_local_kid_fallback="$(dr_uint_field_from_file "$run_dir/before-secondary1-status.json" "local_kid_index_fallback_scans_total")"
+  before_full_bucket="$(dr_uint_field_from_file "$run_dir/before-secondary1-status.json" "flat_accumulator_indexed_repair_full_bucket_fallback_total")"
+  before_proof_mismatch="$(dr_uint_field_from_file "$run_dir/before-secondary1-status.json" "flat_accumulator_indexed_repair_proof_mismatches_total")"
+  before_range_too_old="$(dr_uint_field_from_file "$run_dir/before-primary-status.json" "journal_range_too_old_total")"
+  echo "last_applied_before_secondary1=${before_last}" | tee -a "$run_dir/orchestrator.log"
+  echo "reconcile_count_before_secondary1=${before_reconcile}" | tee -a "$run_dir/orchestrator.log"
+  echo "scan_failures_before_secondary1=${before_scan_failures}" | tee -a "$run_dir/orchestrator.log"
+  echo "local_kid_index_fallback_scans_before_secondary1=${before_local_kid_fallback}" | tee -a "$run_dir/orchestrator.log"
+  echo "full_bucket_fallback_before_secondary1=${before_full_bucket}" | tee -a "$run_dir/orchestrator.log"
+  echo "indexed_proof_mismatch_before_secondary1=${before_proof_mismatch}" | tee -a "$run_dir/orchestrator.log"
+  echo "journal_range_too_old_before_primary=${before_range_too_old}" | tee -a "$run_dir/orchestrator.log"
+
+  "$DR_STRESS_BIN" run \
+    -run-id "$run_id" \
+    -output-dir "$RESULTS_DIR" \
+    -primary-addr "$primary_active" \
+    -primary-token "$DR_PRIMARY_TOKEN" \
+    -secondary1-addr "$secondary1_addrs_csv" \
+    -secondary1-token "$DR_PRIMARY_TOKEN" \
+    -secondary2-addr "$secondary2_addrs_csv" \
+    -secondary2-token "$DR_PRIMARY_TOKEN" \
+    -ensure-kv \
+    -duration "$duration" \
+    -concurrency "$concurrency" \
+    -put-percent 70 \
+    -get-primary-percent 20 \
+    -status-s1-percent 0 \
+    -status-s2-percent 10 \
+    -test-class recovery_disruption \
+    -topology-label primary+2-secondary \
+    -disruption-profile "secondary1_full_cluster_outage_${outage_seconds}s" \
+    -max-wait-seconds "$max_wait_seconds" \
+    -progress-interval "$progress_interval" \
+    -monitor-interval "$monitor_interval" \
+    >"$run_dir/harness.out" 2>"$run_dir/harness.err" &
+  stress_pid=$!
+  echo "stress_pid=${stress_pid}" | tee -a "$run_dir/orchestrator.log"
+
+  sleep "$outage_after"
+  restart_since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "stopping_secondary1_at=${restart_since}" | tee -a "$run_dir/orchestrator.log"
+  compose stop "${services[@]}" >"$run_dir/secondary1-stop.out" 2>"$run_dir/secondary1-stop.err"
+  sleep "$outage_seconds"
+  echo "starting_secondary1_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$run_dir/orchestrator.log"
+  compose start "${services[@]}" >"$run_dir/secondary1-start.out" 2>"$run_dir/secondary1-start.err"
+  for i in "${!SECONDARY1_NODE_ADDRS[@]}"; do
+    unseal_secondary1_dr "secondary1-$((i + 1))" "${SECONDARY1_NODE_ADDRS[$i]}"
+  done
+  wait_raft_peers "secondary1 after outage" "$DR_SECONDARY1_ADDR" "$DR_PRIMARY_TOKEN" "$EXPECTED_RAFT_PEERS" "$max_wait_seconds"
+  secondary1_active="$(wait_cluster_active_addr "secondary1 after outage" 120 "${SECONDARY1_NODE_ADDRS[@]}")"
+  echo "secondary1_active_after=${secondary1_active}" | tee -a "$run_dir/orchestrator.log"
+  wait_secondary_ready "secondary1 after outage" "$secondary1_active" "$max_wait_seconds"
+
+  echo "waiting_for_stress_pid=${stress_pid}" | tee -a "$run_dir/orchestrator.log"
+  set +e
+  wait "$stress_pid"
+  stress_rc=$?
+  set -e
+  echo "stress_rc=${stress_rc}" | tee -a "$run_dir/orchestrator.log"
+  if [[ "$stress_rc" -ne 0 ]]; then
+    die "dr-stress exited non-zero; artifacts preserved in ${run_dir}"
+  fi
+
+  wait_secondary_ready "secondary1 final" "$secondary1_active" "$max_wait_seconds"
+  wait_secondary_ready "secondary2 final" "$DR_SECONDARY2_ADDR" "$max_wait_seconds"
+  dr_status_json "$secondary1_active" "$DR_PRIMARY_TOKEN" >"$run_dir/after-secondary1-status.json"
+  primary_active="$(wait_cluster_active_addr "primary final" 120 "${PRIMARY_NODE_ADDRS[@]}")"
+  dr_status_json "$primary_active" "$DR_PRIMARY_TOKEN" >"$run_dir/after-primary-status.json"
+
+  after_last="$(dr_last_applied_index_from_file "$run_dir/after-secondary1-status.json")"
+  after_reconcile="$(dr_reconcile_count_from_file "$run_dir/after-secondary1-status.json")"
+  after_cursor="$(dr_uint_field_from_file "$run_dir/after-secondary1-status.json" "flat_accumulator_cursor_index")"
+  after_snapshot="$(dr_uint_field_from_file "$run_dir/after-secondary1-status.json" "flat_accumulator_snapshot_index")"
+  after_scan_failures="$(dr_uint_field_from_file "$run_dir/after-secondary1-status.json" "scan_failures_total")"
+  after_local_kid_fallback="$(dr_uint_field_from_file "$run_dir/after-secondary1-status.json" "local_kid_index_fallback_scans_total")"
+  after_full_bucket="$(dr_uint_field_from_file "$run_dir/after-secondary1-status.json" "flat_accumulator_indexed_repair_full_bucket_fallback_total")"
+  after_proof_mismatch="$(dr_uint_field_from_file "$run_dir/after-secondary1-status.json" "flat_accumulator_indexed_repair_proof_mismatches_total")"
+  after_range_too_old="$(dr_uint_field_from_file "$run_dir/after-primary-status.json" "journal_range_too_old_total")"
+  echo "last_applied_after_secondary1=${after_last}" | tee -a "$run_dir/orchestrator.log"
+  echo "reconcile_count_after_secondary1=${after_reconcile}" | tee -a "$run_dir/orchestrator.log"
+  echo "flat_accumulator_cursor_after_secondary1=${after_cursor}" | tee -a "$run_dir/orchestrator.log"
+  echo "flat_accumulator_snapshot_after_secondary1=${after_snapshot}" | tee -a "$run_dir/orchestrator.log"
+  echo "scan_failures_after_secondary1=${after_scan_failures}" | tee -a "$run_dir/orchestrator.log"
+  echo "local_kid_index_fallback_scans_after_secondary1=${after_local_kid_fallback}" | tee -a "$run_dir/orchestrator.log"
+  echo "full_bucket_fallback_after_secondary1=${after_full_bucket}" | tee -a "$run_dir/orchestrator.log"
+  echo "indexed_proof_mismatch_after_secondary1=${after_proof_mismatch}" | tee -a "$run_dir/orchestrator.log"
+  echo "journal_range_too_old_after_primary=${after_range_too_old}" | tee -a "$run_dir/orchestrator.log"
+
+  if (( after_last < before_last )); then
+    die "secondary1 last_applied_index moved backwards after outage: ${before_last} -> ${after_last}"
+  fi
+  if (( after_cursor < before_last )); then
+    die "secondary1 flat accumulator cursor did not cover the pre-outage applied index: cursor=${after_cursor}, before=${before_last}"
+  fi
+  if (( after_reconcile != 0 )); then
+    die "secondary1 ran reconciliation after within-horizon outage: ${after_reconcile}"
+  fi
+  if (( after_scan_failures != 0 )); then
+    die "secondary1 reported scan failures after outage: ${after_scan_failures}"
+  fi
+  if (( after_local_kid_fallback != 0 )); then
+    die "secondary1 ran local KID-index fallback scan after outage: ${after_local_kid_fallback}"
+  fi
+  if (( after_full_bucket != 0 )); then
+    die "secondary1 ran full-bucket indexed repair fallback after outage: ${after_full_bucket}"
+  fi
+  if (( after_proof_mismatch != 0 )); then
+    die "secondary1 recorded indexed repair proof mismatch after outage: ${after_proof_mismatch}"
+  fi
+  if (( after_range_too_old > before_range_too_old )); then
+    die "primary reported journal range too old during within-horizon outage: ${before_range_too_old} -> ${after_range_too_old}"
+  fi
+
+  compose logs --no-color --since "$restart_since" "${services[@]}" >"$run_dir/secondary1-outage-restart.log" 2>"$run_dir/secondary1-outage-restart.log.err" || true
+  if rg -q "local scan complete|starting reconciliation" "$run_dir/secondary1-outage-restart.log"; then
+    die "secondary1 restart logs show scanned reconciliation during within-horizon outage"
+  fi
+
+  verify_one "primary" "$primary_active" "$run_dir" 0
+  verify_one "secondary1" "$secondary1_active" "$run_dir" 0
+  verify_one "secondary2" "$DR_SECONDARY2_ADDR" "$run_dir" 0
+
+  echo "completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$run_dir/orchestrator.log"
+  echo "Secondary outage smoke passed."
   echo "Run: ${run_dir}"
 }
 
@@ -2509,6 +2815,7 @@ main() {
     reseed-secondary-smoke) cmd_reseed_secondary_smoke "$@" ;;
     quiescent-reconnect-smoke) cmd_quiescent_reconnect_smoke "$@" ;;
     accumulator-cold-restart-smoke) cmd_accumulator_cold_restart_smoke "$@" ;;
+    secondary-outage-smoke) cmd_secondary_outage_smoke "$@" ;;
     tuning-load-smoke) cmd_tuning_load_smoke "$@" ;;
     failover-load-lifecycle) cmd_failover_load_lifecycle "$@" ;;
     down) cmd_down "$@" ;;

@@ -21,6 +21,7 @@ import (
 type BaoClient struct {
 	httpClient *http.Client
 	addr       string // e.g. "https://127.0.0.1:8200"
+	addrs      []string
 	token      string
 }
 
@@ -67,20 +68,40 @@ func NewBaoClient(node NodeConfig, cfg *Config) (*BaoClient, error) {
 		Timeout:   cfg.HTTPTimeout + 5*time.Second, // slightly above response header timeout
 	}
 
-	addr := strings.TrimRight(node.Addr, "/")
+	addrs := parseAddrs(node.Addr)
+	addr := ""
+	if len(addrs) > 0 {
+		addr = addrs[0]
+	}
 
 	return &BaoClient{
 		httpClient: client,
 		addr:       addr,
+		addrs:      addrs,
 		token:      node.Token,
 	}, nil
+}
+
+func parseAddrs(raw string) []string {
+	var addrs []string
+	for _, part := range strings.Split(raw, ",") {
+		addr := strings.TrimRight(strings.TrimSpace(part), "/")
+		if addr != "" {
+			addrs = append(addrs, addr)
+		}
+	}
+	return addrs
 }
 
 // do executes an HTTP request and returns status code, response body, and error.
 // The caller is responsible for interpreting the body.  On non-2xx the body
 // is still returned (if available) so error details can be extracted.
 func (c *BaoClient) do(ctx context.Context, method, path string, body io.Reader) (int, []byte, error) {
-	url := c.addr + path
+	return c.doAt(ctx, c.addr, method, path, body)
+}
+
+func (c *BaoClient) doAt(ctx context.Context, addr, method, path string, body io.Reader) (int, []byte, error) {
+	url := addr + path
 	req, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
 		return 0, nil, fmt.Errorf("build request: %w", err)
@@ -245,7 +266,40 @@ type drStatusEnvelope struct {
 
 // DRStatus queries sys/replication/dr/status. Returns parsed status and error.
 func (c *BaoClient) DRStatus(ctx context.Context) (*DRStatusResponse, int, error) {
-	code, body, err := c.do(ctx, http.MethodGet, "/v1/sys/replication/dr/status", nil)
+	if len(c.addrs) <= 1 {
+		return c.drStatusAt(ctx, c.addr)
+	}
+
+	var best *DRStatusResponse
+	var bestCode int
+	var bestScore int
+	var lastErr error
+	var lastCode int
+	for _, addr := range c.addrs {
+		status, code, err := c.drStatusAt(ctx, addr)
+		if err != nil {
+			lastErr = err
+			lastCode = code
+			continue
+		}
+		score := drStatusScore(status)
+		if best == nil || score > bestScore {
+			best = status
+			bestCode = code
+			bestScore = score
+		}
+	}
+	if best != nil {
+		return best, bestCode, nil
+	}
+	if lastErr != nil {
+		return nil, lastCode, lastErr
+	}
+	return nil, 0, fmt.Errorf("no addresses configured")
+}
+
+func (c *BaoClient) drStatusAt(ctx context.Context, addr string) (*DRStatusResponse, int, error) {
+	code, body, err := c.doAt(ctx, addr, http.MethodGet, "/v1/sys/replication/dr/status", nil)
 	if err != nil {
 		return nil, code, err
 	}
@@ -263,6 +317,32 @@ func (c *BaoClient) DRStatus(ctx context.Context) (*DRStatusResponse, int, error
 		return nil, code, fmt.Errorf("decode dr status data: %w", err)
 	}
 	return &status, code, nil
+}
+
+func drStatusScore(status *DRStatusResponse) int {
+	if status == nil {
+		return 0
+	}
+	score := 0
+	if status.Mode != "" {
+		score++
+	}
+	if status.Mode == "primary" {
+		score += 10
+	}
+	if status.Mode == "secondary" {
+		score += 10
+	}
+	if status.SecondaryState == "streaming" {
+		score += 10
+	}
+	if status.PrimaryIndex > 0 {
+		score += 5
+	}
+	if status.PrimaryIndex > 0 && status.LastAppliedIndex >= status.PrimaryIndex && status.LagEntries == 0 {
+		score += 5
+	}
+	return score
 }
 
 // StepDown requests a leader stepdown on the node.
