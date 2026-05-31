@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"hash/crc64"
 	"sync"
+	"time"
 
+	metrics "github.com/hashicorp/go-metrics/compat"
 	"github.com/openbao/openbao/physical/replication/reconciler"
 	"github.com/openbao/openbao/sdk/v2/physical"
 )
@@ -247,10 +249,34 @@ func (s *drReplicationSecondary) persistFlatAccumulatorSnapshot(
 	if err != nil {
 		return err
 	}
-	return writer.Put(ctx, &physical.Entry{
+	start := time.Now()
+	err = writer.Put(ctx, &physical.Entry{
 		Key:   drFlatAccumulatorStoragePath,
 		Value: data,
 	})
+	if err == nil {
+		s.recordFlatAccumulatorSnapshotPersist(len(data), time.Since(start))
+	}
+	return err
+}
+
+func (s *drReplicationSecondary) recordFlatAccumulatorSnapshotPersist(bytes int, duration time.Duration) {
+	if s == nil || bytes < 0 {
+		return
+	}
+	byteCount := uint64(bytes)
+	nanos := durationNanos(duration)
+
+	s.flatAccumulatorSnapshotCount.Add(1)
+	s.flatAccumulatorSnapshotBytes.Add(byteCount)
+	s.flatAccumulatorSnapshotLast.Store(byteCount)
+	s.flatAccumulatorSnapshotNanos.Add(nanos)
+	atomicMaxUint64(&s.flatAccumulatorSnapshotMaxNs, nanos)
+
+	metrics.IncrCounter([]string{"replication", "dr", "secondary", "flat_accumulator_snapshot_persists_total"}, 1)
+	metrics.IncrCounter([]string{"replication", "dr", "secondary", "flat_accumulator_snapshot_bytes_total"}, float32(byteCount))
+	metrics.SetGauge([]string{"replication", "dr", "secondary", "flat_accumulator_snapshot_bytes_last"}, float32(byteCount))
+	metrics.MeasureSince([]string{"replication", "dr", "secondary", "flat_accumulator_snapshot_persist_duration"}, time.Now().Add(-duration))
 }
 
 func (s *drReplicationSecondary) deletePersistedFlatAccumulator(ctx context.Context, writer physical.Backend) error {

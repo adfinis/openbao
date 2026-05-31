@@ -243,7 +243,7 @@ scripts remain available under `/Users/roelc/projects/secretz/openbao/scripts`.
 | S11 | Dynamic tuning under HA load | `scripts/dr_local_test.sh --topology ha tuning-load-smoke` | Update primary and secondary DR tuning while mixed load is running, then force HA handoffs | Tuning writes succeed, new active nodes report the updated profile, workload exits cleanly, both secondaries return to `streaming` with lag 0, and exhaustive verification passes on primary and both secondaries |
 | S12 | HA quiescent reconnect optimization | `scripts/dr_local_test.sh --topology ha quiescent-reconnect-smoke` | Verify active primary handoff avoids scanned reconciliation when stream replay can resume | Both secondaries return to `streaming` lag 0, marker data remains visible, and either `reconcile_count` is unchanged or `flat_accumulator_fast_path_total` increments |
 | S13 | HA accumulator cold restart | `scripts/dr_local_test.sh --topology ha accumulator-cold-restart-smoke` | Verify a full secondary cluster restart reloads the persisted flat accumulator cursor and resumes stream replay without scanned reconciliation | Secondary #1 returns to `streaming` lag 0, marker data remains visible, restart logs show accumulator load, and post-restart `reconcile_count` remains 0 |
-| S14 | HA hot-key stream coalescing validation | `scripts/dr_local_test.sh --topology ha reset --build && scripts/dr_local_test.sh --topology ha smoke --duration 300 --concurrency 48 --stepdown-interval 100 --progress-interval 10 --monitor-interval 2 && scripts/dr_local_test.sh --topology ha verify <run-dir> --sample 0` | Measure secondary apply behavior after transactional stream coalescing under hot-key load and HA handoff pressure | Exhaustive verification passes on primary and both secondaries; sentinel convergence is near-immediate; both secondaries end `streaming` with `lag_entries=0`; no journal drops; status timelines expose `stream_txn_coalesced_entries_total`; compare max lag, stream-buffer high-water mark, and reconciliation dwell against the prior hard HA baseline |
+| S14 | HA hot-key stream coalescing validation | `scripts/dr_local_test.sh --topology ha reset --build && scripts/dr_local_test.sh --topology ha smoke --duration 300 --concurrency 48 --stepdown-interval 100 --progress-interval 10 --monitor-interval 2 && scripts/dr_local_test.sh --topology ha verify <run-dir> --sample 0` | Measure secondary apply behavior after transactional stream coalescing under hot-key load and HA handoff pressure | Exhaustive verification passes on primary and both secondaries; sentinel convergence is near-immediate; both secondaries end `streaming` with `lag_entries=0`; no journal drops; status timelines expose stream transaction counts, coalesced physical-entry counts, flush reasons, apply/commit timing, and flat-accumulator snapshot persist counters |
 
 ### Stress Run Examples
 
@@ -283,16 +283,24 @@ scripts/dr_local_test.sh --topology ha smoke \
 scripts/dr_local_test.sh --topology ha verify <run-dir> --sample 0
 ```
 
-Latest observed run: `/Users/roelc/projects/secretz/openbao/dr-stress-results/drmixed-20260531T083841Z`.
-The run completed 44,662 operations at 144.33 ops/s, had zero status failures,
-zero journal drops, 3.0s/2.0s sentinel convergence, final
-`lag_entries=0`, and exhaustive verification passed on primary, secondary1,
-and secondary2 across 4,538 truth-log keys with zero missing keys, mismatches,
-or read errors. Final status recorded `stream_txn_coalesced_entries_total=73`
-on secondary1 and `50` on secondary2. Compared with the prior 15-minute HA hard
-smoke, max lag dropped from 1,433/1,781 to 878/878, reconciliation dwell dropped
-from 21/26 timeline samples to 4/4, and the stream buffer high-water mark stayed
-below the 50,000 entry cap.
+Latest observed run: `/Users/roelc/projects/secretz/openbao/dr-stress-results/drmixed-20260531T105906Z`.
+The run completed 43,789 operations at 142.18 ops/s, had zero status failures,
+zero journal drops, 1.0s/1.0s sentinel convergence, final `lag_entries=0`, and
+exhaustive verification passed on primary, secondary1, and secondary2 across
+4,498 truth-log keys with zero missing keys, mismatches, or read errors.
+Client-facing transient failures (`put_fail=290`, `get_fail=190`) occurred
+during forced HA handoffs and did not produce replicated data divergence.
+
+The status timeline recorded max secondary lag of 826/826, stream-buffer
+high-water mark of 41,994 entries, and maximum horizon of 220s. Final secondary
+status recorded 6,800 stream transactions on both secondaries, 62,709/62,259
+logical stream entries, 62,665/62,239 materialized physical entries,
+`stream_txn_coalesced_entries_total=44/20`, average transaction size of
+9.22/9.16 entries, and max transaction size of 256 entries. Max-wait flushes
+dominated (6,803/6,802), max-entry flushes were rare (3/1), and max-byte
+flushes were not observed. Apply work averaged 0.24/0.23ms per transaction,
+commit averaged 37.31/37.21ms, and flat accumulator snapshot persistence
+averaged 0.05/0.05ms with about 44.3 KiB snapshots.
 
 Single secondary:
 

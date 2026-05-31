@@ -52,6 +52,43 @@ func (e *errDRRedirect) Error() string {
 
 var errDRSecondaryApplyStopped = errors.New("DR secondary stream apply stopped")
 
+func atomicMaxUint64(target *atomic.Uint64, value uint64) {
+	for {
+		current := target.Load()
+		if value <= current {
+			return
+		}
+		if target.CompareAndSwap(current, value) {
+			return
+		}
+	}
+}
+
+func durationNanos(d time.Duration) uint64 {
+	if d <= 0 {
+		return 0
+	}
+	return uint64(d)
+}
+
+func nanosToMilliseconds(nanos uint64) float64 {
+	return float64(nanos) / float64(time.Millisecond)
+}
+
+func averageUint64(total, count uint64) float64 {
+	if count == 0 {
+		return 0
+	}
+	return float64(total) / float64(count)
+}
+
+func averageNanosMilliseconds(totalNanos, count uint64) float64 {
+	if count == 0 {
+		return 0
+	}
+	return nanosToMilliseconds(totalNanos) / float64(count)
+}
+
 // extractDRRedirect checks whether a gRPC error contains a
 // DRRedirectDetail and returns the leader address if so.
 func extractDRRedirect(err error) (string, bool) {
@@ -389,6 +426,24 @@ type drReplicationSecondary struct {
 	reconcileBudgetRemainingByte atomic.Int64
 	flatAccumulatorFastPathTotal atomic.Uint64
 	streamTxnCoalescedEntries    atomic.Uint64
+	streamTxnBatches             atomic.Uint64
+	streamTxnEntries             atomic.Uint64
+	streamTxnPhysicalEntries     atomic.Uint64
+	streamTxnMaxEntries          atomic.Uint64
+	streamTxnMaxPhysicalEntries  atomic.Uint64
+	streamTxnApplyNanos          atomic.Uint64
+	streamTxnApplyMaxNanos       atomic.Uint64
+	streamTxnCommitNanos         atomic.Uint64
+	streamTxnCommitMaxNanos      atomic.Uint64
+	streamBatchFlushMaxEntries   atomic.Uint64
+	streamBatchFlushMaxBytes     atomic.Uint64
+	streamBatchFlushMaxWait      atomic.Uint64
+	streamBatchFlushShutdown     atomic.Uint64
+	flatAccumulatorSnapshotCount atomic.Uint64
+	flatAccumulatorSnapshotBytes atomic.Uint64
+	flatAccumulatorSnapshotLast  atomic.Uint64
+	flatAccumulatorSnapshotNanos atomic.Uint64
+	flatAccumulatorSnapshotMaxNs atomic.Uint64
 	rangeSplitCount              atomic.Uint64
 	reconcileRPCBytesUsed        atomic.Uint64
 	reconcileQueueDepth          atomic.Int64
@@ -1511,6 +1566,14 @@ func (s *drReplicationSecondary) Status() DRSecondaryStatus {
 	fallbackLastAt := time.Unix(s.fallbackLastAt.Load(), 0)
 	taskRate := float64(s.reconcileTaskRateMillis.Load()) / 1000.0
 	primaryRate, secondaryRate, lagSlope, predictedCatchup, lagEntries := s.rateSnapshot()
+	streamTxnBatches := s.streamTxnBatches.Load()
+	streamTxnEntries := s.streamTxnEntries.Load()
+	streamTxnPhysicalEntries := s.streamTxnPhysicalEntries.Load()
+	streamTxnApplyNanos := s.streamTxnApplyNanos.Load()
+	streamTxnCommitNanos := s.streamTxnCommitNanos.Load()
+	flatAccumulatorSnapshotCount := s.flatAccumulatorSnapshotCount.Load()
+	flatAccumulatorSnapshotBytes := s.flatAccumulatorSnapshotBytes.Load()
+	flatAccumulatorSnapshotNanos := s.flatAccumulatorSnapshotNanos.Load()
 	return DRSecondaryStatus{
 		State:                          s.State().String(),
 		RelationshipID:                 s.relationshipID,
@@ -1532,87 +1595,141 @@ func (s *drReplicationSecondary) Status() DRSecondaryStatus {
 		ReconcileRPCBytesUsed:          s.reconcileRPCBytesUsed.Load(),
 		FlatAccumulatorFastPathTotal:   s.flatAccumulatorFastPathTotal.Load(),
 		StreamTxnCoalescedEntriesTotal: s.streamTxnCoalescedEntries.Load(),
-		ScanFailuresTotal:              s.scanFailures.Load(),
-		CheckpointConflictsTotal:       s.checkpointConflicts.Load(),
-		ReconcileRetriesTotal:          s.reconcileRetries.Load(),
-		ReconcileQueueDepth:            s.reconcileQueueDepth.Load(),
-		ReconcileTaskRetriesTotal:      s.reconcileTaskRetries.Load(),
-		ReconcileDecodeFailuresTotal:   s.reconcileDecodeFailures.Load(),
-		ReconcileStalledTotal:          s.reconcileStalled.Load(),
-		ReconcileStuckSeconds:          reconcileStuckSeconds,
-		ReconcilePhase:                 s.reconcilePhaseString(),
-		LastAppliedAgeSeconds:          lastAppliedAgeSeconds,
-		ReconcileMaxRPCBytes:           s.reconcileMaxRPCBytes,
-		ReconcileMaxWallTimeSeconds:    int64(s.reconcileMaxWallTime / time.Second),
-		ReconcileMaxInflightTasks:      s.reconcileMaxInflightTasks,
-		StreamBatchMaxEntries:          s.streamBatchMaxEntries,
-		StreamBatchMaxBytes:            s.streamBatchMaxBytes,
-		StreamBatchMaxWaitMilliseconds: int64(s.streamBatchMaxWait / time.Millisecond),
-		FallbackActive:                 s.fallbackActive.Load(),
-		FallbackCount:                  s.fallbackCount.Load(),
-		FallbackLastReason:             s.getFallbackLastReason(),
-		FallbackLastAt:                 fallbackLastAt,
-		ReconcileTaskRate:              taskRate,
-		PrimaryWriteRateEPS:            primaryRate,
-		SecondaryApplyRateEPS:          secondaryRate,
-		LagEntries:                     lagEntries,
-		LagSlopeEPS:                    lagSlope,
-		PredictedCatchupSeconds:        predictedCatchup,
-		ReconcilePutWorkersActive:      s.reconcilePutWorkers.Load(),
-		ReconcileDeletePhaseSeconds:    float64(s.reconcileDeletePhaseMS.Load()) / 1000.0,
+		StreamTxnBatchesTotal:          streamTxnBatches,
+		StreamTxnEntriesTotal:          streamTxnEntries,
+		StreamTxnPhysicalEntriesTotal:  streamTxnPhysicalEntries,
+		StreamTxnAverageEntries:        averageUint64(streamTxnEntries, streamTxnBatches),
+		StreamTxnMaxEntries:            s.streamTxnMaxEntries.Load(),
+		StreamTxnAveragePhysicalEntries: averageUint64(
+			streamTxnPhysicalEntries,
+			streamTxnBatches,
+		),
+		StreamTxnMaxPhysicalEntries:           s.streamTxnMaxPhysicalEntries.Load(),
+		StreamTxnApplyMillisecondsTotal:       nanosToMilliseconds(streamTxnApplyNanos),
+		StreamTxnApplyMillisecondsAverage:     averageNanosMilliseconds(streamTxnApplyNanos, streamTxnBatches),
+		StreamTxnApplyMillisecondsMax:         nanosToMilliseconds(s.streamTxnApplyMaxNanos.Load()),
+		StreamTxnCommitMillisecondsTotal:      nanosToMilliseconds(streamTxnCommitNanos),
+		StreamTxnCommitMillisecondsAverage:    averageNanosMilliseconds(streamTxnCommitNanos, streamTxnBatches),
+		StreamTxnCommitMillisecondsMax:        nanosToMilliseconds(s.streamTxnCommitMaxNanos.Load()),
+		StreamBatchFlushMaxEntriesTotal:       s.streamBatchFlushMaxEntries.Load(),
+		StreamBatchFlushMaxBytesTotal:         s.streamBatchFlushMaxBytes.Load(),
+		StreamBatchFlushMaxWaitTotal:          s.streamBatchFlushMaxWait.Load(),
+		StreamBatchFlushShutdownTotal:         s.streamBatchFlushShutdown.Load(),
+		FlatAccumulatorSnapshotPersistsTotal:  flatAccumulatorSnapshotCount,
+		FlatAccumulatorSnapshotBytesTotal:     flatAccumulatorSnapshotBytes,
+		FlatAccumulatorSnapshotBytesAverage:   averageUint64(flatAccumulatorSnapshotBytes, flatAccumulatorSnapshotCount),
+		FlatAccumulatorSnapshotBytesLast:      s.flatAccumulatorSnapshotLast.Load(),
+		FlatAccumulatorSnapshotPersistMsTotal: nanosToMilliseconds(flatAccumulatorSnapshotNanos),
+		FlatAccumulatorSnapshotPersistMsAverage: averageNanosMilliseconds(
+			flatAccumulatorSnapshotNanos,
+			flatAccumulatorSnapshotCount,
+		),
+		FlatAccumulatorSnapshotPersistMsMax: nanosToMilliseconds(s.flatAccumulatorSnapshotMaxNs.Load()),
+		ScanFailuresTotal:                   s.scanFailures.Load(),
+		CheckpointConflictsTotal:            s.checkpointConflicts.Load(),
+		ReconcileRetriesTotal:               s.reconcileRetries.Load(),
+		ReconcileQueueDepth:                 s.reconcileQueueDepth.Load(),
+		ReconcileTaskRetriesTotal:           s.reconcileTaskRetries.Load(),
+		ReconcileDecodeFailuresTotal:        s.reconcileDecodeFailures.Load(),
+		ReconcileStalledTotal:               s.reconcileStalled.Load(),
+		ReconcileStuckSeconds:               reconcileStuckSeconds,
+		ReconcilePhase:                      s.reconcilePhaseString(),
+		LastAppliedAgeSeconds:               lastAppliedAgeSeconds,
+		ReconcileMaxRPCBytes:                s.reconcileMaxRPCBytes,
+		ReconcileMaxWallTimeSeconds:         int64(s.reconcileMaxWallTime / time.Second),
+		ReconcileMaxInflightTasks:           s.reconcileMaxInflightTasks,
+		StreamBatchMaxEntries:               s.streamBatchMaxEntries,
+		StreamBatchMaxBytes:                 s.streamBatchMaxBytes,
+		StreamBatchMaxWaitMilliseconds:      int64(s.streamBatchMaxWait / time.Millisecond),
+		FallbackActive:                      s.fallbackActive.Load(),
+		FallbackCount:                       s.fallbackCount.Load(),
+		FallbackLastReason:                  s.getFallbackLastReason(),
+		FallbackLastAt:                      fallbackLastAt,
+		ReconcileTaskRate:                   taskRate,
+		PrimaryWriteRateEPS:                 primaryRate,
+		SecondaryApplyRateEPS:               secondaryRate,
+		LagEntries:                          lagEntries,
+		LagSlopeEPS:                         lagSlope,
+		PredictedCatchupSeconds:             predictedCatchup,
+		ReconcilePutWorkersActive:           s.reconcilePutWorkers.Load(),
+		ReconcileDeletePhaseSeconds:         float64(s.reconcileDeletePhaseMS.Load()) / 1000.0,
 	}
 }
 
 // DRSecondaryStatus is a point-in-time snapshot of replication status.
 type DRSecondaryStatus struct {
-	State                          string
-	RelationshipID                 string
-	PrimaryIndex                   uint64
-	LastAppliedIndex               uint64
-	EntriesApplied                 uint64
-	ReconcileCount                 uint64
-	LastReconcileAt                time.Time
-	ConnectRetries                 uint64
-	ConnectFailures                uint64
-	ReconcileRangesInflight        int64
-	ReconcileRangesFailed          int64
-	ReconcileBudgetRemainingBytes  uint64
-	ReconcileActiveCheckpointID    string
-	ReconcileActiveCheckpointIndex uint64
-	ReconcileFailReasonLast        string
-	RangeManifestCount             int
-	RangeSplitCount                uint64
-	ReconcileRPCBytesUsed          uint64
-	FlatAccumulatorFastPathTotal   uint64
-	StreamTxnCoalescedEntriesTotal uint64
-	ScanFailuresTotal              uint64
-	CheckpointConflictsTotal       uint64
-	ReconcileRetriesTotal          uint64
-	ReconcileQueueDepth            int64
-	ReconcileTaskRetriesTotal      uint64
-	ReconcileDecodeFailuresTotal   uint64
-	ReconcileStalledTotal          uint64
-	ReconcileStuckSeconds          int64
-	ReconcilePhase                 string
-	LastAppliedAgeSeconds          int64
-	ReconcileMaxRPCBytes           uint64
-	ReconcileMaxWallTimeSeconds    int64
-	ReconcileMaxInflightTasks      int
-	StreamBatchMaxEntries          int
-	StreamBatchMaxBytes            int
-	StreamBatchMaxWaitMilliseconds int64
-	FallbackActive                 bool
-	FallbackCount                  uint64
-	FallbackLastReason             string
-	FallbackLastAt                 time.Time
-	ReconcileTaskRate              float64
-	PrimaryWriteRateEPS            float64
-	SecondaryApplyRateEPS          float64
-	LagEntries                     uint64
-	LagSlopeEPS                    float64
-	PredictedCatchupSeconds        float64
-	ReconcilePutWorkersActive      int64
-	ReconcileDeletePhaseSeconds    float64
+	State                                   string
+	RelationshipID                          string
+	PrimaryIndex                            uint64
+	LastAppliedIndex                        uint64
+	EntriesApplied                          uint64
+	ReconcileCount                          uint64
+	LastReconcileAt                         time.Time
+	ConnectRetries                          uint64
+	ConnectFailures                         uint64
+	ReconcileRangesInflight                 int64
+	ReconcileRangesFailed                   int64
+	ReconcileBudgetRemainingBytes           uint64
+	ReconcileActiveCheckpointID             string
+	ReconcileActiveCheckpointIndex          uint64
+	ReconcileFailReasonLast                 string
+	RangeManifestCount                      int
+	RangeSplitCount                         uint64
+	ReconcileRPCBytesUsed                   uint64
+	FlatAccumulatorFastPathTotal            uint64
+	StreamTxnCoalescedEntriesTotal          uint64
+	StreamTxnBatchesTotal                   uint64
+	StreamTxnEntriesTotal                   uint64
+	StreamTxnPhysicalEntriesTotal           uint64
+	StreamTxnAverageEntries                 float64
+	StreamTxnMaxEntries                     uint64
+	StreamTxnAveragePhysicalEntries         float64
+	StreamTxnMaxPhysicalEntries             uint64
+	StreamTxnApplyMillisecondsTotal         float64
+	StreamTxnApplyMillisecondsAverage       float64
+	StreamTxnApplyMillisecondsMax           float64
+	StreamTxnCommitMillisecondsTotal        float64
+	StreamTxnCommitMillisecondsAverage      float64
+	StreamTxnCommitMillisecondsMax          float64
+	StreamBatchFlushMaxEntriesTotal         uint64
+	StreamBatchFlushMaxBytesTotal           uint64
+	StreamBatchFlushMaxWaitTotal            uint64
+	StreamBatchFlushShutdownTotal           uint64
+	FlatAccumulatorSnapshotPersistsTotal    uint64
+	FlatAccumulatorSnapshotBytesTotal       uint64
+	FlatAccumulatorSnapshotBytesAverage     float64
+	FlatAccumulatorSnapshotBytesLast        uint64
+	FlatAccumulatorSnapshotPersistMsTotal   float64
+	FlatAccumulatorSnapshotPersistMsAverage float64
+	FlatAccumulatorSnapshotPersistMsMax     float64
+	ScanFailuresTotal                       uint64
+	CheckpointConflictsTotal                uint64
+	ReconcileRetriesTotal                   uint64
+	ReconcileQueueDepth                     int64
+	ReconcileTaskRetriesTotal               uint64
+	ReconcileDecodeFailuresTotal            uint64
+	ReconcileStalledTotal                   uint64
+	ReconcileStuckSeconds                   int64
+	ReconcilePhase                          string
+	LastAppliedAgeSeconds                   int64
+	ReconcileMaxRPCBytes                    uint64
+	ReconcileMaxWallTimeSeconds             int64
+	ReconcileMaxInflightTasks               int
+	StreamBatchMaxEntries                   int
+	StreamBatchMaxBytes                     int
+	StreamBatchMaxWaitMilliseconds          int64
+	FallbackActive                          bool
+	FallbackCount                           uint64
+	FallbackLastReason                      string
+	FallbackLastAt                          time.Time
+	ReconcileTaskRate                       float64
+	PrimaryWriteRateEPS                     float64
+	SecondaryApplyRateEPS                   float64
+	LagEntries                              uint64
+	LagSlopeEPS                             float64
+	PredictedCatchupSeconds                 float64
+	ReconcilePutWorkersActive               int64
+	ReconcileDeletePhaseSeconds             float64
 }
 
 func (s *drReplicationSecondary) applyRuntimeTuning(cfg *DRConfig) {
@@ -2763,6 +2880,67 @@ func (s *drReplicationSecondary) runStream(ctx context.Context) error {
 	}
 }
 
+type drStreamBatchFlushReason string
+
+const (
+	drStreamBatchFlushMaxEntries drStreamBatchFlushReason = "max_entries"
+	drStreamBatchFlushMaxBytes   drStreamBatchFlushReason = "max_bytes"
+	drStreamBatchFlushMaxWait    drStreamBatchFlushReason = "max_wait"
+	drStreamBatchFlushShutdown   drStreamBatchFlushReason = "shutdown"
+)
+
+func (s *drReplicationSecondary) recordStreamBatchFlush(reason drStreamBatchFlushReason) {
+	if s == nil {
+		return
+	}
+	switch reason {
+	case drStreamBatchFlushMaxEntries:
+		s.streamBatchFlushMaxEntries.Add(1)
+		metrics.IncrCounter([]string{"replication", "dr", "secondary", "stream_batch_flush_max_entries_total"}, 1)
+	case drStreamBatchFlushMaxBytes:
+		s.streamBatchFlushMaxBytes.Add(1)
+		metrics.IncrCounter([]string{"replication", "dr", "secondary", "stream_batch_flush_max_bytes_total"}, 1)
+	case drStreamBatchFlushMaxWait:
+		s.streamBatchFlushMaxWait.Add(1)
+		metrics.IncrCounter([]string{"replication", "dr", "secondary", "stream_batch_flush_max_wait_total"}, 1)
+	case drStreamBatchFlushShutdown:
+		s.streamBatchFlushShutdown.Add(1)
+		metrics.IncrCounter([]string{"replication", "dr", "secondary", "stream_batch_flush_shutdown_total"}, 1)
+	}
+}
+
+func (s *drReplicationSecondary) recordStreamTxnStats(logicalEntries, physicalEntries int, applyDuration, commitDuration time.Duration) {
+	if s == nil || logicalEntries <= 0 {
+		return
+	}
+	if physicalEntries < 0 {
+		physicalEntries = 0
+	}
+
+	logical := uint64(logicalEntries)
+	physical := uint64(physicalEntries)
+	applyNanos := durationNanos(applyDuration)
+	commitNanos := durationNanos(commitDuration)
+
+	s.streamTxnBatches.Add(1)
+	s.streamTxnEntries.Add(logical)
+	s.streamTxnPhysicalEntries.Add(physical)
+	atomicMaxUint64(&s.streamTxnMaxEntries, logical)
+	atomicMaxUint64(&s.streamTxnMaxPhysicalEntries, physical)
+	s.streamTxnApplyNanos.Add(applyNanos)
+	atomicMaxUint64(&s.streamTxnApplyMaxNanos, applyNanos)
+	s.streamTxnCommitNanos.Add(commitNanos)
+	atomicMaxUint64(&s.streamTxnCommitMaxNanos, commitNanos)
+
+	metrics.IncrCounter([]string{"replication", "dr", "secondary", "stream_txn_batches_total"}, 1)
+	metrics.IncrCounter([]string{"replication", "dr", "secondary", "stream_txn_entries_total"}, float32(logicalEntries))
+	metrics.IncrCounter([]string{"replication", "dr", "secondary", "stream_txn_physical_entries_total"}, float32(physicalEntries))
+	metrics.SetGauge([]string{"replication", "dr", "secondary", "stream_txn_max_entries"}, float32(s.streamTxnMaxEntries.Load()))
+	metrics.SetGauge([]string{"replication", "dr", "secondary", "stream_txn_max_physical_entries"}, float32(s.streamTxnMaxPhysicalEntries.Load()))
+	metrics.MeasureSince([]string{"replication", "dr", "secondary", "stream_txn_apply_duration"}, time.Now().Add(-applyDuration))
+	metrics.MeasureSince([]string{"replication", "dr", "secondary", "stream_txn_commit_duration"}, time.Now().Add(-commitDuration))
+}
+
 // runStreamApplyWorker consumes entries from the apply channel and persists them
 // to storage. It attempts to batch updates into transactions for performance.
 // After each successful flush it sends the number of flushed entries to
@@ -2844,7 +3022,7 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 
 	// Flush consumes the current batch. It optimistically tries a transaction,
 	// and falls back to sequential application on error.
-	flush := func() error {
+	flush := func(reason drStreamBatchFlushReason) error {
 		if len(batch) == 0 {
 			return nil
 		}
@@ -2865,6 +3043,7 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 						"batch_max_entries", maxEntries,
 						"batch_max_bytes", maxBytes)
 				})
+				s.recordStreamBatchFlush(reason)
 				metrics.IncrCounter([]string{"replication", "dr", "secondary", "stream_txn_success"}, 1)
 				metrics.MeasureSince([]string{"replication", "dr", "secondary", "apply_latency"}, applyStart)
 
@@ -2906,6 +3085,7 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 		}
 
 		metrics.MeasureSince([]string{"replication", "dr", "secondary", "apply_latency"}, applyStart)
+		s.recordStreamBatchFlush(reason)
 		discardBatch()
 		replenishCredits(flushedCount)
 		applyYield()
@@ -2921,12 +3101,12 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 			discardBatch()
 			return nil
 		case <-ticker.C:
-			if err := flush(); err != nil {
+			if err := flush(drStreamBatchFlushMaxWait); err != nil {
 				return err
 			}
 		case incoming, ok := <-applyCh:
 			if !ok {
-				return flush()
+				return flush(drStreamBatchFlushShutdown)
 			}
 			for _, change := range incoming {
 				batch = append(batch, change)
@@ -2934,7 +3114,11 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 				batchBytes += len(change.Key) + len(change.Value) + 48
 			}
 			if len(batch) >= maxEntries || batchBytes >= maxBytes {
-				if err := flush(); err != nil {
+				reason := drStreamBatchFlushMaxBytes
+				if len(batch) >= maxEntries {
+					reason = drStreamBatchFlushMaxEntries
+				}
+				if err := flush(reason); err != nil {
 					return err
 				}
 			}
@@ -3030,8 +3214,10 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 	}
 	defer txn.Rollback(ctx)
 
+	applyStart := time.Now()
 	current := s.lastAppliedIndex.Load()
 	batch, lastIndex, affected, coalescedEntries, keyringTouched, rootKeyTouched, runtimeStateTouched := coalesceDRStreamTxnBatch(batch, current)
+	materializedEntries := 0
 	var invalidateKeys []string
 	accumulatorWarm := s.rangeAccumulator != nil && s.rangeAccumulator.isInitialized()
 	var accumulatorBase [drRangeMaxTotalRanges]drFlatAccumulatorBucket
@@ -3075,6 +3261,7 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 			if err := txn.Delete(ctx, change.Key); err != nil {
 				return err
 			}
+			materializedEntries++
 			invalidateKeys = append(invalidateKeys, change.Key)
 			if isDRRuntimeStatePath(change.Key) {
 				runtimeStateTouched = true
@@ -3088,6 +3275,7 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 			if err := txn.Put(ctx, entry); err != nil {
 				return err
 			}
+			materializedEntries++
 			invalidateKeys = append(invalidateKeys, change.Key)
 
 			switch change.Key {
@@ -3144,9 +3332,12 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 		return fmt.Errorf("delete stale flat accumulator: %w", err)
 	}
 
+	commitStart := time.Now()
 	if err := txn.Commit(ctx); err != nil {
 		return err
 	}
+	commitDuration := time.Since(commitStart)
+	applyDuration := commitStart.Sub(applyStart)
 	if err := s.ensureStreamApplyActive(ctx); err != nil {
 		if s.rangeAccumulator != nil {
 			s.rangeAccumulator.invalidate()
@@ -3190,6 +3381,7 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 
 	s.setLastAppliedIndex(lastIndex)
 	s.entriesApplied.Add(uint64(affected))
+	s.recordStreamTxnStats(affected, materializedEntries, applyDuration, commitDuration)
 	if coalescedEntries > 0 {
 		s.streamTxnCoalescedEntries.Add(uint64(coalescedEntries))
 		metrics.IncrCounter([]string{"replication", "dr", "secondary", "stream_txn_coalesced_entries_total"}, float32(coalescedEntries))

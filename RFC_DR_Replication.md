@@ -957,6 +957,11 @@ The status API should expose:
 - reconnect counters
 - fallback counters and last fallback reason
 - stream lag and apply rates
+- stream transaction batch counts, logical entries, materialized physical
+  entries, coalesced entries, and apply/commit timing
+- stream batch flush reasons
+- flat accumulator snapshot count, byte volume, last snapshot size, and persist
+  timing
 - range task counts
 - budget usage
 - journal replay health
@@ -1176,9 +1181,11 @@ requires a local scan before reconciliation can compare ranges.
 Transactional stream apply now coalesces repeated mutations to the same key
 within a batch. This reduces secondary write pressure for hot-key workloads, but
 it does not change the replay or reconciliation proof model. The secondary
-status response exposes `stream_txn_coalesced_entries_total` so future stress
-runs can measure avoided physical writes directly instead of inferring the
-effect only from lag, buffer, and reconciliation-dwell signals.
+status response exposes transactional apply counters, flush-reason counters,
+apply and commit timing, and flat-accumulator snapshot size and persistence
+timing. This lets stress runs measure avoided physical writes, batch shape, and
+local snapshot write amplification directly instead of inferring the effect only
+from lag, buffer, and reconciliation-dwell signals.
 
 Failover semantics deliberately avoid automatic merge or failback. This makes
 the protocol safer, but it shifts old-primary fencing, traffic routing, and
@@ -1511,14 +1518,23 @@ secondary1, and secondary2 against the stress truth log.
 A targeted HA hot-key validation on 2026-05-31 exercised transactional stream
 coalescing with a rebuilt image, 48 workers, 80% hot-key traffic, and primary
 stepdowns every 100 seconds for 5 minutes. Primary, secondary1, and secondary2
-all passed exhaustive verification across 4,538 truth-log keys with zero
+all passed exhaustive verification across 4,498 truth-log keys with zero
 missing keys, mismatches, or read errors. Both secondaries converged on the
-sentinel in 3.0s and 2.0s respectively, ended at `lag_entries=0`, and reported
-`stream_txn_coalesced_entries_total` values of 73 and 50. Compared with the
-prior 15-minute HA hard smoke, the run showed lower max lag, lower
-reconciliation dwell, and a lower stream-buffer high-water mark, while
-client-facing transient failures remained attributable to forced HA handoff
-behavior rather than DR data divergence.
+sentinel in 1.0s, ended at `lag_entries=0`, and reported zero journal drops or
+status failures. The status timeline observed a maximum secondary lag of
+826/826 entries, a stream-buffer high-water mark of 41,994 entries, and a
+maximum horizon of 220s, still below the configured journal cap.
+
+The same run recorded the secondary apply-path shape directly: both
+secondaries applied 6,800 stream transactions, averaging 9.22/9.16 logical
+entries per transaction with rare max-entry flushes, while most flushes were
+driven by the 10ms max-wait timer. Coalescing avoided 44/20 physical entries in
+this workload. Local apply work averaged about 0.24ms per transaction; storage
+commit averaged about 37ms and therefore dominated the measured apply path.
+Flat accumulator snapshots persisted on each stream transaction, averaged about
+44.3 KiB, and took about 0.05ms on average to persist. This suggests the next
+optimization target is storage transaction pressure and snapshot cadence, not
+hash projection or accumulator serialization cost.
 
 The main known gap is availability polish during primary HA active handoff
 under sustained write and DR backlog pressure; stress runs still observe

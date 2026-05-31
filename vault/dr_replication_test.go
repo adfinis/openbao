@@ -2741,6 +2741,24 @@ func TestDRSecondaryStatus(t *testing.T) {
 	sec.reconcileCount.Store(2)
 	sec.flatAccumulatorFastPathTotal.Store(1)
 	sec.streamTxnCoalescedEntries.Store(3)
+	sec.streamTxnBatches.Store(2)
+	sec.streamTxnEntries.Store(10)
+	sec.streamTxnPhysicalEntries.Store(8)
+	sec.streamTxnMaxEntries.Store(7)
+	sec.streamTxnMaxPhysicalEntries.Store(5)
+	sec.streamTxnApplyNanos.Store(uint64(6 * time.Millisecond))
+	sec.streamTxnApplyMaxNanos.Store(uint64(4 * time.Millisecond))
+	sec.streamTxnCommitNanos.Store(uint64(3 * time.Millisecond))
+	sec.streamTxnCommitMaxNanos.Store(uint64(2 * time.Millisecond))
+	sec.streamBatchFlushMaxEntries.Store(4)
+	sec.streamBatchFlushMaxBytes.Store(5)
+	sec.streamBatchFlushMaxWait.Store(6)
+	sec.streamBatchFlushShutdown.Store(7)
+	sec.flatAccumulatorSnapshotCount.Store(2)
+	sec.flatAccumulatorSnapshotBytes.Store(1000)
+	sec.flatAccumulatorSnapshotLast.Store(600)
+	sec.flatAccumulatorSnapshotNanos.Store(uint64(5 * time.Millisecond))
+	sec.flatAccumulatorSnapshotMaxNs.Store(uint64(3 * time.Millisecond))
 	sec.lastReconcileAt.Store(time.Now().Unix())
 
 	status := sec.Status()
@@ -2762,6 +2780,30 @@ func TestDRSecondaryStatus(t *testing.T) {
 	if status.StreamTxnCoalescedEntriesTotal != 3 {
 		t.Fatalf("expected stream txn coalesced entries total 3, got %d", status.StreamTxnCoalescedEntriesTotal)
 	}
+	if status.StreamTxnBatchesTotal != 2 {
+		t.Fatalf("expected stream txn batches total 2, got %d", status.StreamTxnBatchesTotal)
+	}
+	if status.StreamTxnAverageEntries != 5 {
+		t.Fatalf("expected stream txn average entries 5, got %f", status.StreamTxnAverageEntries)
+	}
+	if status.StreamTxnMaxPhysicalEntries != 5 {
+		t.Fatalf("expected stream txn max physical entries 5, got %d", status.StreamTxnMaxPhysicalEntries)
+	}
+	if status.StreamTxnApplyMillisecondsAverage != 3 {
+		t.Fatalf("expected stream txn average apply ms 3, got %f", status.StreamTxnApplyMillisecondsAverage)
+	}
+	if status.StreamTxnCommitMillisecondsMax != 2 {
+		t.Fatalf("expected stream txn max commit ms 2, got %f", status.StreamTxnCommitMillisecondsMax)
+	}
+	if status.StreamBatchFlushMaxWaitTotal != 6 {
+		t.Fatalf("expected stream batch max-wait flush total 6, got %d", status.StreamBatchFlushMaxWaitTotal)
+	}
+	if status.FlatAccumulatorSnapshotBytesAverage != 500 {
+		t.Fatalf("expected flat accumulator average snapshot bytes 500, got %f", status.FlatAccumulatorSnapshotBytesAverage)
+	}
+	if status.FlatAccumulatorSnapshotPersistMsAverage != 2.5 {
+		t.Fatalf("expected flat accumulator average persist ms 2.5, got %f", status.FlatAccumulatorSnapshotPersistMsAverage)
+	}
 }
 
 func TestDRSystemBackend_StatusIncludesStreamOptimizationCounters(t *testing.T) {
@@ -2775,6 +2817,15 @@ func TestDRSystemBackend_StatusIncludesStreamOptimizationCounters(t *testing.T) 
 	secondary := newDRReplicationSecondary(core, make([]byte, drReplSaltLen), "rel-status-fast-path", log.NewNullLogger())
 	secondary.flatAccumulatorFastPathTotal.Store(7)
 	secondary.streamTxnCoalescedEntries.Store(11)
+	secondary.streamTxnBatches.Store(13)
+	secondary.streamTxnEntries.Store(39)
+	secondary.streamTxnPhysicalEntries.Store(28)
+	secondary.streamTxnMaxEntries.Store(9)
+	secondary.streamTxnMaxPhysicalEntries.Store(8)
+	secondary.streamBatchFlushMaxWait.Store(5)
+	secondary.flatAccumulatorSnapshotCount.Store(2)
+	secondary.flatAccumulatorSnapshotBytes.Store(1000)
+	secondary.flatAccumulatorSnapshotLast.Store(512)
 	mgr.secondary = secondary
 	core.drManager = mgr
 
@@ -2791,6 +2842,24 @@ func TestDRSystemBackend_StatusIncludesStreamOptimizationCounters(t *testing.T) 
 	}
 	if got := resp.Data["stream_txn_coalesced_entries_total"]; got != uint64(11) {
 		t.Fatalf("expected stream_txn_coalesced_entries_total=11, got %#v", got)
+	}
+	if got := resp.Data["stream_txn_batches_total"]; got != uint64(13) {
+		t.Fatalf("expected stream_txn_batches_total=13, got %#v", got)
+	}
+	if got := resp.Data["stream_txn_average_entries"]; got != float64(3) {
+		t.Fatalf("expected stream_txn_average_entries=3, got %#v", got)
+	}
+	if got := resp.Data["stream_txn_max_physical_entries"]; got != uint64(8) {
+		t.Fatalf("expected stream_txn_max_physical_entries=8, got %#v", got)
+	}
+	if got := resp.Data["stream_batch_flush_max_wait_total"]; got != uint64(5) {
+		t.Fatalf("expected stream_batch_flush_max_wait_total=5, got %#v", got)
+	}
+	if got := resp.Data["flat_accumulator_snapshot_bytes_average"]; got != float64(500) {
+		t.Fatalf("expected flat_accumulator_snapshot_bytes_average=500, got %#v", got)
+	}
+	if got := resp.Data["flat_accumulator_snapshot_bytes_last"]; got != uint64(512) {
+		t.Fatalf("expected flat_accumulator_snapshot_bytes_last=512, got %#v", got)
 	}
 }
 
