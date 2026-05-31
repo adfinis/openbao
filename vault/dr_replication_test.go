@@ -3280,6 +3280,23 @@ func TestDRRelationshipManager_UpdateTuningRejectsInvalidAndRollsBack(t *testing
 			},
 		},
 		{
+			name:            "stream buffer below secondary initial window",
+			wantErrContains: "stream_buffer_max_entries",
+			apply: func(cfg *DRConfig) error {
+				cfg.StreamBufferMaxEntries = drSecondaryApplyQueueMinEntries - 1
+				return nil
+			},
+		},
+		{
+			name:            "stream batch requires matching buffer window",
+			wantErrContains: "stream_buffer_max_entries",
+			apply: func(cfg *DRConfig) error {
+				cfg.StreamBufferMaxEntries = drSecondaryApplyQueueMinEntries
+				cfg.StreamBatchMaxEntries = drSecondaryApplyQueueMinEntries
+				return nil
+			},
+		},
+		{
 			name:            "per relationship budget exceeds global budget",
 			wantErrContains: "checkpoint_per_relationship_budget_bytes",
 			apply: func(cfg *DRConfig) error {
@@ -3358,6 +3375,19 @@ func TestDRSystemBackend_DRTuningRejectsInvalidInputs(t *testing.T) {
 			name:            "zero signed integer",
 			data:            map[string]interface{}{"stream_batch_max_entries": 0},
 			wantErrContains: "stream_batch_max_entries",
+		},
+		{
+			name:            "stream buffer below secondary initial window",
+			data:            map[string]interface{}{"stream_buffer_max_entries": drSecondaryApplyQueueMinEntries - 1},
+			wantErrContains: "stream_buffer_max_entries",
+		},
+		{
+			name: "stream batch requires matching buffer window",
+			data: map[string]interface{}{
+				"stream_buffer_max_entries": drSecondaryApplyQueueMinEntries,
+				"stream_batch_max_entries":  drSecondaryApplyQueueMinEntries,
+			},
+			wantErrContains: "stream_buffer_max_entries",
 		},
 		{
 			name:            "negative duration",

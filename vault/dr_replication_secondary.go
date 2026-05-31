@@ -300,6 +300,7 @@ const (
 	drDefaultReconcileMaxInflightTasks          = 16
 	drDefaultReconcileStallAbort                = 90 * time.Second
 	drDefaultRPCDeadline                        = 30 * time.Second
+	drSecondaryApplyQueueMinEntries             = 1024
 	drDefaultStreamBatchMaxEntries              = 256
 	drDefaultStreamBatchMaxBytes                = 1 << 20 // 1 MiB
 	drDefaultStreamBatchMaxWait                 = 25 * time.Millisecond
@@ -340,6 +341,18 @@ const (
 	// under sustained write load.
 	drDefaultApplyYieldDuration = 1 * time.Millisecond
 )
+
+func drSecondaryInitialStreamWindowEntries(streamBatchMaxEntries int) int {
+	maxInt := int(^uint(0) >> 1)
+	if streamBatchMaxEntries > maxInt/4 {
+		return maxInt
+	}
+	applyQueueEntries := streamBatchMaxEntries * 4
+	if applyQueueEntries < drSecondaryApplyQueueMinEntries {
+		applyQueueEntries = drSecondaryApplyQueueMinEntries
+	}
+	return applyQueueEntries
+}
 
 // drHeartbeatInterval controls DR heartbeat cadence. Kept as a package var
 // so tests can shorten it for deterministic execution time.
@@ -2917,10 +2930,7 @@ func (s *drReplicationSecondary) runStream(ctx context.Context) error {
 		return fmt.Errorf("failed to open change stream: %w", err)
 	}
 
-	applyQueueEntries := s.streamBatchMaxEntries * 4
-	if applyQueueEntries < 1024 {
-		applyQueueEntries = 1024
-	}
+	applyQueueEntries := drSecondaryInitialStreamWindowEntries(s.streamBatchMaxEntries)
 	// Size the batch channel by the number of gRPC batches, not
 	// individual entries.  Each batch can carry up to 64 entries
 	// (drStreamSendBatchMaxEntries), so the channel depth is the

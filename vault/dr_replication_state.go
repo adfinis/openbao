@@ -749,6 +749,18 @@ func validateDRTuningConfig(cfg *DRConfig) error {
 	if cfg.CheckpointGlobalBudgetBytes > 0 && cfg.CheckpointPerRelBudgetBytes > cfg.CheckpointGlobalBudgetBytes {
 		return fmt.Errorf("checkpoint_per_relationship_budget_bytes must be <= checkpoint_global_budget_bytes")
 	}
+	streamBufferMaxEntries := cfg.StreamBufferMaxEntries
+	if streamBufferMaxEntries == 0 {
+		streamBufferMaxEntries = drStreamBufferMaxEntries
+	}
+	streamBatchMaxEntries := cfg.StreamBatchMaxEntries
+	if streamBatchMaxEntries == 0 {
+		streamBatchMaxEntries = drDefaultStreamBatchMaxEntries
+	}
+	initialStreamWindow := drSecondaryInitialStreamWindowEntries(streamBatchMaxEntries)
+	if streamBufferMaxEntries < initialStreamWindow {
+		return fmt.Errorf("stream_buffer_max_entries must be >= secondary initial stream window (%d)", initialStreamWindow)
+	}
 	if cfg.StreamJournalMaxBytes > 0 && cfg.StreamJournalSegmentBytes > cfg.StreamJournalMaxBytes {
 		return fmt.Errorf("stream_journal_segment_bytes must be <= stream_journal_max_bytes")
 	}
