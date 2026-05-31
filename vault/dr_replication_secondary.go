@@ -388,6 +388,7 @@ type drReplicationSecondary struct {
 	reconcileRangesFailed        atomic.Int64
 	reconcileBudgetRemainingByte atomic.Int64
 	flatAccumulatorFastPathTotal atomic.Uint64
+	streamTxnCoalescedEntries    atomic.Uint64
 	rangeSplitCount              atomic.Uint64
 	reconcileRPCBytesUsed        atomic.Uint64
 	reconcileQueueDepth          atomic.Int64
@@ -1530,6 +1531,7 @@ func (s *drReplicationSecondary) Status() DRSecondaryStatus {
 		RangeSplitCount:                s.rangeSplitCount.Load(),
 		ReconcileRPCBytesUsed:          s.reconcileRPCBytesUsed.Load(),
 		FlatAccumulatorFastPathTotal:   s.flatAccumulatorFastPathTotal.Load(),
+		StreamTxnCoalescedEntriesTotal: s.streamTxnCoalescedEntries.Load(),
 		ScanFailuresTotal:              s.scanFailures.Load(),
 		CheckpointConflictsTotal:       s.checkpointConflicts.Load(),
 		ReconcileRetriesTotal:          s.reconcileRetries.Load(),
@@ -1582,6 +1584,7 @@ type DRSecondaryStatus struct {
 	RangeSplitCount                uint64
 	ReconcileRPCBytesUsed          uint64
 	FlatAccumulatorFastPathTotal   uint64
+	StreamTxnCoalescedEntriesTotal uint64
 	ScanFailuresTotal              uint64
 	CheckpointConflictsTotal       uint64
 	ReconcileRetriesTotal          uint64
@@ -2944,15 +2947,16 @@ type drStreamTxnCoalescedChange struct {
 	position int
 }
 
-func coalesceDRStreamTxnBatch(batch []*EntryChange, current uint64) ([]*EntryChange, uint64, int, bool, bool, bool) {
+func coalesceDRStreamTxnBatch(batch []*EntryChange, current uint64) ([]*EntryChange, uint64, int, int, bool, bool, bool) {
 	if len(batch) == 0 {
-		return nil, 0, 0, false, false, false
+		return nil, 0, 0, 0, false, false, false
 	}
 
 	byKey := make(map[string]int)
 	coalesced := make([]drStreamTxnCoalescedChange, 0, len(batch))
 	var lastIndex uint64
 	var affected int
+	var coalescedEntries int
 	var keyringTouched bool
 	var rootKeyTouched bool
 	var runtimeStateTouched bool
@@ -2996,6 +3000,7 @@ func coalesceDRStreamTxnBatch(batch []*EntryChange, current uint64) ([]*EntryCha
 		}
 		if existing, ok := byKey[change.Key]; ok {
 			coalesced[existing] = drStreamTxnCoalescedChange{change: change, position: i}
+			coalescedEntries++
 			continue
 		}
 		byKey[change.Key] = len(coalesced)
@@ -3010,7 +3015,7 @@ func coalesceDRStreamTxnBatch(batch []*EntryChange, current uint64) ([]*EntryCha
 	for _, entry := range coalesced {
 		changes = append(changes, entry.change)
 	}
-	return changes, lastIndex, affected, keyringTouched, rootKeyTouched, runtimeStateTouched
+	return changes, lastIndex, affected, coalescedEntries, keyringTouched, rootKeyTouched, runtimeStateTouched
 }
 
 // applyStreamTxn attempts to apply a batch of changes in a single transaction.
@@ -3026,7 +3031,7 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 	defer txn.Rollback(ctx)
 
 	current := s.lastAppliedIndex.Load()
-	batch, lastIndex, affected, keyringTouched, rootKeyTouched, runtimeStateTouched := coalesceDRStreamTxnBatch(batch, current)
+	batch, lastIndex, affected, coalescedEntries, keyringTouched, rootKeyTouched, runtimeStateTouched := coalesceDRStreamTxnBatch(batch, current)
 	var invalidateKeys []string
 	accumulatorWarm := s.rangeAccumulator != nil && s.rangeAccumulator.isInitialized()
 	var accumulatorBase [drRangeMaxTotalRanges]drFlatAccumulatorBucket
@@ -3185,6 +3190,10 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 
 	s.setLastAppliedIndex(lastIndex)
 	s.entriesApplied.Add(uint64(affected))
+	if coalescedEntries > 0 {
+		s.streamTxnCoalescedEntries.Add(uint64(coalescedEntries))
+		metrics.IncrCounter([]string{"replication", "dr", "secondary", "stream_txn_coalesced_entries_total"}, float32(coalescedEntries))
+	}
 	metrics.IncrCounter([]string{"replication", "dr", "secondary", "entries_applied"}, float32(affected))
 	metrics.SetGauge([]string{"replication", "dr", "secondary", "last_applied_index"}, float32(lastIndex))
 

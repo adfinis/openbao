@@ -2740,6 +2740,7 @@ func TestDRSecondaryStatus(t *testing.T) {
 	sec.entriesApplied.Store(100)
 	sec.reconcileCount.Store(2)
 	sec.flatAccumulatorFastPathTotal.Store(1)
+	sec.streamTxnCoalescedEntries.Store(3)
 	sec.lastReconcileAt.Store(time.Now().Unix())
 
 	status := sec.Status()
@@ -2758,9 +2759,12 @@ func TestDRSecondaryStatus(t *testing.T) {
 	if status.FlatAccumulatorFastPathTotal != 1 {
 		t.Fatalf("expected flat accumulator fast path total 1, got %d", status.FlatAccumulatorFastPathTotal)
 	}
+	if status.StreamTxnCoalescedEntriesTotal != 3 {
+		t.Fatalf("expected stream txn coalesced entries total 3, got %d", status.StreamTxnCoalescedEntriesTotal)
+	}
 }
 
-func TestDRSystemBackend_StatusIncludesFlatAccumulatorFastPathCounter(t *testing.T) {
+func TestDRSystemBackend_StatusIncludesStreamOptimizationCounters(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 
 	mgr := newDRRelationshipManager(core, core.logger)
@@ -2770,6 +2774,7 @@ func TestDRSystemBackend_StatusIncludesFlatAccumulatorFastPathCounter(t *testing
 	}
 	secondary := newDRReplicationSecondary(core, make([]byte, drReplSaltLen), "rel-status-fast-path", log.NewNullLogger())
 	secondary.flatAccumulatorFastPathTotal.Store(7)
+	secondary.streamTxnCoalescedEntries.Store(11)
 	mgr.secondary = secondary
 	core.drManager = mgr
 
@@ -2783,6 +2788,9 @@ func TestDRSystemBackend_StatusIncludesFlatAccumulatorFastPathCounter(t *testing
 	}
 	if got := resp.Data["flat_accumulator_fast_path_total"]; got != uint64(7) {
 		t.Fatalf("expected flat_accumulator_fast_path_total=7, got %#v", got)
+	}
+	if got := resp.Data["stream_txn_coalesced_entries_total"]; got != uint64(11) {
+		t.Fatalf("expected stream_txn_coalesced_entries_total=11, got %#v", got)
 	}
 }
 
@@ -3834,12 +3842,15 @@ func TestDRCoalesceStreamTxnBatch(t *testing.T) {
 		{OpType: "unknown", Key: "secret/unknown", RaftIndex: 17},
 	}
 
-	changes, lastIndex, affected, keyringTouched, rootKeyTouched, runtimeStateTouched := coalesceDRStreamTxnBatch(batch, 10)
+	changes, lastIndex, affected, coalescedEntries, keyringTouched, rootKeyTouched, runtimeStateTouched := coalesceDRStreamTxnBatch(batch, 10)
 	if lastIndex != 17 {
 		t.Fatalf("expected lastIndex 17, got %d", lastIndex)
 	}
 	if affected != 6 {
 		t.Fatalf("expected 6 affected logical entries, got %d", affected)
+	}
+	if coalescedEntries != 1 {
+		t.Fatalf("expected 1 coalesced entry, got %d", coalescedEntries)
 	}
 	if !keyringTouched {
 		t.Fatal("expected keyring touch to be preserved")

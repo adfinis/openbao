@@ -1175,10 +1175,10 @@ requires a local scan before reconciliation can compare ranges.
 
 Transactional stream apply now coalesces repeated mutations to the same key
 within a batch. This reduces secondary write pressure for hot-key workloads, but
-it does not change the replay or reconciliation proof model. Future validation
-should expose explicit coalescing counters so avoided physical writes can be
-measured directly instead of inferred from lag, buffer, and reconciliation-dwell
-signals.
+it does not change the replay or reconciliation proof model. The secondary
+status response exposes `stream_txn_coalesced_entries_total` so future stress
+runs can measure avoided physical writes directly instead of inferring the
+effect only from lag, buffer, and reconciliation-dwell signals.
 
 Failover semantics deliberately avoid automatic merge or failback. This makes
 the protocol safer, but it shifts old-primary fencing, traffic routing, and
