@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/crc64"
+	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -21,8 +23,10 @@ var drFlatAccumulatorCRCTable = crc64.MakeTable(crc64.ISO)
 const (
 	drFlatAccumulatorStoragePath       = "core/cluster/local/dr/flat-accumulator"
 	drFlatAccumulatorCursorStoragePath = "core/cluster/local/dr/flat-accumulator-cursor"
+	drFlatAccumulatorDeltaStoragePath  = "core/cluster/local/dr/flat-accumulator-deltas/"
 	drFlatAccumulatorSnapshotVersion   = 1
 	drFlatAccumulatorCursorVersion     = 1
+	drFlatAccumulatorDeltaVersion      = 1
 	drFlatAccumulatorRangeBits         = 10
 	drFlatAccumulatorChecksumAlgorithm = "crc64-iso-xor-kid-vid-v1"
 )
@@ -54,6 +58,25 @@ type drFlatAccumulatorPersistedCursor struct {
 	ClusterID           string `json:"cluster_id,omitempty"`
 	CommitIndex         uint64 `json:"commit_index"`
 	SnapshotCommitIndex uint64 `json:"snapshot_commit_index,omitempty"`
+}
+
+type drFlatAccumulatorPersistedDeltaBatch struct {
+	Version             int                                   `json:"version"`
+	RelationshipID      string                                `json:"relationship_id"`
+	ClusterID           string                                `json:"cluster_id,omitempty"`
+	RangeBits           int                                   `json:"range_bits"`
+	ChecksumAlgorithm   string                                `json:"checksum_algorithm"`
+	CommitIndex         uint64                                `json:"commit_index"`
+	SnapshotCommitIndex uint64                                `json:"snapshot_commit_index,omitempty"`
+	Deltas              []drFlatAccumulatorPersistedDeltaItem `json:"deltas,omitempty"`
+}
+
+type drFlatAccumulatorPersistedDeltaItem struct {
+	KID       []byte `json:"kid"`
+	OldExists bool   `json:"old_exists,omitempty"`
+	OldVID    []byte `json:"old_vid,omitempty"`
+	NewExists bool   `json:"new_exists,omitempty"`
+	NewVID    []byte `json:"new_vid,omitempty"`
 }
 
 type drFlatAccumulatorDelta struct {
@@ -324,6 +347,161 @@ func (s *drReplicationSecondary) persistFlatAccumulatorCursor(
 	return nil
 }
 
+func drFlatAccumulatorDeltaPath(index uint64) string {
+	return fmt.Sprintf("%s%020d", drFlatAccumulatorDeltaStoragePath, index)
+}
+
+func drFlatAccumulatorDeltaIndexFromKey(key string) (uint64, bool) {
+	index, err := strconv.ParseUint(key, 10, 64)
+	return index, err == nil && index > 0
+}
+
+func drFlatAccumulatorBytesFromArray(value [32]byte) []byte {
+	out := make([]byte, 32)
+	copy(out, value[:])
+	return out
+}
+
+func drFlatAccumulatorArrayFromBytes(name string, value []byte) ([32]byte, error) {
+	var out [32]byte
+	if len(value) != len(out) {
+		return out, fmt.Errorf("%s length mismatch", name)
+	}
+	copy(out[:], value)
+	return out, nil
+}
+
+func drFlatAccumulatorPersistedDeltasFromMemory(deltas []drFlatAccumulatorDelta) []drFlatAccumulatorPersistedDeltaItem {
+	if len(deltas) == 0 {
+		return nil
+	}
+	out := make([]drFlatAccumulatorPersistedDeltaItem, 0, len(deltas))
+	for _, delta := range deltas {
+		item := drFlatAccumulatorPersistedDeltaItem{
+			KID:       drFlatAccumulatorBytesFromArray(delta.kid),
+			OldExists: delta.oldExists,
+			NewExists: delta.newExists,
+		}
+		if delta.oldExists {
+			item.OldVID = drFlatAccumulatorBytesFromArray(delta.oldVID)
+		}
+		if delta.newExists {
+			item.NewVID = drFlatAccumulatorBytesFromArray(delta.newVID)
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+func drFlatAccumulatorDeltasFromPersisted(items []drFlatAccumulatorPersistedDeltaItem) ([]drFlatAccumulatorDelta, error) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+	out := make([]drFlatAccumulatorDelta, 0, len(items))
+	for i, item := range items {
+		kid, err := drFlatAccumulatorArrayFromBytes(fmt.Sprintf("deltas[%d].kid", i), item.KID)
+		if err != nil {
+			return nil, err
+		}
+		delta := drFlatAccumulatorDelta{
+			kid:       kid,
+			oldExists: item.OldExists,
+			newExists: item.NewExists,
+		}
+		if item.OldExists {
+			oldVID, err := drFlatAccumulatorArrayFromBytes(fmt.Sprintf("deltas[%d].old_vid", i), item.OldVID)
+			if err != nil {
+				return nil, err
+			}
+			delta.oldVID = oldVID
+		}
+		if item.NewExists {
+			newVID, err := drFlatAccumulatorArrayFromBytes(fmt.Sprintf("deltas[%d].new_vid", i), item.NewVID)
+			if err != nil {
+				return nil, err
+			}
+			delta.newVID = newVID
+		}
+		out = append(out, delta)
+	}
+	return out, nil
+}
+
+func (s *drReplicationSecondary) persistFlatAccumulatorDeltaBatch(
+	ctx context.Context,
+	writer physical.Backend,
+	index uint64,
+	snapshotIndex uint64,
+	deltas []drFlatAccumulatorDelta,
+) error {
+	if s == nil || writer == nil || index == 0 {
+		return nil
+	}
+
+	batch := drFlatAccumulatorPersistedDeltaBatch{
+		Version:             drFlatAccumulatorDeltaVersion,
+		RelationshipID:      s.relationshipID,
+		ClusterID:           s.flatAccumulatorClusterID(),
+		RangeBits:           drFlatAccumulatorRangeBits,
+		ChecksumAlgorithm:   drFlatAccumulatorChecksumAlgorithm,
+		CommitIndex:         index,
+		SnapshotCommitIndex: snapshotIndex,
+		Deltas:              drFlatAccumulatorPersistedDeltasFromMemory(deltas),
+	}
+
+	path := drFlatAccumulatorDeltaPath(index)
+	if existing, err := writer.Get(ctx, path); err != nil {
+		return err
+	} else if existing != nil && len(existing.Value) > 0 {
+		var persisted drFlatAccumulatorPersistedDeltaBatch
+		if err := json.Unmarshal(existing.Value, &persisted); err != nil {
+			return fmt.Errorf("read existing flat accumulator delta batch: %w", err)
+		}
+		if err := s.validateFlatAccumulatorDeltaBatch(&persisted); err != nil {
+			return fmt.Errorf("validate existing flat accumulator delta batch: %w", err)
+		}
+		batch.Deltas = append(persisted.Deltas, batch.Deltas...)
+	}
+
+	data, err := json.Marshal(batch)
+	if err != nil {
+		return err
+	}
+	if err := writer.Put(ctx, &physical.Entry{
+		Key:   path,
+		Value: data,
+	}); err != nil {
+		return err
+	}
+	s.recordFlatAccumulatorDeltaPersist(index, len(deltas))
+	return nil
+}
+
+func (s *drReplicationSecondary) recordFlatAccumulatorDeltaPersist(index uint64, deltaCount int) {
+	if s == nil || index == 0 {
+		return
+	}
+	s.flatAccumulatorDeltaBatches.Add(1)
+	if deltaCount > 0 {
+		s.flatAccumulatorDeltaEntries.Add(uint64(deltaCount))
+	}
+	for {
+		oldest := s.flatAccumulatorDeltaOldestIndex.Load()
+		if oldest != 0 && oldest <= index {
+			break
+		}
+		if s.flatAccumulatorDeltaOldestIndex.CompareAndSwap(oldest, index) {
+			break
+		}
+	}
+	atomicMaxUint64(&s.flatAccumulatorDeltaNewestIndex, index)
+	metrics.IncrCounter([]string{"replication", "dr", "secondary", "flat_accumulator_delta_batches_total"}, 1)
+	if deltaCount > 0 {
+		metrics.IncrCounter([]string{"replication", "dr", "secondary", "flat_accumulator_delta_entries_total"}, float32(deltaCount))
+	}
+	metrics.SetGauge([]string{"replication", "dr", "secondary", "flat_accumulator_delta_newest_index"}, float32(index))
+}
+
 func (s *drReplicationSecondary) shouldPersistFlatAccumulatorSnapshot(index uint64, force bool) bool {
 	if s == nil || index == 0 {
 		return false
@@ -353,6 +531,7 @@ func (s *drReplicationSecondary) persistFlatAccumulatorState(
 	index uint64,
 	buckets [drRangeMaxTotalRanges]drFlatAccumulatorBucket,
 	forceSnapshot bool,
+	deltas []drFlatAccumulatorDelta,
 ) error {
 	if s == nil || writer == nil || index == 0 {
 		return nil
@@ -363,7 +542,13 @@ func (s *drReplicationSecondary) persistFlatAccumulatorState(
 			return err
 		}
 		snapshotIndex = index
+		if err := s.deletePersistedFlatAccumulatorDeltas(ctx, writer, index); err != nil {
+			return err
+		}
 	} else {
+		if err := s.persistFlatAccumulatorDeltaBatch(ctx, writer, index, snapshotIndex, deltas); err != nil {
+			return err
+		}
 		s.flatAccumulatorSnapshotSkipped.Add(1)
 		metrics.IncrCounter([]string{"replication", "dr", "secondary", "flat_accumulator_snapshot_skipped_total"}, 1)
 	}
@@ -382,7 +567,7 @@ func (s *drReplicationSecondary) persistCurrentFlatAccumulatorSnapshot(ctx conte
 	if !ok {
 		return
 	}
-	if err := s.persistFlatAccumulatorState(ctx, s.core.physical, index, buckets, true); err != nil {
+	if err := s.persistFlatAccumulatorState(ctx, s.core.physical, index, buckets, true, nil); err != nil {
 		s.logger.Warn("failed to persist final DR flat accumulator snapshot", "commit_index", index, "error", err)
 	}
 }
@@ -392,6 +577,9 @@ func (s *drReplicationSecondary) deletePersistedFlatAccumulator(ctx context.Cont
 		return nil
 	}
 	if err := writer.Delete(ctx, drFlatAccumulatorStoragePath); err != nil {
+		return err
+	}
+	if err := s.deletePersistedFlatAccumulatorDeltas(ctx, writer, 0); err != nil {
 		return err
 	}
 	s.flatAccumulatorSnapshotIndex.Store(0)
@@ -418,10 +606,7 @@ func (s *drReplicationSecondary) resetAndPersistFlatAccumulatorFromSet(ctx conte
 		return nil
 	}
 	buckets := drFlatAccumulatorBucketsFromSet(rs)
-	if err := s.persistFlatAccumulatorSnapshot(ctx, s.core.physical, index, buckets); err != nil {
-		return err
-	}
-	if err := s.persistFlatAccumulatorCursor(ctx, s.core.physical, index, index); err != nil {
+	if err := s.persistFlatAccumulatorState(ctx, s.core.physical, index, buckets, true, nil); err != nil {
 		return err
 	}
 	s.rangeAccumulator.replace(index, buckets)
@@ -467,12 +652,31 @@ func (s *drReplicationSecondary) loadPersistentFlatAccumulator(ctx context.Conte
 		return
 	}
 	if cursorOK && cursor.CommitIndex > snapshot.CommitIndex {
-		s.logger.Info("discarding stale DR flat accumulator snapshot behind cursor",
-			"snapshot_commit_index", snapshot.CommitIndex,
-			"cursor_commit_index", cursor.CommitIndex)
-		_ = s.deletePersistedFlatAccumulator(ctx, s.core.physical)
-		s.setLastAppliedIndex(cursor.CommitIndex)
-		return
+		buckets, ok, err := s.replayPersistedFlatAccumulatorDeltas(ctx, snapshot, cursor)
+		if err != nil {
+			s.flatAccumulatorDeltaReplayFailures.Add(1)
+			metrics.IncrCounter([]string{"replication", "dr", "secondary", "flat_accumulator_delta_replay_failures_total"}, 1)
+			s.logger.Warn("discarding stale DR flat accumulator snapshot after delta replay failed",
+				"snapshot_commit_index", snapshot.CommitIndex,
+				"cursor_commit_index", cursor.CommitIndex,
+				"error", err)
+			_ = s.deletePersistedFlatAccumulator(ctx, s.core.physical)
+			s.setLastAppliedIndex(cursor.CommitIndex)
+			return
+		}
+		if ok {
+			s.rangeAccumulator.replace(cursor.CommitIndex, buckets)
+			s.flatAccumulatorSnapshotIndex.Store(snapshot.CommitIndex)
+			s.flatAccumulatorSnapshotLastAt.Store(time.Now().UnixNano())
+			if err := s.refreshFlatAccumulatorDeltaIndexStats(ctx, s.core.physical); err != nil {
+				s.logger.Warn("failed to refresh DR flat accumulator delta stats", "error", err)
+			}
+			s.setLastAppliedIndex(cursor.CommitIndex)
+			s.logger.Info("loaded DR flat accumulator snapshot with delta replay",
+				"snapshot_commit_index", snapshot.CommitIndex,
+				"cursor_commit_index", cursor.CommitIndex)
+			return
+		}
 	}
 
 	var buckets [drRangeMaxTotalRanges]drFlatAccumulatorBucket
@@ -489,6 +693,87 @@ func (s *drReplicationSecondary) loadPersistentFlatAccumulator(ctx context.Conte
 		s.setLastAppliedIndex(snapshot.CommitIndex)
 	}
 	s.logger.Info("loaded DR flat accumulator snapshot", "commit_index", snapshot.CommitIndex)
+}
+
+func (s *drReplicationSecondary) replayPersistedFlatAccumulatorDeltas(
+	ctx context.Context,
+	snapshot drFlatAccumulatorPersistedSnapshot,
+	cursor drFlatAccumulatorPersistedCursor,
+) ([drRangeMaxTotalRanges]drFlatAccumulatorBucket, bool, error) {
+	var buckets [drRangeMaxTotalRanges]drFlatAccumulatorBucket
+	if cursor.CommitIndex <= snapshot.CommitIndex {
+		return buckets, false, nil
+	}
+	for i, bucket := range snapshot.Buckets {
+		buckets[i] = drFlatAccumulatorBucket{
+			checksum: bucket.Checksum,
+			count:    bucket.Count,
+		}
+	}
+
+	keys, err := s.core.physical.List(ctx, drFlatAccumulatorDeltaStoragePath)
+	if err != nil {
+		return buckets, false, err
+	}
+	sort.Strings(keys)
+
+	var replayedBatches uint64
+	var replayedEntries uint64
+	var lastDeltaIndex uint64
+	for _, key := range keys {
+		index, ok := drFlatAccumulatorDeltaIndexFromKey(key)
+		if !ok {
+			continue
+		}
+		if index <= snapshot.CommitIndex || index > cursor.CommitIndex {
+			continue
+		}
+		entry, err := s.core.physical.Get(ctx, drFlatAccumulatorDeltaStoragePath+key)
+		if err != nil {
+			return buckets, false, err
+		}
+		if entry == nil || len(entry.Value) == 0 {
+			return buckets, false, fmt.Errorf("missing flat accumulator delta batch %d", index)
+		}
+		var batch drFlatAccumulatorPersistedDeltaBatch
+		if err := json.Unmarshal(entry.Value, &batch); err != nil {
+			return buckets, false, err
+		}
+		if err := s.validateFlatAccumulatorDeltaBatch(&batch); err != nil {
+			return buckets, false, err
+		}
+		if batch.CommitIndex != index {
+			return buckets, false, fmt.Errorf("delta batch key/index mismatch: key=%d batch=%d", index, batch.CommitIndex)
+		}
+		if batch.SnapshotCommitIndex != 0 && batch.SnapshotCommitIndex != snapshot.CommitIndex {
+			return buckets, false, fmt.Errorf("delta batch snapshot index mismatch: batch=%d snapshot=%d", batch.SnapshotCommitIndex, snapshot.CommitIndex)
+		}
+		deltas, err := drFlatAccumulatorDeltasFromPersisted(batch.Deltas)
+		if err != nil {
+			return buckets, false, err
+		}
+		if !applyFlatAccumulatorDeltasToBuckets(&buckets, deltas) {
+			return buckets, false, fmt.Errorf("delta batch %d failed accumulator apply", index)
+		}
+		replayedBatches++
+		replayedEntries += uint64(len(deltas))
+		lastDeltaIndex = index
+	}
+
+	if lastDeltaIndex != cursor.CommitIndex {
+		return buckets, false, fmt.Errorf("flat accumulator delta coverage ended at %d, cursor at %d", lastDeltaIndex, cursor.CommitIndex)
+	}
+	s.flatAccumulatorDeltaReplayCount.Add(1)
+	s.flatAccumulatorDeltaReplayBatches.Add(replayedBatches)
+	s.flatAccumulatorDeltaReplayEntries.Add(replayedEntries)
+	metrics.IncrCounter([]string{"replication", "dr", "secondary", "flat_accumulator_delta_replay_total"}, 1)
+	if replayedBatches > 0 {
+		metrics.IncrCounter([]string{"replication", "dr", "secondary", "flat_accumulator_delta_replay_batches_total"}, float32(replayedBatches))
+	}
+	if replayedEntries > 0 {
+		metrics.IncrCounter([]string{"replication", "dr", "secondary", "flat_accumulator_delta_replay_entries_total"}, float32(replayedEntries))
+	}
+	return buckets, true, nil
 }
 
 func (s *drReplicationSecondary) loadPersistentFlatAccumulatorCursor(ctx context.Context) (drFlatAccumulatorPersistedCursor, bool) {
@@ -565,6 +850,91 @@ func (s *drReplicationSecondary) validateFlatAccumulatorCursor(cursor *drFlatAcc
 	if cursor.SnapshotCommitIndex > cursor.CommitIndex {
 		return fmt.Errorf("snapshot_commit_index is ahead of commit_index")
 	}
+	return nil
+}
+
+func (s *drReplicationSecondary) validateFlatAccumulatorDeltaBatch(batch *drFlatAccumulatorPersistedDeltaBatch) error {
+	if batch == nil {
+		return fmt.Errorf("delta batch is nil")
+	}
+	if batch.Version != drFlatAccumulatorDeltaVersion {
+		return fmt.Errorf("unsupported delta batch version %d", batch.Version)
+	}
+	if batch.RelationshipID == "" || batch.RelationshipID != s.relationshipID {
+		return fmt.Errorf("relationship_id mismatch")
+	}
+	if clusterID := s.flatAccumulatorClusterID(); clusterID != "" && batch.ClusterID != "" && batch.ClusterID != clusterID {
+		return fmt.Errorf("cluster_id mismatch")
+	}
+	if batch.RangeBits != drFlatAccumulatorRangeBits {
+		return fmt.Errorf("range_bits mismatch")
+	}
+	if batch.ChecksumAlgorithm != drFlatAccumulatorChecksumAlgorithm {
+		return fmt.Errorf("checksum_algorithm mismatch")
+	}
+	if batch.CommitIndex == 0 {
+		return fmt.Errorf("commit_index is zero")
+	}
+	if batch.SnapshotCommitIndex > batch.CommitIndex {
+		return fmt.Errorf("snapshot_commit_index is ahead of commit_index")
+	}
+	if _, err := drFlatAccumulatorDeltasFromPersisted(batch.Deltas); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *drReplicationSecondary) deletePersistedFlatAccumulatorDeltas(ctx context.Context, writer physical.Backend, throughIndex uint64) error {
+	if s == nil || writer == nil {
+		return nil
+	}
+	keys, err := writer.List(ctx, drFlatAccumulatorDeltaStoragePath)
+	if err != nil {
+		return err
+	}
+	for _, key := range keys {
+		index, ok := drFlatAccumulatorDeltaIndexFromKey(key)
+		if !ok {
+			continue
+		}
+		if throughIndex == 0 || index <= throughIndex {
+			if err := writer.Delete(ctx, drFlatAccumulatorDeltaStoragePath+key); err != nil {
+				return err
+			}
+		}
+	}
+	if throughIndex == 0 {
+		s.flatAccumulatorDeltaOldestIndex.Store(0)
+		s.flatAccumulatorDeltaNewestIndex.Store(0)
+		return nil
+	}
+	return s.refreshFlatAccumulatorDeltaIndexStats(ctx, writer)
+}
+
+func (s *drReplicationSecondary) refreshFlatAccumulatorDeltaIndexStats(ctx context.Context, reader physical.Backend) error {
+	if s == nil || reader == nil {
+		return nil
+	}
+	keys, err := reader.List(ctx, drFlatAccumulatorDeltaStoragePath)
+	if err != nil {
+		return err
+	}
+	var oldest uint64
+	var newest uint64
+	for _, key := range keys {
+		index, ok := drFlatAccumulatorDeltaIndexFromKey(key)
+		if !ok {
+			continue
+		}
+		if oldest == 0 || index < oldest {
+			oldest = index
+		}
+		if index > newest {
+			newest = index
+		}
+	}
+	s.flatAccumulatorDeltaOldestIndex.Store(oldest)
+	s.flatAccumulatorDeltaNewestIndex.Store(newest)
 	return nil
 }
 

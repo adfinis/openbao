@@ -773,6 +773,14 @@ func (b *SystemBackend) handleDRStatus(ctx context.Context, req *logical.Request
 		data["flat_accumulator_snapshot_persist_milliseconds_average"] = status.FlatAccumulatorSnapshotPersistMsAverage
 		data["flat_accumulator_snapshot_persist_milliseconds_max"] = status.FlatAccumulatorSnapshotPersistMsMax
 		data["flat_accumulator_snapshot_skipped_total"] = status.FlatAccumulatorSnapshotSkippedTotal
+		data["flat_accumulator_delta_batches_total"] = status.FlatAccumulatorDeltaBatchesTotal
+		data["flat_accumulator_delta_entries_total"] = status.FlatAccumulatorDeltaEntriesTotal
+		data["flat_accumulator_delta_oldest_index"] = status.FlatAccumulatorDeltaOldestIndex
+		data["flat_accumulator_delta_newest_index"] = status.FlatAccumulatorDeltaNewestIndex
+		data["flat_accumulator_delta_replay_total"] = status.FlatAccumulatorDeltaReplayTotal
+		data["flat_accumulator_delta_replay_batches_total"] = status.FlatAccumulatorDeltaReplayBatchesTotal
+		data["flat_accumulator_delta_replay_entries_total"] = status.FlatAccumulatorDeltaReplayEntriesTotal
+		data["flat_accumulator_delta_replay_failures_total"] = status.FlatAccumulatorDeltaReplayFailuresTotal
 		data["flat_accumulator_snapshot_min_entries"] = status.FlatAccumulatorSnapshotMinEntries
 		data["flat_accumulator_snapshot_min_interval_milliseconds"] = status.FlatAccumulatorSnapshotMinIntervalMilliseconds
 		data["scan_failures_total"] = status.ScanFailuresTotal

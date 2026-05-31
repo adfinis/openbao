@@ -1360,6 +1360,15 @@ func (m *drRelationshipManager) clearSecondaryCheckpointCursor(ctx context.Conte
 		if err := m.core.physical.Delete(ctx, drFlatAccumulatorCursorStoragePath); err != nil {
 			return fmt.Errorf("failed to clear DR secondary flat accumulator cursor: %w", err)
 		}
+		keys, err := m.core.physical.List(ctx, drFlatAccumulatorDeltaStoragePath)
+		if err != nil {
+			return fmt.Errorf("failed to list DR secondary flat accumulator deltas: %w", err)
+		}
+		for _, key := range keys {
+			if err := m.core.physical.Delete(ctx, drFlatAccumulatorDeltaStoragePath+key); err != nil {
+				return fmt.Errorf("failed to clear DR secondary flat accumulator delta: %w", err)
+			}
+		}
 	}
 	return nil
 }

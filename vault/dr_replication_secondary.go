@@ -417,46 +417,54 @@ type drReplicationSecondary struct {
 	transportReady atomic.Bool
 
 	// metrics
-	entriesApplied                 atomic.Uint64
-	reconcileCount                 atomic.Uint64
-	lastReconcileAt                atomic.Int64 // unix timestamp
-	streamDisconnects              atomic.Uint64
-	connectRetries                 atomic.Uint64
-	connectFailures                atomic.Uint64
-	reconcileRangesInflight        atomic.Int64
-	reconcileRangesFailed          atomic.Int64
-	reconcileBudgetRemainingByte   atomic.Int64
-	flatAccumulatorFastPathTotal   atomic.Uint64
-	streamTxnCoalescedEntries      atomic.Uint64
-	streamTxnBatches               atomic.Uint64
-	streamTxnEntries               atomic.Uint64
-	streamTxnPhysicalEntries       atomic.Uint64
-	streamTxnMaxEntries            atomic.Uint64
-	streamTxnMaxPhysicalEntries    atomic.Uint64
-	streamTxnApplyNanos            atomic.Uint64
-	streamTxnApplyMaxNanos         atomic.Uint64
-	streamTxnCommitNanos           atomic.Uint64
-	streamTxnCommitMaxNanos        atomic.Uint64
-	streamBatchFlushMaxEntries     atomic.Uint64
-	streamBatchFlushMaxBytes       atomic.Uint64
-	streamBatchFlushMaxWait        atomic.Uint64
-	streamBatchFlushShutdown       atomic.Uint64
-	flatAccumulatorCursorWrites    atomic.Uint64
-	flatAccumulatorCursorIndex     atomic.Uint64
-	flatAccumulatorSnapshotCount   atomic.Uint64
-	flatAccumulatorSnapshotBytes   atomic.Uint64
-	flatAccumulatorSnapshotLast    atomic.Uint64
-	flatAccumulatorSnapshotNanos   atomic.Uint64
-	flatAccumulatorSnapshotMaxNs   atomic.Uint64
-	flatAccumulatorSnapshotIndex   atomic.Uint64
-	flatAccumulatorSnapshotLastAt  atomic.Int64
-	flatAccumulatorSnapshotSkipped atomic.Uint64
-	rangeSplitCount                atomic.Uint64
-	reconcileRPCBytesUsed          atomic.Uint64
-	reconcileQueueDepth            atomic.Int64
-	reconcileStalled               atomic.Uint64
-	lastReconcileActivityAt        atomic.Int64 // unix timestamp
-	lastReconcileApplyAt           atomic.Int64 // unix timestamp
+	entriesApplied                     atomic.Uint64
+	reconcileCount                     atomic.Uint64
+	lastReconcileAt                    atomic.Int64 // unix timestamp
+	streamDisconnects                  atomic.Uint64
+	connectRetries                     atomic.Uint64
+	connectFailures                    atomic.Uint64
+	reconcileRangesInflight            atomic.Int64
+	reconcileRangesFailed              atomic.Int64
+	reconcileBudgetRemainingByte       atomic.Int64
+	flatAccumulatorFastPathTotal       atomic.Uint64
+	streamTxnCoalescedEntries          atomic.Uint64
+	streamTxnBatches                   atomic.Uint64
+	streamTxnEntries                   atomic.Uint64
+	streamTxnPhysicalEntries           atomic.Uint64
+	streamTxnMaxEntries                atomic.Uint64
+	streamTxnMaxPhysicalEntries        atomic.Uint64
+	streamTxnApplyNanos                atomic.Uint64
+	streamTxnApplyMaxNanos             atomic.Uint64
+	streamTxnCommitNanos               atomic.Uint64
+	streamTxnCommitMaxNanos            atomic.Uint64
+	streamBatchFlushMaxEntries         atomic.Uint64
+	streamBatchFlushMaxBytes           atomic.Uint64
+	streamBatchFlushMaxWait            atomic.Uint64
+	streamBatchFlushShutdown           atomic.Uint64
+	flatAccumulatorCursorWrites        atomic.Uint64
+	flatAccumulatorCursorIndex         atomic.Uint64
+	flatAccumulatorSnapshotCount       atomic.Uint64
+	flatAccumulatorSnapshotBytes       atomic.Uint64
+	flatAccumulatorSnapshotLast        atomic.Uint64
+	flatAccumulatorSnapshotNanos       atomic.Uint64
+	flatAccumulatorSnapshotMaxNs       atomic.Uint64
+	flatAccumulatorSnapshotIndex       atomic.Uint64
+	flatAccumulatorSnapshotLastAt      atomic.Int64
+	flatAccumulatorSnapshotSkipped     atomic.Uint64
+	flatAccumulatorDeltaBatches        atomic.Uint64
+	flatAccumulatorDeltaEntries        atomic.Uint64
+	flatAccumulatorDeltaOldestIndex    atomic.Uint64
+	flatAccumulatorDeltaNewestIndex    atomic.Uint64
+	flatAccumulatorDeltaReplayCount    atomic.Uint64
+	flatAccumulatorDeltaReplayBatches  atomic.Uint64
+	flatAccumulatorDeltaReplayEntries  atomic.Uint64
+	flatAccumulatorDeltaReplayFailures atomic.Uint64
+	rangeSplitCount                    atomic.Uint64
+	reconcileRPCBytesUsed              atomic.Uint64
+	reconcileQueueDepth                atomic.Int64
+	reconcileStalled                   atomic.Uint64
+	lastReconcileActivityAt            atomic.Int64 // unix timestamp
+	lastReconcileApplyAt               atomic.Int64 // unix timestamp
 
 	sessionMu                          sync.RWMutex
 	activeCheckpointID                 string
@@ -1640,6 +1648,14 @@ func (s *drReplicationSecondary) Status() DRSecondaryStatus {
 		),
 		FlatAccumulatorSnapshotPersistMsMax:            nanosToMilliseconds(s.flatAccumulatorSnapshotMaxNs.Load()),
 		FlatAccumulatorSnapshotSkippedTotal:            s.flatAccumulatorSnapshotSkipped.Load(),
+		FlatAccumulatorDeltaBatchesTotal:               s.flatAccumulatorDeltaBatches.Load(),
+		FlatAccumulatorDeltaEntriesTotal:               s.flatAccumulatorDeltaEntries.Load(),
+		FlatAccumulatorDeltaOldestIndex:                s.flatAccumulatorDeltaOldestIndex.Load(),
+		FlatAccumulatorDeltaNewestIndex:                s.flatAccumulatorDeltaNewestIndex.Load(),
+		FlatAccumulatorDeltaReplayTotal:                s.flatAccumulatorDeltaReplayCount.Load(),
+		FlatAccumulatorDeltaReplayBatchesTotal:         s.flatAccumulatorDeltaReplayBatches.Load(),
+		FlatAccumulatorDeltaReplayEntriesTotal:         s.flatAccumulatorDeltaReplayEntries.Load(),
+		FlatAccumulatorDeltaReplayFailuresTotal:        s.flatAccumulatorDeltaReplayFailures.Load(),
 		FlatAccumulatorSnapshotMinEntries:              s.flatAccumulatorSnapshotMinEntries,
 		FlatAccumulatorSnapshotMinIntervalMilliseconds: int64(s.flatAccumulatorSnapshotMinInterval / time.Millisecond),
 		ScanFailuresTotal:                              s.scanFailures.Load(),
@@ -1723,6 +1739,14 @@ type DRSecondaryStatus struct {
 	FlatAccumulatorSnapshotPersistMsAverage        float64
 	FlatAccumulatorSnapshotPersistMsMax            float64
 	FlatAccumulatorSnapshotSkippedTotal            uint64
+	FlatAccumulatorDeltaBatchesTotal               uint64
+	FlatAccumulatorDeltaEntriesTotal               uint64
+	FlatAccumulatorDeltaOldestIndex                uint64
+	FlatAccumulatorDeltaNewestIndex                uint64
+	FlatAccumulatorDeltaReplayTotal                uint64
+	FlatAccumulatorDeltaReplayBatchesTotal         uint64
+	FlatAccumulatorDeltaReplayEntriesTotal         uint64
+	FlatAccumulatorDeltaReplayFailuresTotal        uint64
 	FlatAccumulatorSnapshotMinEntries              uint64
 	FlatAccumulatorSnapshotMinIntervalMilliseconds int64
 	ScanFailuresTotal                              uint64
@@ -3340,7 +3364,7 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 			return err
 		}
 		if accumulatorWarm {
-			if err := s.persistFlatAccumulatorState(ctx, txn, lastIndex, accumulatorNext, forceAccumulatorSnapshot); err != nil {
+			if err := s.persistFlatAccumulatorState(ctx, txn, lastIndex, accumulatorNext, forceAccumulatorSnapshot, nil); err != nil {
 				return fmt.Errorf("persist flat accumulator marker: %w", err)
 			}
 			if err := txn.Commit(ctx); err != nil {
@@ -3373,7 +3397,7 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 		}
 	}
 	if accumulatorWarm {
-		if err := s.persistFlatAccumulatorState(ctx, txn, lastIndex, accumulatorNext, forceAccumulatorSnapshot); err != nil {
+		if err := s.persistFlatAccumulatorState(ctx, txn, lastIndex, accumulatorNext, forceAccumulatorSnapshot, accumulatorDeltas); err != nil {
 			return fmt.Errorf("persist flat accumulator: %w", err)
 		}
 	} else if err := s.deletePersistedFlatAccumulator(ctx, txn); err != nil {
@@ -3470,7 +3494,7 @@ func (s *drReplicationSecondary) applyStreamChange(ctx context.Context, change *
 	if change.Key == "" {
 		if s.rangeAccumulator != nil {
 			if _, buckets, ok := s.rangeAccumulator.snapshot(); ok {
-				if err := s.persistFlatAccumulatorState(ctx, s.core.physical, change.RaftIndex, buckets, false); err != nil {
+				if err := s.persistFlatAccumulatorState(ctx, s.core.physical, change.RaftIndex, buckets, false, nil); err != nil {
 					s.logger.Warn("failed to persist DR flat accumulator marker", "raft_index", change.RaftIndex, "error", err)
 				} else {
 					s.rangeAccumulator.replace(change.RaftIndex, buckets)
@@ -3487,7 +3511,7 @@ func (s *drReplicationSecondary) applyStreamChange(ctx context.Context, change *
 		s.logger.Debug("skipping cluster-local path in stream", "key", change.Key)
 		if s.rangeAccumulator != nil {
 			if _, buckets, ok := s.rangeAccumulator.snapshot(); ok {
-				if err := s.persistFlatAccumulatorState(ctx, s.core.physical, change.RaftIndex, buckets, false); err != nil {
+				if err := s.persistFlatAccumulatorState(ctx, s.core.physical, change.RaftIndex, buckets, false, nil); err != nil {
 					s.logger.Warn("failed to persist DR flat accumulator skip marker", "raft_index", change.RaftIndex, "key", change.Key, "error", err)
 				} else {
 					s.rangeAccumulator.replace(change.RaftIndex, buckets)
@@ -3584,7 +3608,11 @@ func (s *drReplicationSecondary) applyStreamChange(ctx context.Context, change *
 		s.invalidateAppliedStorageKey(ctx, change.Key)
 		if accumulatorWarm {
 			s.rangeAccumulator.replace(change.RaftIndex, accumulatorNext)
-			if err := s.persistFlatAccumulatorState(ctx, s.core.physical, change.RaftIndex, accumulatorNext, false); err != nil {
+			var deltas []drFlatAccumulatorDelta
+			if accumulatorDeltaOK {
+				deltas = []drFlatAccumulatorDelta{accumulatorDelta}
+			}
+			if err := s.persistFlatAccumulatorState(ctx, s.core.physical, change.RaftIndex, accumulatorNext, false, deltas); err != nil {
 				s.logger.Warn("failed to persist DR flat accumulator after stream put", "raft_index", change.RaftIndex, "error", err)
 			}
 		} else if err := s.persistFlatAccumulatorCursor(ctx, s.core.physical, change.RaftIndex, s.flatAccumulatorSnapshotIndex.Load()); err != nil {
@@ -3607,7 +3635,11 @@ func (s *drReplicationSecondary) applyStreamChange(ctx context.Context, change *
 		s.invalidateAppliedStorageKey(ctx, change.Key)
 		if accumulatorWarm {
 			s.rangeAccumulator.replace(change.RaftIndex, accumulatorNext)
-			if err := s.persistFlatAccumulatorState(ctx, s.core.physical, change.RaftIndex, accumulatorNext, false); err != nil {
+			var deltas []drFlatAccumulatorDelta
+			if accumulatorDeltaOK {
+				deltas = []drFlatAccumulatorDelta{accumulatorDelta}
+			}
+			if err := s.persistFlatAccumulatorState(ctx, s.core.physical, change.RaftIndex, accumulatorNext, false, deltas); err != nil {
 				s.logger.Warn("failed to persist DR flat accumulator after stream delete", "raft_index", change.RaftIndex, "error", err)
 			}
 		} else if err := s.persistFlatAccumulatorCursor(ctx, s.core.physical, change.RaftIndex, s.flatAccumulatorSnapshotIndex.Load()); err != nil {

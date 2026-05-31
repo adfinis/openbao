@@ -534,6 +534,15 @@ is also stored under a never-replicated local DR path and is bound to the
 relationship ID, DR cluster ID, range version, checksum algorithm, and primary
 commit index.
 
+When a full snapshot is skipped by cadence, the secondary writes a local-only
+delta batch in the same transaction as the replicated storage mutations and the
+applied cursor. Each delta batch records the commit index, the snapshot index it
+extends, and the KID/old-VID/new-VID contribution changes needed to advance the
+flat accumulator. Empty delta batches are still written for cursor-only
+advances, so restart can prove coverage up to the durable cursor. When a later
+full snapshot is persisted, delta batches at or below that snapshot index are
+pruned.
+
 When a streamed transaction contains multiple changes to the same key, the
 flat accumulator is updated from the pre-transaction value directly to the final
 coalesced value. A `Put` followed by a later `Delete` therefore removes the old
@@ -555,15 +564,19 @@ longer available, the primary explicitly requires reconciliation and the
 secondary enters the checkpoint-fenced reconciliation path.
 
 The persisted accumulator is fail-closed. If restart finds a cursor ahead of
-the full accumulator snapshot, it restores the applied cursor but discards the
-stale snapshot instead of trusting it. The next reconciliation must rebuild by
-scanning local storage or by finishing a later proven reconciliation. Before any
-non-atomic reconciliation repair or resnapshot mutation is applied, the
-secondary deletes the persisted accumulator. If the process crashes mid-repair,
-restart cannot reload a stale accumulator for partially repaired storage. After
-reconciliation or resnapshot finalizes successfully, the accumulator is reseeded
-from the verified local KID/VID set and persisted at the finalized checkpoint
-index.
+the full accumulator snapshot, it replays persisted delta batches from the
+snapshot index to the cursor index. If coverage is complete and all deltas
+validate, the secondary restores the accumulator at the cursor without scanning
+local storage. If any delta batch is missing, incompatible, corrupt, or fails
+the accumulator apply checks, restart restores only the applied cursor and
+deletes the stale accumulator state instead of trusting it. The next
+reconciliation must then rebuild by scanning local storage or by finishing a
+later proven reconciliation. Before any non-atomic reconciliation repair or
+resnapshot mutation is applied, the secondary deletes the persisted accumulator.
+If the process crashes mid-repair, restart cannot reload a stale accumulator for
+partially repaired storage. After reconciliation or resnapshot finalizes
+successfully, the accumulator is reseeded from the verified local KID/VID set
+and persisted at the finalized checkpoint index.
 
 ### Range checksums
 
@@ -971,7 +984,8 @@ The status API should expose:
   entries, coalesced entries, and apply/commit timing
 - stream batch flush reasons
 - flat accumulator cursor writes/index, snapshot count/index, skipped snapshot
-  count, byte volume, last snapshot size, persist timing, and cadence tuning
+  count, byte volume, last snapshot size, persist timing, delta batch counts,
+  delta replay counts/failures, and cadence tuning
 - range task counts
 - budget usage
 - journal replay health
@@ -1188,17 +1202,19 @@ persisted flat accumulator avoids the local O(N) scan when it is aligned with
 the checkpoint, but an absent, incompatible, or invalidated accumulator still
 requires a local scan before reconciliation can compare ranges. The applied
 cursor is intentionally smaller and more frequently written than the full
-snapshot; it preserves restart replay correctness but is not enough to skip a
-local scan by itself.
+snapshot. Cursor-only recovery preserves restart replay correctness; snapshot
+plus delta replay additionally restores the flat accumulator without scanning
+when the delta coverage from snapshot to cursor is complete.
 
 Transactional stream apply now coalesces repeated mutations to the same key
 within a batch. This reduces secondary write pressure for hot-key workloads, but
 it does not change the replay or reconciliation proof model. The secondary
 status response exposes transactional apply counters, flush-reason counters,
 apply and commit timing, and flat-accumulator cursor/snapshot persistence
-timing. This lets stress runs measure avoided physical writes, batch shape,
-local snapshot write amplification, and snapshot cadence directly instead of
-inferring the effect only from lag, buffer, and reconciliation-dwell signals.
+timing, plus delta persistence and replay counters. This lets stress runs
+measure avoided physical writes, batch shape, local snapshot write amplification,
+snapshot cadence, and restart accumulator recovery directly instead of inferring
+the effect only from lag, buffer, and reconciliation-dwell signals.
 
 Failover semantics deliberately avoid automatic merge or failback. This makes
 the protocol safer, but it shifts old-primary fencing, traffic routing, and
@@ -1550,6 +1566,16 @@ flat-accumulator snapshots dropped to 64/63 with 6,891/6,920 skipped snapshots.
 This suggests the cursor/snapshot split materially reduces full-snapshot write
 amplification without changing data-correctness outcomes; the next optimization
 target remains storage transaction pressure and apply scheduling.
+
+A targeted HA accumulator cold-restart smoke on 2026-05-31 stopped a full
+secondary cluster after it had advanced from accumulator snapshot index 41 to
+cursor index 48, then restarted and unsealed all secondary nodes. The active
+secondary restored `flat_accumulator_cursor_index=48` by replaying persisted
+delta batches from the snapshot, reported `flat_accumulator_delta_replay_total=1`
+with zero replay failures, performed no reconciliation, reported zero scan
+failures, and returned both secondaries to `streaming` with `lag_entries=0`.
+This validates the restart optimization for the common case where a secondary
+has a recent flat snapshot and bounded local deltas.
 
 The main known gap is availability polish during primary HA active handoff
 under sustained write and DR backlog pressure; stress runs still observe

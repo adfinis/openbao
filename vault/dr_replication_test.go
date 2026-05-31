@@ -2763,6 +2763,14 @@ func TestDRSecondaryStatus(t *testing.T) {
 	sec.flatAccumulatorSnapshotNanos.Store(uint64(5 * time.Millisecond))
 	sec.flatAccumulatorSnapshotMaxNs.Store(uint64(3 * time.Millisecond))
 	sec.flatAccumulatorSnapshotSkipped.Store(9)
+	sec.flatAccumulatorDeltaBatches.Store(10)
+	sec.flatAccumulatorDeltaEntries.Store(11)
+	sec.flatAccumulatorDeltaOldestIndex.Store(39)
+	sec.flatAccumulatorDeltaNewestIndex.Store(41)
+	sec.flatAccumulatorDeltaReplayCount.Store(12)
+	sec.flatAccumulatorDeltaReplayBatches.Store(13)
+	sec.flatAccumulatorDeltaReplayEntries.Store(14)
+	sec.flatAccumulatorDeltaReplayFailures.Store(15)
 	sec.lastReconcileAt.Store(time.Now().Unix())
 
 	status := sec.Status()
@@ -2820,6 +2828,30 @@ func TestDRSecondaryStatus(t *testing.T) {
 	if status.FlatAccumulatorSnapshotSkippedTotal != 9 {
 		t.Fatalf("expected flat accumulator snapshot skipped total 9, got %d", status.FlatAccumulatorSnapshotSkippedTotal)
 	}
+	if status.FlatAccumulatorDeltaBatchesTotal != 10 {
+		t.Fatalf("expected flat accumulator delta batches total 10, got %d", status.FlatAccumulatorDeltaBatchesTotal)
+	}
+	if status.FlatAccumulatorDeltaEntriesTotal != 11 {
+		t.Fatalf("expected flat accumulator delta entries total 11, got %d", status.FlatAccumulatorDeltaEntriesTotal)
+	}
+	if status.FlatAccumulatorDeltaOldestIndex != 39 {
+		t.Fatalf("expected flat accumulator delta oldest index 39, got %d", status.FlatAccumulatorDeltaOldestIndex)
+	}
+	if status.FlatAccumulatorDeltaNewestIndex != 41 {
+		t.Fatalf("expected flat accumulator delta newest index 41, got %d", status.FlatAccumulatorDeltaNewestIndex)
+	}
+	if status.FlatAccumulatorDeltaReplayTotal != 12 {
+		t.Fatalf("expected flat accumulator delta replay total 12, got %d", status.FlatAccumulatorDeltaReplayTotal)
+	}
+	if status.FlatAccumulatorDeltaReplayBatchesTotal != 13 {
+		t.Fatalf("expected flat accumulator delta replay batches total 13, got %d", status.FlatAccumulatorDeltaReplayBatchesTotal)
+	}
+	if status.FlatAccumulatorDeltaReplayEntriesTotal != 14 {
+		t.Fatalf("expected flat accumulator delta replay entries total 14, got %d", status.FlatAccumulatorDeltaReplayEntriesTotal)
+	}
+	if status.FlatAccumulatorDeltaReplayFailuresTotal != 15 {
+		t.Fatalf("expected flat accumulator delta replay failures total 15, got %d", status.FlatAccumulatorDeltaReplayFailuresTotal)
+	}
 }
 
 func TestDRSystemBackend_StatusIncludesStreamOptimizationCounters(t *testing.T) {
@@ -2846,6 +2878,14 @@ func TestDRSystemBackend_StatusIncludesStreamOptimizationCounters(t *testing.T) 
 	secondary.flatAccumulatorSnapshotBytes.Store(1000)
 	secondary.flatAccumulatorSnapshotLast.Store(512)
 	secondary.flatAccumulatorSnapshotSkipped.Store(4)
+	secondary.flatAccumulatorDeltaBatches.Store(5)
+	secondary.flatAccumulatorDeltaEntries.Store(6)
+	secondary.flatAccumulatorDeltaOldestIndex.Store(12)
+	secondary.flatAccumulatorDeltaNewestIndex.Store(15)
+	secondary.flatAccumulatorDeltaReplayCount.Store(2)
+	secondary.flatAccumulatorDeltaReplayBatches.Store(3)
+	secondary.flatAccumulatorDeltaReplayEntries.Store(4)
+	secondary.flatAccumulatorDeltaReplayFailures.Store(1)
 	mgr.secondary = secondary
 	core.drManager = mgr
 
@@ -2892,6 +2932,30 @@ func TestDRSystemBackend_StatusIncludesStreamOptimizationCounters(t *testing.T) 
 	}
 	if got := resp.Data["flat_accumulator_snapshot_skipped_total"]; got != uint64(4) {
 		t.Fatalf("expected flat_accumulator_snapshot_skipped_total=4, got %#v", got)
+	}
+	if got := resp.Data["flat_accumulator_delta_batches_total"]; got != uint64(5) {
+		t.Fatalf("expected flat_accumulator_delta_batches_total=5, got %#v", got)
+	}
+	if got := resp.Data["flat_accumulator_delta_entries_total"]; got != uint64(6) {
+		t.Fatalf("expected flat_accumulator_delta_entries_total=6, got %#v", got)
+	}
+	if got := resp.Data["flat_accumulator_delta_oldest_index"]; got != uint64(12) {
+		t.Fatalf("expected flat_accumulator_delta_oldest_index=12, got %#v", got)
+	}
+	if got := resp.Data["flat_accumulator_delta_newest_index"]; got != uint64(15) {
+		t.Fatalf("expected flat_accumulator_delta_newest_index=15, got %#v", got)
+	}
+	if got := resp.Data["flat_accumulator_delta_replay_total"]; got != uint64(2) {
+		t.Fatalf("expected flat_accumulator_delta_replay_total=2, got %#v", got)
+	}
+	if got := resp.Data["flat_accumulator_delta_replay_batches_total"]; got != uint64(3) {
+		t.Fatalf("expected flat_accumulator_delta_replay_batches_total=3, got %#v", got)
+	}
+	if got := resp.Data["flat_accumulator_delta_replay_entries_total"]; got != uint64(4) {
+		t.Fatalf("expected flat_accumulator_delta_replay_entries_total=4, got %#v", got)
+	}
+	if got := resp.Data["flat_accumulator_delta_replay_failures_total"]; got != uint64(1) {
+		t.Fatalf("expected flat_accumulator_delta_replay_failures_total=1, got %#v", got)
 	}
 }
 
@@ -3946,7 +4010,7 @@ func TestDRSecondaryStreamTxnPersistsFlatAccumulator(t *testing.T) {
 	}
 }
 
-func TestDRSecondaryStreamTxnCadencePersistsCursorWithoutStaleSnapshotLoad(t *testing.T) {
+func TestDRSecondaryStreamTxnCadenceReplaysPersistedAccumulatorDeltas(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	ctx := context.Background()
 	replSalt := bytes.Repeat([]byte{0x47}, 32)
@@ -3994,14 +4058,98 @@ func TestDRSecondaryStreamTxnCadencePersistsCursorWithoutStaleSnapshotLoad(t *te
 	if got := secondary.flatAccumulatorSnapshotIndex.Load(); got != 10 {
 		t.Fatalf("expected persisted snapshot index 10, got %d", got)
 	}
+	if got := secondary.flatAccumulatorDeltaBatches.Load(); got != 1 {
+		t.Fatalf("expected one persisted delta batch, got %d", got)
+	}
+	if got := secondary.flatAccumulatorDeltaEntries.Load(); got != 1 {
+		t.Fatalf("expected one persisted delta entry, got %d", got)
+	}
 
 	reloaded := newDRReplicationSecondary(core, replSalt, "rel-flat-cadence", core.logger)
 	reloaded.loadPersistentFlatAccumulator(ctx)
+	assertDRFlatAccumulatorMatchesSet(t, reloaded.rangeAccumulator, 11, localSet)
+	if got := reloaded.lastAppliedIndex.Load(); got != 11 {
+		t.Fatalf("expected cursor-loaded lastAppliedIndex 11, got %d", got)
+	}
+	if got := reloaded.flatAccumulatorDeltaReplayCount.Load(); got != 1 {
+		t.Fatalf("expected one delta replay, got %d", got)
+	}
+	if got := reloaded.flatAccumulatorDeltaReplayEntries.Load(); got != 1 {
+		t.Fatalf("expected one replayed delta entry, got %d", got)
+	}
+	if entry, err := core.physical.Get(ctx, drFlatAccumulatorStoragePath); err != nil {
+		t.Fatal(err)
+	} else if entry != nil {
+		var snapshot drFlatAccumulatorPersistedSnapshot
+		if err := json.Unmarshal(entry.Value, &snapshot); err != nil {
+			t.Fatal(err)
+		}
+		if snapshot.CommitIndex != 10 {
+			t.Fatalf("expected persisted snapshot index 10 to remain, got %d", snapshot.CommitIndex)
+		}
+	}
+	if entry, err := core.physical.Get(ctx, drFlatAccumulatorCursorStoragePath); err != nil {
+		t.Fatal(err)
+	} else if entry == nil {
+		t.Fatal("expected flat accumulator cursor to remain")
+	}
+	if entry, err := core.physical.Get(ctx, drFlatAccumulatorDeltaPath(11)); err != nil {
+		t.Fatal(err)
+	} else if entry == nil {
+		t.Fatal("expected flat accumulator delta batch to remain")
+	}
+}
+
+func TestDRSecondaryStreamTxnCadenceMissingDeltasFailsClosed(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	replSalt := bytes.Repeat([]byte{0x49}, 32)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-flat-missing-delta", core.logger)
+	secondary.flatAccumulatorSnapshotMinEntries = 1024
+	secondary.flatAccumulatorSnapshotMinInterval = time.Hour
+
+	txnBackend, ok := core.physical.(physical.TransactionalBackend)
+	if !ok {
+		t.Fatal("test core physical backend must support transactions")
+	}
+
+	key := "secret/flat-missing-delta"
+	oldEntry := &physical.Entry{Key: key, Value: []byte("old")}
+	if err := core.physical.Put(ctx, oldEntry); err != nil {
+		t.Fatalf("failed to seed physical entry: %v", err)
+	}
+	kid, oldVID := secondary.scanner.ComputeItemFromEntry(oldEntry)
+	localSet := &reconciler.ReconciliationSet{
+		KIDToVID: map[[32]byte][32]byte{kid: oldVID},
+	}
+	secondary.rangeAccumulator.resetFromSet(localSet, 10)
+	secondary.lastAppliedIndex.Store(10)
+	if err := secondary.resetAndPersistFlatAccumulatorFromSet(ctx, localSet, 10); err != nil {
+		t.Fatalf("failed to seed persisted accumulator: %v", err)
+	}
+
+	if err := secondary.applyStreamTxn(ctx, txnBackend, []*EntryChange{{
+		OpType:    string(physical.PutOperation),
+		Key:       key,
+		Value:     []byte("new"),
+		RaftIndex: 11,
+	}}, false); err != nil {
+		t.Fatalf("stream txn failed: %v", err)
+	}
+	if err := core.physical.Delete(ctx, drFlatAccumulatorDeltaPath(11)); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded := newDRReplicationSecondary(core, replSalt, "rel-flat-missing-delta", core.logger)
+	reloaded.loadPersistentFlatAccumulator(ctx)
 	if reloaded.rangeAccumulator.isInitialized() {
-		t.Fatal("expected stale snapshot behind cursor to be ignored")
+		t.Fatal("expected accumulator to remain unavailable after missing delta")
 	}
 	if got := reloaded.lastAppliedIndex.Load(); got != 11 {
 		t.Fatalf("expected cursor-loaded lastAppliedIndex 11, got %d", got)
+	}
+	if got := reloaded.flatAccumulatorDeltaReplayFailures.Load(); got != 1 {
+		t.Fatalf("expected one delta replay failure, got %d", got)
 	}
 	if entry, err := core.physical.Get(ctx, drFlatAccumulatorStoragePath); err != nil {
 		t.Fatal(err)
