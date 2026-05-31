@@ -390,6 +390,50 @@ caps unchanged. Both runs filled the primary in-memory stream ring to its 50k
 retained entry cap without dropping stress events; journal horizon sizing
 remains a separate reconnect-retention concern.
 
+Latest observed 1-hour no-stepdown steady-state run with the 25ms wait:
+`/Users/roelc/projects/secretz/openbao/dr-stress-results/drmixed-20260531T170624Z`.
+The run completed 410,078 operations at 113.75 ops/s with zero put, get, or
+status failures, zero dropped stress events, and 1.0s/1.0s sentinel convergence.
+Exhaustive verification passed on primary, secondary1, and secondary2 across
+18,127 truth-log keys with zero missing keys, mismatches, or read errors. The
+primary in-memory stream ring stayed full at p50/p90/p99/max 50,000 entries,
+but no stream drops were observed. The stream-buffer horizon ranged from 162s to
+595s, with p50 287s, p90 398s, and p99 519s. Secondary lag remained bounded:
+secondary1 max lag 20 entries with p99 4, and secondary2 max lag 231 entries
+with p99 22. Final secondary stream transactions averaged 13.35/13.34 entries
+and 61.40ms/61.40ms commit time. Live primary journal status after the run
+reported about 886 MiB retained across 14 segments, `journal_range_too_old_total=0`,
+backpressure `healthy`, and zero backpressure rejections.
+
+Latest observed 15-minute HA hard smoke with the compiled 25ms default:
+`/Users/roelc/projects/secretz/openbao/dr-stress-results/drmixed-20260531T182008Z`.
+The run used 48 workers and primary stepdowns every 300 seconds. It completed
+109,998 operations at 121.57 ops/s, had zero status failures, zero dropped
+stress events, and 1.0s/1.0s sentinel convergence. Exhaustive verification
+passed on primary, secondary1, and secondary2 across 9,182 truth-log keys with
+zero missing keys, mismatches, or read errors. Client-facing transient failures
+(`put_fail=290`, `get_fail=177`) occurred during forced HA disruption and did
+not produce replicated data divergence.
+
+Compared with the earlier 15-minute HA hard smoke
+`drmixed-20260531T145022Z`, this run processed about 2.0% more operations and
+reduced client-facing transient failures. Secondary stream transaction batches
+dropped by 35.7%/35.8%, average entries per stream transaction rose from about
+10.7 to about 17.0, and total measured stream commit time dropped by
+26.1%/26.5%, despite average commit time rising to 58.58ms/59.05ms because
+each transaction carried more entries. Both secondaries reconciled twice,
+recorded one indexed-repair proof mismatch, took the fail-closed local-scan
+fallback once, and ended `streaming` with `lag_entries=0`.
+
+The status timeline recorded p50 stream-buffer occupancy of 27,766 entries,
+p90/p99/max occupancy at the 50,000-entry in-memory ring cap, maximum
+stream-buffer horizon of 491s, and p99 horizon of 432s. Secondary lag was low
+outside reconcile windows: p90 lag was 3/4 entries, while p99 lag rose to
+1,740/1,620 entries during the bounded reconcile periods. Live primary journal
+status after the run reported about 212 MiB retained across 4 segments,
+`journal_range_too_old_total=0`, backpressure `healthy`, zero backpressure
+rejections, and two active stream subscribers.
+
 Single secondary:
 
 ```bash

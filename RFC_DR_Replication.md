@@ -1682,6 +1682,27 @@ flushed due to the entry cap, so increasing `stream_batch_max_entries` is not
 yet justified by this profile. The prototype default was therefore moved to
 25ms while leaving the entry and byte caps unchanged.
 
+A follow-up 1-hour no-stepdown HA run with the 25ms default completed 410,078
+operations at 113.75 ops/s with zero put, get, or status failures. Primary,
+secondary1, and secondary2 passed exhaustive verification across 18,127 truth-log
+keys with zero missing keys, mismatches, or read errors. The in-memory stream
+ring stayed full, but no drops occurred, p99 secondary lag remained low, and the
+primary journal retained about 886 MiB after the run with
+`journal_range_too_old_total=0`. This supports treating a full in-memory ring as
+a pressure signal rather than a correctness failure when disk-backed journal
+coverage remains healthy.
+
+A follow-up 15-minute HA hard smoke using the compiled 25ms default then
+validated the same tuning under forced primary stepdowns every 300 seconds. The
+run completed 109,998 operations at 121.57 ops/s, had zero stream drops and zero
+status failures, converged both sentinels in 1.0s, and passed exhaustive
+verification on primary and both secondaries across 9,182 truth-log keys.
+Compared with the earlier 15-minute HA hard smoke, secondary stream transaction
+batches dropped by about 36%, average entries per transaction increased from
+about 10.7 to about 17.0, and total measured stream commit time dropped by
+about 26%. Both secondaries exercised the indexed-repair proof-mismatch
+fallback once, returned to `streaming`, and ended with `lag_entries=0`.
+
 The main known gap is availability polish during primary HA active handoff
 under sustained write and DR backlog pressure; stress runs still observe
 transient client-visible errors even when final replicated data converges.
