@@ -171,6 +171,7 @@ type DRStatusResponse struct {
 	DRBackpressureState     string  `json:"dr_backpressure_state"`
 	PrimaryWriteRateEPS     float64 `json:"primary_write_rate_eps"`
 	SecondaryApplyRateEPS   float64 `json:"secondary_apply_rate_eps"`
+	StreamTxnCoalescedTotal int64   `json:"stream_txn_coalesced_entries_total"`
 	FallbackActive          bool    `json:"fallback_active"`
 	FallbackCount           int64   `json:"fallback_count"`
 	FallbackLastReason      string  `json:"fallback_last_reason"`
