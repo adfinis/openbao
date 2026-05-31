@@ -746,6 +746,13 @@ func (b *SystemBackend) handleDRStatus(ctx context.Context, req *logical.Request
 		data["flat_accumulator_fast_path_total"] = status.FlatAccumulatorFastPathTotal
 		data["flat_accumulator_empty_repair_total"] = status.FlatAccumulatorEmptyRepairTotal
 		data["flat_accumulator_empty_repair_ranges_total"] = status.FlatAccumulatorEmptyRepairRanges
+		data["flat_accumulator_indexed_repair_total"] = status.FlatAccumulatorIndexedRepairTotal
+		data["flat_accumulator_indexed_repair_ranges_total"] = status.FlatAccumulatorIndexedRepairRanges
+		data["local_kid_index_bucket_loads_total"] = status.LocalKIDIndexBucketLoadsTotal
+		data["local_kid_index_entries_loaded_total"] = status.LocalKIDIndexEntriesLoadedTotal
+		data["local_kid_index_load_failures_total"] = status.LocalKIDIndexLoadFailuresTotal
+		data["local_kid_index_resets_total"] = status.LocalKIDIndexResetsTotal
+		data["local_kid_index_updates_total"] = status.LocalKIDIndexUpdatesTotal
 		data["stream_txn_coalesced_entries_total"] = status.StreamTxnCoalescedEntriesTotal
 		data["stream_txn_batches_total"] = status.StreamTxnBatchesTotal
 		data["stream_txn_entries_total"] = status.StreamTxnEntriesTotal

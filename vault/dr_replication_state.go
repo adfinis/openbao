@@ -1369,6 +1369,9 @@ func (m *drRelationshipManager) clearSecondaryCheckpointCursor(ctx context.Conte
 				return fmt.Errorf("failed to clear DR secondary flat accumulator delta: %w", err)
 			}
 		}
+		if err := deletePersistedLocalKIDIndex(ctx, m.core.physical); err != nil {
+			return fmt.Errorf("failed to clear DR secondary local KID index: %w", err)
+		}
 	}
 	return nil
 }

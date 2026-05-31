@@ -549,6 +549,22 @@ coalesced value. A `Put` followed by a later `Delete` therefore removes the old
 contribution without adding an intermediate contribution, and repeated `Put`s
 add only the final value's contribution.
 
+The secondary also maintains a local-only bucketed KID index for the same
+top-level KID ranges. Each entry stores `KID -> (key, VID)` under a
+never-replicated local DR path. This is not a Merkle tree or a persistent range
+digest: it has no parent/child nodes and no traversal state. It is a point
+lookup index that lets the secondary build a local `RangeMapIndex` for only the
+top-level buckets that the flat accumulator already proved divergent.
+
+For transactional physical backends, stream apply updates replicated storage,
+the flat accumulator cursor/deltas, and the local KID index in the same local
+transaction. Verified reconciliation resets the index for the repaired ranges
+or for the full scanned set. If the local KID index is absent, stale,
+relationship-mismatched, cluster-mismatched, or inconsistent with the flat
+accumulator bucket count/checksum, the secondary deletes the stale index and
+falls back to the full local scan. Non-atomic repair paths delete the index
+before mutating storage so restart cannot trust a partially updated mapping.
+
 This makes warm reconnects cheap in two ways:
 
 - If the primary stream journal still covers the secondary's last applied
@@ -560,11 +576,13 @@ This makes warm reconnects cheap in two ways:
   checkpoint. If a mismatched range is provably empty locally, the secondary can
   fetch and apply the primary's range contents directly because there are no
   local-only keys to delete.
-- If a mismatched range has local entries, the secondary still falls back to the
-  full local scan. The flat accumulator can identify the divergent bucket, but
-  it does not contain the KID-to-key mapping needed to delete local-only keys
-  safely. Avoiding that scan for non-empty divergent buckets requires a separate
-  local bucketed KID-to-key/VID index, not just the flat checksums.
+- If a mismatched range has local entries and the local KID index is current at
+  the accumulator index, the secondary loads only that bucket's index entries,
+  performs normal digest drill-down/fetch proof validation, applies fetched
+  primary entries, and deletes local-only keys by resolving their KIDs through
+  the local index.
+- If a mismatched non-empty range has no valid local KID index, the secondary
+  still falls back to the full local scan.
 
 On process restart, a secondary that has already completed keyring bootstrap
 and has a restored applied cursor attempts stream replay first. It does not run
@@ -994,7 +1012,8 @@ The status API should expose:
 - stream batch flush reasons
 - flat accumulator cursor writes/index, snapshot count/index, skipped snapshot
   count, byte volume, last snapshot size, persist timing, delta batch counts,
-  delta replay counts/failures, empty-bucket repair counts, and cadence tuning
+  delta replay counts/failures, empty-bucket and indexed-bucket repair counts,
+  local KID index load/reset/update counts, and cadence tuning
 - range task counts
 - budget usage
 - journal replay health
@@ -1114,14 +1133,19 @@ patterns.
 
 The one deliberate divergence from the most common implementations is that
 OpenBao does not maintain a persistent Merkle or hierarchical diff index between
-reconciliations. Range descriptors are still checkpoint-fenced, and the only
+reconciliations. Range descriptors are still checkpoint-fenced, and the
 persisted comparison cache is a flat local accumulator over top-level KID
-ranges. This trades hierarchical index state and its maintenance failure modes
-for a simpler materialized view plus a bounded full-range verification pass when
-the accumulator is absent or not checkpoint-aligned. It is also the reason the
-protocol must prove fetch completeness before inferring deletes (see "Why digest
-proof before deletes"). This is an engineering tradeoff over how to schedule and
-bound comparison work, not a new reconciliation algorithm.
+ranges. The secondary may also maintain a local-only `KID -> (key, VID)` point
+index for those same flat buckets, but that index has no hierarchy, traversal
+state, or independent diff authority. It only materializes the key mapping
+needed to repair accumulator-proven divergent buckets without a full local
+scan. This trades hierarchical index state and its maintenance failure modes for
+a simpler materialized view plus bounded verification/fallback behavior when
+the accumulator or local point index is absent, stale, or not checkpoint-aligned.
+It is also the reason the protocol must prove fetch completeness before
+inferring deletes (see "Why digest proof before deletes"). This is an
+engineering tradeoff over how to schedule and bound comparison work, not a new
+reconciliation algorithm.
 
 These techniques are general prior art that predates and is independent of any
 specific vendor's replication product. This subsection describes the technical
@@ -1209,15 +1233,18 @@ The current conservative range-selection strategy verifies the complete
 top-level range partition for each checkpoint reconciliation. A transactionally
 persisted flat accumulator avoids the local O(N) scan when it is at or behind
 the checkpoint and all ranges match, or when all divergent ranges are locally
-empty and can be filled from primary range fetches. Non-empty divergent ranges
-still require a local scan because the flat accumulator does not carry the
-KID-to-key mapping needed for safe local-only deletes. An absent, incompatible,
-or invalidated accumulator also requires a local scan before reconciliation can
-compare ranges. The applied cursor is intentionally smaller and more frequently
-written than the full snapshot. Cursor-only recovery preserves restart replay
-correctness; snapshot plus delta replay additionally restores the flat
-accumulator without scanning when the delta coverage from snapshot to cursor is
-complete.
+empty and can be filled from primary range fetches. A current local KID index
+also lets non-empty divergent buckets repair through the normal digest/fetch
+proof path without scanning unrelated buckets, because local-only deletes can be
+resolved from KID back to physical key for the divergent bucket. An absent,
+incompatible, or invalidated accumulator still requires a local scan before
+reconciliation can compare ranges. An absent, stale, or bucket-inconsistent
+local KID index falls back to that same full scan before repairing non-empty
+divergent buckets. The applied cursor is intentionally smaller and more
+frequently written than the full snapshot. Cursor-only recovery preserves
+restart replay correctness; snapshot plus delta replay additionally restores
+the flat accumulator without scanning when the delta coverage from snapshot to
+cursor is complete.
 
 Transactional stream apply now coalesces repeated mutations to the same key
 within a batch. This reduces secondary write pressure for hot-key workloads, but

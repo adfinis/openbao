@@ -593,6 +593,9 @@ func (s *drReplicationSecondary) deletePersistedFlatAccumulatorState(ctx context
 	if s == nil || writer == nil {
 		return nil
 	}
+	if err := s.deletePersistedLocalKIDIndex(ctx, writer); err != nil {
+		return err
+	}
 	if err := writer.Delete(ctx, drFlatAccumulatorCursorStoragePath); err != nil {
 		return err
 	}
@@ -607,6 +610,9 @@ func (s *drReplicationSecondary) resetAndPersistFlatAccumulatorFromSet(ctx conte
 	}
 	buckets := drFlatAccumulatorBucketsFromSet(rs)
 	if err := s.persistFlatAccumulatorState(ctx, s.core.physical, index, buckets, true, nil); err != nil {
+		return err
+	}
+	if err := s.resetLocalKIDIndexFromSet(ctx, s.core.physical, index, rs); err != nil {
 		return err
 	}
 	s.rangeAccumulator.replace(index, buckets)
