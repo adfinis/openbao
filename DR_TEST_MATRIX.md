@@ -242,7 +242,7 @@ scripts remain available under `/Users/roelc/projects/secretz/openbao/scripts`.
 | S10 | HA steady-state soak | `scripts/dr_local_test.sh --topology ha smoke --duration 7200 --concurrency 24 --put-percent 55 --get-primary-percent 25 --status-s1-percent 10 --status-s2-percent 10 --max-wait-seconds 600 --progress-interval 30` | Measure non-failover DR behavior under sustained but non-adversarial load | 0 workload failures, 0 dropped events, both secondaries converge with lag 0, and exhaustive verification passes with `scripts/dr_local_test.sh --topology ha verify <run-dir> --sample 0` |
 | S11 | Dynamic tuning under HA load | `scripts/dr_local_test.sh --topology ha tuning-load-smoke` | Update primary and secondary DR tuning while mixed load is running, then force HA handoffs | Tuning writes succeed, new active nodes report the updated profile, workload exits cleanly, both secondaries return to `streaming` with lag 0, and exhaustive verification passes on primary and both secondaries |
 | S12 | HA quiescent reconnect optimization | `scripts/dr_local_test.sh --topology ha quiescent-reconnect-smoke` | Verify active primary handoff avoids scanned reconciliation when stream replay can resume | Both secondaries return to `streaming` lag 0, marker data remains visible, and either `reconcile_count` is unchanged or `flat_accumulator_fast_path_total` increments |
-| S13 | HA accumulator cold restart | `scripts/dr_local_test.sh --topology ha accumulator-cold-restart-smoke` | Verify a full secondary cluster restart reloads the persisted flat accumulator cursor and resumes stream replay without scanned reconciliation | Secondary #1 returns to `streaming` lag 0, marker data remains visible, post-restart cursor covers the pre-restart `last_applied_index`, `reconcile_count=0`, `scan_failures_total=0`, and restart logs show no local scan or reconciliation. With cadence-delayed snapshots, status should show either full snapshot load, snapshot+delta replay, or cursor-only fail-closed recovery |
+| S13 | HA accumulator cold restart | `scripts/dr_local_test.sh --topology ha accumulator-cold-restart-smoke` | Verify a full secondary cluster restart reloads the persisted flat accumulator cursor and resumes stream replay without scanned reconciliation | Secondary #1 returns to `streaming` lag 0, marker data remains visible, post-restart cursor covers the pre-restart `last_applied_index`, scan/reconcile/fallback counters do not increase, and restart logs show no local scan or reconciliation. Process-local counters may reset across a full secondary-cluster restart. With cadence-delayed snapshots, status should show either full snapshot load, snapshot+delta replay, or cursor-only fail-closed recovery |
 | S14 | HA hot-key stream coalescing validation | `scripts/dr_local_test.sh --topology ha reset --build && scripts/dr_local_test.sh --topology ha smoke --duration 300 --concurrency 48 --stepdown-interval 100 --progress-interval 10 --monitor-interval 2 && scripts/dr_local_test.sh --topology ha verify <run-dir> --sample 0` | Measure secondary apply behavior after transactional stream coalescing and flat-accumulator snapshot cadence under hot-key load and HA handoff pressure | Exhaustive verification passes on primary and both secondaries; sentinel convergence is near-immediate; both secondaries end `streaming` with `lag_entries=0`; no journal drops; status timelines expose stream transaction counts, coalesced physical-entry counts, flush reasons, apply/commit timing, flat-accumulator cursor writes, skipped snapshots, and snapshot persist counters |
 | S15 | HA local KID-index fallback validation | `scripts/dr_local_test.sh --topology ha reset --build && scripts/dr_local_test.sh --topology ha smoke --duration 900 --concurrency 48 --stepdown-interval 300 --progress-interval 30 --monitor-interval 5 && scripts/dr_local_test.sh --topology ha verify <run-dir> --sample 0` | Exercise indexed-bucket repair under sustained HA disruption and prove proof-mismatch fallback does not strand reconciliation finalize | Indexed repair proof mismatches increment `flat_accumulator_indexed_repair_proof_mismatches_total`, record the last range/count/checksum mismatch, invalidate the optimizer with reason `indexed_repair_proof_mismatch`, and fall back to full local scan; both secondaries return to `streaming` with `reconcile_phase=idle`, sentinel convergence succeeds, no stream events are dropped, and exhaustive verification passes on primary and both secondaries |
 
@@ -290,13 +290,22 @@ Repo-local HA accumulator cold restart:
 scripts/dr_local_test.sh --topology ha accumulator-cold-restart-smoke
 ```
 
-Latest observed cold restart run: `/Users/roelc/projects/secretz/openbao/dr-stress-results/accumulator-cold-restart-20260531T122513Z`.
-Secondary #1 restarted from pre-restart `last_applied_index=48`, restored
-`flat_accumulator_cursor_index=48` from a persisted snapshot at index 41 plus
-delta replay (`flat_accumulator_delta_replay_total=1`,
-`flat_accumulator_delta_replay_failures_total=0`), ran no reconciliation
-(`reconcile_count=0`), reported no scan failures, and both secondaries returned
-to `streaming` with `lag_entries=0`.
+Latest observed quiescent reconnect run:
+`/Users/roelc/projects/secretz/openbao/dr-stress-results/quiescent-reconnect-20260531T204826Z`.
+It ran against the post-15-minute HA stress topology, forced an active primary
+handoff from `http://localhost:8800` to `http://localhost:8802`, and both
+secondaries returned to `streaming` with `lag_entries=0` without increasing
+`reconcile_count`.
+
+Latest observed cold restart run:
+`/Users/roelc/projects/secretz/openbao/dr-stress-results/accumulator-cold-restart-20260531T205052Z`.
+It ran against the same post-stress topology. Secondary #1 restarted from
+pre-restart `last_applied_index=56113`, restored
+`flat_accumulator_cursor_index=56113` and
+`flat_accumulator_snapshot_index=56113`, observed the accumulator restart log,
+reported no scan failures, no local KID-index fallback scans, no full-bucket
+fallback, and no indexed proof mismatches, and both secondaries returned to
+`streaming` with `lag_entries=0`.
 
 Latest observed hot-key coalescing run: `/Users/roelc/projects/secretz/openbao/dr-stress-results/drmixed-20260531T112327Z`.
 The run completed 44,930 operations at 145.57 ops/s, had zero status failures,

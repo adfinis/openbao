@@ -1959,8 +1959,8 @@ cmd_accumulator_cold_restart_smoke() {
     wait_secondary_ready "secondary2 pre-restart" "$secondary2_active" "$timeout"
   fi
 
-  local run_id run_dir marker_key primary_active before_last after_last after_reconcile restart_since
-  local after_cursor after_snapshot after_scan_failures
+  local run_id run_dir marker_key primary_active before_last before_reconcile before_scan_failures before_local_kid_fallback before_full_bucket before_proof_mismatch restart_since
+  local after_last after_reconcile after_cursor after_snapshot after_scan_failures after_local_kid_fallback after_full_bucket after_proof_mismatch
   local services=(secondary1-1 secondary1-2 secondary1-3)
 
   run_id="accumulator-cold-restart-$(date -u +%Y%m%dT%H%M%SZ)"
@@ -1992,7 +1992,17 @@ cmd_accumulator_cold_restart_smoke() {
 
   dr_status_json "$secondary1_active" "$DR_PRIMARY_TOKEN" >"$run_dir/before-secondary1-status.json"
   before_last="$(dr_last_applied_index_from_file "$run_dir/before-secondary1-status.json")"
+  before_reconcile="$(dr_reconcile_count_from_file "$run_dir/before-secondary1-status.json")"
+  before_scan_failures="$(dr_uint_field_from_file "$run_dir/before-secondary1-status.json" "scan_failures_total")"
+  before_local_kid_fallback="$(dr_uint_field_from_file "$run_dir/before-secondary1-status.json" "local_kid_index_fallback_scans_total")"
+  before_full_bucket="$(dr_uint_field_from_file "$run_dir/before-secondary1-status.json" "flat_accumulator_indexed_repair_full_bucket_fallback_total")"
+  before_proof_mismatch="$(dr_uint_field_from_file "$run_dir/before-secondary1-status.json" "flat_accumulator_indexed_repair_proof_mismatches_total")"
   echo "last_applied_before_secondary1=${before_last}" | tee -a "$run_dir/orchestrator.log"
+  echo "reconcile_count_before_secondary1=${before_reconcile}" | tee -a "$run_dir/orchestrator.log"
+  echo "scan_failures_before_secondary1=${before_scan_failures}" | tee -a "$run_dir/orchestrator.log"
+  echo "local_kid_index_fallback_scans_before_secondary1=${before_local_kid_fallback}" | tee -a "$run_dir/orchestrator.log"
+  echo "full_bucket_fallback_before_secondary1=${before_full_bucket}" | tee -a "$run_dir/orchestrator.log"
+  echo "indexed_proof_mismatch_before_secondary1=${before_proof_mismatch}" | tee -a "$run_dir/orchestrator.log"
 
   restart_since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "stopping_secondary1_at=${restart_since}" | tee -a "$run_dir/orchestrator.log"
@@ -2020,11 +2030,17 @@ cmd_accumulator_cold_restart_smoke() {
   after_cursor="$(dr_uint_field_from_file "$run_dir/after-secondary1-status.json" "flat_accumulator_cursor_index")"
   after_snapshot="$(dr_uint_field_from_file "$run_dir/after-secondary1-status.json" "flat_accumulator_snapshot_index")"
   after_scan_failures="$(dr_uint_field_from_file "$run_dir/after-secondary1-status.json" "scan_failures_total")"
+  after_local_kid_fallback="$(dr_uint_field_from_file "$run_dir/after-secondary1-status.json" "local_kid_index_fallback_scans_total")"
+  after_full_bucket="$(dr_uint_field_from_file "$run_dir/after-secondary1-status.json" "flat_accumulator_indexed_repair_full_bucket_fallback_total")"
+  after_proof_mismatch="$(dr_uint_field_from_file "$run_dir/after-secondary1-status.json" "flat_accumulator_indexed_repair_proof_mismatches_total")"
   echo "last_applied_after_secondary1=${after_last}" | tee -a "$run_dir/orchestrator.log"
   echo "reconcile_count_after_secondary1=${after_reconcile}" | tee -a "$run_dir/orchestrator.log"
   echo "flat_accumulator_cursor_after_secondary1=${after_cursor}" | tee -a "$run_dir/orchestrator.log"
   echo "flat_accumulator_snapshot_after_secondary1=${after_snapshot}" | tee -a "$run_dir/orchestrator.log"
   echo "scan_failures_after_secondary1=${after_scan_failures}" | tee -a "$run_dir/orchestrator.log"
+  echo "local_kid_index_fallback_scans_after_secondary1=${after_local_kid_fallback}" | tee -a "$run_dir/orchestrator.log"
+  echo "full_bucket_fallback_after_secondary1=${after_full_bucket}" | tee -a "$run_dir/orchestrator.log"
+  echo "indexed_proof_mismatch_after_secondary1=${after_proof_mismatch}" | tee -a "$run_dir/orchestrator.log"
 
   if (( after_last < before_last )); then
     die "secondary1 last_applied_index moved backwards after cold restart: ${before_last} -> ${after_last}"
@@ -2032,11 +2048,20 @@ cmd_accumulator_cold_restart_smoke() {
   if (( after_cursor < before_last )); then
     die "secondary1 flat accumulator cursor did not cover the pre-restart applied index: cursor=${after_cursor}, before=${before_last}"
   fi
-  if (( after_reconcile != 0 )); then
-    die "secondary1 ran reconciliation after cold restart; expected stream replay from persisted accumulator cursor"
+  if (( after_reconcile > before_reconcile )); then
+    die "secondary1 ran reconciliation after cold restart; expected stream replay from persisted accumulator cursor: ${before_reconcile} -> ${after_reconcile}"
   fi
-  if (( after_scan_failures != 0 )); then
-    die "secondary1 reported scan failures after cold restart: ${after_scan_failures}"
+  if (( after_scan_failures > before_scan_failures )); then
+    die "secondary1 reported new scan failures after cold restart: ${before_scan_failures} -> ${after_scan_failures}"
+  fi
+  if (( after_local_kid_fallback > before_local_kid_fallback )); then
+    die "secondary1 ran local KID-index fallback scan after cold restart: ${before_local_kid_fallback} -> ${after_local_kid_fallback}"
+  fi
+  if (( after_full_bucket > before_full_bucket )); then
+    die "secondary1 ran full-bucket indexed repair fallback after cold restart: ${before_full_bucket} -> ${after_full_bucket}"
+  fi
+  if (( after_proof_mismatch > before_proof_mismatch )); then
+    die "secondary1 recorded indexed repair proof mismatch after cold restart: ${before_proof_mismatch} -> ${after_proof_mismatch}"
   fi
 
   compose logs --no-color --since "$restart_since" "${services[@]}" >"$run_dir/secondary1-restart.log" 2>"$run_dir/secondary1-restart.log.err" || true
