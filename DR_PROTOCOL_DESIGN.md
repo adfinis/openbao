@@ -54,6 +54,25 @@ mutations for the same physical key inside one streamed transaction. Only the
 final put or delete for a key is materialized. This is safe because the batch
 is applied atomically and intermediate states are not externally visible.
 
+```mermaid
+flowchart TB
+    A["Primary Raft-applied physical mutation"] --> B{"Replicated path?"}
+    B -->|"No: cluster-local path"| C["Emit index-advance marker"]
+    B -->|"Yes"| D["Append filtered mutation<br/>to DR stream journal"]
+    C --> E["Fan out to secondary subscribers"]
+    D --> E
+    E --> F["Secondary receives StreamChanges batch"]
+    F --> G["Spend flow-control credits"]
+    G --> H["Coalesce duplicate mutations<br/>within transaction"]
+    H --> I["Write ciphertext entries<br/>to secondary storage"]
+    I --> J["Update local DR metadata<br/>cursor / accumulator / KID index"]
+    J --> K{"Durable commit succeeds?"}
+    K -->|"No"| L["Fail closed<br/>do not advance lastAppliedIndex"]
+    K -->|"Yes"| M["Advance lastAppliedIndex"]
+    M --> N["Refresh affected runtime state"]
+    N --> O["Remain in streaming state"]
+```
+
 ## Replay Failure
 
 Streaming fails closed. A lagging subscriber is disconnected instead of
@@ -65,6 +84,23 @@ The in-memory stream ring being full is a pressure signal, not by itself a
 correctness failure. Correctness depends on whether the primary can still prove
 journal or buffer coverage from the secondary cursor. If it cannot, the stream
 path terminates and reconciliation becomes mandatory.
+
+```mermaid
+flowchart TD
+    A["Secondary connection lost"] --> B["Reconnect with lastAppliedIndex"]
+    B --> C{"Primary can prove<br/>journal or buffer coverage<br/>from cursor?"}
+    C -->|"Yes"| D["Replay missing stream entries"]
+    D --> E["Durably apply replay"]
+    E --> F["Advance lastAppliedIndex"]
+    F --> G["Resume streaming"]
+    C -->|"No"| H["Enter checkpoint-fenced reconciliation"]
+    H --> I["Request immutable checkpoint"]
+    I --> J["Compare and repair ranges"]
+    J --> K{"All reconcile phases succeeded?"}
+    K -->|"No"| L["Fail closed<br/>keep previous committed state"]
+    K -->|"Yes"| M["Finalize checkpoint<br/>advance lastAppliedIndex"]
+    M --> G
+```
 
 ## Checkpoints
 
@@ -119,6 +155,34 @@ identity/entity/id/123              0x60fe...           0xff02...
 The implementation divides the one-dimensional KID space into deterministic
 ranges. Range checksums and digests are aggregates over KID/VID pairs.
 
+```mermaid
+flowchart LR
+    subgraph Storage["Physical storage table"]
+        K1["secret/data/app<br/>value bytes"]
+        K2["auth/userpass/alice<br/>value bytes"]
+        K3["identity/entity/123<br/>value bytes"]
+        K4["pki/cert/serial<br/>value bytes"]
+    end
+
+    Projection["KID = H(storage key, salt)<br/>VID = H(ciphertext value, flags)"]
+
+    subgraph Ranges["Sorted KID space"]
+        R0["Range 0<br/>count + checksum"]
+        R1["Range 1<br/>count + checksum"]
+        R2["Range 2<br/>count + checksum"]
+        R3["Range 3<br/>count + checksum"]
+    end
+
+    K1 --> Projection
+    K2 --> Projection
+    K3 --> Projection
+    K4 --> Projection
+    Projection --> R0
+    Projection --> R1
+    Projection --> R2
+    Projection --> R3
+```
+
 ## Reconciliation Flow
 
 The reconciliation flow is:
@@ -136,6 +200,43 @@ The reconciliation flow is:
 10. Secondary deletes local-only keys only after fetched remote spans are
     proven complete.
 11. Secondary advances `lastAppliedIndex` only after every phase succeeds.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant S as Secondary
+    participant P as Primary
+    participant CS as Checkpoint store
+    participant LS as Secondary storage
+
+    S->>P: RequestCheckpoint(relationship_id)
+    P->>CS: Materialize immutable checkpoint
+    P-->>S: checkpoint_id + commit_index + relationship_id
+
+    S->>LS: Build or load local KID/VID view
+    S->>P: ExchangeRangeChecksums(checkpoint tuple)
+    P->>CS: Read checkpoint range checksums
+    P-->>S: Top-level range checksums
+
+    S->>S: Select mismatched ranges
+
+    loop For each mismatched range
+        S->>P: ExchangeRangeDigests(parent span)
+        P->>CS: Read child digest descriptors
+        P-->>S: Child span coverage + count + digest
+        S->>S: Validate no gaps, overlap, or invalid split
+        S->>P: FetchEntries(mismatched spans)
+        P->>CS: Fetch checkpoint-scoped entries
+        P-->>S: Entry batch + digest metadata
+        S->>S: Recompute digest and prove completeness
+        S->>LS: Apply fetched primary puts
+        S->>LS: Delete local-only keys after proof
+    end
+
+    S->>S: Verify all required ranges complete
+    S->>LS: Persist checkpoint high-water mark
+    S->>S: Advance lastAppliedIndex
+```
 
 ## Range Checksums
 
@@ -237,6 +338,27 @@ all deltas validate, the accumulator is restored without scanning local
 storage. If any delta is missing, corrupt, incompatible, or fails apply checks,
 the secondary deletes stale optimizer state and falls back to scan-based
 reconciliation when reconciliation is next required.
+
+```mermaid
+flowchart TD
+    A["Streamed transaction arrives"] --> B["Read old VID if needed"]
+    B --> C["Coalesce repeated mutations<br/>for the same key"]
+    C --> D["Apply final physical mutation"]
+    D --> E["Update stream-applied index marker"]
+    E --> F["Update flat accumulator bucket<br/>XOR old out / new in"]
+    F --> G["Update local KID index<br/>KID -> key, VID"]
+    G --> H["Commit local transaction"]
+
+    H --> I{"Snapshot cadence reached?"}
+    I -->|"Yes"| J["Persist full accumulator snapshot"]
+    I -->|"No"| K["Persist local delta batch"]
+    J --> L["Prune covered deltas"]
+    K --> M["Restart can replay deltas<br/>from snapshot to cursor"]
+
+    M --> N{"Delta coverage complete?"}
+    N -->|"Yes"| O["Restore accumulator<br/>without local scan"]
+    N -->|"No"| P["Invalidate optimizer state<br/>scan on next reconciliation"]
+```
 
 ## Local KID Index
 

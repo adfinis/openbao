@@ -36,6 +36,39 @@ The current prototype primarily models clean versus forced promotion. The
 planned-switchover wording is useful because many "clean" promotions in
 production are likely to be operator-planned rather than true disaster events.
 
+```mermaid
+stateDiagram-v2
+    state "Secondary streaming" as SecondaryStreaming
+    state "Planned switchover candidate" as PlannedSwitchover
+    state "Clean promotion candidate" as CleanCandidate
+    state "Forced promotion candidate" as ForcedCandidate
+    state "Awaiting data-loss acknowledgement" as AwaitingAck
+    state "Promoted authority" as PromotedAuthority
+    state "Writable promoted cluster" as NewWrites
+    state "New DR primary" as NewDRPrimary
+    state "Reseed other secondaries" as ReseedSecondaries
+    state "Stale-lineage fence" as StaleFence
+    state "Reject old material" as RejectOldMaterial
+
+    [*] --> SecondaryStreaming
+    SecondaryStreaming --> PlannedSwitchover: primary reachable and writes quiesced
+    SecondaryStreaming --> CleanCandidate: lag 0 and stable streaming proof
+    SecondaryStreaming --> ForcedCandidate: proof unavailable or reconciling
+
+    PlannedSwitchover --> PromotedAuthority: final drain proof
+    CleanCandidate --> PromotedAuthority: promote with unreachable confirmation
+    ForcedCandidate --> AwaitingAck: require accept_data_loss
+    AwaitingAck --> PromotedAuthority: acknowledgement accepted
+    AwaitingAck --> SecondaryStreaming: operator aborts
+
+    PromotedAuthority --> NewWrites: read-only cleared
+    NewWrites --> NewDRPrimary: operator enables DR primary mode
+    NewDRPrimary --> ReseedSecondaries: issue fresh activation tokens
+
+    PromotedAuthority --> StaleFence: persist promotion lineage
+    StaleFence --> RejectOldMaterial: reject old IDs, tokens, and certs
+```
+
 ## Promotion Preconditions
 
 Every promotion requires `confirm_primary_unreachable=true` or an equivalent
@@ -148,6 +181,37 @@ authority.
 Re-enabling from the promoted authority is a new lineage. The secondary must
 clear old replication cursor state, including checkpoint high-water marks, so
 it cannot accidentally treat the old relationship as resumable.
+
+```mermaid
+flowchart LR
+    subgraph Before["Before disaster"]
+        P["Primary A<br/>DR primary"]
+        S1["Secondary B<br/>relationship R1"]
+        S2["Secondary C<br/>relationship R2"]
+        P -->|"stream R1"| S1
+        P -->|"stream R2"| S2
+    end
+
+    subgraph Failover["After Primary A loss"]
+        S1P["Secondary B promoted<br/>new authority"]
+        PA["Old Primary A<br/>old timeline if restarted"]
+        S2Old["Secondary C<br/>still on old lineage"]
+    end
+
+    S1 -->|"promote"| S1P
+    P -.->|"may later return"| PA
+    S2 -.->|"does not automatically follow B"| S2Old
+
+    subgraph Reseed["Explicit promoted-authority reseed"]
+        NewP["Promoted B<br/>DR primary enabled"]
+        Token["Fresh activation token<br/>new lineage"]
+        NewS2["Secondary C<br/>re-enabled / reseeded"]
+        NewP --> Token --> NewS2
+    end
+
+    S1P --> NewP
+    S2Old -->|"disable old lineage<br/>clear old cursor"| NewS2
+```
 
 ## Old Primary Fencing
 

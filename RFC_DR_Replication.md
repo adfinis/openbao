@@ -159,17 +159,41 @@ The design has five planes:
    promoted-authority reseed.
 
 ```mermaid
-flowchart TD
-    P["Primary OpenBao cluster"] --> S["Ordered DR stream"]
-    P --> C["Checkpoint artifacts"]
-    S --> A["Secondary durable apply"]
-    C --> R["Secondary reconciliation"]
-    A --> ST["Secondary storage"]
-    R --> ST
-    T["mTLS relationship authz"] --> S
-    T --> C
-    ST --> RR["Runtime refresh"]
-    RR --> F["Promotion/recovery authority"]
+flowchart LR
+    Client["Clients and workloads"]
+
+    subgraph Primary["Primary OpenBao cluster"]
+        PAPI["OpenBao API"]
+        PCore["Primary core"]
+        PStorage["Primary storage<br/>ciphertext domain"]
+        PJournal["DR stream journal<br/>and in-memory buffer"]
+        PCheckpoint["Checkpoint artifacts<br/>range digests<br/>FetchEntries"]
+        PRel["Relationship manager<br/>mTLS authz<br/>revocation"]
+    end
+
+    subgraph Secondary["Secondary OpenBao cluster"]
+        SAPI["Read-only replicated API surface"]
+        SCore["Secondary core"]
+        SStorage["Secondary storage<br/>ciphertext domain"]
+        SApply["Stream apply"]
+        SRecon["Checkpoint reconciliation"]
+        SRuntime["Runtime refresh<br/>namespaces / mounts / identity / caches"]
+    end
+
+    Client -->|"writes"| PAPI
+    PAPI --> PCore
+    PCore --> PStorage
+    PCore --> PJournal
+    PCore --> PCheckpoint
+    PRel --> PJournal
+    PRel --> PCheckpoint
+
+    PJournal -->|"ordered StreamChanges<br/>mTLS relationship authz"| SApply
+    PCheckpoint -->|"checkpoint digests and fetches"| SRecon
+    SApply --> SStorage
+    SRecon --> SStorage
+    SStorage --> SRuntime
+    SRuntime --> SAPI
 ```
 
 ### Replication domain

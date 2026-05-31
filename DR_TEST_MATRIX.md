@@ -8,6 +8,48 @@ This matrix defines manual and automated validation for DR replication in this r
 - End-to-end validation against a local multi-cluster Docker test environment.
 - Failure-path checks: reconnect/reconcile, revoke, failover, and sustained load.
 
+```mermaid
+flowchart TD
+    A["DR validation harness"] --> B["Bootstrap and relationship tests"]
+    A --> C["Streaming and replay tests"]
+    A --> D["Checkpoint reconciliation tests"]
+    A --> E["Runtime refresh and engine matrix"]
+    A --> F["Promotion and reseed tests"]
+    A --> G["HA stress and soak tests"]
+    A --> H["Security invariant tests"]
+
+    B --> B1["token expiry<br/>single use<br/>relationship binding"]
+    B --> B2["mTLS fingerprint authz<br/>cert rotation<br/>revocation"]
+
+    C --> C1["ordered apply"]
+    C --> C2["lastAppliedIndex advancement"]
+    C --> C3["journal replay horizon"]
+
+    D --> D1["checkpoint tuple mismatch"]
+    D --> D2["digest coverage failures"]
+    D --> D3["fetch proof failures"]
+    D --> D4["delete inference safety"]
+
+    E --> E1["namespaces"]
+    E --> E2["mount/auth/audit tables"]
+    E --> E3["identity route replacement"]
+    E --> E4["route-backed cache invalidation"]
+
+    F --> F1["clean promotion"]
+    F --> F2["forced promotion"]
+    F --> F3["promotion lineage persistence"]
+    F --> F4["promoted-authority reseed"]
+
+    G --> G1["sustained writes"]
+    G --> G2["leader stepdown"]
+    G --> G3["active handoff"]
+    G --> G4["lag and convergence"]
+
+    H --> H1["SyncKeyring AAD binding"]
+    H --> H2["unauthenticated endpoint bounds"]
+    H --> H3["stale-lineage rejection"]
+```
+
 ## Environment Assumptions
 
 - OpenBao repo root: `/Users/roelc/projects/secretz/openbao`

@@ -84,6 +84,23 @@ routes depend on namespace records. Identity refresh comes after route refresh
 because the identity store must attach to the replicated identity route, not
 the old local route.
 
+```mermaid
+flowchart TD
+    A["Replicated physical storage commit"] --> B{"Touched runtime-sensitive path?"}
+    B -->|"No"| Z["No runtime refresh needed"]
+    B -->|"Yes"| C["Classify affected path"]
+
+    C --> D["1. Refresh namespace store"]
+    D --> E["2. Reload mount/auth/audit tables"]
+    E --> F["3. Refresh identity route<br/>and reconnect identityStore"]
+    F --> G["4. Reload identity artifacts<br/>entities / groups / aliases / OIDC"]
+    G --> H["5. Invalidate route-backed backend caches<br/>PKI / transit / other cached backends"]
+    H --> I["Secondary exposes replicated runtime state"]
+
+    C --> J["Protect local-only paths"]
+    J --> K["seal config<br/>root-key wrapping<br/>cluster identity<br/>DR config<br/>HA locks"]
+```
+
 ## Runtime Areas
 
 | Area | Storage class | Runtime object | Ordering requirement | Failure mode if missed |

@@ -58,6 +58,38 @@ Lifecycle:
 10. Promotion lineage prevents stale old-primary material from creating or
     reviving relationships after failover.
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Op as Operator
+    participant P as Primary API
+    participant PR as Relationship manager
+    participant S as Secondary API
+    participant SG as Secondary gRPC client
+    participant PG as Primary gRPC server
+
+    Op->>P: Enable DR primary mode
+    P->>PR: Create or load DR transport CA
+    Op->>P: Create secondary activation token
+    P->>PR: Persist pending relationship<br/>store verifier hash only
+    P-->>Op: Activation token<br/>relationship_id, DR CA, bootstrap token, salt, addresses
+
+    Op->>S: Enable DR secondary mode
+    S->>S: Generate DR client certificate
+    S->>P: register-secondary<br/>relationship_id + bootstrap token + cert
+    P->>PR: Verify token hash and pending state
+    PR-->>P: Record secondary cert fingerprint
+    P-->>S: Registration accepted
+
+    SG->>PG: Establish DR mTLS
+    PG->>PR: Authorize peer fingerprint
+    SG->>PG: SyncKeyring<br/>ephemeral public key + nonce
+    PG->>PR: Re-check registered relationship
+    PG-->>SG: Wrapped root key + keyring entries
+    SG->>S: Persist primary keyring<br/>under secondary seal
+    PG->>PR: Mark relationship active
+```
+
 ## Activation Token and Bootstrap
 
 The activation token carries:
@@ -184,6 +216,33 @@ re-check relationship authorization before continuing or returning:
 - `ExchangeRangeDigests`
 - `FetchEntries`
 - `SyncKeyring`
+
+```mermaid
+flowchart TD
+    A["Activation token<br/>privileged bearer material"] --> B["Pending relationship"]
+    B --> C["Bootstrap token verifier hash<br/>stored on primary"]
+    C --> D["register-secondary<br/>single use / expiry / failed attempts"]
+    D --> E["Secondary cert fingerprint recorded"]
+    E --> F["DR mTLS channel"]
+
+    F --> G["Every DR RPC derives caller identity<br/>from peer certificate"]
+    G --> H["Relationship record authorization"]
+    H --> I{"Relationship active<br/>and not revoked?"}
+    I -->|"No"| J["Fail closed<br/>deny RPC or terminate stream"]
+    I -->|"Yes"| K["Allow scoped DR operation"]
+
+    K --> L["SyncKeyring"]
+    L --> M["Root key wrapped to ephemeral key<br/>AAD-bound to relationship / cluster / cert / nonces"]
+
+    K --> N["Checkpoint RPCs"]
+    N --> O["Checkpoint tuple must match<br/>relationship_id + checkpoint_id + commit_index"]
+
+    K --> P["FetchEntries"]
+    P --> Q["Digest proof required<br/>before apply or delete"]
+
+    K --> R["Promotion"]
+    R --> S["Persist stale-lineage fence<br/>reject old tokens / certs / relationship IDs"]
+```
 
 ## Unauthenticated HTTP Boundary
 
