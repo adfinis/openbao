@@ -105,6 +105,9 @@ dr-test-ha-promoted-durability-smoke:
 dr-test-ha-reseed-secondary-smoke:
 	@./scripts/dr_local_test.sh --topology ha reseed-secondary-smoke
 
+dr-test-ha-indexed-repair-smoke:
+	@./scripts/dr_local_test.sh --topology ha indexed-repair-smoke
+
 dr-test-ha-failover-load-lifecycle:
 	@./scripts/dr_local_test.sh --topology ha failover-load-lifecycle
 
@@ -293,7 +296,7 @@ influxdb-database-plugin:
 postgresql-database-plugin:
 	@CGO_ENABLED=0 go build -o bin/postgresql-database-plugin ./plugins/database/postgresql/postgresql-database-plugin
 
-.PHONY: bin default prep test vet bootstrap fmt fmtcheck mysql-database-plugin mysql-legacy-database-plugin cassandra-database-plugin influxdb-database-plugin postgresql-database-plugin ember-dist ember-dist-dev static-dist static-dist-dev assetcheck check-openbao-in-path packages build build-ci semgrep semgrep-ci vet-godoctests ci-vet-godoctests dr-test-up dr-test-reset dr-test-status dr-test-smoke dr-test-verify dr-test-failover-smoke dr-test-down dr-test-ha-reset dr-test-ha-status dr-test-ha-smoke dr-test-ha-verify dr-test-ha-failover-smoke dr-test-ha-promoted-durability-smoke dr-test-ha-reseed-secondary-smoke dr-test-ha-failover-load-lifecycle dr-test-ha-down
+.PHONY: bin default prep test vet bootstrap fmt fmtcheck mysql-database-plugin mysql-legacy-database-plugin cassandra-database-plugin influxdb-database-plugin postgresql-database-plugin ember-dist ember-dist-dev static-dist static-dist-dev assetcheck check-openbao-in-path packages build build-ci semgrep semgrep-ci vet-godoctests ci-vet-godoctests dr-test-up dr-test-reset dr-test-status dr-test-smoke dr-test-verify dr-test-failover-smoke dr-test-down dr-test-ha-reset dr-test-ha-status dr-test-ha-smoke dr-test-ha-verify dr-test-ha-failover-smoke dr-test-ha-promoted-durability-smoke dr-test-ha-reseed-secondary-smoke dr-test-ha-indexed-repair-smoke dr-test-ha-failover-load-lifecycle dr-test-ha-down
 
 .NOTPARALLEL: ember-dist ember-dist-dev
 
