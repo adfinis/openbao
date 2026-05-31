@@ -38,6 +38,7 @@ Usage:
   scripts/dr_local_test.sh --topology ha quiescent-reconnect-smoke [--no-reset] [--build]
   scripts/dr_local_test.sh --topology ha accumulator-cold-restart-smoke [--no-reset] [--build] [--stop-seconds N]
   scripts/dr_local_test.sh --topology ha secondary-outage-smoke [--duration N] [--concurrency N] [--outage-after N] [--outage-seconds N] [--no-reset] [--build]
+  scripts/dr_local_test.sh --topology ha secondary-outage-reconcile-smoke [--duration N] [--concurrency N] [--outage-after N] [--outage-seconds N] [--no-reset] [--build]
   scripts/dr_local_test.sh --topology ha tuning-load-smoke [--duration N] [--concurrency N] [--no-reset]
   scripts/dr_local_test.sh --topology ha failover-load-lifecycle [--duration N] [--concurrency N] [--hard-stop-after N] [--no-reset]
   scripts/dr_local_test.sh [--topology single|ha] down
@@ -63,6 +64,7 @@ HA topology:
   scripts/dr_local_test.sh --topology ha quiescent-reconnect-smoke
   scripts/dr_local_test.sh --topology ha accumulator-cold-restart-smoke
   scripts/dr_local_test.sh --topology ha secondary-outage-smoke
+  scripts/dr_local_test.sh --topology ha secondary-outage-reconcile-smoke
   scripts/dr_local_test.sh --topology ha tuning-load-smoke
   scripts/dr_local_test.sh --topology ha failover-load-lifecycle
 USAGE
@@ -1777,6 +1779,48 @@ write_tuning_profile() {
         dr_backpressure_critical_min_qps=48
       )
       ;;
+    out-of-horizon)
+      args=(
+        checkpoint_ttl_seconds=900
+        checkpoint_global_budget_bytes=536870912
+        checkpoint_per_relationship_budget_bytes=134217728
+        stream_buffer_max_entries=1024
+        stream_buffer_max_bytes=4194304
+        reconcile_max_rpc_bytes=67108864
+        reconcile_max_wall_time_seconds=900
+        reconcile_max_inflight_tasks=8
+        stream_batch_max_entries=128
+        stream_batch_max_bytes=524288
+        stream_batch_max_wait_milliseconds=20
+        stream_journal_enabled=true
+        stream_journal_max_bytes=262144
+        stream_journal_segment_bytes=32768
+        stream_journal_retention_seconds=30
+        reconcile_apply_workers=8
+        reconcile_put_batch_max_entries=256
+        reconcile_put_batch_max_bytes=1048576
+        convergence_min_rate_ratio=0.40
+        convergence_stall_seconds=90
+        fallback_enabled=true
+        fallback_stall_seconds=90
+        fallback_failure_threshold=2
+        fallback_min_lag_entries=256
+        fallback_cooldown_seconds=180
+        fallback_max_per_hour=4
+        checkpoint_artifact_enabled=true
+        checkpoint_artifact_global_budget_bytes=536870912
+        checkpoint_artifact_per_relationship_budget_bytes=134217728
+        checkpoint_artifact_ttl_seconds=900
+        checkpoint_artifact_segment_bytes=4194304
+        dr_backpressure_enabled=false
+        dr_backpressure_degraded_ratio=0.75
+        dr_backpressure_critical_ratio=0.50
+        dr_backpressure_min_lag_entries=512
+        dr_backpressure_horizon_seconds=60
+        dr_backpressure_degraded_min_qps=96
+        dr_backpressure_critical_min_qps=48
+      )
+      ;;
     relaxed)
       args=(
         checkpoint_ttl_seconds=1800
@@ -2150,6 +2194,9 @@ cmd_secondary_outage_smoke() {
   local max_wait_seconds=300
   local do_reset=true
   local do_build=false
+  local expect_reconcile=false
+  local tuning_profile=""
+  local run_prefix="secondary-outage"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -2189,6 +2236,18 @@ cmd_secondary_outage_smoke() {
         do_build=true
         shift
         ;;
+      --expect-reconcile)
+        expect_reconcile=true
+        shift
+        ;;
+      --tuning-profile)
+        tuning_profile="${2:?missing value for --tuning-profile}"
+        shift 2
+        ;;
+      --run-prefix)
+        run_prefix="${2:?missing value for --run-prefix}"
+        shift 2
+        ;;
       *)
         die "unknown secondary-outage-smoke option: $1"
         ;;
@@ -2202,6 +2261,7 @@ cmd_secondary_outage_smoke() {
   [[ "$progress_interval" =~ ^[0-9]+$ ]] || die "--progress-interval must be an integer"
   [[ "$monitor_interval" =~ ^[0-9]+$ ]] || die "--monitor-interval must be an integer"
   [[ "$max_wait_seconds" =~ ^[0-9]+$ ]] || die "--max-wait-seconds must be an integer"
+  [[ "$run_prefix" =~ ^[a-zA-Z0-9._-]+$ ]] || die "--run-prefix contains unsupported characters"
   (( duration > 0 )) || die "--duration must be > 0"
   (( concurrency > 0 )) || die "--concurrency must be > 0"
   (( outage_after > 0 && outage_after < duration )) || die "--outage-after must be > 0 and less than --duration"
@@ -2230,7 +2290,7 @@ cmd_secondary_outage_smoke() {
   local after_last after_reconcile after_cursor after_snapshot after_scan_failures after_local_kid_fallback after_full_bucket after_proof_mismatch after_range_too_old
   local services=(secondary1-1 secondary1-2 secondary1-3)
 
-  run_id="secondary-outage-$(date -u +%Y%m%dT%H%M%SZ)"
+  run_id="${run_prefix}-$(date -u +%Y%m%dT%H%M%SZ)"
   run_dir="${RESULTS_DIR}/${run_id}"
   mkdir -p "$run_dir"
 
@@ -2242,7 +2302,14 @@ cmd_secondary_outage_smoke() {
     echo "concurrency=${concurrency}"
     echo "outage_after=${outage_after}"
     echo "outage_seconds=${outage_seconds}"
+    echo "expect_reconcile=${expect_reconcile}"
+    echo "tuning_profile=${tuning_profile}"
   } | tee "$run_dir/orchestrator.log"
+
+  if [[ -n "$tuning_profile" ]]; then
+    apply_tuning_profile_to_all "$tuning_profile" "$run_dir"
+    capture_tuning_load_state "$run_dir" "after-${tuning_profile}"
+  fi
 
   primary_active="$(wait_cluster_active_addr "primary pre-outage" 120 "${PRIMARY_NODE_ADDRS[@]}")"
   secondary1_active="$(wait_cluster_active_addr "secondary1 pre-outage" 120 "${SECONDARY1_NODE_ADDRS[@]}")"
@@ -2292,7 +2359,7 @@ cmd_secondary_outage_smoke() {
     -status-s2-percent 10 \
     -test-class recovery_disruption \
     -topology-label primary+2-secondary \
-    -disruption-profile "secondary1_full_cluster_outage_${outage_seconds}s" \
+    -disruption-profile "secondary1_full_cluster_outage_${outage_seconds}s_${tuning_profile:-default}" \
     -max-wait-seconds "$max_wait_seconds" \
     -progress-interval "$progress_interval" \
     -monitor-interval "$monitor_interval" \
@@ -2356,27 +2423,45 @@ cmd_secondary_outage_smoke() {
   if (( after_cursor < before_last )); then
     die "secondary1 flat accumulator cursor did not cover the pre-outage applied index: cursor=${after_cursor}, before=${before_last}"
   fi
-  if (( after_reconcile != 0 )); then
-    die "secondary1 ran reconciliation after within-horizon outage: ${after_reconcile}"
-  fi
   if (( after_scan_failures != 0 )); then
     die "secondary1 reported scan failures after outage: ${after_scan_failures}"
   fi
-  if (( after_local_kid_fallback != 0 )); then
-    die "secondary1 ran local KID-index fallback scan after outage: ${after_local_kid_fallback}"
-  fi
-  if (( after_full_bucket != 0 )); then
-    die "secondary1 ran full-bucket indexed repair fallback after outage: ${after_full_bucket}"
-  fi
-  if (( after_proof_mismatch != 0 )); then
-    die "secondary1 recorded indexed repair proof mismatch after outage: ${after_proof_mismatch}"
-  fi
-  if (( after_range_too_old > before_range_too_old )); then
-    die "primary reported journal range too old during within-horizon outage: ${before_range_too_old} -> ${after_range_too_old}"
+  if [[ "$expect_reconcile" == "true" ]]; then
+    if (( after_reconcile == 0 )); then
+      die "secondary1 did not run reconciliation after out-of-horizon outage"
+    fi
+    if (( after_range_too_old <= before_range_too_old )); then
+      die "primary did not report journal range too old during out-of-horizon outage: ${before_range_too_old} -> ${after_range_too_old}"
+    fi
+    if (( after_cursor < after_last )); then
+      die "secondary1 flat accumulator cursor did not cover final applied index after reconciliation: cursor=${after_cursor}, applied=${after_last}"
+    fi
+  else
+    if (( after_reconcile != 0 )); then
+      die "secondary1 ran reconciliation after within-horizon outage: ${after_reconcile}"
+    fi
+    if (( after_local_kid_fallback != 0 )); then
+      die "secondary1 ran local KID-index fallback scan after outage: ${after_local_kid_fallback}"
+    fi
+    if (( after_full_bucket != 0 )); then
+      die "secondary1 ran full-bucket indexed repair fallback after outage: ${after_full_bucket}"
+    fi
+    if (( after_proof_mismatch != 0 )); then
+      die "secondary1 recorded indexed repair proof mismatch after outage: ${after_proof_mismatch}"
+    fi
+    if (( after_range_too_old > before_range_too_old )); then
+      die "primary reported journal range too old during within-horizon outage: ${before_range_too_old} -> ${after_range_too_old}"
+    fi
   fi
 
   compose logs --no-color --since "$restart_since" "${services[@]}" >"$run_dir/secondary1-outage-restart.log" 2>"$run_dir/secondary1-outage-restart.log.err" || true
-  if rg -q "local scan complete|starting reconciliation" "$run_dir/secondary1-outage-restart.log"; then
+  if [[ "$expect_reconcile" == "true" ]]; then
+    if rg -q "journal cannot satisfy catch-up|starting reconciliation" "$run_dir/secondary1-outage-restart.log"; then
+      echo "secondary1 out-of-horizon reconciliation log observed" | tee -a "$run_dir/orchestrator.log"
+    else
+      echo "secondary1 out-of-horizon reconciliation log not observed; validated via counters" | tee -a "$run_dir/orchestrator.log"
+    fi
+  elif rg -q "local scan complete|starting reconciliation" "$run_dir/secondary1-outage-restart.log"; then
     die "secondary1 restart logs show scanned reconciliation during within-horizon outage"
   fi
 
@@ -2385,8 +2470,25 @@ cmd_secondary_outage_smoke() {
   verify_one "secondary2" "$DR_SECONDARY2_ADDR" "$run_dir" 0
 
   echo "completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$run_dir/orchestrator.log"
-  echo "Secondary outage smoke passed."
+  if [[ "$expect_reconcile" == "true" ]]; then
+    echo "Secondary outage reconcile smoke passed."
+  else
+    echo "Secondary outage smoke passed."
+  fi
   echo "Run: ${run_dir}"
+}
+
+cmd_secondary_outage_reconcile_smoke() {
+  cmd_secondary_outage_smoke \
+    --expect-reconcile \
+    --tuning-profile out-of-horizon \
+    --run-prefix secondary-outage-reconcile \
+    --duration 180 \
+    --concurrency 48 \
+    --outage-after 20 \
+    --outage-seconds 90 \
+    --max-wait-seconds 900 \
+    "$@"
 }
 
 cmd_tuning_load_smoke() {
@@ -2816,6 +2918,7 @@ main() {
     quiescent-reconnect-smoke) cmd_quiescent_reconnect_smoke "$@" ;;
     accumulator-cold-restart-smoke) cmd_accumulator_cold_restart_smoke "$@" ;;
     secondary-outage-smoke) cmd_secondary_outage_smoke "$@" ;;
+    secondary-outage-reconcile-smoke) cmd_secondary_outage_reconcile_smoke "$@" ;;
     tuning-load-smoke) cmd_tuning_load_smoke "$@" ;;
     failover-load-lifecycle) cmd_failover_load_lifecycle "$@" ;;
     down) cmd_down "$@" ;;

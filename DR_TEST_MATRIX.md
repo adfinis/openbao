@@ -218,6 +218,7 @@ docker logs --since=10m bao-primary-1 | rg 'dr-replication|checkpoint|change str
 - Strict TLS and relationship authz are fail-closed; stale bootstrap/tokens/certs correctly break reconnect.
 - In the HA Docker topology, `api_addr` uses container DNS names. Host-side arbitrary-token lookup against a DR secondary can redirect to those internal names; the engine matrix uses service-token self lookup to verify replicated token usability without relying on host DNS for secondary leader redirects.
 - Direct-to-node HA tests should pass all nodes in a secondary cluster to `dr-stress` as a comma-separated address list when the active node can move during the test. The harness scores DR status responses and follows the node reporting current `streaming` state instead of relying on a fixed host port.
+- Forced out-of-horizon tests may shrink the stream buffer/journal, but `stream_buffer_max_entries` must remain at least the secondary's initial stream window. With the current defaults that means `>=1024`; smaller values exercise `ResourceExhausted` stream admission rather than journal-too-old replay fallback.
 - Namespace replication requires runtime refresh rather than generic invalidation. Generic invalidation of `core/namespaces/*` can collide with already-mounted namespace singleton routes; the lifecycle matrix verifies namespace lookup, namespace `sys/mounts`, and namespace KV after failover and reseed.
 - Audit devices are declarative/config-managed in OpenBao and cannot be enabled through the API by the default matrix. Audit parity should be validated by a separate topology profile with audit devices predeclared in config.
 - The default engine matrix intentionally covers self-contained built-ins. LDAP, Kubernetes, RADIUS, Kerberos, RabbitMQ, and live database credential issuance require external services and should be covered by explicit dependency-backed profiles rather than making the default lifecycle test brittle.
@@ -247,6 +248,7 @@ scripts remain available under `/Users/roelc/projects/secretz/openbao/scripts`.
 | S14 | HA hot-key stream coalescing validation | `scripts/dr_local_test.sh --topology ha reset --build && scripts/dr_local_test.sh --topology ha smoke --duration 300 --concurrency 48 --stepdown-interval 100 --progress-interval 10 --monitor-interval 2 && scripts/dr_local_test.sh --topology ha verify <run-dir> --sample 0` | Measure secondary apply behavior after transactional stream coalescing and flat-accumulator snapshot cadence under hot-key load and HA handoff pressure | Exhaustive verification passes on primary and both secondaries; sentinel convergence is near-immediate; both secondaries end `streaming` with `lag_entries=0`; no journal drops; status timelines expose stream transaction counts, coalesced physical-entry counts, flush reasons, apply/commit timing, flat-accumulator cursor writes, skipped snapshots, and snapshot persist counters |
 | S15 | HA local KID-index fallback validation | `scripts/dr_local_test.sh --topology ha reset --build && scripts/dr_local_test.sh --topology ha smoke --duration 900 --concurrency 48 --stepdown-interval 300 --progress-interval 30 --monitor-interval 5 && scripts/dr_local_test.sh --topology ha verify <run-dir> --sample 0` | Exercise indexed-bucket repair under sustained HA disruption and prove proof-mismatch fallback does not strand reconciliation finalize | Indexed repair proof mismatches increment `flat_accumulator_indexed_repair_proof_mismatches_total`, record the last range/count/checksum mismatch, invalidate the optimizer with reason `indexed_repair_proof_mismatch`, and fall back to full local scan; both secondaries return to `streaming` with `reconcile_phase=idle`, sentinel convergence succeeds, no stream events are dropped, and exhaustive verification passes on primary and both secondaries |
 | S16 | HA secondary outage within journal horizon | `scripts/dr_local_test.sh --topology ha secondary-outage-smoke --duration 120 --concurrency 32 --outage-after 20 --outage-seconds 40 --progress-interval 10 --monitor-interval 2` | Stop all nodes in secondary #1 while writes continue, restart it before the stream journal horizon expires, and verify replay catch-up without reconciliation | Secondary #1 may elect a different active node after restart; the stress harness follows active DR status across the secondary node list. Both secondaries converge with nonzero `primary_index`, secondary #1 advances its flat accumulator cursor to the final applied index, `reconcile_count` remains zero after restart, `scan_failures_total`, `local_kid_index_fallback_scans_total`, full-bucket fallback, proof mismatches, and primary `journal_range_too_old_total` remain zero, and exhaustive verification passes on primary and both secondaries |
+| S17 | HA secondary outage beyond journal horizon | `scripts/dr_local_test.sh --topology ha secondary-outage-reconcile-smoke --progress-interval 10 --monitor-interval 2` | Shrink the primary stream buffer/journal for the test, stop all nodes in secondary #1 while writes continue, restart it after replay is no longer possible, and verify reconciliation repair | Primary `journal_range_too_old_total` increments, secondary #1 runs reconciliation and returns to `streaming` with `lag_entries=0`, `reconcile_phase=idle`, and final `last_applied_index=primary_index`; flat accumulator cursor covers the final applied index, scan failures, local KID fallback scans, full-bucket fallback, and indexed proof mismatches remain zero, and exhaustive verification passes on primary and both secondaries |
 
 ### Stress Run Examples
 
@@ -327,6 +329,28 @@ repair fallback, no indexed proof mismatches, and no primary
 `journal_range_too_old_total` increment. Exhaustive verification passed on
 primary, secondary1, and secondary2 across 2,143 truth-log keys with zero
 missing keys, mismatches, or read errors.
+
+Latest observed out-of-horizon secondary outage run:
+`/Users/roelc/projects/secretz/openbao/dr-stress-results/secondary-outage-reconcile-20260531T213024Z`.
+The run applied the `out-of-horizon` tuning profile
+(`stream_buffer_max_entries=1024`, `stream_journal_max_bytes=262144`,
+`stream_journal_segment_bytes=32768`, retention 30s), stopped all secondary #1
+nodes for 90 seconds, and kept 48 workers writing to primary. The primary
+reported `journal_range_too_old_total=4`, secondary #1 ran reconciliation
+(`reconcile_count=4`) and returned to `streaming` with
+`last_applied_index=primary_index=14954`; sentinel convergence was 6.0s/1.0s.
+
+Secondary #1 repaired via indexed accumulator reconciliation:
+`flat_accumulator_indexed_repair_total=4`,
+`flat_accumulator_indexed_repair_ranges_total=3288`,
+`flat_accumulator_cursor_index=14954`,
+`flat_accumulator_snapshot_index=14869`, with no scan failures, no local
+KID-index fallback scans, no full-bucket fallback, and no indexed proof
+mismatches. The workload completed 21,333 operations at 112.51 ops/s with zero
+PUT failures, zero status failures, and zero dropped stress events; 7
+client-facing GET failures occurred during the disruption window. Exhaustive
+verification passed on primary, secondary1, and secondary2 across 2,972
+truth-log keys with zero missing keys, mismatches, or read errors.
 
 Latest observed hot-key coalescing run: `/Users/roelc/projects/secretz/openbao/dr-stress-results/drmixed-20260531T112327Z`.
 The run completed 44,930 operations at 145.57 ops/s, had zero status failures,
