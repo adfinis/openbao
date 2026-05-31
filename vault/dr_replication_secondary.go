@@ -302,7 +302,7 @@ const (
 	drDefaultRPCDeadline                        = 30 * time.Second
 	drDefaultStreamBatchMaxEntries              = 256
 	drDefaultStreamBatchMaxBytes                = 1 << 20 // 1 MiB
-	drDefaultStreamBatchMaxWait                 = 10 * time.Millisecond
+	drDefaultStreamBatchMaxWait                 = 25 * time.Millisecond
 	drDefaultFlatAccumulatorSnapshotMinEntries  = 4096
 	drDefaultFlatAccumulatorSnapshotMinInterval = 5 * time.Second
 	drDefaultReconcileApplyWorkers              = 16

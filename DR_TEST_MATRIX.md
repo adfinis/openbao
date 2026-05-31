@@ -366,6 +366,30 @@ increased average entries per transaction by 26.3%/23.8%. Both secondaries ended
 `streaming` with `lag_entries=0`; each recorded one indexed repair proof
 mismatch and took the fail-closed local-scan fallback.
 
+Controlled no-stepdown stream apply tuning comparison:
+
+- Historical default 10ms wait: `/Users/roelc/projects/secretz/openbao/dr-stress-results/drmixed-20260531T164804Z`.
+  The run completed 37,920 operations at 124.21 ops/s with zero put/status
+  failures, 26 get misses, 1.0s/1.0s sentinel convergence, no dropped stress
+  events, and exhaustive verification passed on primary, secondary1, and
+  secondary2 across 3,999 truth-log keys. Final secondary stream transactions
+  averaged 12.09/12.05 entries with 51.45ms/51.37ms average commit time.
+- Tuned 25ms wait: `/Users/roelc/projects/secretz/openbao/dr-stress-results/drmixed-20260531T165458Z`.
+  The run completed 43,860 operations at 144.01 ops/s with zero put/status
+  failures, 26 get misses, 1.0s/1.0s sentinel convergence, no dropped stress
+  events, and exhaustive verification passed on primary, secondary1, and
+  secondary2 across 4,556 truth-log keys. Final secondary stream transactions
+  averaged 12.63/12.62 entries with 44.41ms/44.29ms average commit time.
+
+The 25ms wait-only tuning processed 15.7% more operations and 17.2% more stream
+entries while lowering average commit time by about 13.7% and total measured
+commit time by about 3.2%/3.5%. Neither run flushed due to the 256-entry cap, so
+raising `stream_batch_max_entries` is not the next tuning target for this
+profile. The prototype default moved to 25ms while leaving the entry and byte
+caps unchanged. Both runs filled the primary in-memory stream ring to its 50k
+retained entry cap without dropping stress events; journal horizon sizing
+remains a separate reconnect-retention concern.
+
 Single secondary:
 
 ```bash

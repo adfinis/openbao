@@ -1671,6 +1671,17 @@ handoff churn, but secondary stream transaction counts still dropped by about
 Primary, secondary1, and secondary2 passed exhaustive verification across 3,709
 truth-log keys with zero missing keys, mismatches, or read errors.
 
+A controlled no-stepdown tuning comparison on 2026-05-31 then isolated the
+stream apply wait setting. Raising `stream_batch_max_wait` from 10ms to 25ms,
+without changing the 256-entry cap or byte cap, processed 15.7% more operations
+and 17.2% more stream entries in the same 5-minute profile. Average stream
+transaction commit time dropped by about 13.7%, total measured commit time
+dropped by about 3.2-3.5%, sentinel convergence remained 1.0s/1.0s, and
+exhaustive verification passed on primary and both secondaries. Neither run
+flushed due to the entry cap, so increasing `stream_batch_max_entries` is not
+yet justified by this profile. The prototype default was therefore moved to
+25ms while leaving the entry and byte caps unchanged.
+
 The main known gap is availability polish during primary HA active handoff
 under sustained write and DR backlog pressure; stress runs still observe
 transient client-visible errors even when final replicated data converges.
