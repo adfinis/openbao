@@ -116,6 +116,17 @@ hazards for byte/entry budgets, enforces cross-field budget and backpressure
 relationships, and verifies manager/API rollback so rejected updates cannot
 leave partial in-memory tuning behind.
 
+A 2026-05-31 repo-local 15-minute HA hard smoke rebuilt `openbao:dev`, reset
+the nine-node HA topology, and ran the default hard profile with 48 workers and
+primary stepdowns every 300 seconds. The run completed 88,023 operations at
+97.28 ops/s. As expected for the current availability gap, client-facing
+transient failures occurred during HA handoff (`put_fail=382`, `get_fail=210`),
+but DR status checks did not fail, stream drops remained zero, both sentinels
+converged in about one second, and exhaustive verification passed on the
+primary and both secondaries for all 7,744 terminal keys. Secondary2 exercised
+one indexed-bucket repair over 226 ranges and returned to `streaming` with
+`lag_entries=0`; no fallback scan was required.
+
 ## Test Environment
 
 - OpenBao repository: `/Users/roelc/projects/secretz/openbao`
@@ -774,6 +785,59 @@ Exhaustive verification:
 Final DR status showed two active primary relationships and both secondaries in
 `streaming` with `lag_entries=0`.
 
+## Repo-Local HA Hard Smoke After Tuning Guard
+
+Latest HA hard-smoke artifact:
+
+`/Users/roelc/projects/secretz/openbao/dr-stress-results/drmixed-20260531T214747Z`
+
+Profile:
+
+| Metric | Value |
+| --- | ---: |
+| Duration | 900s |
+| Concurrency | 48 workers |
+| Stepdown interval | 300s |
+| Total operations | 88,023 |
+| Throughput | 97.28 ops/s |
+| Successful puts | 48,129 |
+| Failed puts | 382 |
+| Successful primary gets | 21,776 |
+| Failed primary gets | 210 |
+| Successful DR status checks | 17,526 |
+| Failed DR status checks | 0 |
+| Dropped stress events | 0 |
+
+Replication convergence:
+
+| Secondary | Converged | Final lag | Final applied index | Primary index | Sentinel wait |
+| --- | --- | ---: | ---: | ---: | ---: |
+| secondary1 | yes | 0 | 48,420 | 48,420 | 1.0s |
+| secondary2 | yes | 0 | 48,420 | 48,420 | 1.0s |
+
+Exhaustive verification:
+
+| Target | Keys checked | Matches | Missing | Mismatches | Errors | Result |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| primary | 7,744 | 7,744 | 0 | 0 | 0 | PASS |
+| secondary1 | 7,744 | 7,744 | 0 | 0 | 0 | PASS |
+| secondary2 | 7,744 | 7,744 | 0 | 0 | 0 | PASS |
+
+Interpretation:
+
+- The run was started after rebuilding the local image and resetting the HA
+  topology, so the prior out-of-horizon tuning profile was cleared.
+- Client-facing transient put/get failures remain an availability issue during
+  primary active handoff under sustained pressure, not a final data-correctness
+  failure in this run.
+- The primary stream buffer reached its configured in-memory cap during the
+  run, but no stream drops occurred and journal replay remained available.
+- Secondary2 briefly entered reconciliation after the second handoff, performed
+  one indexed-bucket repair over 226 ranges, and returned to `streaming`.
+- Final status showed both secondaries with `lag_entries=0`,
+  `reconcile_phase=idle`, no scan failures, and no local KID-index fallback
+  scans.
+
 ## Repo-Local Steady-State HA Soak
 
 Latest steady-state soak artifact:
@@ -922,6 +986,7 @@ Important findings from the expanded matrix:
 | `promoted-durability-20260529T214508Z` | Repo-local promoted HA durability smoke | PASS | Full promoted secondary1 restart, stale old-primary token rejection after restart, active handoff from secondary1-1 to secondary1-2, and post-handoff write all passed. |
 | `reseed-secondary-20260529T215004Z` | Repo-local explicit secondary2 reseed to promoted authority | PASS | Promoted secondary1 became the new DR primary, secondary2 was re-enabled from a fresh promoted token, promoted-only data replicated, old-primary-only data was removed from secondary2, and old primary stayed separate. |
 | `drmixed-20260530T001551Z` | Repo-local HA credential rotation under load | PASS | 15,085 ops, 0 workload failures, secondary1 DR client certificate rotation during load, forced stepdowns every 30s, sentinel convergence in 1s for both secondaries, exhaustive verification passed on all clusters. |
+| `drmixed-20260531T214747Z` | Repo-local 15m HA hard smoke after reset/rebuild | Correctness PASS, availability degraded | 88,023 ops; 382 put failures, 210 get failures, 0 status failures, 0 stream drops; both sentinels converged in about 1s; exhaustive verification passed on primary, secondary1, and secondary2 for all 7,744 terminal keys; secondary2 exercised indexed-bucket repair without fallback scan. |
 | `failover-smoke-20260530T100634Z` | Repo-local HA forced failover smoke on rebuilt image | PASS | Reset rebuilt `openbao:dev`; forced promotion required explicit acknowledgement, stale old-primary token was rejected, and promoted/old-primary timelines stayed isolated. |
 | `promoted-durability-20260530T100738Z` | Repo-local promoted HA durability rerun on rebuilt image | PASS | Promoted secondary1 survived full restart, rejected stale old-primary tokens after restart, moved active from `http://localhost:8902` to `http://localhost:8900`, and accepted post-handoff writes. |
 | `reseed-secondary-20260530T100820Z` | Repo-local explicit secondary2 reseed rerun on rebuilt image | PASS | Promoted secondary1 became the new DR primary, secondary2 was re-enabled from a fresh promoted token, secondary2 converged with lag 0, promoted-only data replicated, and old-primary-only data did not merge. |
@@ -941,6 +1006,10 @@ The stress tests produced transient client-visible errors during active handoff:
 - HAProxy 15-minute run:
   - 443 failed puts
   - 62 failed primary gets
+  - 0 failed status checks
+- Repo-local 15-minute HA hard smoke after reset/rebuild:
+  - 382 failed puts
+  - 210 failed primary gets
   - 0 failed status checks
 
 The HAProxy run showed two clear failure bursts:
