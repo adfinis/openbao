@@ -52,7 +52,7 @@ This matrix defines manual and automated validation for DR replication in this r
 | A25 | DR fetch/reconcile resource bounds | `go test ./vault -run 'TestFetchEntriesRejectsOversizedAndMalformedRequests|TestFetchEntriesSplitsResponseBatchesByByteBudget|TestFetchEntriesRejectsSingleEntryOverResponseByteBudget|TestDRIntegration_RangeTaskEnforcesFetchedValueByteBudget' -count=1` | Pass |
 | A26 | DR checkpoint build admission | `go test ./vault -run 'TestDRPrimary_CheckpointBuildAdmissionLimitsCrossRelationshipConcurrency' -count=1` | Pass |
 | A27 | DR tuning validation and rollback | `go test ./vault -run 'TestDRRelationshipManager_UpdateTuning|TestDRSystemBackend_DRTuningRejectsInvalidInputs|TestDRPrimary_AllowWriteRequest_BackpressureRejectsNonExempt|TestDRBackpressureExemptPath' -count=1` | Pass |
-| A28 | DR flat accumulator persistence, delta replay, local KID index repair, and stream transaction coalescing | `go test ./vault -run 'TestDR(CoalesceStreamTxnBatch|FlatRangeAccumulator_ResetAndApplyDeltas|SecondaryFlatAccumulatorAdvancesOnStreamApply|SecondaryStreamTxnPersistsFlatAccumulator|LocalKIDIndexChangesRequireCompleteBaseline|SecondaryStreamTxnCadenceReplaysPersistedAccumulatorDeltas|SecondaryStreamTxnCadenceMissingDeltasFailsClosed|SecondaryApplyWorkerStopPersistsFinalFlatAccumulatorSnapshot|SecondaryQuiescentReconnectUsesFlatAccumulatorFastPath|FlatAccumulatorEmptyBucketRepairAvoidsLocalScan|FlatAccumulatorIndexedBucketRepairAvoidsLocalScan|RangeReconciliationSeedsFlatAccumulatorOnPhaseAMatch|RangeReconciliationSeedsFlatAccumulatorAfterRepair|SystemBackend_StatusIncludesStreamOptimizationCounters)' -count=1` | Pass |
+| A28 | DR flat accumulator persistence, delta replay, local KID index repair, and stream transaction coalescing | `go test ./vault -run 'TestDR(CoalesceStreamTxnBatch|FlatRangeAccumulator_ResetAndApplyDeltas|SecondaryFlatAccumulatorAdvancesOnStreamApply|SecondaryStreamTxnPersistsFlatAccumulator|LocalKIDIndexChangesRequireCompleteBaseline|IndexedRepairProofMismatchObservability|LocalKIDIndexLoadReasons|SecondaryStreamTxnCadenceReplaysPersistedAccumulatorDeltas|SecondaryStreamTxnCadenceMissingDeltasFailsClosed|SecondaryApplyWorkerStopPersistsFinalFlatAccumulatorSnapshot|SecondaryQuiescentReconnectUsesFlatAccumulatorFastPath|FlatAccumulatorEmptyBucketRepairAvoidsLocalScan|FlatAccumulatorIndexedBucketRepairAvoidsLocalScan|RangeReconciliationSeedsFlatAccumulatorOnPhaseAMatch|RangeReconciliationSeedsFlatAccumulatorAfterRepair|SystemBackend_StatusIncludesStreamOptimizationCounters)' -count=1` | Pass |
 
 Recommended compile pre-step:
 
@@ -244,7 +244,7 @@ scripts remain available under `/Users/roelc/projects/secretz/openbao/scripts`.
 | S12 | HA quiescent reconnect optimization | `scripts/dr_local_test.sh --topology ha quiescent-reconnect-smoke` | Verify active primary handoff avoids scanned reconciliation when stream replay can resume | Both secondaries return to `streaming` lag 0, marker data remains visible, and either `reconcile_count` is unchanged or `flat_accumulator_fast_path_total` increments |
 | S13 | HA accumulator cold restart | `scripts/dr_local_test.sh --topology ha accumulator-cold-restart-smoke` | Verify a full secondary cluster restart reloads the persisted flat accumulator cursor and resumes stream replay without scanned reconciliation | Secondary #1 returns to `streaming` lag 0, marker data remains visible, post-restart cursor covers the pre-restart `last_applied_index`, `reconcile_count=0`, `scan_failures_total=0`, and restart logs show no local scan or reconciliation. With cadence-delayed snapshots, status should show either full snapshot load, snapshot+delta replay, or cursor-only fail-closed recovery |
 | S14 | HA hot-key stream coalescing validation | `scripts/dr_local_test.sh --topology ha reset --build && scripts/dr_local_test.sh --topology ha smoke --duration 300 --concurrency 48 --stepdown-interval 100 --progress-interval 10 --monitor-interval 2 && scripts/dr_local_test.sh --topology ha verify <run-dir> --sample 0` | Measure secondary apply behavior after transactional stream coalescing and flat-accumulator snapshot cadence under hot-key load and HA handoff pressure | Exhaustive verification passes on primary and both secondaries; sentinel convergence is near-immediate; both secondaries end `streaming` with `lag_entries=0`; no journal drops; status timelines expose stream transaction counts, coalesced physical-entry counts, flush reasons, apply/commit timing, flat-accumulator cursor writes, skipped snapshots, and snapshot persist counters |
-| S15 | HA local KID-index fallback validation | `scripts/dr_local_test.sh --topology ha reset --build && scripts/dr_local_test.sh --topology ha smoke --duration 900 --concurrency 48 --stepdown-interval 300 --progress-interval 30 --monitor-interval 5 && scripts/dr_local_test.sh --topology ha verify <run-dir> --sample 0` | Exercise indexed-bucket repair under sustained HA disruption and prove proof-mismatch fallback does not strand reconciliation finalize | Indexed repair proof mismatches invalidate the optimizer and fall back to full local scan; both secondaries return to `streaming` with `reconcile_phase=idle`, sentinel convergence succeeds, no stream events are dropped, and exhaustive verification passes on primary and both secondaries |
+| S15 | HA local KID-index fallback validation | `scripts/dr_local_test.sh --topology ha reset --build && scripts/dr_local_test.sh --topology ha smoke --duration 900 --concurrency 48 --stepdown-interval 300 --progress-interval 30 --monitor-interval 5 && scripts/dr_local_test.sh --topology ha verify <run-dir> --sample 0` | Exercise indexed-bucket repair under sustained HA disruption and prove proof-mismatch fallback does not strand reconciliation finalize | Indexed repair proof mismatches increment `flat_accumulator_indexed_repair_proof_mismatches_total`, record the last range/count/checksum mismatch, invalidate the optimizer with reason `indexed_repair_proof_mismatch`, and fall back to full local scan; both secondaries return to `streaming` with `reconcile_phase=idle`, sentinel convergence succeeds, no stream events are dropped, and exhaustive verification passes on primary and both secondaries |
 
 ### Stress Run Examples
 
@@ -332,6 +332,22 @@ secondary2 reported `range=5 local_count=16 remote_count=17`, secondary1
 reported `range=158 local_count=22 remote_count=23`, both invalidated the
 indexed optimizer path, fell back to full local scan, and ended in
 `secondary_state=streaming` with `reconcile_phase=idle`.
+
+Latest observed HA journal catch-up rerun after the empty-buffer leader-handoff
+fix: `/Users/roelc/projects/secretz/openbao/dr-stress-results/drmixed-20260531T155536Z`.
+The run completed 40,147 operations at 126.26 ops/s over 5 minutes with
+48 workers and primary stepdowns every 100 seconds. It had zero status failures,
+zero stream drops, 1.0s/13.0s sentinel convergence, and exhaustive verification
+passed on primary, secondary1, and secondary2 across 4,202 truth-log keys with
+zero missing keys, mismatches, or read errors. Client-facing transient failures
+(`put_fail=94`, `get_fail=106`) occurred during forced HA disruption and did not
+produce replicated data divergence.
+
+The rerun validated that a new active primary can replay follower-maintained
+journal entries even when its in-memory stream buffer starts empty. Secondary2
+also recorded one indexed repair proof mismatch, invalidated the indexed fast
+path with reason `indexed_repair_proof_mismatch`, fell back to a full local
+scan, and converged cleanly.
 
 Single secondary:
 

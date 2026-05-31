@@ -398,6 +398,9 @@ Primary HA followers also append the filtered stream journal. When leadership
 moves, the new active primary should already have journal coverage for changes
 that occurred while it was a follower. This allows secondaries to reconnect to
 the new leader and catch up from journal before falling back to reconciliation.
+This journal catch-up rule applies even when the new active primary has an empty
+in-memory stream buffer; a non-zero secondary cursor can resume from the
+disk-backed journal when the journal proves coverage for that cursor.
 
 Flow control is credit-based. The secondary opens `StreamChanges` with its
 current `lastAppliedIndex` and an initial window. The primary sends entry
@@ -1025,7 +1028,9 @@ The status API should expose:
 - flat accumulator cursor writes/index, snapshot count/index, skipped snapshot
   count, byte volume, last snapshot size, persist timing, delta batch counts,
   delta replay counts/failures, empty-bucket and indexed-bucket repair counts,
-  local KID index load/reset/update counts, and cadence tuning
+  indexed-bucket proof mismatch count and last non-sensitive count delta,
+  local KID index load/reset/update counts, fallback-scan reason,
+  invalidation reason, and cadence tuning
 - range task counts
 - budget usage
 - journal replay health
@@ -1644,6 +1649,15 @@ with zero replay failures, performed no reconciliation, reported zero scan
 failures, and returned both secondaries to `streaming` with `lag_entries=0`.
 This validates the restart optimization for the common case where a secondary
 has a recent flat snapshot and bounded local deltas.
+
+A follow-up 5-minute HA hard smoke on 2026-05-31 validated journal catch-up
+after primary HA handoff when the new active primary has follower-maintained
+journal coverage but an empty in-memory stream buffer. The run completed 40,147
+operations at 126.26 ops/s with 48 workers and primary stepdowns every 100
+seconds. Primary, secondary1, and secondary2 passed exhaustive verification
+across 4,202 truth-log keys with zero missing keys, mismatches, or read errors.
+Secondary2 converged on the sentinel in 13.0s after reconciliation repaired one
+indexed-bucket proof mismatch through the fail-closed full-scan fallback.
 
 The main known gap is availability polish during primary HA active handoff
 under sustained write and DR backlog pressure; stress runs still observe

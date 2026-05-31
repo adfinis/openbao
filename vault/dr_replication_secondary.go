@@ -55,6 +55,26 @@ var (
 	errDRIndexedBucketRepairProofMismatch = errors.New("flat accumulator indexed-bucket repair proof mismatch")
 )
 
+type drIndexedBucketRepairProofMismatchError struct {
+	rangeID          uint64
+	localCount       uint64
+	remoteCount      uint64
+	checksumMismatch bool
+}
+
+func (e *drIndexedBucketRepairProofMismatchError) Error() string {
+	return fmt.Sprintf("%s: range=%d local_count=%d remote_count=%d checksum_mismatch=%t",
+		errDRIndexedBucketRepairProofMismatch,
+		e.rangeID,
+		e.localCount,
+		e.remoteCount,
+		e.checksumMismatch)
+}
+
+func (e *drIndexedBucketRepairProofMismatchError) Unwrap() error {
+	return errDRIndexedBucketRepairProofMismatch
+}
+
 func atomicMaxUint64(target *atomic.Uint64, value uint64) {
 	for {
 		current := target.Load()
@@ -423,63 +443,70 @@ type drReplicationSecondary struct {
 	transportReady atomic.Bool
 
 	// metrics
-	entriesApplied                     atomic.Uint64
-	reconcileCount                     atomic.Uint64
-	lastReconcileAt                    atomic.Int64 // unix timestamp
-	streamDisconnects                  atomic.Uint64
-	connectRetries                     atomic.Uint64
-	connectFailures                    atomic.Uint64
-	reconcileRangesInflight            atomic.Int64
-	reconcileRangesFailed              atomic.Int64
-	reconcileBudgetRemainingByte       atomic.Int64
-	flatAccumulatorFastPathTotal       atomic.Uint64
-	flatAccumulatorEmptyRepairTotal    atomic.Uint64
-	flatAccumulatorEmptyRepairRanges   atomic.Uint64
-	flatAccumulatorIndexedRepairTotal  atomic.Uint64
-	flatAccumulatorIndexedRepairRanges atomic.Uint64
-	localKIDIndexBucketLoads           atomic.Uint64
-	localKIDIndexEntriesLoaded         atomic.Uint64
-	localKIDIndexLoadFailures          atomic.Uint64
-	localKIDIndexResets                atomic.Uint64
-	localKIDIndexUpdates               atomic.Uint64
-	streamTxnCoalescedEntries          atomic.Uint64
-	streamTxnBatches                   atomic.Uint64
-	streamTxnEntries                   atomic.Uint64
-	streamTxnPhysicalEntries           atomic.Uint64
-	streamTxnMaxEntries                atomic.Uint64
-	streamTxnMaxPhysicalEntries        atomic.Uint64
-	streamTxnApplyNanos                atomic.Uint64
-	streamTxnApplyMaxNanos             atomic.Uint64
-	streamTxnCommitNanos               atomic.Uint64
-	streamTxnCommitMaxNanos            atomic.Uint64
-	streamBatchFlushMaxEntries         atomic.Uint64
-	streamBatchFlushMaxBytes           atomic.Uint64
-	streamBatchFlushMaxWait            atomic.Uint64
-	streamBatchFlushShutdown           atomic.Uint64
-	flatAccumulatorCursorWrites        atomic.Uint64
-	flatAccumulatorCursorIndex         atomic.Uint64
-	flatAccumulatorSnapshotCount       atomic.Uint64
-	flatAccumulatorSnapshotBytes       atomic.Uint64
-	flatAccumulatorSnapshotLast        atomic.Uint64
-	flatAccumulatorSnapshotNanos       atomic.Uint64
-	flatAccumulatorSnapshotMaxNs       atomic.Uint64
-	flatAccumulatorSnapshotIndex       atomic.Uint64
-	flatAccumulatorSnapshotLastAt      atomic.Int64
-	flatAccumulatorSnapshotSkipped     atomic.Uint64
-	flatAccumulatorDeltaBatches        atomic.Uint64
-	flatAccumulatorDeltaEntries        atomic.Uint64
-	flatAccumulatorDeltaOldestIndex    atomic.Uint64
-	flatAccumulatorDeltaNewestIndex    atomic.Uint64
-	flatAccumulatorDeltaReplayCount    atomic.Uint64
-	flatAccumulatorDeltaReplayBatches  atomic.Uint64
-	flatAccumulatorDeltaReplayEntries  atomic.Uint64
-	flatAccumulatorDeltaReplayFailures atomic.Uint64
-	rangeSplitCount                    atomic.Uint64
-	reconcileRPCBytesUsed              atomic.Uint64
-	reconcileQueueDepth                atomic.Int64
-	reconcileStalled                   atomic.Uint64
-	lastReconcileActivityAt            atomic.Int64 // unix timestamp
-	lastReconcileApplyAt               atomic.Int64 // unix timestamp
+	entriesApplied                                    atomic.Uint64
+	reconcileCount                                    atomic.Uint64
+	lastReconcileAt                                   atomic.Int64 // unix timestamp
+	streamDisconnects                                 atomic.Uint64
+	connectRetries                                    atomic.Uint64
+	connectFailures                                   atomic.Uint64
+	reconcileRangesInflight                           atomic.Int64
+	reconcileRangesFailed                             atomic.Int64
+	reconcileBudgetRemainingByte                      atomic.Int64
+	flatAccumulatorFastPathTotal                      atomic.Uint64
+	flatAccumulatorEmptyRepairTotal                   atomic.Uint64
+	flatAccumulatorEmptyRepairRanges                  atomic.Uint64
+	flatAccumulatorIndexedRepairTotal                 atomic.Uint64
+	flatAccumulatorIndexedRepairRanges                atomic.Uint64
+	flatAccumulatorIndexedRepairProofMismatches       atomic.Uint64
+	flatAccumulatorIndexedRepairProofMismatchRange    atomic.Uint64
+	flatAccumulatorIndexedRepairProofMismatchLocal    atomic.Uint64
+	flatAccumulatorIndexedRepairProofMismatchRemote   atomic.Uint64
+	flatAccumulatorIndexedRepairProofMismatchChecksum atomic.Bool
+	localKIDIndexBucketLoads                          atomic.Uint64
+	localKIDIndexEntriesLoaded                        atomic.Uint64
+	localKIDIndexLoadFailures                         atomic.Uint64
+	localKIDIndexResets                               atomic.Uint64
+	localKIDIndexUpdates                              atomic.Uint64
+	localKIDIndexFallbackScans                        atomic.Uint64
+	localKIDIndexInvalidations                        atomic.Uint64
+	streamTxnCoalescedEntries                         atomic.Uint64
+	streamTxnBatches                                  atomic.Uint64
+	streamTxnEntries                                  atomic.Uint64
+	streamTxnPhysicalEntries                          atomic.Uint64
+	streamTxnMaxEntries                               atomic.Uint64
+	streamTxnMaxPhysicalEntries                       atomic.Uint64
+	streamTxnApplyNanos                               atomic.Uint64
+	streamTxnApplyMaxNanos                            atomic.Uint64
+	streamTxnCommitNanos                              atomic.Uint64
+	streamTxnCommitMaxNanos                           atomic.Uint64
+	streamBatchFlushMaxEntries                        atomic.Uint64
+	streamBatchFlushMaxBytes                          atomic.Uint64
+	streamBatchFlushMaxWait                           atomic.Uint64
+	streamBatchFlushShutdown                          atomic.Uint64
+	flatAccumulatorCursorWrites                       atomic.Uint64
+	flatAccumulatorCursorIndex                        atomic.Uint64
+	flatAccumulatorSnapshotCount                      atomic.Uint64
+	flatAccumulatorSnapshotBytes                      atomic.Uint64
+	flatAccumulatorSnapshotLast                       atomic.Uint64
+	flatAccumulatorSnapshotNanos                      atomic.Uint64
+	flatAccumulatorSnapshotMaxNs                      atomic.Uint64
+	flatAccumulatorSnapshotIndex                      atomic.Uint64
+	flatAccumulatorSnapshotLastAt                     atomic.Int64
+	flatAccumulatorSnapshotSkipped                    atomic.Uint64
+	flatAccumulatorDeltaBatches                       atomic.Uint64
+	flatAccumulatorDeltaEntries                       atomic.Uint64
+	flatAccumulatorDeltaOldestIndex                   atomic.Uint64
+	flatAccumulatorDeltaNewestIndex                   atomic.Uint64
+	flatAccumulatorDeltaReplayCount                   atomic.Uint64
+	flatAccumulatorDeltaReplayBatches                 atomic.Uint64
+	flatAccumulatorDeltaReplayEntries                 atomic.Uint64
+	flatAccumulatorDeltaReplayFailures                atomic.Uint64
+	rangeSplitCount                                   atomic.Uint64
+	reconcileRPCBytesUsed                             atomic.Uint64
+	reconcileQueueDepth                               atomic.Int64
+	reconcileStalled                                  atomic.Uint64
+	lastReconcileActivityAt                           atomic.Int64 // unix timestamp
+	lastReconcileApplyAt                              atomic.Int64 // unix timestamp
 
 	sessionMu                          sync.RWMutex
 	activeCheckpointID                 string
@@ -492,6 +519,10 @@ type drReplicationSecondary struct {
 	lastRangeManifestCount             int
 	lastReconcileFailureByType         map[string]uint64
 	checkpointHighWaterMarkPersistHook func(uint64) error
+
+	optimizerStatusMu                   sync.RWMutex
+	lastLocalKIDIndexFallbackScanReason string
+	lastLocalKIDIndexInvalidationReason string
 
 	// Additional heavy-load observability counters.
 	scanFailures            atomic.Uint64
@@ -1078,6 +1109,59 @@ func (s *drReplicationSecondary) getFallbackLastReason() string {
 	return s.fallbackLastReason
 }
 
+func (s *drReplicationSecondary) recordLocalKIDIndexFallbackScan(reason string) {
+	if s == nil {
+		return
+	}
+	if reason == "" {
+		reason = "unknown"
+	}
+	s.localKIDIndexFallbackScans.Add(1)
+	metrics.IncrCounter([]string{"replication", "dr", "secondary", "local_kid_index_fallback_scans_total"}, 1)
+	s.optimizerStatusMu.Lock()
+	s.lastLocalKIDIndexFallbackScanReason = reason
+	s.optimizerStatusMu.Unlock()
+}
+
+func (s *drReplicationSecondary) recordLocalKIDIndexInvalidation(reason string) {
+	if s == nil {
+		return
+	}
+	if reason == "" {
+		reason = "unknown"
+	}
+	s.localKIDIndexInvalidations.Add(1)
+	metrics.IncrCounter([]string{"replication", "dr", "secondary", "local_kid_index_invalidations_total"}, 1)
+	s.optimizerStatusMu.Lock()
+	s.lastLocalKIDIndexInvalidationReason = reason
+	s.optimizerStatusMu.Unlock()
+}
+
+func (s *drReplicationSecondary) localKIDIndexOptimizerStatus() (fallbackReason, invalidationReason string) {
+	if s == nil {
+		return "", ""
+	}
+	s.optimizerStatusMu.RLock()
+	defer s.optimizerStatusMu.RUnlock()
+	return s.lastLocalKIDIndexFallbackScanReason, s.lastLocalKIDIndexInvalidationReason
+}
+
+func (s *drReplicationSecondary) recordIndexedRepairProofMismatch(err error) {
+	if s == nil {
+		return
+	}
+	s.flatAccumulatorIndexedRepairProofMismatches.Add(1)
+	metrics.IncrCounter([]string{"replication", "dr", "secondary", "flat_accumulator_indexed_repair_proof_mismatches_total"}, 1)
+	var mismatch *drIndexedBucketRepairProofMismatchError
+	if !errors.As(err, &mismatch) || mismatch == nil {
+		return
+	}
+	s.flatAccumulatorIndexedRepairProofMismatchRange.Store(mismatch.rangeID)
+	s.flatAccumulatorIndexedRepairProofMismatchLocal.Store(mismatch.localCount)
+	s.flatAccumulatorIndexedRepairProofMismatchRemote.Store(mismatch.remoteCount)
+	s.flatAccumulatorIndexedRepairProofMismatchChecksum.Store(mismatch.checksumMismatch)
+}
+
 // Promote transitions the secondary to a standalone primary.
 func (s *drReplicationSecondary) Promote() error {
 	s.logger.Info("promoting DR secondary to primary")
@@ -1608,41 +1692,51 @@ func (s *drReplicationSecondary) Status() DRSecondaryStatus {
 	flatAccumulatorSnapshotCount := s.flatAccumulatorSnapshotCount.Load()
 	flatAccumulatorSnapshotBytes := s.flatAccumulatorSnapshotBytes.Load()
 	flatAccumulatorSnapshotNanos := s.flatAccumulatorSnapshotNanos.Load()
+	localKIDIndexFallbackReason, localKIDIndexInvalidationReason := s.localKIDIndexOptimizerStatus()
 	return DRSecondaryStatus{
-		State:                              s.State().String(),
-		RelationshipID:                     s.relationshipID,
-		PrimaryIndex:                       s.primaryIndex.Load(),
-		LastAppliedIndex:                   s.lastAppliedIndex.Load(),
-		EntriesApplied:                     s.entriesApplied.Load(),
-		ReconcileCount:                     s.reconcileCount.Load(),
-		LastReconcileAt:                    time.Unix(s.lastReconcileAt.Load(), 0),
-		ConnectRetries:                     s.connectRetries.Load(),
-		ConnectFailures:                    s.connectFailures.Load(),
-		ReconcileRangesInflight:            s.reconcileRangesInflight.Load(),
-		ReconcileRangesFailed:              s.reconcileRangesFailed.Load(),
-		ReconcileBudgetRemainingBytes:      uint64(remaining),
-		ReconcileActiveCheckpointID:        activeID,
-		ReconcileActiveCheckpointIndex:     activeIndex,
-		ReconcileFailReasonLast:            failReason,
-		RangeManifestCount:                 rangeManifestCount,
-		RangeSplitCount:                    s.rangeSplitCount.Load(),
-		ReconcileRPCBytesUsed:              s.reconcileRPCBytesUsed.Load(),
-		FlatAccumulatorFastPathTotal:       s.flatAccumulatorFastPathTotal.Load(),
-		FlatAccumulatorEmptyRepairTotal:    s.flatAccumulatorEmptyRepairTotal.Load(),
-		FlatAccumulatorEmptyRepairRanges:   s.flatAccumulatorEmptyRepairRanges.Load(),
-		FlatAccumulatorIndexedRepairTotal:  s.flatAccumulatorIndexedRepairTotal.Load(),
-		FlatAccumulatorIndexedRepairRanges: s.flatAccumulatorIndexedRepairRanges.Load(),
-		LocalKIDIndexBucketLoadsTotal:      s.localKIDIndexBucketLoads.Load(),
-		LocalKIDIndexEntriesLoadedTotal:    s.localKIDIndexEntriesLoaded.Load(),
-		LocalKIDIndexLoadFailuresTotal:     s.localKIDIndexLoadFailures.Load(),
-		LocalKIDIndexResetsTotal:           s.localKIDIndexResets.Load(),
-		LocalKIDIndexUpdatesTotal:          s.localKIDIndexUpdates.Load(),
-		StreamTxnCoalescedEntriesTotal:     s.streamTxnCoalescedEntries.Load(),
-		StreamTxnBatchesTotal:              streamTxnBatches,
-		StreamTxnEntriesTotal:              streamTxnEntries,
-		StreamTxnPhysicalEntriesTotal:      streamTxnPhysicalEntries,
-		StreamTxnAverageEntries:            averageUint64(streamTxnEntries, streamTxnBatches),
-		StreamTxnMaxEntries:                s.streamTxnMaxEntries.Load(),
+		State:                                             s.State().String(),
+		RelationshipID:                                    s.relationshipID,
+		PrimaryIndex:                                      s.primaryIndex.Load(),
+		LastAppliedIndex:                                  s.lastAppliedIndex.Load(),
+		EntriesApplied:                                    s.entriesApplied.Load(),
+		ReconcileCount:                                    s.reconcileCount.Load(),
+		LastReconcileAt:                                   time.Unix(s.lastReconcileAt.Load(), 0),
+		ConnectRetries:                                    s.connectRetries.Load(),
+		ConnectFailures:                                   s.connectFailures.Load(),
+		ReconcileRangesInflight:                           s.reconcileRangesInflight.Load(),
+		ReconcileRangesFailed:                             s.reconcileRangesFailed.Load(),
+		ReconcileBudgetRemainingBytes:                     uint64(remaining),
+		ReconcileActiveCheckpointID:                       activeID,
+		ReconcileActiveCheckpointIndex:                    activeIndex,
+		ReconcileFailReasonLast:                           failReason,
+		RangeManifestCount:                                rangeManifestCount,
+		RangeSplitCount:                                   s.rangeSplitCount.Load(),
+		ReconcileRPCBytesUsed:                             s.reconcileRPCBytesUsed.Load(),
+		FlatAccumulatorFastPathTotal:                      s.flatAccumulatorFastPathTotal.Load(),
+		FlatAccumulatorEmptyRepairTotal:                   s.flatAccumulatorEmptyRepairTotal.Load(),
+		FlatAccumulatorEmptyRepairRanges:                  s.flatAccumulatorEmptyRepairRanges.Load(),
+		FlatAccumulatorIndexedRepairTotal:                 s.flatAccumulatorIndexedRepairTotal.Load(),
+		FlatAccumulatorIndexedRepairRanges:                s.flatAccumulatorIndexedRepairRanges.Load(),
+		FlatAccumulatorIndexedRepairProofMismatches:       s.flatAccumulatorIndexedRepairProofMismatches.Load(),
+		FlatAccumulatorIndexedRepairProofMismatchRange:    s.flatAccumulatorIndexedRepairProofMismatchRange.Load(),
+		FlatAccumulatorIndexedRepairProofMismatchLocal:    s.flatAccumulatorIndexedRepairProofMismatchLocal.Load(),
+		FlatAccumulatorIndexedRepairProofMismatchRemote:   s.flatAccumulatorIndexedRepairProofMismatchRemote.Load(),
+		FlatAccumulatorIndexedRepairProofMismatchChecksum: s.flatAccumulatorIndexedRepairProofMismatchChecksum.Load(),
+		LocalKIDIndexBucketLoadsTotal:                     s.localKIDIndexBucketLoads.Load(),
+		LocalKIDIndexEntriesLoadedTotal:                   s.localKIDIndexEntriesLoaded.Load(),
+		LocalKIDIndexLoadFailuresTotal:                    s.localKIDIndexLoadFailures.Load(),
+		LocalKIDIndexResetsTotal:                          s.localKIDIndexResets.Load(),
+		LocalKIDIndexUpdatesTotal:                         s.localKIDIndexUpdates.Load(),
+		LocalKIDIndexFallbackScansTotal:                   s.localKIDIndexFallbackScans.Load(),
+		LocalKIDIndexFallbackScanReasonLast:               localKIDIndexFallbackReason,
+		LocalKIDIndexInvalidationsTotal:                   s.localKIDIndexInvalidations.Load(),
+		LocalKIDIndexInvalidationReasonLast:               localKIDIndexInvalidationReason,
+		StreamTxnCoalescedEntriesTotal:                    s.streamTxnCoalescedEntries.Load(),
+		StreamTxnBatchesTotal:                             streamTxnBatches,
+		StreamTxnEntriesTotal:                             streamTxnEntries,
+		StreamTxnPhysicalEntriesTotal:                     streamTxnPhysicalEntries,
+		StreamTxnAverageEntries:                           averageUint64(streamTxnEntries, streamTxnBatches),
+		StreamTxnMaxEntries:                               s.streamTxnMaxEntries.Load(),
 		StreamTxnAveragePhysicalEntries: averageUint64(
 			streamTxnPhysicalEntries,
 			streamTxnBatches,
@@ -1715,101 +1809,110 @@ func (s *drReplicationSecondary) Status() DRSecondaryStatus {
 
 // DRSecondaryStatus is a point-in-time snapshot of replication status.
 type DRSecondaryStatus struct {
-	State                                          string
-	RelationshipID                                 string
-	PrimaryIndex                                   uint64
-	LastAppliedIndex                               uint64
-	EntriesApplied                                 uint64
-	ReconcileCount                                 uint64
-	LastReconcileAt                                time.Time
-	ConnectRetries                                 uint64
-	ConnectFailures                                uint64
-	ReconcileRangesInflight                        int64
-	ReconcileRangesFailed                          int64
-	ReconcileBudgetRemainingBytes                  uint64
-	ReconcileActiveCheckpointID                    string
-	ReconcileActiveCheckpointIndex                 uint64
-	ReconcileFailReasonLast                        string
-	RangeManifestCount                             int
-	RangeSplitCount                                uint64
-	ReconcileRPCBytesUsed                          uint64
-	FlatAccumulatorFastPathTotal                   uint64
-	FlatAccumulatorEmptyRepairTotal                uint64
-	FlatAccumulatorEmptyRepairRanges               uint64
-	FlatAccumulatorIndexedRepairTotal              uint64
-	FlatAccumulatorIndexedRepairRanges             uint64
-	LocalKIDIndexBucketLoadsTotal                  uint64
-	LocalKIDIndexEntriesLoadedTotal                uint64
-	LocalKIDIndexLoadFailuresTotal                 uint64
-	LocalKIDIndexResetsTotal                       uint64
-	LocalKIDIndexUpdatesTotal                      uint64
-	StreamTxnCoalescedEntriesTotal                 uint64
-	StreamTxnBatchesTotal                          uint64
-	StreamTxnEntriesTotal                          uint64
-	StreamTxnPhysicalEntriesTotal                  uint64
-	StreamTxnAverageEntries                        float64
-	StreamTxnMaxEntries                            uint64
-	StreamTxnAveragePhysicalEntries                float64
-	StreamTxnMaxPhysicalEntries                    uint64
-	StreamTxnApplyMillisecondsTotal                float64
-	StreamTxnApplyMillisecondsAverage              float64
-	StreamTxnApplyMillisecondsMax                  float64
-	StreamTxnCommitMillisecondsTotal               float64
-	StreamTxnCommitMillisecondsAverage             float64
-	StreamTxnCommitMillisecondsMax                 float64
-	StreamBatchFlushMaxEntriesTotal                uint64
-	StreamBatchFlushMaxBytesTotal                  uint64
-	StreamBatchFlushMaxWaitTotal                   uint64
-	StreamBatchFlushShutdownTotal                  uint64
-	FlatAccumulatorCursorWritesTotal               uint64
-	FlatAccumulatorCursorIndex                     uint64
-	FlatAccumulatorSnapshotPersistsTotal           uint64
-	FlatAccumulatorSnapshotIndex                   uint64
-	FlatAccumulatorSnapshotBytesTotal              uint64
-	FlatAccumulatorSnapshotBytesAverage            float64
-	FlatAccumulatorSnapshotBytesLast               uint64
-	FlatAccumulatorSnapshotPersistMsTotal          float64
-	FlatAccumulatorSnapshotPersistMsAverage        float64
-	FlatAccumulatorSnapshotPersistMsMax            float64
-	FlatAccumulatorSnapshotSkippedTotal            uint64
-	FlatAccumulatorDeltaBatchesTotal               uint64
-	FlatAccumulatorDeltaEntriesTotal               uint64
-	FlatAccumulatorDeltaOldestIndex                uint64
-	FlatAccumulatorDeltaNewestIndex                uint64
-	FlatAccumulatorDeltaReplayTotal                uint64
-	FlatAccumulatorDeltaReplayBatchesTotal         uint64
-	FlatAccumulatorDeltaReplayEntriesTotal         uint64
-	FlatAccumulatorDeltaReplayFailuresTotal        uint64
-	FlatAccumulatorSnapshotMinEntries              uint64
-	FlatAccumulatorSnapshotMinIntervalMilliseconds int64
-	ScanFailuresTotal                              uint64
-	CheckpointConflictsTotal                       uint64
-	ReconcileRetriesTotal                          uint64
-	ReconcileQueueDepth                            int64
-	ReconcileTaskRetriesTotal                      uint64
-	ReconcileDecodeFailuresTotal                   uint64
-	ReconcileStalledTotal                          uint64
-	ReconcileStuckSeconds                          int64
-	ReconcilePhase                                 string
-	LastAppliedAgeSeconds                          int64
-	ReconcileMaxRPCBytes                           uint64
-	ReconcileMaxWallTimeSeconds                    int64
-	ReconcileMaxInflightTasks                      int
-	StreamBatchMaxEntries                          int
-	StreamBatchMaxBytes                            int
-	StreamBatchMaxWaitMilliseconds                 int64
-	FallbackActive                                 bool
-	FallbackCount                                  uint64
-	FallbackLastReason                             string
-	FallbackLastAt                                 time.Time
-	ReconcileTaskRate                              float64
-	PrimaryWriteRateEPS                            float64
-	SecondaryApplyRateEPS                          float64
-	LagEntries                                     uint64
-	LagSlopeEPS                                    float64
-	PredictedCatchupSeconds                        float64
-	ReconcilePutWorkersActive                      int64
-	ReconcileDeletePhaseSeconds                    float64
+	State                                             string
+	RelationshipID                                    string
+	PrimaryIndex                                      uint64
+	LastAppliedIndex                                  uint64
+	EntriesApplied                                    uint64
+	ReconcileCount                                    uint64
+	LastReconcileAt                                   time.Time
+	ConnectRetries                                    uint64
+	ConnectFailures                                   uint64
+	ReconcileRangesInflight                           int64
+	ReconcileRangesFailed                             int64
+	ReconcileBudgetRemainingBytes                     uint64
+	ReconcileActiveCheckpointID                       string
+	ReconcileActiveCheckpointIndex                    uint64
+	ReconcileFailReasonLast                           string
+	RangeManifestCount                                int
+	RangeSplitCount                                   uint64
+	ReconcileRPCBytesUsed                             uint64
+	FlatAccumulatorFastPathTotal                      uint64
+	FlatAccumulatorEmptyRepairTotal                   uint64
+	FlatAccumulatorEmptyRepairRanges                  uint64
+	FlatAccumulatorIndexedRepairTotal                 uint64
+	FlatAccumulatorIndexedRepairRanges                uint64
+	FlatAccumulatorIndexedRepairProofMismatches       uint64
+	FlatAccumulatorIndexedRepairProofMismatchRange    uint64
+	FlatAccumulatorIndexedRepairProofMismatchLocal    uint64
+	FlatAccumulatorIndexedRepairProofMismatchRemote   uint64
+	FlatAccumulatorIndexedRepairProofMismatchChecksum bool
+	LocalKIDIndexBucketLoadsTotal                     uint64
+	LocalKIDIndexEntriesLoadedTotal                   uint64
+	LocalKIDIndexLoadFailuresTotal                    uint64
+	LocalKIDIndexResetsTotal                          uint64
+	LocalKIDIndexUpdatesTotal                         uint64
+	LocalKIDIndexFallbackScansTotal                   uint64
+	LocalKIDIndexFallbackScanReasonLast               string
+	LocalKIDIndexInvalidationsTotal                   uint64
+	LocalKIDIndexInvalidationReasonLast               string
+	StreamTxnCoalescedEntriesTotal                    uint64
+	StreamTxnBatchesTotal                             uint64
+	StreamTxnEntriesTotal                             uint64
+	StreamTxnPhysicalEntriesTotal                     uint64
+	StreamTxnAverageEntries                           float64
+	StreamTxnMaxEntries                               uint64
+	StreamTxnAveragePhysicalEntries                   float64
+	StreamTxnMaxPhysicalEntries                       uint64
+	StreamTxnApplyMillisecondsTotal                   float64
+	StreamTxnApplyMillisecondsAverage                 float64
+	StreamTxnApplyMillisecondsMax                     float64
+	StreamTxnCommitMillisecondsTotal                  float64
+	StreamTxnCommitMillisecondsAverage                float64
+	StreamTxnCommitMillisecondsMax                    float64
+	StreamBatchFlushMaxEntriesTotal                   uint64
+	StreamBatchFlushMaxBytesTotal                     uint64
+	StreamBatchFlushMaxWaitTotal                      uint64
+	StreamBatchFlushShutdownTotal                     uint64
+	FlatAccumulatorCursorWritesTotal                  uint64
+	FlatAccumulatorCursorIndex                        uint64
+	FlatAccumulatorSnapshotPersistsTotal              uint64
+	FlatAccumulatorSnapshotIndex                      uint64
+	FlatAccumulatorSnapshotBytesTotal                 uint64
+	FlatAccumulatorSnapshotBytesAverage               float64
+	FlatAccumulatorSnapshotBytesLast                  uint64
+	FlatAccumulatorSnapshotPersistMsTotal             float64
+	FlatAccumulatorSnapshotPersistMsAverage           float64
+	FlatAccumulatorSnapshotPersistMsMax               float64
+	FlatAccumulatorSnapshotSkippedTotal               uint64
+	FlatAccumulatorDeltaBatchesTotal                  uint64
+	FlatAccumulatorDeltaEntriesTotal                  uint64
+	FlatAccumulatorDeltaOldestIndex                   uint64
+	FlatAccumulatorDeltaNewestIndex                   uint64
+	FlatAccumulatorDeltaReplayTotal                   uint64
+	FlatAccumulatorDeltaReplayBatchesTotal            uint64
+	FlatAccumulatorDeltaReplayEntriesTotal            uint64
+	FlatAccumulatorDeltaReplayFailuresTotal           uint64
+	FlatAccumulatorSnapshotMinEntries                 uint64
+	FlatAccumulatorSnapshotMinIntervalMilliseconds    int64
+	ScanFailuresTotal                                 uint64
+	CheckpointConflictsTotal                          uint64
+	ReconcileRetriesTotal                             uint64
+	ReconcileQueueDepth                               int64
+	ReconcileTaskRetriesTotal                         uint64
+	ReconcileDecodeFailuresTotal                      uint64
+	ReconcileStalledTotal                             uint64
+	ReconcileStuckSeconds                             int64
+	ReconcilePhase                                    string
+	LastAppliedAgeSeconds                             int64
+	ReconcileMaxRPCBytes                              uint64
+	ReconcileMaxWallTimeSeconds                       int64
+	ReconcileMaxInflightTasks                         int
+	StreamBatchMaxEntries                             int
+	StreamBatchMaxBytes                               int
+	StreamBatchMaxWaitMilliseconds                    int64
+	FallbackActive                                    bool
+	FallbackCount                                     uint64
+	FallbackLastReason                                string
+	FallbackLastAt                                    time.Time
+	ReconcileTaskRate                                 float64
+	PrimaryWriteRateEPS                               float64
+	SecondaryApplyRateEPS                             float64
+	LagEntries                                        uint64
+	LagSlopeEPS                                       float64
+	PredictedCatchupSeconds                           float64
+	ReconcilePutWorkersActive                         int64
+	ReconcileDeletePhaseSeconds                       float64
 }
 
 func (s *drReplicationSecondary) applyRuntimeTuning(cfg *DRConfig) {
@@ -3409,7 +3512,7 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 			}
 			s.rangeAccumulator.replace(lastIndex, accumulatorNext)
 		} else {
-			if err := s.invalidatePersistedLocalKIDIndex(ctx, txn); err != nil {
+			if err := s.invalidatePersistedLocalKIDIndexWithReason(ctx, txn, "stream_marker_accumulator_not_warm"); err != nil {
 				return fmt.Errorf("invalidate stale local kid index marker: %w", err)
 			}
 			if err := s.persistFlatAccumulatorCursor(ctx, txn, lastIndex, s.flatAccumulatorSnapshotIndex.Load()); err != nil {
@@ -3445,7 +3548,7 @@ func (s *drReplicationSecondary) applyStreamTxn(ctx context.Context, backend phy
 		}
 	} else if err := s.deletePersistedFlatAccumulator(ctx, txn); err != nil {
 		return fmt.Errorf("delete stale flat accumulator: %w", err)
-	} else if err := s.invalidatePersistedLocalKIDIndex(ctx, txn); err != nil {
+	} else if err := s.invalidatePersistedLocalKIDIndexWithReason(ctx, txn, "stream_txn_accumulator_not_warm"); err != nil {
 		return fmt.Errorf("invalidate stale local kid index: %w", err)
 	} else if err := s.persistFlatAccumulatorCursor(ctx, txn, lastIndex, s.flatAccumulatorSnapshotIndex.Load()); err != nil {
 		return fmt.Errorf("persist flat accumulator cursor: %w", err)
@@ -3609,7 +3712,7 @@ func (s *drReplicationSecondary) applyStreamChange(ctx context.Context, change *
 	if err := s.deletePersistedFlatAccumulator(ctx, s.core.physical); err != nil {
 		return fmt.Errorf("delete stale flat accumulator: %w", err)
 	}
-	if err := s.invalidatePersistedLocalKIDIndex(ctx, s.core.physical); err != nil {
+	if err := s.invalidatePersistedLocalKIDIndexWithReason(ctx, s.core.physical, "single_stream_apply"); err != nil {
 		return fmt.Errorf("invalidate stale local kid index: %w", err)
 	}
 
@@ -3832,7 +3935,7 @@ func (s *drReplicationSecondary) applyFetchedChangeWithKIDMapAndLocalKIDIndexMod
 		return fmt.Errorf("delete stale flat accumulator: %w", err)
 	}
 	if !preserveLocalKIDIndex {
-		if err := s.invalidatePersistedLocalKIDIndex(ctx, s.core.physical); err != nil {
+		if err := s.invalidatePersistedLocalKIDIndexWithReason(ctx, s.core.physical, "fetched_change_apply"); err != nil {
 			return fmt.Errorf("invalidate stale local kid index: %w", err)
 		}
 	}
@@ -4065,17 +4168,20 @@ func (s *drReplicationSecondary) tryFlatAccumulatorReconciliation(ctx context.Co
 			}
 		}
 		if len(nonEmptyRanges) > 0 {
-			indexSet, ok, err := s.loadLocalKIDIndexForRanges(ctx, s.core.physical, accumulatorIndex, nonEmptyRanges, localBuckets)
+			indexSet, ok, reason, err := s.loadLocalKIDIndexForRanges(ctx, s.core.physical, accumulatorIndex, nonEmptyRanges, localBuckets)
 			if err != nil {
 				s.localKIDIndexLoadFailures.Add(1)
-				s.logger.Warn("local KID index could not be loaded; falling back to local scan", "error", err)
-				if deleteErr := s.invalidatePersistedLocalKIDIndex(ctx, s.core.physical); deleteErr != nil {
+				s.recordLocalKIDIndexFallbackScan(reason)
+				s.logger.Warn("local KID index could not be loaded; falling back to local scan", "reason", reason, "error", err)
+				if deleteErr := s.invalidatePersistedLocalKIDIndexWithReason(ctx, s.core.physical, "load_failed_"+reason); deleteErr != nil {
 					return true, fmt.Errorf("invalidate stale local KID index after load failure: %w", deleteErr)
 				}
 				return false, nil
 			}
 			if !ok {
+				s.recordLocalKIDIndexFallbackScan(reason)
 				s.logger.Info("local KID index unavailable for flat accumulator repair; falling back to local scan",
+					"reason", reason,
 					"ranges", len(nonEmptyRanges),
 					"accumulator_index", accumulatorIndex)
 				return false, nil
@@ -4084,11 +4190,13 @@ func (s *drReplicationSecondary) tryFlatAccumulatorReconciliation(ctx context.Co
 		}
 		if err := s.runFlatAccumulatorIndexedBucketRepair(ctx, checkpoint, localBuckets, mismatches, localSet, startTime); err != nil {
 			if errors.Is(err, errDRIndexedBucketRepairProofMismatch) {
+				s.recordIndexedRepairProofMismatch(err)
+				s.recordLocalKIDIndexFallbackScan("indexed_repair_proof_mismatch")
 				s.logger.Warn("flat accumulator indexed-bucket repair could not prove completeness; falling back to full local scan",
 					"checkpoint_id", checkpoint.CheckpointId,
 					"checkpoint_index", checkpoint.CommitIndex,
 					"error", err)
-				if invalidateErr := s.invalidatePersistedLocalKIDIndex(ctx, s.core.physical); invalidateErr != nil {
+				if invalidateErr := s.invalidatePersistedLocalKIDIndexWithReason(ctx, s.core.physical, "indexed_repair_proof_mismatch"); invalidateErr != nil {
 					return true, fmt.Errorf("invalidate stale local KID index after indexed repair proof failure: %w", invalidateErr)
 				}
 				if s.rangeAccumulator != nil {
@@ -4118,7 +4226,7 @@ func (s *drReplicationSecondary) tryFlatAccumulatorReconciliation(ctx context.Co
 				"from_index", accumulatorIndex,
 				"to_index", checkpoint.CommitIndex,
 				"error", err)
-			if invalidateErr := s.invalidatePersistedLocalKIDIndex(ctx, s.core.physical); invalidateErr != nil {
+			if invalidateErr := s.invalidatePersistedLocalKIDIndexWithReason(ctx, s.core.physical, "phase_a_meta_advance_failed"); invalidateErr != nil {
 				s.logger.Warn("failed to invalidate local KID index after metadata advance failure", "error", invalidateErr)
 			}
 		}
@@ -4265,11 +4373,12 @@ func (s *drReplicationSecondary) runFlatAccumulatorIndexedBucketRepair(
 			remoteChecksum = mismatch.remote.GetChecksum()
 		}
 		if nextBuckets[mismatch.rangeID].count != remoteCount || nextBuckets[mismatch.rangeID].checksum != remoteChecksum {
-			return fmt.Errorf("%w: range=%d local_count=%d remote_count=%d",
-				errDRIndexedBucketRepairProofMismatch,
-				mismatch.rangeID,
-				nextBuckets[mismatch.rangeID].count,
-				remoteCount)
+			return &drIndexedBucketRepairProofMismatchError{
+				rangeID:          mismatch.rangeID,
+				localCount:       nextBuckets[mismatch.rangeID].count,
+				remoteCount:      remoteCount,
+				checksumMismatch: nextBuckets[mismatch.rangeID].checksum != remoteChecksum,
+			}
 		}
 	}
 
@@ -4293,7 +4402,7 @@ func (s *drReplicationSecondary) runFlatAccumulatorIndexedBucketRepair(
 			"checkpoint_index", checkpoint.CommitIndex,
 			"ranges", len(repairedRanges),
 			"error", err)
-		if invalidateErr := s.invalidatePersistedLocalKIDIndex(ctx, s.core.physical); invalidateErr != nil {
+		if invalidateErr := s.invalidatePersistedLocalKIDIndexWithReason(ctx, s.core.physical, "indexed_repair_persist_failed"); invalidateErr != nil {
 			s.logger.Warn("failed to invalidate local KID index after indexed repair persist failure", "error", invalidateErr)
 		}
 	}
@@ -4563,7 +4672,7 @@ func (s *drReplicationSecondary) clearPersistedReconcileOptimizationState(ctx co
 		return fmt.Errorf("delete stale flat accumulator: %w", err)
 	}
 	if !preserveLocalKIDIndex {
-		if err := s.invalidatePersistedLocalKIDIndex(ctx, s.core.physical); err != nil {
+		if err := s.invalidatePersistedLocalKIDIndexWithReason(ctx, s.core.physical, "clear_reconcile_optimizer_state"); err != nil {
 			return fmt.Errorf("invalidate stale local kid index: %w", err)
 		}
 	}
@@ -4603,7 +4712,7 @@ func (s *drReplicationSecondary) persistReconcileOptimizerStateBestEffort(ctx co
 	}
 	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cleanupCancel()
-	if invalidateErr := s.invalidatePersistedLocalKIDIndex(cleanupCtx, s.core.physical); invalidateErr != nil {
+	if invalidateErr := s.invalidatePersistedLocalKIDIndexWithReason(cleanupCtx, s.core.physical, "optimizer_persist_failed"); invalidateErr != nil {
 		s.logger.Warn("failed to invalidate local KID index after optimizer persist failure", "error", invalidateErr)
 	}
 }

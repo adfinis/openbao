@@ -82,10 +82,10 @@ func (s *drReplicationSecondary) advanceLocalKIDIndexMetaIfCurrent(ctx context.C
 	}
 	var meta drLocalKIDIndexMeta
 	if err := json.Unmarshal(entry.Value, &meta); err != nil {
-		return s.invalidatePersistedLocalKIDIndex(ctx, writer)
+		return s.invalidatePersistedLocalKIDIndexWithReason(ctx, writer, "advance_meta_decode_failed")
 	}
 	if err := s.validateLocalKIDIndexMeta(&meta); err != nil {
-		return s.invalidatePersistedLocalKIDIndex(ctx, writer)
+		return s.invalidatePersistedLocalKIDIndexWithReason(ctx, writer, "advance_meta_invalid")
 	}
 	if meta.CommitIndex != fromIndex {
 		return nil
@@ -106,10 +106,10 @@ func (s *drReplicationSecondary) persistLocalKIDIndexChanges(ctx context.Context
 	}
 	var meta drLocalKIDIndexMeta
 	if err := json.Unmarshal(entry.Value, &meta); err != nil {
-		return s.invalidatePersistedLocalKIDIndex(ctx, writer)
+		return s.invalidatePersistedLocalKIDIndexWithReason(ctx, writer, "stream_delta_meta_decode_failed")
 	}
 	if err := s.validateLocalKIDIndexMeta(&meta); err != nil {
-		return s.invalidatePersistedLocalKIDIndex(ctx, writer)
+		return s.invalidatePersistedLocalKIDIndexWithReason(ctx, writer, "stream_delta_meta_invalid")
 	}
 	if meta.CommitIndex > index {
 		return nil
@@ -186,7 +186,7 @@ func (s *drReplicationSecondary) resetLocalKIDIndexRangesFromSet(ctx context.Con
 		return fmt.Errorf("local kid index reset requires reconciliation set")
 	}
 	if len(rs.KIDToVID) > 0 && rs.KIDToKey == nil {
-		return s.invalidatePersistedLocalKIDIndex(ctx, writer)
+		return s.invalidatePersistedLocalKIDIndexWithReason(ctx, writer, "reset_missing_key_map")
 	}
 	rangeSet := make(map[uint64]struct{}, len(ranges))
 	for _, rangeID := range ranges {
@@ -206,7 +206,7 @@ func (s *drReplicationSecondary) resetLocalKIDIndexRangesFromSet(ctx context.Con
 		return hex.EncodeToString(kids[i][:]) < hex.EncodeToString(kids[j][:])
 	})
 
-	if err := s.invalidatePersistedLocalKIDIndex(ctx, writer); err != nil {
+	if err := s.invalidatePersistedLocalKIDIndexWithReason(ctx, writer, "reset_rebuild_start"); err != nil {
 		return err
 	}
 	if txnBackend, ok := writer.(physical.TransactionalBackend); ok {
@@ -360,9 +360,14 @@ func (s *drReplicationSecondary) deletePersistedLocalKIDIndex(ctx context.Contex
 }
 
 func (s *drReplicationSecondary) invalidatePersistedLocalKIDIndex(ctx context.Context, writer physical.Backend) error {
+	return s.invalidatePersistedLocalKIDIndexWithReason(ctx, writer, "unspecified")
+}
+
+func (s *drReplicationSecondary) invalidatePersistedLocalKIDIndexWithReason(ctx context.Context, writer physical.Backend, reason string) error {
 	if writer == nil {
 		return nil
 	}
+	s.recordLocalKIDIndexInvalidation(reason)
 	return writer.Delete(ctx, drLocalKIDIndexMetaPath)
 }
 
@@ -387,26 +392,26 @@ func (s *drReplicationSecondary) loadLocalKIDIndexForRanges(
 	expectedIndex uint64,
 	ranges []uint64,
 	expectedBuckets [drRangeMaxTotalRanges]drFlatAccumulatorBucket,
-) (*reconciler.ReconciliationSet, bool, error) {
+) (*reconciler.ReconciliationSet, bool, string, error) {
 	if s == nil || reader == nil || expectedIndex == 0 {
-		return nil, false, nil
+		return nil, false, "unavailable", nil
 	}
 	entry, err := reader.Get(ctx, drLocalKIDIndexMetaPath)
 	if err != nil {
-		return nil, false, err
+		return nil, false, "meta_read_failed", err
 	}
 	if entry == nil {
-		return nil, false, nil
+		return nil, false, "meta_missing", nil
 	}
 	var meta drLocalKIDIndexMeta
 	if err := json.Unmarshal(entry.Value, &meta); err != nil {
-		return nil, false, err
+		return nil, false, "meta_decode_failed", err
 	}
 	if err := s.validateLocalKIDIndexMeta(&meta); err != nil {
-		return nil, false, err
+		return nil, false, "meta_invalid", err
 	}
 	if meta.CommitIndex != expectedIndex {
-		return nil, false, nil
+		return nil, false, "meta_index_mismatch", nil
 	}
 
 	rs := &reconciler.ReconciliationSet{
@@ -417,7 +422,7 @@ func (s *drReplicationSecondary) loadLocalKIDIndexForRanges(
 	seenRanges := make(map[uint64]struct{}, len(ranges))
 	for _, rangeID := range ranges {
 		if rangeID >= drRangeMaxTotalRanges {
-			return nil, false, fmt.Errorf("local kid index range %d outside max %d", rangeID, drRangeMaxTotalRanges)
+			return nil, false, "range_out_of_bounds", fmt.Errorf("local kid index range %d outside max %d", rangeID, drRangeMaxTotalRanges)
 		}
 		if _, ok := seenRanges[rangeID]; ok {
 			continue
@@ -426,23 +431,23 @@ func (s *drReplicationSecondary) loadLocalKIDIndexForRanges(
 		prefix := drLocalKIDIndexRangePrefix(rangeID)
 		keys, err := reader.List(ctx, prefix)
 		if err != nil {
-			return nil, false, err
+			return nil, false, "entry_list_failed", err
 		}
 		for _, key := range keys {
 			entry, err := reader.Get(ctx, prefix+key)
 			if err != nil {
-				return nil, false, err
+				return nil, false, "entry_read_failed", err
 			}
 			if entry == nil {
 				continue
 			}
 			item, err := s.decodeLocalKIDIndexEntry(entry.Value)
 			if err != nil {
-				return nil, false, err
+				return nil, false, "entry_decode_failed", err
 			}
 			rangeForKID := reconciler.RangeIDFromKID(item.kid)
 			if rangeForKID != rangeID {
-				return nil, false, fmt.Errorf("local kid index entry %x stored under range %d but maps to %d", item.kid, rangeID, rangeForKID)
+				return nil, false, "entry_range_mismatch", fmt.Errorf("local kid index entry %x stored under range %d but maps to %d", item.kid, rangeID, rangeForKID)
 			}
 			rs.KIDToVID[item.kid] = item.vid
 			rs.KIDToKey[item.kid] = item.key
@@ -455,12 +460,12 @@ func (s *drReplicationSecondary) loadLocalKIDIndexForRanges(
 		checksum, count := reconciler.ComputeRangeChecksum(localIndex, rangeID)
 		expected := expectedBuckets[rangeID]
 		if checksum != expected.checksum || count != expected.count {
-			return nil, false, fmt.Errorf("local kid index bucket mismatch for range %d: index_count=%d accumulator_count=%d", rangeID, count, expected.count)
+			return nil, false, "bucket_mismatch", fmt.Errorf("local kid index bucket mismatch for range %d: index_count=%d accumulator_count=%d", rangeID, count, expected.count)
 		}
 	}
 	s.localKIDIndexBucketLoads.Add(uint64(len(seenRanges)))
 	s.localKIDIndexEntriesLoaded.Add(uint64(len(rs.KIDToVID)))
-	return rs, true, nil
+	return rs, true, "loaded", nil
 }
 
 func (s *drReplicationSecondary) validateLocalKIDIndexMeta(meta *drLocalKIDIndexMeta) error {

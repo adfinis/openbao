@@ -752,50 +752,65 @@ func (s *drReplicationPrimary) StreamChanges(stream grpc.BidiStreamingServer[Str
 		return stream.Send(&EntryBatch{Entries: batch})
 	}
 
+	replayJournalRange := func(startInclusive, endExclusive uint64) error {
+		if s.streamJournal == nil {
+			s.logger.Warn("buffer cannot satisfy catch-up and stream journal is unavailable",
+				"requested_from", startInclusive,
+				"replay_until", endExclusive)
+			return status.Errorf(codes.FailedPrecondition, "buffer too old: secondary missing from %d (inclusive), journal unavailable; reconciliation required",
+				startInclusive)
+		}
+		s.journalReplayAttempts.Add(1)
+		metrics.IncrCounter([]string{"replication", "dr", "stream", "journal_replay_attempts_total"}, 1)
+		journalBatch := make([]*EntryChange, 0, drStreamSendBatchMaxEntries)
+		if err := s.streamJournal.replayRange(startInclusive, endExclusive, func(e physical.ChangeStreamEntry) error {
+			journalBatch = append(journalBatch, entryChangeFromPhysical(e))
+			if len(journalBatch) >= drStreamSendBatchMaxEntries {
+				if err := sendCatchupBatch(journalBatch); err != nil {
+					return err
+				}
+				journalBatch = journalBatch[:0]
+			}
+			return nil
+		}); err != nil {
+			if errors.Is(err, errDRStreamJournalRangeTooOld) {
+				s.journalRangeTooOld.Add(1)
+				metrics.IncrCounter([]string{"replication", "dr", "stream", "journal_range_too_old_total"}, 1)
+				s.logger.Warn("journal cannot satisfy catch-up, secondary needs reconciliation",
+					"requested_from", startInclusive,
+					"replay_until", endExclusive)
+				return status.Errorf(codes.FailedPrecondition, "journal too old: secondary missing from %d (inclusive); reconciliation required",
+					startInclusive)
+			}
+			return status.Errorf(codes.Internal, "journal catch-up failed: %v", err)
+		}
+		if err := sendCatchupBatch(journalBatch); err != nil {
+			return err
+		}
+		s.journalReplaySuccess.Add(1)
+		metrics.IncrCounter([]string{"replication", "dr", "stream", "journal_replay_success_total"}, 1)
+		return nil
+	}
+
 	bufferStart := resumeFrom
 	if len(bufferSnapshot) > 0 {
 		oldestIdx := bufferSnapshot[0].RaftIndex
 		if bufferStart < oldestIdx {
-			if s.streamJournal != nil {
-				s.journalReplayAttempts.Add(1)
-				metrics.IncrCounter([]string{"replication", "dr", "stream", "journal_replay_attempts_total"}, 1)
-				// Batch journal replay entries for throughput.
-				journalBatch := make([]*EntryChange, 0, drStreamSendBatchMaxEntries)
-				if err := s.streamJournal.replayRange(bufferStart, oldestIdx, func(e physical.ChangeStreamEntry) error {
-					journalBatch = append(journalBatch, entryChangeFromPhysical(e))
-					if len(journalBatch) >= drStreamSendBatchMaxEntries {
-						if err := sendCatchupBatch(journalBatch); err != nil {
-							return err
-						}
-						journalBatch = journalBatch[:0]
-					}
-					return nil
-				}); err != nil {
-					if errors.Is(err, errDRStreamJournalRangeTooOld) {
-						s.journalRangeTooOld.Add(1)
-						metrics.IncrCounter([]string{"replication", "dr", "stream", "journal_range_too_old_total"}, 1)
-						s.logger.Warn("journal cannot satisfy catch-up, secondary needs reconciliation",
-							"requested_from", bufferStart,
-							"oldest_buffered", oldestIdx)
-						return status.Errorf(codes.FailedPrecondition, "journal too old: secondary missing from %d (inclusive), oldest buffered %d; reconciliation required",
-							bufferStart, oldestIdx)
-					}
-					return status.Errorf(codes.Internal, "journal catch-up failed: %v", err)
-				}
-				// Flush remaining journal entries.
-				if err := sendCatchupBatch(journalBatch); err != nil {
-					return err
-				}
-				s.journalReplaySuccess.Add(1)
-				metrics.IncrCounter([]string{"replication", "dr", "stream", "journal_replay_success_total"}, 1)
-			} else {
-				s.logger.Warn("buffer cannot satisfy catch-up, secondary needs reconciliation",
-					"requested_from", bufferStart,
-					"oldest_buffered", oldestIdx)
-				return status.Errorf(codes.FailedPrecondition, "buffer too old: secondary missing from %d (inclusive), oldest buffered %d; reconciliation required",
-					bufferStart, oldestIdx)
+			if err := replayJournalRange(bufferStart, oldestIdx); err != nil {
+				return err
 			}
 			bufferStart = oldestIdx
+		}
+	} else if s.streamJournal != nil {
+		_, segments, _, newestIdx := s.streamJournal.stats()
+		if bufferStart > 0 && segments > 0 && newestIdx >= bufferStart {
+			endExclusive := newestIdx + 1
+			if newestIdx == ^uint64(0) {
+				endExclusive = 0
+			}
+			if err := replayJournalRange(bufferStart, endExclusive); err != nil {
+				return err
+			}
 		}
 	}
 	// Batch buffer catch-up entries for throughput.

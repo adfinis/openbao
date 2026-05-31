@@ -2780,6 +2780,17 @@ func TestDRSecondaryStatus(t *testing.T) {
 	sec.localKIDIndexLoadFailures.Store(22)
 	sec.localKIDIndexResets.Store(23)
 	sec.localKIDIndexUpdates.Store(24)
+	sec.flatAccumulatorIndexedRepairProofMismatches.Store(25)
+	sec.flatAccumulatorIndexedRepairProofMismatchRange.Store(26)
+	sec.flatAccumulatorIndexedRepairProofMismatchLocal.Store(27)
+	sec.flatAccumulatorIndexedRepairProofMismatchRemote.Store(28)
+	sec.flatAccumulatorIndexedRepairProofMismatchChecksum.Store(true)
+	sec.localKIDIndexFallbackScans.Store(29)
+	sec.localKIDIndexInvalidations.Store(30)
+	sec.optimizerStatusMu.Lock()
+	sec.lastLocalKIDIndexFallbackScanReason = "bucket_mismatch"
+	sec.lastLocalKIDIndexInvalidationReason = "indexed_repair_proof_mismatch"
+	sec.optimizerStatusMu.Unlock()
 	sec.lastReconcileAt.Store(time.Now().Unix())
 
 	status := sec.Status()
@@ -2810,6 +2821,21 @@ func TestDRSecondaryStatus(t *testing.T) {
 	if status.FlatAccumulatorIndexedRepairRanges != 19 {
 		t.Fatalf("expected flat accumulator indexed repair ranges 19, got %d", status.FlatAccumulatorIndexedRepairRanges)
 	}
+	if status.FlatAccumulatorIndexedRepairProofMismatches != 25 {
+		t.Fatalf("expected flat accumulator indexed repair proof mismatches 25, got %d", status.FlatAccumulatorIndexedRepairProofMismatches)
+	}
+	if status.FlatAccumulatorIndexedRepairProofMismatchRange != 26 {
+		t.Fatalf("expected flat accumulator indexed repair proof mismatch range 26, got %d", status.FlatAccumulatorIndexedRepairProofMismatchRange)
+	}
+	if status.FlatAccumulatorIndexedRepairProofMismatchLocal != 27 {
+		t.Fatalf("expected flat accumulator indexed repair proof mismatch local count 27, got %d", status.FlatAccumulatorIndexedRepairProofMismatchLocal)
+	}
+	if status.FlatAccumulatorIndexedRepairProofMismatchRemote != 28 {
+		t.Fatalf("expected flat accumulator indexed repair proof mismatch remote count 28, got %d", status.FlatAccumulatorIndexedRepairProofMismatchRemote)
+	}
+	if !status.FlatAccumulatorIndexedRepairProofMismatchChecksum {
+		t.Fatal("expected flat accumulator indexed repair proof mismatch checksum flag")
+	}
 	if status.LocalKIDIndexBucketLoadsTotal != 20 {
 		t.Fatalf("expected local KID index bucket loads 20, got %d", status.LocalKIDIndexBucketLoadsTotal)
 	}
@@ -2824,6 +2850,18 @@ func TestDRSecondaryStatus(t *testing.T) {
 	}
 	if status.LocalKIDIndexUpdatesTotal != 24 {
 		t.Fatalf("expected local KID index updates 24, got %d", status.LocalKIDIndexUpdatesTotal)
+	}
+	if status.LocalKIDIndexFallbackScansTotal != 29 {
+		t.Fatalf("expected local KID index fallback scans 29, got %d", status.LocalKIDIndexFallbackScansTotal)
+	}
+	if status.LocalKIDIndexFallbackScanReasonLast != "bucket_mismatch" {
+		t.Fatalf("expected local KID index fallback reason bucket_mismatch, got %q", status.LocalKIDIndexFallbackScanReasonLast)
+	}
+	if status.LocalKIDIndexInvalidationsTotal != 30 {
+		t.Fatalf("expected local KID index invalidations 30, got %d", status.LocalKIDIndexInvalidationsTotal)
+	}
+	if status.LocalKIDIndexInvalidationReasonLast != "indexed_repair_proof_mismatch" {
+		t.Fatalf("expected local KID index invalidation reason indexed_repair_proof_mismatch, got %q", status.LocalKIDIndexInvalidationReasonLast)
 	}
 	if status.StreamTxnCoalescedEntriesTotal != 3 {
 		t.Fatalf("expected stream txn coalesced entries total 3, got %d", status.StreamTxnCoalescedEntriesTotal)
@@ -2904,11 +2942,22 @@ func TestDRSystemBackend_StatusIncludesStreamOptimizationCounters(t *testing.T) 
 	secondary.flatAccumulatorEmptyRepairRanges.Store(9)
 	secondary.flatAccumulatorIndexedRepairTotal.Store(10)
 	secondary.flatAccumulatorIndexedRepairRanges.Store(12)
+	secondary.flatAccumulatorIndexedRepairProofMismatches.Store(24)
+	secondary.flatAccumulatorIndexedRepairProofMismatchRange.Store(25)
+	secondary.flatAccumulatorIndexedRepairProofMismatchLocal.Store(26)
+	secondary.flatAccumulatorIndexedRepairProofMismatchRemote.Store(27)
+	secondary.flatAccumulatorIndexedRepairProofMismatchChecksum.Store(true)
 	secondary.localKIDIndexBucketLoads.Store(14)
 	secondary.localKIDIndexEntriesLoaded.Store(16)
 	secondary.localKIDIndexLoadFailures.Store(18)
 	secondary.localKIDIndexResets.Store(20)
 	secondary.localKIDIndexUpdates.Store(22)
+	secondary.localKIDIndexFallbackScans.Store(28)
+	secondary.localKIDIndexInvalidations.Store(30)
+	secondary.optimizerStatusMu.Lock()
+	secondary.lastLocalKIDIndexFallbackScanReason = "meta_missing"
+	secondary.lastLocalKIDIndexInvalidationReason = "reset_rebuild_start"
+	secondary.optimizerStatusMu.Unlock()
 	secondary.streamTxnCoalescedEntries.Store(11)
 	secondary.streamTxnBatches.Store(13)
 	secondary.streamTxnEntries.Store(39)
@@ -2957,6 +3006,21 @@ func TestDRSystemBackend_StatusIncludesStreamOptimizationCounters(t *testing.T) 
 	if got := resp.Data["flat_accumulator_indexed_repair_ranges_total"]; got != uint64(12) {
 		t.Fatalf("expected flat_accumulator_indexed_repair_ranges_total=12, got %#v", got)
 	}
+	if got := resp.Data["flat_accumulator_indexed_repair_proof_mismatches_total"]; got != uint64(24) {
+		t.Fatalf("expected flat_accumulator_indexed_repair_proof_mismatches_total=24, got %#v", got)
+	}
+	if got := resp.Data["flat_accumulator_indexed_repair_proof_mismatch_range_last"]; got != uint64(25) {
+		t.Fatalf("expected flat_accumulator_indexed_repair_proof_mismatch_range_last=25, got %#v", got)
+	}
+	if got := resp.Data["flat_accumulator_indexed_repair_proof_mismatch_local_count_last"]; got != uint64(26) {
+		t.Fatalf("expected flat_accumulator_indexed_repair_proof_mismatch_local_count_last=26, got %#v", got)
+	}
+	if got := resp.Data["flat_accumulator_indexed_repair_proof_mismatch_remote_count_last"]; got != uint64(27) {
+		t.Fatalf("expected flat_accumulator_indexed_repair_proof_mismatch_remote_count_last=27, got %#v", got)
+	}
+	if got := resp.Data["flat_accumulator_indexed_repair_proof_mismatch_checksum_last"]; got != true {
+		t.Fatalf("expected flat_accumulator_indexed_repair_proof_mismatch_checksum_last=true, got %#v", got)
+	}
 	if got := resp.Data["local_kid_index_bucket_loads_total"]; got != uint64(14) {
 		t.Fatalf("expected local_kid_index_bucket_loads_total=14, got %#v", got)
 	}
@@ -2971,6 +3035,18 @@ func TestDRSystemBackend_StatusIncludesStreamOptimizationCounters(t *testing.T) 
 	}
 	if got := resp.Data["local_kid_index_updates_total"]; got != uint64(22) {
 		t.Fatalf("expected local_kid_index_updates_total=22, got %#v", got)
+	}
+	if got := resp.Data["local_kid_index_fallback_scans_total"]; got != uint64(28) {
+		t.Fatalf("expected local_kid_index_fallback_scans_total=28, got %#v", got)
+	}
+	if got := resp.Data["local_kid_index_fallback_scan_reason_last"]; got != "meta_missing" {
+		t.Fatalf("expected local_kid_index_fallback_scan_reason_last=meta_missing, got %#v", got)
+	}
+	if got := resp.Data["local_kid_index_invalidations_total"]; got != uint64(30) {
+		t.Fatalf("expected local_kid_index_invalidations_total=30, got %#v", got)
+	}
+	if got := resp.Data["local_kid_index_invalidation_reason_last"]; got != "reset_rebuild_start" {
+		t.Fatalf("expected local_kid_index_invalidation_reason_last=reset_rebuild_start, got %#v", got)
 	}
 	if got := resp.Data["stream_txn_coalesced_entries_total"]; got != uint64(11) {
 		t.Fatalf("expected stream_txn_coalesced_entries_total=11, got %#v", got)
@@ -4181,6 +4257,96 @@ func TestDRLocalKIDIndexChangesRequireCompleteBaseline(t *testing.T) {
 	}
 }
 
+func TestDRIndexedRepairProofMismatchObservability(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	replSalt := bytes.Repeat([]byte{0x49}, 32)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-indexed-proof-observe", core.logger)
+
+	mismatchErr := &drIndexedBucketRepairProofMismatchError{
+		rangeID:          158,
+		localCount:       22,
+		remoteCount:      23,
+		checksumMismatch: true,
+	}
+	if !errors.Is(mismatchErr, errDRIndexedBucketRepairProofMismatch) {
+		t.Fatal("expected proof mismatch error to unwrap to sentinel")
+	}
+	secondary.recordIndexedRepairProofMismatch(mismatchErr)
+	secondary.recordLocalKIDIndexFallbackScan("indexed_repair_proof_mismatch")
+	if err := secondary.invalidatePersistedLocalKIDIndexWithReason(ctx, core.physical, "indexed_repair_proof_mismatch"); err != nil {
+		t.Fatal(err)
+	}
+
+	status := secondary.Status()
+	if status.FlatAccumulatorIndexedRepairProofMismatches != 1 {
+		t.Fatalf("expected one indexed repair proof mismatch, got %d", status.FlatAccumulatorIndexedRepairProofMismatches)
+	}
+	if status.FlatAccumulatorIndexedRepairProofMismatchRange != 158 {
+		t.Fatalf("expected last proof mismatch range 158, got %d", status.FlatAccumulatorIndexedRepairProofMismatchRange)
+	}
+	if status.FlatAccumulatorIndexedRepairProofMismatchLocal != 22 {
+		t.Fatalf("expected last proof mismatch local count 22, got %d", status.FlatAccumulatorIndexedRepairProofMismatchLocal)
+	}
+	if status.FlatAccumulatorIndexedRepairProofMismatchRemote != 23 {
+		t.Fatalf("expected last proof mismatch remote count 23, got %d", status.FlatAccumulatorIndexedRepairProofMismatchRemote)
+	}
+	if !status.FlatAccumulatorIndexedRepairProofMismatchChecksum {
+		t.Fatal("expected checksum mismatch flag to be true")
+	}
+	if status.LocalKIDIndexFallbackScansTotal != 1 {
+		t.Fatalf("expected one local KID index fallback scan, got %d", status.LocalKIDIndexFallbackScansTotal)
+	}
+	if status.LocalKIDIndexFallbackScanReasonLast != "indexed_repair_proof_mismatch" {
+		t.Fatalf("expected indexed repair fallback reason, got %q", status.LocalKIDIndexFallbackScanReasonLast)
+	}
+	if status.LocalKIDIndexInvalidationsTotal != 1 {
+		t.Fatalf("expected one local KID index invalidation, got %d", status.LocalKIDIndexInvalidationsTotal)
+	}
+	if status.LocalKIDIndexInvalidationReasonLast != "indexed_repair_proof_mismatch" {
+		t.Fatalf("expected indexed repair invalidation reason, got %q", status.LocalKIDIndexInvalidationReasonLast)
+	}
+}
+
+func TestDRLocalKIDIndexLoadReasons(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	replSalt := bytes.Repeat([]byte{0x4a}, 32)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-local-index-reasons", core.logger)
+	var buckets [drRangeMaxTotalRanges]drFlatAccumulatorBucket
+
+	if _, ok, reason, err := secondary.loadLocalKIDIndexForRanges(ctx, core.physical, 10, []uint64{0}, buckets); err != nil {
+		t.Fatal(err)
+	} else if ok || reason != "meta_missing" {
+		t.Fatalf("expected meta_missing without local KID index meta, ok=%t reason=%q", ok, reason)
+	}
+
+	if err := secondary.persistLocalKIDIndexMeta(ctx, core.physical, 9); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, reason, err := secondary.loadLocalKIDIndexForRanges(ctx, core.physical, 10, []uint64{0}, buckets); err != nil {
+		t.Fatal(err)
+	} else if ok || reason != "meta_index_mismatch" {
+		t.Fatalf("expected meta_index_mismatch for stale local KID index meta, ok=%t reason=%q", ok, reason)
+	}
+
+	key := "secret/local-index-reasons"
+	kid := secondary.scanner.ComputeKID(key)
+	vid := secondary.scanner.ComputeVIDWithSealWrap([]byte("value"), false)
+	localSet := &reconciler.ReconciliationSet{
+		KIDToVID: map[[32]byte][32]byte{kid: vid},
+		KIDToKey: map[[32]byte]string{kid: key},
+	}
+	if err := secondary.resetLocalKIDIndexFromSet(ctx, core.physical, 10, localSet); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, reason, err := secondary.loadLocalKIDIndexForRanges(ctx, core.physical, 10, []uint64{reconciler.RangeIDFromKID(kid)}, buckets); err == nil {
+		t.Fatalf("expected bucket mismatch error, ok=%t reason=%q", ok, reason)
+	} else if reason != "bucket_mismatch" {
+		t.Fatalf("expected bucket_mismatch reason, got %q (err=%v)", reason, err)
+	}
+}
+
 func TestDRSecondaryStreamTxnCadenceReplaysPersistedAccumulatorDeltas(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	ctx := context.Background()
@@ -4887,7 +5053,7 @@ func TestDRFlatAccumulatorIndexedBucketRepairAvoidsLocalScan(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected flat accumulator snapshot at checkpoint index %d", checkpoint.CommitIndex)
 	}
-	indexedStableSet, ok, err := secondary.loadLocalKIDIndexForRanges(ctx, core.physical, checkpoint.CommitIndex, []uint64{stableRangeID}, buckets)
+	indexedStableSet, ok, _, err := secondary.loadLocalKIDIndexForRanges(ctx, core.physical, checkpoint.CommitIndex, []uint64{stableRangeID}, buckets)
 	if err != nil {
 		t.Fatalf("failed to load stable local KID index bucket after indexed repair: %v", err)
 	}
@@ -7353,6 +7519,77 @@ func TestStreamChanges_CatchupDebitsCredits(t *testing.T) {
 		},
 	}
 	collectN(2, "after replenishment")
+
+	cancel()
+	<-errCh
+}
+
+func TestStreamChanges_CatchupUsesJournalWhenBufferEmpty(t *testing.T) {
+	primary, relID, fingerprint := newCreditTestPrimary(t, 2*time.Second)
+
+	primary.streamJournal = newDRStreamJournal(primary.logger, t.TempDir())
+	if err := primary.streamJournal.configure(true, drDefaultStreamJournalMaxBytes, drDefaultStreamJournalSegmentBytes, drDefaultStreamJournalRetention); err != nil {
+		t.Fatal(err)
+	}
+	entries := []physical.ChangeStreamEntry{
+		{OpType: physical.PutOperation, Key: "journal/100", Value: []byte("v100"), RaftIndex: 100},
+		{OpType: physical.PutOperation, Key: "journal/101", Value: []byte("v101"), RaftIndex: 101},
+		{OpType: physical.PutOperation, Key: "journal/102", Value: []byte("v102"), RaftIndex: 102},
+	}
+	if err := primary.streamJournal.append(entries); err != nil {
+		t.Fatal(err)
+	}
+	primary.bufMu.Lock()
+	primary.changeBuffer = nil
+	primary.bufBytes = 0
+	primary.bufMu.Unlock()
+
+	ctx, cancel := context.WithCancel(
+		context.WithValue(context.Background(), drPeerFingerprintContextKey{}, fingerprint),
+	)
+	defer cancel()
+
+	stream := &creditTestBidiStream{
+		ctx: ctx,
+		initMsg: &StreamChangesUpstream{
+			Msg: &StreamChangesUpstream_Init{
+				Init: &StreamChangesRequest{
+					RelationshipId:   relID,
+					LastAppliedIndex: 100,
+					InitialWindow:    10,
+				},
+			},
+		},
+		creditCh: make(chan *StreamChangesUpstream),
+		sentCh:   make(chan *EntryChange, len(entries)),
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- primary.StreamChanges(stream)
+	}()
+
+	var got []string
+	timeout := time.After(3 * time.Second)
+	for len(got) < len(entries) {
+		select {
+		case change := <-stream.sentCh:
+			got = append(got, fmt.Sprintf("%s:%d", change.Key, change.RaftIndex))
+		case <-timeout:
+			t.Fatalf("timed out waiting for journal catch-up entries; got %v", got)
+		}
+	}
+
+	want := []string{"journal/100:100", "journal/101:101", "journal/102:102"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected journal catch-up entries: got %v want %v", got, want)
+	}
+	if attempts := primary.journalReplayAttempts.Load(); attempts != 1 {
+		t.Fatalf("expected one journal replay attempt, got %d", attempts)
+	}
+	if successes := primary.journalReplaySuccess.Load(); successes != 1 {
+		t.Fatalf("expected one journal replay success, got %d", successes)
+	}
 
 	cancel()
 	<-errCh
