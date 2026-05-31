@@ -330,6 +330,15 @@ dr_status_json() {
   bao_for "$addr" "$token" read -format=json sys/replication/dr/status
 }
 
+dr_uint_field_from_file() {
+  local file="$1"
+  local field="$2"
+  local value
+  value="$(jq -r --arg field "$field" '.data[$field] // 0' "$file")"
+  [[ "$value" =~ ^[0-9]+$ ]] || die "invalid ${field} in ${file}: ${value}"
+  printf "%s" "$value"
+}
+
 dr_fast_path_total_from_file() {
   local file="$1"
   local value
@@ -1951,6 +1960,7 @@ cmd_accumulator_cold_restart_smoke() {
   fi
 
   local run_id run_dir marker_key primary_active before_last after_last after_reconcile restart_since
+  local after_cursor after_snapshot after_scan_failures
   local services=(secondary1-1 secondary1-2 secondary1-3)
 
   run_id="accumulator-cold-restart-$(date -u +%Y%m%dT%H%M%SZ)"
@@ -2007,19 +2017,33 @@ cmd_accumulator_cold_restart_smoke() {
   dr_status_json "$secondary1_active" "$DR_PRIMARY_TOKEN" >"$run_dir/after-secondary1-status.json"
   after_last="$(dr_last_applied_index_from_file "$run_dir/after-secondary1-status.json")"
   after_reconcile="$(dr_reconcile_count_from_file "$run_dir/after-secondary1-status.json")"
+  after_cursor="$(dr_uint_field_from_file "$run_dir/after-secondary1-status.json" "flat_accumulator_cursor_index")"
+  after_snapshot="$(dr_uint_field_from_file "$run_dir/after-secondary1-status.json" "flat_accumulator_snapshot_index")"
+  after_scan_failures="$(dr_uint_field_from_file "$run_dir/after-secondary1-status.json" "scan_failures_total")"
   echo "last_applied_after_secondary1=${after_last}" | tee -a "$run_dir/orchestrator.log"
   echo "reconcile_count_after_secondary1=${after_reconcile}" | tee -a "$run_dir/orchestrator.log"
+  echo "flat_accumulator_cursor_after_secondary1=${after_cursor}" | tee -a "$run_dir/orchestrator.log"
+  echo "flat_accumulator_snapshot_after_secondary1=${after_snapshot}" | tee -a "$run_dir/orchestrator.log"
+  echo "scan_failures_after_secondary1=${after_scan_failures}" | tee -a "$run_dir/orchestrator.log"
 
   if (( after_last < before_last )); then
     die "secondary1 last_applied_index moved backwards after cold restart: ${before_last} -> ${after_last}"
   fi
+  if (( after_cursor < before_last )); then
+    die "secondary1 flat accumulator cursor did not cover the pre-restart applied index: cursor=${after_cursor}, before=${before_last}"
+  fi
   if (( after_reconcile != 0 )); then
     die "secondary1 ran reconciliation after cold restart; expected stream replay from persisted accumulator cursor"
   fi
+  if (( after_scan_failures != 0 )); then
+    die "secondary1 reported scan failures after cold restart: ${after_scan_failures}"
+  fi
 
   compose logs --no-color --since "$restart_since" "${services[@]}" >"$run_dir/secondary1-restart.log" 2>"$run_dir/secondary1-restart.log.err" || true
-  if ! rg -q "loaded DR flat accumulator snapshot" "$run_dir/secondary1-restart.log"; then
-    die "secondary1 restart logs did not show persisted flat accumulator load"
+  if rg -q "loaded DR flat accumulator snapshot|loaded DR flat accumulator cursor without snapshot|discarding stale DR flat accumulator snapshot behind cursor" "$run_dir/secondary1-restart.log"; then
+    echo "secondary1 restart accumulator log observed" | tee -a "$run_dir/orchestrator.log"
+  else
+    echo "secondary1 restart accumulator log not observed; validated via status cursor=${after_cursor} snapshot=${after_snapshot}" | tee -a "$run_dir/orchestrator.log"
   fi
   if rg -q "local scan complete|starting reconciliation" "$run_dir/secondary1-restart.log"; then
     die "secondary1 restart logs show scanned reconciliation during cold restart"

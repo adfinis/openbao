@@ -242,7 +242,7 @@ scripts remain available under `/Users/roelc/projects/secretz/openbao/scripts`.
 | S10 | HA steady-state soak | `scripts/dr_local_test.sh --topology ha smoke --duration 7200 --concurrency 24 --put-percent 55 --get-primary-percent 25 --status-s1-percent 10 --status-s2-percent 10 --max-wait-seconds 600 --progress-interval 30` | Measure non-failover DR behavior under sustained but non-adversarial load | 0 workload failures, 0 dropped events, both secondaries converge with lag 0, and exhaustive verification passes with `scripts/dr_local_test.sh --topology ha verify <run-dir> --sample 0` |
 | S11 | Dynamic tuning under HA load | `scripts/dr_local_test.sh --topology ha tuning-load-smoke` | Update primary and secondary DR tuning while mixed load is running, then force HA handoffs | Tuning writes succeed, new active nodes report the updated profile, workload exits cleanly, both secondaries return to `streaming` with lag 0, and exhaustive verification passes on primary and both secondaries |
 | S12 | HA quiescent reconnect optimization | `scripts/dr_local_test.sh --topology ha quiescent-reconnect-smoke` | Verify active primary handoff avoids scanned reconciliation when stream replay can resume | Both secondaries return to `streaming` lag 0, marker data remains visible, and either `reconcile_count` is unchanged or `flat_accumulator_fast_path_total` increments |
-| S13 | HA accumulator cold restart | `scripts/dr_local_test.sh --topology ha accumulator-cold-restart-smoke` | Verify a full secondary cluster restart reloads the persisted flat accumulator cursor and resumes stream replay without scanned reconciliation | Secondary #1 returns to `streaming` lag 0, marker data remains visible, restart logs show accumulator load, and post-restart `reconcile_count` remains 0 |
+| S13 | HA accumulator cold restart | `scripts/dr_local_test.sh --topology ha accumulator-cold-restart-smoke` | Verify a full secondary cluster restart reloads the persisted flat accumulator cursor and resumes stream replay without scanned reconciliation | Secondary #1 returns to `streaming` lag 0, marker data remains visible, post-restart cursor covers the pre-restart `last_applied_index`, `reconcile_count=0`, `scan_failures_total=0`, and restart logs show no local scan or reconciliation. Logs may show either full snapshot load or stale snapshot discard with cursor-only recovery |
 | S14 | HA hot-key stream coalescing validation | `scripts/dr_local_test.sh --topology ha reset --build && scripts/dr_local_test.sh --topology ha smoke --duration 300 --concurrency 48 --stepdown-interval 100 --progress-interval 10 --monitor-interval 2 && scripts/dr_local_test.sh --topology ha verify <run-dir> --sample 0` | Measure secondary apply behavior after transactional stream coalescing and flat-accumulator snapshot cadence under hot-key load and HA handoff pressure | Exhaustive verification passes on primary and both secondaries; sentinel convergence is near-immediate; both secondaries end `streaming` with `lag_entries=0`; no journal drops; status timelines expose stream transaction counts, coalesced physical-entry counts, flush reasons, apply/commit timing, flat-accumulator cursor writes, skipped snapshots, and snapshot persist counters |
 
 ### Stress Run Examples
@@ -282,6 +282,19 @@ scripts/dr_local_test.sh --topology ha smoke \
   --monitor-interval 2
 scripts/dr_local_test.sh --topology ha verify <run-dir> --sample 0
 ```
+
+Repo-local HA accumulator cold restart:
+
+```bash
+scripts/dr_local_test.sh --topology ha accumulator-cold-restart-smoke
+```
+
+Latest observed cold restart run: `/Users/roelc/projects/secretz/openbao/dr-stress-results/accumulator-cold-restart-20260531T113835Z`.
+Secondary #1 restarted from pre-restart `last_applied_index=48`, restored
+`flat_accumulator_cursor_index=48`, discarded the stale full accumulator
+snapshot (`flat_accumulator_snapshot_index=0`), ran no reconciliation
+(`reconcile_count=0`), reported no scan failures, and both secondaries returned
+to `streaming` with `lag_entries=0`.
 
 Latest observed run: `/Users/roelc/projects/secretz/openbao/dr-stress-results/drmixed-20260531T112327Z`.
 The run completed 44,930 operations at 145.57 ops/s, had zero status failures,
