@@ -257,6 +257,9 @@ func applyFlatAccumulatorDeltasToBuckets(buckets *[drRangeMaxTotalRanges]drFlatA
 }
 
 func (s *drReplicationSecondary) flatAccumulatorClusterID() string {
+	if s != nil && s.clusterID != "" {
+		return s.clusterID
+	}
 	if s == nil || s.core == nil || s.core.drManager == nil {
 		return ""
 	}

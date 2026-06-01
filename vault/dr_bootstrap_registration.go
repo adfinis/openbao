@@ -34,6 +34,7 @@ const (
 	drRegistrationResponseHeaderTimeout = 10 * time.Second
 	drRegistrationRequestTimeout        = 15 * time.Second
 	drBootstrapTokenHashDomain          = "openbao-dr-bootstrap-token-v1"
+	drSecondaryLocalControlTokenDomain  = "openbao-dr-secondary-local-control-token-v1"
 )
 
 type drPrimaryAPIClientConfig struct {
@@ -371,6 +372,19 @@ func bootstrapTokenMatches(rel *DRRelationship, bootstrapToken string) bool {
 		return subtle.ConstantTimeCompare([]byte(rel.BootstrapToken), []byte(bootstrapToken)) == 1
 	}
 	return false
+}
+
+func hashDRSecondaryLocalControlToken(clusterID, relationshipID, token string) string {
+	sum := sha256.Sum256([]byte(drSecondaryLocalControlTokenDomain + "\x00" + clusterID + "\x00" + relationshipID + "\x00" + token))
+	return hex.EncodeToString(sum[:])
+}
+
+func secondaryLocalControlTokenMatches(cfg DRConfig, token string) bool {
+	if cfg.SecondaryLocalControlTokenHash == "" || token == "" {
+		return false
+	}
+	got := hashDRSecondaryLocalControlToken(cfg.ClusterID, cfg.RelationshipID, token)
+	return subtle.ConstantTimeCompare([]byte(got), []byte(cfg.SecondaryLocalControlTokenHash)) == 1
 }
 
 func (m *drRelationshipManager) recordBootstrapFailureLocked(ctx context.Context, rel *DRRelationship, reason string, now time.Time, sourceIP string, terminal bool) {

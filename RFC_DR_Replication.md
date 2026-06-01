@@ -12,8 +12,9 @@ promotion, reseed, runtime refresh, and P0 security boundaries. Availability
 under adversarial HA handoff, production defaults, rolling upgrades,
 dependency-backed engine profiles, and operator UX still need hardening. Recent
 HA validation also separates DR convergence from secondary API read-serving:
-strict warm-standby secondaries converge and reconcile, but general pre-promotion
-data reads still need an explicit product decision and validation path.
+strict warm-standby secondaries converge and reconcile, and terminal secondary
+correctness is verified through DR checkpoint proofs rather than general
+pre-promotion data reads.
 
 ## Summary
 
@@ -79,10 +80,20 @@ This RFC is asking for maintainer feedback on:
 6. Whether the replication domain is correct: ciphertext physical storage plus
    runtime metadata, with cluster-local paths excluded and runtime refresh
    required before serving from replicated state.
-7. Whether the secondary serving surface should remain DR status/control only
-   before promotion, or whether a supported read-only data API should be part
-   of the first version.
-8. What validation evidence maintainers would require before this moves from
+7. Whether the secondary serving surface should remain DR status/control plus
+   checkpoint verification before promotion, or whether a supported read-only
+   data API should be part of the first version.
+8. Whether the large-cluster lifecycle should continue toward a fully
+   first-class pre-seed and resnapshot API surface. The prototype now includes
+   checkpoint-bound manifest generation, inline bundle export/import, disabled
+   secondary acceptance, replicated-storage replacement with local-only
+   preservation, and baseline application on secondary enable. The remaining
+   design question is the production artifact shape: segmented transfer,
+   resumability, provenance, and optimizer seeding.
+9. Whether the proposed resource model is acceptable: finite journal
+   retention, bounded checkpoint build/digest/fetch work on the primary, and a
+   checkpoint-scoped reconcile budget ledger on the secondary.
+10. What validation evidence maintainers would require before this moves from
    RFC/design review toward production implementation.
 
 ## Problem statement
@@ -108,11 +119,12 @@ a reusable plaintext copy of root-key material.
 In normal operation, clients write to the primary. The secondary is read-only
 for replicated state and applies ordered ciphertext storage changes from the
 primary. The secondary exposes status for state, lag, last applied index,
-stream/reconnect/reconcile activity, and safety counters.
+stream/reconnect/reconcile activity, safety counters, and checkpoint
+verification.
 
-Whether secondaries expose a general read-only replicated data API before
-promotion is a production semantics question. This RFC currently treats DR
-convergence and secondary API read-serving as separate validation surfaces.
+General read-only replicated data APIs on secondaries are deferred. This RFC
+treats DR convergence and secondary API read-serving as separate validation
+surfaces and keeps strict warm-standby semantics as the first production shape.
 
 If the stream disconnects and the primary can prove replay coverage from the
 secondary's last applied index, the secondary resumes streaming. If replay
@@ -207,7 +219,7 @@ flowchart LR
     end
 
     subgraph Secondary["Secondary OpenBao cluster"]
-        SAPI["Read-only replicated API surface"]
+        SAPI["DR status/control<br/>checkpoint verification"]
         SCore["Secondary core"]
         SStorage["Secondary storage<br/>ciphertext domain"]
         SApply["Stream apply"]
@@ -269,7 +281,10 @@ The normal path is ordered physical mutation streaming. The secondary only
 advances `lastAppliedIndex` after durable apply. The primary maintains an
 in-memory stream buffer and a disk-backed stream journal; if either proves
 coverage from the secondary cursor, reconnect can resume without
-reconciliation.
+reconciliation. Journal retention is intentionally finite: if a secondary is
+offline beyond the retained horizon, replay fails closed and the secondary
+must converge through checkpoint reconciliation, resnapshot, or an explicit
+operator pre-seed workflow.
 
 Secondary stream apply uses transactional batching and may adapt its local
 flush cadence under backlog or commit pressure. The adaptive wait window is
@@ -299,6 +314,29 @@ mismatched bucket. Its metadata tracks key-set changes and may lag the value
 accumulator after value-only batches. These are accelerators, not authority.
 If they are absent, stale, relationship-mismatched, cluster-mismatched, or fail
 bucket proof validation, reconciliation falls back to a full local scan.
+
+For large existing clusters, initial catch-up should not require every fresh
+secondary to fetch the entire dataset through ordinary reconciliation. The
+preferred lifecycle is a DR-aware pre-seed: create the relationship, cut a
+checkpoint-bound seed bundle for that relationship, restore it into a disabled
+secondary, validate the seed manifest and local-only scrub, then replay or
+reconcile only the post-seed delta. Resnapshot remains the online fallback when
+bounded reconciliation cannot converge or the operator wants a fresh base copy.
+Neither path changes the authority boundary: promotion still requires
+relationship binding, stale-lineage fencing, local-only exclusion, and
+checkpoint proof.
+
+The current prototype has the control-plane and inline artifact lifecycle for
+this boundary: the primary can generate a checkpoint-bound pre-seed manifest
+for a specific relationship and bundle hash; the primary can export an inline
+JSON bundle from checkpoint artifacts; the disabled secondary can validate and
+import that bundle only with explicit confirmation that replacing replicated
+storage is intended; and secondary enable consumes the accepted baseline only
+with the same activation token before starting normal stream/reconcile
+catch-up. Config restore also consumes a still-pending accepted manifest before
+starting the secondary controller, closing the mid-enable crash window. The
+inline bundle is a PoC artifact format; production still needs segmented or
+streaming transfer, resumability, provenance, and optional optimizer seeding.
 
 ### Runtime refresh
 
@@ -378,6 +416,18 @@ opinion. Any external legal review must happen separately.
 
 Full snapshot on every disconnect is simple but too expensive and unnecessary
 for small stream gaps.
+
+Operator pre-seeding is different from automatic snapshot-on-disconnect and
+should remain in scope as a lifecycle optimization for very large or old
+clusters. A pre-seeded secondary can start from an externally restored,
+primary-authorized base copy and then use normal DR relationship binding,
+checkpoint verification, and stream/reconcile catch-up for the remaining
+delta. The seed should be generated after relationship creation so the seed
+manifest can bind checkpoint identity, relationship ID, primary identity,
+range/checksum versions, local-only scrub version, and optional optimizer
+metadata to the activation material. Pre-seeding must not bypass
+proof-before-delete, local-only path exclusion, stale-lineage fencing, or
+promotion checks.
 
 Backend WAL shipping as the authoritative protocol is efficient where a
 storage backend exposes a stable WAL contract, but it couples DR to backend
@@ -462,14 +512,18 @@ profiles.
 1. Should planned switchover be part of the first version, or should the first
    version only support disaster promotion?
 2. What exact secondary serving surface should the first version expose before
-   promotion: DR status/control only, or a supported read-only data API with
-   defined cache and transaction semantics? This RFC currently recommends
-   strict warm-standby semantics until read-serving is validated.
+   promotion: DR status/control plus checkpoint verification only, or a
+   supported read-only data API with defined cache and transaction semantics?
+   This RFC currently recommends strict warm-standby semantics until
+   read-serving is validated.
 3. What rolling-upgrade and protocol-version compatibility guarantees must the
    first production version support?
 4. How should DR transport CA rotation work without requiring full
    relationship replacement?
-5. What final UI/API wording should be used for planned authority transfer,
+5. What should the production bulk pre-seed artifact format be? The prototype
+   exposes inline JSON export/import for lifecycle validation, but not a
+   segmented, resumable, signed artifact provenance model.
+6. What final UI/API wording should be used for planned authority transfer,
    disaster promotion, forced-promotion reasons, and data-loss estimate basis?
 
 ## Productionization and validation follow-ups
@@ -480,11 +534,21 @@ direction blockers for this RFC:
 - choose production defaults for checkpoint retention, journal retention,
   backpressure, split depth, fetch batch sizing, adaptive stream batching, and
   resource budgets
+- model worst-case primary checkpoint/digest/fetch CPU and I/O under highly
+  fragmented secondary reconnects
+- add an explicit secondary reconcile budget ledger for bytes, entries, RPCs,
+  retries, and wall time
+- finish the operator pre-seed and resnapshot lifecycle for very large clusters
+  where initial full reconciliation would be operationally expensive; the
+  current prototype has inline export/import and secondary-enable baseline
+  application, but still needs segmented production artifacts, optimizer
+  seeding, and an end-to-end delta catch-up smoke
 - define availability targets for HA active handoff under sustained DR backlog
   pressure
 - validate WAN latency, packet loss, proxy, and load-balancer behavior
-- define and validate secondary pre-promotion read-serving semantics, or add a
-  storage/checkpoint verification path for strict warm-standby deployments
+- decide whether secondary pre-promotion read-serving belongs in the first
+  version; the strict warm-standby path verifies terminal correctness through
+  checkpoint proofs instead of data reads
 - add dependency-backed engine profiles for auth/secret engines that require
   external services
 - add a deterministic audit-device topology profile for audit-table validation

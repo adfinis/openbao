@@ -33,7 +33,7 @@ Each `dr-stress` workload run is expected to emit:
 | `writes.ndjson` | Truth ledger for terminal key/value verification. |
 | `status_timeline.ndjson` | Periodic DR status snapshots for lag, buffer, reconciliation, and throughput analysis. |
 | `progress.log` | Human-readable workload progress stream. |
-| `verify-*.json` | Independent verification output for primary and secondary clusters. |
+| `verify-*.json` | Independent verification output. Primary/promoted clusters use API reads; strict secondaries use checkpoint verification. |
 
 Orchestrated smokes add scenario-specific files such as
 `orchestrator.log`, `before-*-status.json`, `after-*-status.json`,
@@ -47,7 +47,7 @@ Orchestrated smokes add scenario-specific files such as
 | HA mixed load with primary handoff | `drmixed-20260531T214747Z` | Pass with expected client transients | 900s, 48 workers, primary stepdown every 300s, 88,023 operations, zero status failures, zero dropped events, 1s/1s sentinel convergence, exhaustive verification passed on all three clusters across 7,744 truth-log keys. PUT/GET failures were client-facing HA disruption noise. |
 | HA mixed load after key-only KID index | `drmixed-20260531T231905Z` | Pass with expected client transients | 900s, 48 workers, primary stepdown every 300s, 133,318 operations, zero status failures, zero dropped events, 1s/1s sentinel convergence, exhaustive verification passed on all three clusters across 10,430 truth-log keys. Indexed repair loaded 558/298 ranges with zero fallback scans or proof mismatches. |
 | HA mixed load after adaptive stream batching | `drmixed-20260531T235152Z` | Pass with expected client transients and one optimizer fallback | 900s, 48 workers, primary stepdown every 300s, 126,106 operations, zero status failures, zero dropped events, 1s/1s sentinel convergence, exhaustive verification passed on all three clusters across 10,184 truth-log keys. Stream transaction count dropped by roughly 55%, but secondary #1 hit one `bucket_mismatch` local KID-index fallback scan during reconciliation. This is now regression context rather than the current optimizer result. |
-| HA mixed load after adaptive batching and standby key-transition deferral | `drmixed-20260601T114049Z` | Pass for HA convergence and optimizer behavior; secondary API verification blocked | 900s, 48 workers, primary stepdown every 300s, 111,169 operations, zero status failures, zero dropped events, 1s/1s sentinel convergence, both secondaries ended streaming with lag 0, both reconciled through indexed repair over 1,024 ranges, zero local KID fallback scans, zero indexed proof mismatches, and standby keyring-missing transitions deferred without sealed/fatal logs. Primary API verification passed across 9,192 truth-log keys. Secondary API verification returned `transaction is read-only` for all sampled keys and is tracked as a serving-semantics gap, not a data mismatch. |
+| HA mixed load after adaptive batching and standby key-transition deferral | `drmixed-20260601T114049Z` | Pass for HA convergence and optimizer behavior; secondary API verification blocked | 900s, 48 workers, primary stepdown every 300s, 111,169 operations, zero status failures, zero dropped events, 1s/1s sentinel convergence, both secondaries ended streaming with lag 0, both reconciled through indexed repair over 1,024 ranges, zero local KID fallback scans, zero indexed proof mismatches, and standby keyring-missing transitions deferred without sealed/fatal logs. Primary API verification passed across 9,192 truth-log keys. Secondary API verification returned `transaction is read-only` for all sampled keys, which is expected under strict warm-standby semantics and should be replaced by checkpoint verification in new runs. |
 | Indexed repair beyond journal horizon | `indexed-repair-20260531T224314Z` | Pass with expected client transients | Forced secondary #1 outage beyond journal horizon. Primary `journal_range_too_old_total=2`; secondary #1 reached indexed repair total 2, 1,825 indexed ranges, 1,773 bucket loads, and 9,867 loaded KID-index entries with zero fallback scans, proof mismatches, full-bucket fallback, scan failures, or load failures. Exhaustive verification passed on all three clusters across 3,261 truth-log keys. |
 | Secondary outage within journal horizon | `secondary-outage-20260531T211438Z` | Pass with expected client transients | 120s, 32 workers, secondary #1 stopped for 40s and recovered via journal replay. No reconciliation, no fallback scan, no journal-too-old increment, zero PUT/status failures, zero dropped events, and exhaustive verification passed on all three clusters across 2,143 truth-log keys. |
 | Accumulator cold restart | `accumulator-cold-restart-20260531T205052Z` | Pass | Full secondary #1 restart restored `flat_accumulator_cursor_index=56113` and `flat_accumulator_snapshot_index=56113`, kept `reconcile_count=0`, and observed no scan/fallback/proof-mismatch counters. |
@@ -80,10 +80,9 @@ The curated set supports these current claims:
   primary and promoted-primary lineages fenced.
 - The broad engine/runtime matrix has passed across failover and reseed for the
   current local feature set.
-- Secondary API read-serving semantics are not yet validated. The latest
-  exhaustive secondary API verification attempt failed with `transaction is
-  read-only`; status convergence, sentinel convergence, and optimizer counters
-  must not be cited as terminal secondary API correctness.
+- Secondary API read-serving semantics are intentionally outside the strict
+  warm-standby surface. Terminal secondary correctness should be cited through
+  checkpoint verification, or through API verification after promotion.
 
 ## Secondary Transaction-Pressure Baseline
 
@@ -170,15 +169,31 @@ behavior without explaining their age and purpose.
 
 ## Next Evidence Targets
 
-- Define and fix secondary read-serving semantics, or explicitly document that
-  secondaries are DR-control/status-only before promotion. Re-run terminal
-  secondary verification through the chosen path.
-- Add a storage-level or checkpoint-artifact verification path if the first
-  production scope keeps strict warm-standby semantics and does not expose a
-  general secondary data-read API.
+- Re-run the HA smoke and indexed-repair smoke with strict-secondary checkpoint
+  verification artifacts, so the curated evidence no longer depends on
+  secondary data reads.
+- Keep secondary read-serving as an explicit future product decision rather
+  than an implicit correctness requirement for strict warm standbys.
 - Re-run the indexed-repair smoke after the latest standby key-transition and
   adaptive batching fixes to compare fallback scans, proof mismatches, and
   exhaustive verification.
+- Add a pre-seed/resnapshot lifecycle validation target before making
+  scalability claims for old or very large primary clusters. Journal retention
+  is finite, so secondaries offline beyond the replay horizon must converge
+  through bounded reconciliation, resnapshot, or operator pre-seeding. The
+  prototype now has primary manifest generation, inline bundle export,
+  disabled-secondary bundle import or manifest acceptance,
+  activation-token-bound baseline application during secondary enable and
+  config restore, and
+  unit coverage for stale lineage, relationship mismatch, algorithm mismatch,
+  expired material, local-only scrub metadata, bundle integrity, local-only
+  path rejection, replicated-storage replacement, and checkpoint-artifact
+  export. The remaining gap is an end-to-end local topology smoke proving
+  post-seed delta catch-up and terminal checkpoint verification.
+- Add explicit reconcile-budget and primary checkpoint-pressure validation
+  targets. The current stress results show promising convergence behavior, but
+  they are not yet a worst-case model for fragmented reconnects or maliciously
+  expensive checkpoint drill-down.
 - Add a current dynamic tuning validation run once tuning defaults stabilize.
 - Add a current 1-hour no-stepdown stream-apply baseline with the latest code.
 - Add dependency-backed engine profiles when their services are available in the

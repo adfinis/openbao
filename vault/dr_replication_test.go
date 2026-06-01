@@ -215,6 +215,46 @@ func TestDRRelationshipManager_EnableSecondary_SaveConfigFailureRollsBackState(t
 	}
 }
 
+func TestDRRelationshipManager_EnableSecondaryStoresLocalControlTokenHash(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	mgr := newDRRelationshipManager(core, core.logger)
+
+	token := &DRActivationToken{
+		ClusterID:      "cluster-local-control",
+		RelationshipID: "rel-local-control",
+		PrimaryAddr:    "127.0.0.1:8201",
+		PrimaryAddrs:   []string{"127.0.0.1:8201"},
+		ReplSalt:       make([]byte, drReplSaltLen),
+	}
+	if _, err := rand.Read(token.ReplSalt); err != nil {
+		t.Fatal(err)
+	}
+
+	const localControlToken = "secondary-local-control-token"
+	if err := mgr.EnableSecondary(ctx, token, localControlToken); err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.DisableSecondary(ctx)
+
+	cfg := mgr.Config()
+	if cfg.SecondaryLocalControlTokenHash == "" {
+		t.Fatal("expected secondary local control token hash to be stored")
+	}
+	if cfg.SecondaryLocalControlTokenHash == localControlToken {
+		t.Fatal("stored local control token hash contains raw token")
+	}
+	if !secondaryLocalControlTokenMatches(cfg, localControlToken) {
+		t.Fatal("expected local control token to authenticate")
+	}
+	if secondaryLocalControlTokenMatches(cfg, "wrong-token") {
+		t.Fatal("unexpected match for wrong local control token")
+	}
+	if secondaryLocalControlTokenMatches(cfg, "") {
+		t.Fatal("unexpected match for empty local control token")
+	}
+}
+
 func TestDRRelationshipManager_EnableSecondaryClearsStaleCheckpointCursor(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	ctx := context.Background()
@@ -5295,6 +5335,129 @@ func TestDRSecondaryQuiescentReconnectUsesFlatAccumulatorFastPath(t *testing.T) 
 	}
 	if status.ScanFailuresTotal != 0 {
 		t.Fatalf("expected no scan failures, got %d", status.ScanFailuresTotal)
+	}
+}
+
+func TestDRSecondaryVerifyCheckpointMatchesAccumulator(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := bytes.Repeat([]byte{0x25}, 32)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-verify-checkpoint", core.logger)
+	secondary.setState(DRSecondaryStreaming)
+
+	kidA := secondary.scanner.ComputeKID("secret/a")
+	vidA := secondary.scanner.ComputeVIDWithSealWrap([]byte("a"), false)
+	kidB := secondary.scanner.ComputeKID("secret/b")
+	vidB := secondary.scanner.ComputeVIDWithSealWrap([]byte("b"), false)
+	localSet := &reconciler.ReconciliationSet{
+		KIDToVID: map[[32]byte][32]byte{
+			kidA: vidA,
+			kidB: vidB,
+		},
+	}
+	secondary.rangeAccumulator.resetFromSet(localSet, 42)
+	_, localBuckets, ok := secondary.rangeAccumulator.snapshot()
+	if !ok {
+		t.Fatal("expected warm accumulator snapshot")
+	}
+
+	secondary.client = &drTestClient{
+		requestCheckpointFn: func(_ context.Context, req *CheckpointRequest, _ ...grpc.CallOption) (*CheckpointResponse, error) {
+			if req.GetRelationshipId() != secondary.relationshipID {
+				t.Fatalf("unexpected relationship id %q", req.GetRelationshipId())
+			}
+			return &CheckpointResponse{CheckpointId: "cp-verify-checkpoint", CommitIndex: 42}, nil
+		},
+		exchangeRangeChecksumsFn: func(_ context.Context, req *RangeChecksumRequest, _ ...grpc.CallOption) (*RangeChecksumResponse, error) {
+			if req.GetRelationshipId() != secondary.relationshipID {
+				t.Fatalf("unexpected relationship id %q", req.GetRelationshipId())
+			}
+			if req.GetCheckpointId() != "cp-verify-checkpoint" || req.GetCheckpointIndex() != 42 {
+				t.Fatalf("unexpected checkpoint tuple %q/%d", req.GetCheckpointId(), req.GetCheckpointIndex())
+			}
+			resp := &RangeChecksumResponse{Checksums: make([]*RangeChecksum, 0, len(req.GetRangeIds()))}
+			for _, rangeID := range req.GetRangeIds() {
+				bucket := localBuckets[rangeID]
+				resp.Checksums = append(resp.Checksums, &RangeChecksum{
+					RangeId:  rangeID,
+					Checksum: bucket.checksum,
+					Count:    bucket.count,
+				})
+			}
+			return resp, nil
+		},
+	}
+
+	result, err := secondary.VerifyCheckpoint(context.Background())
+	if err != nil {
+		t.Fatalf("VerifyCheckpoint returned error: %v", err)
+	}
+	if !result.Pass || result.Reason != "ok" {
+		t.Fatalf("expected passing verification, got %#v", result)
+	}
+	if result.CheckpointID != "cp-verify-checkpoint" || result.CheckpointIndex != 42 || result.AccumulatorIndex != 42 {
+		t.Fatalf("unexpected checkpoint result tuple: %#v", result)
+	}
+	if result.MatchedRanges != drRangeMaxTotalRanges || result.MismatchedRanges != 0 || result.MissingRanges != 0 {
+		t.Fatalf("unexpected range counts: %#v", result)
+	}
+}
+
+func TestDRSecondaryVerifyCheckpointDetectsMismatch(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := bytes.Repeat([]byte{0x26}, 32)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-verify-checkpoint-mismatch", core.logger)
+	secondary.setState(DRSecondaryStreaming)
+
+	kid := secondary.scanner.ComputeKID("secret/mismatch")
+	vid := secondary.scanner.ComputeVIDWithSealWrap([]byte("local"), false)
+	mismatchRange := reconciler.RangeIDFromKID(kid)
+	localSet := &reconciler.ReconciliationSet{
+		KIDToVID: map[[32]byte][32]byte{kid: vid},
+	}
+	secondary.rangeAccumulator.resetFromSet(localSet, 43)
+	_, localBuckets, ok := secondary.rangeAccumulator.snapshot()
+	if !ok {
+		t.Fatal("expected warm accumulator snapshot")
+	}
+
+	secondary.client = &drTestClient{
+		requestCheckpointFn: func(_ context.Context, req *CheckpointRequest, _ ...grpc.CallOption) (*CheckpointResponse, error) {
+			return &CheckpointResponse{CheckpointId: "cp-verify-checkpoint-mismatch", CommitIndex: 43}, nil
+		},
+		exchangeRangeChecksumsFn: func(_ context.Context, req *RangeChecksumRequest, _ ...grpc.CallOption) (*RangeChecksumResponse, error) {
+			resp := &RangeChecksumResponse{Checksums: make([]*RangeChecksum, 0, len(req.GetRangeIds()))}
+			for _, rangeID := range req.GetRangeIds() {
+				bucket := localBuckets[rangeID]
+				checksum := bucket.checksum
+				if rangeID == mismatchRange {
+					checksum ^= 1
+				}
+				resp.Checksums = append(resp.Checksums, &RangeChecksum{
+					RangeId:  rangeID,
+					Checksum: checksum,
+					Count:    bucket.count,
+				})
+			}
+			return resp, nil
+		},
+	}
+
+	result, err := secondary.VerifyCheckpoint(context.Background())
+	if err != nil {
+		t.Fatalf("VerifyCheckpoint returned error: %v", err)
+	}
+	if result.Pass {
+		t.Fatalf("expected failing verification, got %#v", result)
+	}
+	if result.Reason != "range_checksum_mismatch" {
+		t.Fatalf("expected range_checksum_mismatch, got %q", result.Reason)
+	}
+	if result.MismatchedRanges != 1 || len(result.Mismatches) != 1 {
+		t.Fatalf("expected one mismatch, got %#v", result)
+	}
+	mismatch := result.Mismatches[0]
+	if mismatch.RangeID != mismatchRange || !mismatch.ChecksumMismatch || mismatch.CountMismatch || mismatch.MissingRemote {
+		t.Fatalf("unexpected mismatch details: %#v", mismatch)
 	}
 }
 

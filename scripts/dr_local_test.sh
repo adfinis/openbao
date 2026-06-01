@@ -29,7 +29,8 @@ Usage:
   scripts/dr_local_test.sh [--topology single|ha] reset [--build]
   scripts/dr_local_test.sh [--topology single|ha] status
   scripts/dr_local_test.sh [--topology single|ha] smoke [dr-stress flags...]
-  scripts/dr_local_test.sh [--topology single|ha] verify [RUN_DIR] [--sample N]
+  scripts/dr_local_test.sh [--topology single|ha] verify [RUN_DIR] [--sample N] [--secondary-method api|checkpoint]
+  scripts/dr_local_test.sh [--topology single|ha] preseed-smoke [--no-reset] [--build]
   scripts/dr_local_test.sh [--topology single|ha] engine-matrix
   scripts/dr_local_test.sh --topology ha engine-lifecycle-matrix
   scripts/dr_local_test.sh [--topology single|ha] failover-smoke
@@ -64,6 +65,7 @@ HA topology:
   scripts/dr_local_test.sh --topology ha smoke --duration 900 --concurrency 48 --stepdown-interval 300
   scripts/dr_local_test.sh --topology ha quiescent-reconnect-smoke
   scripts/dr_local_test.sh --topology ha accumulator-cold-restart-smoke
+  scripts/dr_local_test.sh preseed-smoke
   scripts/dr_local_test.sh --topology ha secondary-outage-smoke
   scripts/dr_local_test.sh --topology ha secondary-outage-reconcile-smoke
   scripts/dr_local_test.sh --topology ha indexed-repair-smoke
@@ -914,16 +916,26 @@ latest_run_dir() {
 verify_one() {
   local label="$1"
   local addr="$2"
-  local run_dir="$3"
-  local sample="$4"
+  local token="$3"
+  local run_dir="$4"
+  local sample="$5"
+  local method="${6:-}"
   local out="${run_dir}/verify-${label}.json"
 
-  echo "Verifying ${label}..."
+  if [[ -z "$method" ]]; then
+    case "$label" in
+      secondary*) method="checkpoint" ;;
+      *) method="api" ;;
+    esac
+  fi
+
+  echo "Verifying ${label} with ${method} method..."
   "$DR_STRESS_BIN" verify \
     -addr "$addr" \
-    -token "$DR_PRIMARY_TOKEN" \
+    -token "$token" \
     -run-dir "$run_dir" \
     -sample "$sample" \
+    -method "$method" \
     -json >"$out"
   jq '.summary // .' "$out"
 }
@@ -933,11 +945,16 @@ cmd_verify() {
   ensure_dr_stress
   local run_dir=""
   local sample=0
+  local secondary_method="checkpoint"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --sample)
         sample="${2:?missing value for --sample}"
+        shift 2
+        ;;
+      --secondary-method)
+        secondary_method="${2:?missing value for --secondary-method}"
         shift 2
         ;;
       -*)
@@ -958,9 +975,149 @@ cmd_verify() {
   fi
   [[ -n "$run_dir" && -d "$run_dir" ]] || die "no run directory found"
 
-  verify_one "primary" "$DR_PRIMARY_ADDR" "$run_dir" "$sample"
-  verify_one "secondary1" "$DR_SECONDARY1_ADDR" "$run_dir" "$sample"
-  verify_one "secondary2" "$DR_SECONDARY2_ADDR" "$run_dir" "$sample"
+  case "$secondary_method" in
+    api|checkpoint) ;;
+    *) die "--secondary-method must be api or checkpoint" ;;
+  esac
+
+  local primary_addr="$DR_PRIMARY_ADDR"
+  local secondary1_addr="$DR_SECONDARY1_ADDR"
+  local secondary2_addr="$DR_SECONDARY2_ADDR"
+  if [[ "$TOPOLOGY" == "ha" ]]; then
+    primary_addr="$(join_csv "${PRIMARY_NODE_ADDRS[@]}")"
+    secondary1_addr="$(join_csv "${SECONDARY1_NODE_ADDRS[@]}")"
+    secondary2_addr="$(join_csv "${SECONDARY2_NODE_ADDRS[@]}")"
+  fi
+
+  verify_one "primary" "$primary_addr" "$DR_PRIMARY_TOKEN" "$run_dir" "$sample" "api"
+  verify_one "secondary1" "$secondary1_addr" "$DR_SECONDARY1_TOKEN" "$run_dir" "$sample" "$secondary_method"
+  verify_one "secondary2" "$secondary2_addr" "$DR_SECONDARY2_TOKEN" "$run_dir" "$sample" "$secondary_method"
+}
+
+cmd_preseed_smoke() {
+  need_bin jq
+  local do_reset=true
+  local build=false
+  local timeout=300
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-reset)
+        do_reset=false
+        shift
+        ;;
+      --build)
+        build=true
+        shift
+        ;;
+      --timeout)
+        timeout="${2:?missing value for --timeout}"
+        shift 2
+        ;;
+      *)
+        die "unknown preseed-smoke option: $1"
+        ;;
+    esac
+  done
+
+  if [[ "$do_reset" == "true" ]]; then
+    if [[ "$build" == "true" ]]; then
+      cmd_reset --build
+    else
+      cmd_reset
+    fi
+  fi
+  load_env
+
+  local primary_addr="$DR_PRIMARY_ADDR"
+  local secondary2_addr="$DR_SECONDARY2_ADDR"
+  if [[ "$TOPOLOGY" == "ha" ]]; then
+    primary_addr="$(wait_cluster_active_addr "primary" 120 "${PRIMARY_NODE_ADDRS[@]}")"
+    secondary2_addr="$(wait_cluster_active_addr "secondary2" 120 "${SECONDARY2_NODE_ADDRS[@]}")"
+  fi
+
+  local run_id run_dir token relationship_id export_json bundle_file import_json verify_json status_json_file
+  local base_key delta_key
+  run_id="preseed-smoke-$(date -u +%Y%m%dT%H%M%SZ)"
+  run_dir="${RESULTS_DIR}/${run_id}"
+  bundle_file="${run_dir}/bundle.json"
+  export_json="${run_dir}/export.json"
+  import_json="${run_dir}/import.json"
+  verify_json="${run_dir}/verify-secondary2.json"
+  status_json_file="${run_dir}/secondary2-status.json"
+  base_key="${run_id}/base"
+  delta_key="${run_id}/delta-after-export"
+  mkdir -p "$run_dir"
+
+  {
+    echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "topology=${TOPOLOGY}"
+    echo "primary_addr=${primary_addr}"
+    echo "secondary2_addr=${secondary2_addr}"
+  } >"${run_dir}/orchestrator.log"
+
+  echo "Preparing primary baseline for ${run_id}..."
+  ensure_kv_mount_on "$primary_addr" "$DR_PRIMARY_TOKEN"
+  kv_put "$primary_addr" "$DR_PRIMARY_TOKEN" "$base_key" "base-before-preseed-export" "$run_id"
+  wait_secondary_ready "secondary2-original-lineage" "$secondary2_addr" 180
+
+  echo "Issuing fresh pre-seed activation token..."
+  token="$(bao_for "$primary_addr" "$DR_PRIMARY_TOKEN" write -f -format=json sys/replication/dr/primary/secondary-token | jq -r '.data.token')"
+  relationship_id="$(jq -r '.relationship_id' <<<"$token")"
+  [[ -n "$relationship_id" && "$relationship_id" != "null" ]] || die "activation token did not include relationship_id"
+
+  echo "Exporting pre-seed bundle for relationship ${relationship_id}..."
+  bao_for "$primary_addr" "$DR_PRIMARY_TOKEN" write -format=json \
+    sys/replication/dr/primary/preseed/export \
+    relationship_id="$relationship_id" \
+    ttl_seconds=3600 >"$export_json"
+  jq -r '.data.bundle' "$export_json" >"$bundle_file"
+  jq -e '.version == 1 and (.entries | length) > 0' "$bundle_file" >/dev/null || die "pre-seed bundle is empty or malformed"
+
+  echo "Writing post-export delta on primary..."
+  kv_put "$primary_addr" "$DR_PRIMARY_TOKEN" "$delta_key" "delta-after-preseed-export" "$run_id"
+
+  echo "Disabling secondary2 from its existing relationship..."
+  call_idempotent "not in DR secondary mode" \
+    bao_for "$secondary2_addr" "$DR_PRIMARY_TOKEN" write -f sys/replication/dr/secondary/disable
+
+  echo "Importing pre-seed bundle into disabled secondary2..."
+  bao_for "$secondary2_addr" "$DR_PRIMARY_TOKEN" write -format=json \
+    sys/replication/dr/secondary/preseed/import \
+    token="$token" \
+    bundle="$(<"$bundle_file")" \
+    confirm_replace_replicated_storage=true >"$import_json"
+
+  echo "Enabling secondary2 from imported pre-seed baseline..."
+  bao_for "$secondary2_addr" "$DR_PRIMARY_TOKEN" write sys/replication/dr/secondary/enable token="$token"
+  wait_secondary_ready "secondary2-preseed-lineage" "$secondary2_addr" "$timeout"
+
+  echo "Verifying secondary2 checkpoint convergence..."
+  bao_for "$secondary2_addr" "$DR_PRIMARY_TOKEN" read -format=json sys/replication/dr/secondary/verify-checkpoint >"$verify_json"
+  jq -e '.data.pass == true and .data.mismatched_ranges == 0 and .data.missing_ranges == 0' "$verify_json" >/dev/null || {
+    jq '.data // .' "$verify_json" >&2
+    die "pre-seed checkpoint verification failed"
+  }
+
+  bao_for "$secondary2_addr" "$DR_PRIMARY_TOKEN" read -format=json sys/replication/dr/status >"$status_json_file"
+  jq -e '.data.secondary_state == "streaming" and .data.lag_entries == 0' "$status_json_file" >/dev/null || {
+    jq '.data // .' "$status_json_file" >&2
+    die "pre-seed secondary did not finish streaming with lag 0"
+  }
+
+  assert_kv_present "primary" "$primary_addr" "$DR_PRIMARY_TOKEN" "$base_key"
+  assert_kv_present "primary" "$primary_addr" "$DR_PRIMARY_TOKEN" "$delta_key"
+
+  {
+    echo "relationship_id=${relationship_id}"
+    echo "entry_count=$(jq -r '.data.entry_count' "$export_json")"
+    echo "checkpoint_index=$(jq -r '.data.checkpoint_index' "$export_json")"
+    echo "verified_checkpoint_index=$(jq -r '.data.checkpoint_index' "$verify_json")"
+    echo "completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } | tee -a "${run_dir}/orchestrator.log"
+
+  echo "Pre-seed smoke passed."
+  echo "Run dir: ${run_dir}"
 }
 
 verify_engine_matrix_target() {
@@ -2592,9 +2749,9 @@ cmd_secondary_outage_smoke() {
     die "secondary1 restart logs show scanned reconciliation during within-horizon outage"
   fi
 
-  verify_one "primary" "$primary_active" "$run_dir" 0
-  verify_one "secondary1" "$secondary1_active" "$run_dir" 0
-  verify_one "secondary2" "$DR_SECONDARY2_ADDR" "$run_dir" 0
+  verify_one "primary" "$primary_active" "$DR_PRIMARY_TOKEN" "$run_dir" 0
+  verify_one "secondary1" "$secondary1_active" "$DR_SECONDARY1_TOKEN" "$run_dir" 0
+  verify_one "secondary2" "$DR_SECONDARY2_ADDR" "$DR_SECONDARY2_TOKEN" "$run_dir" 0
 
   echo "completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$run_dir/orchestrator.log"
   if [[ "$expect_reconcile" == "true" ]]; then
@@ -2786,9 +2943,9 @@ cmd_tuning_load_smoke() {
   wait_secondary_ready "secondary2 final" "$DR_SECONDARY2_ADDR" 300
   capture_tuning_load_state "$run_dir" "final"
 
-  verify_one "primary" "$DR_PRIMARY_ADDR" "$run_dir" 0
-  verify_one "secondary1" "$DR_SECONDARY1_ADDR" "$run_dir" 0
-  verify_one "secondary2" "$DR_SECONDARY2_ADDR" "$run_dir" 0
+  verify_one "primary" "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" "$run_dir" 0
+  verify_one "secondary1" "$DR_SECONDARY1_ADDR" "$DR_SECONDARY1_TOKEN" "$run_dir" 0
+  verify_one "secondary2" "$DR_SECONDARY2_ADDR" "$DR_SECONDARY2_TOKEN" "$run_dir" 0
 
   echo "completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$run_dir/orchestrator.log"
   echo "Dynamic tuning HA load smoke passed."
@@ -3050,6 +3207,7 @@ main() {
     status) cmd_status "$@" ;;
     smoke) cmd_smoke "$@" ;;
     verify) cmd_verify "$@" ;;
+    preseed-smoke) cmd_preseed_smoke "$@" ;;
     engine-matrix) cmd_engine_matrix "$@" ;;
     engine-lifecycle-matrix) cmd_engine_lifecycle_matrix "$@" ;;
     failover-smoke) cmd_failover_smoke "$@" ;;

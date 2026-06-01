@@ -14,6 +14,15 @@ import (
 	"time"
 )
 
+type mismatchDetail struct {
+	Key         string   `json:"key"`
+	ExpectedSeq uint64   `json:"expected_seq,omitempty"`
+	AllowedSeqs []uint64 `json:"allowed_seqs,omitempty"`
+	ActualSeq   string   `json:"actual_seq,omitempty"`
+	ActualRunID string   `json:"actual_run_id,omitempty"`
+	Reason      string   `json:"reason"`
+}
+
 func verifyMode(args []string) {
 	fs := flag.NewFlagSet("verify", flag.ExitOnError)
 
@@ -25,6 +34,7 @@ func verifyMode(args []string) {
 	kvMount := fs.String("kv-mount", "kv", "KV v2 mount path")
 	runDir := fs.String("run-dir", "", "Path to a run directory (containing writes.ndjson)")
 	sampleCount := fs.Int("sample", 100, "Number of keys to sample for verification")
+	method := fs.String("method", "api", "Verification method: api or checkpoint")
 	jsonOut := fs.Bool("json", false, "Output results as JSON")
 	httpTimeout := fs.Int("http-timeout", 30, "HTTP timeout in seconds")
 
@@ -81,20 +91,68 @@ func verifyMode(args []string) {
 
 	log.Printf("loaded %d unique keys from truth log", len(truthMap))
 
+	verifyMethod := strings.ToLower(strings.TrimSpace(*method))
+	if verifyMethod == "" {
+		verifyMethod = "api"
+	}
+	if verifyMethod != "api" && verifyMethod != "checkpoint" {
+		log.Fatalf("unsupported verification method %q", *method)
+	}
+	if verifyMethod == "checkpoint" {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*httpTimeout)*time.Second+5*time.Second)
+		resp, code, err := client.DRVerifyCheckpoint(ctx)
+		cancel()
+		if err != nil {
+			result := map[string]interface{}{
+				"method":              "checkpoint",
+				"total_keys_in_truth": len(truthMap),
+				"pass":                false,
+				"errors":              1,
+				"details": []map[string]interface{}{{
+					"reason": fmt.Sprintf("checkpoint verification error: %v", err),
+					"code":   code,
+				}},
+			}
+			writeVerifyResult(result, *jsonOut)
+			os.Exit(1)
+		}
+		result := map[string]interface{}{
+			"method":              "checkpoint",
+			"total_keys_in_truth": len(truthMap),
+			"sampled":             0,
+			"matches":             0,
+			"mismatches":          resp.MismatchedRanges,
+			"missing":             resp.MissingRanges,
+			"uncertain_missing":   0,
+			"errors":              0,
+			"pass":                resp.Pass,
+			"checkpoint":          resp,
+		}
+		if !resp.Pass {
+			result["details"] = []map[string]interface{}{{
+				"reason":              resp.Reason,
+				"state":               resp.State,
+				"checkpoint_index":    resp.CheckpointIndex,
+				"accumulator_index":   resp.AccumulatorIndex,
+				"mismatched_ranges":   resp.MismatchedRanges,
+				"missing_ranges":      resp.MissingRanges,
+				"checkpoint_id":       resp.CheckpointID,
+				"verification_method": "checkpoint",
+			}}
+		}
+		writeVerifyResult(result, *jsonOut)
+		if !resp.Pass {
+			os.Exit(1)
+		}
+		return
+	}
+
 	// Sample keys.
 	keys := sampleKeys(truthMap, *sampleCount)
 	log.Printf("verifying %d sampled keys", len(keys))
 
 	// Verify each key.
 	var matches, mismatches, missing, uncertainMissing, errors int
-	type mismatchDetail struct {
-		Key         string   `json:"key"`
-		ExpectedSeq uint64   `json:"expected_seq,omitempty"`
-		AllowedSeqs []uint64 `json:"allowed_seqs,omitempty"`
-		ActualSeq   string   `json:"actual_seq,omitempty"`
-		ActualRunID string   `json:"actual_run_id,omitempty"`
-		Reason      string   `json:"reason"`
-	}
 	var details []mismatchDetail
 	var ambiguousSampled int
 
@@ -206,6 +264,7 @@ func verifyMode(args []string) {
 	}
 
 	result := map[string]interface{}{
+		"method":              "api",
 		"total_keys_in_truth": len(truthMap),
 		"sampled":             len(keys),
 		"matches":             matches,
@@ -220,35 +279,64 @@ func verifyMode(args []string) {
 		result["details"] = details
 	}
 
-	if *jsonOut {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		enc.Encode(result)
-	} else {
-		fmt.Printf("\n=== Verify Results ===\n")
-		fmt.Printf("Truth log keys: %d\n", len(truthMap))
-		fmt.Printf("Sampled:        %d\n", len(keys))
-		fmt.Printf("Matches:        %d\n", matches)
-		fmt.Printf("Mismatches:     %d\n", mismatches)
-		fmt.Printf("Missing:        %d\n", missing)
-		fmt.Printf("Uncertain miss: %d\n", uncertainMissing)
-		fmt.Printf("Errors:         %d\n", errors)
-		fmt.Printf("Ambiguous:      %d\n", ambiguousSampled)
-
-		pass := mismatches == 0 && missing == 0 && errors == 0
-		if pass {
-			fmt.Println("Result:         PASS")
-		} else {
-			fmt.Println("Result:         FAIL")
-			for _, d := range details {
-				fmt.Printf("  %s: %s\n", d.Key, d.Reason)
-			}
-		}
-		fmt.Println()
-	}
+	writeVerifyResult(result, *jsonOut)
 
 	if mismatches > 0 || missing > 0 || errors > 0 {
 		os.Exit(1)
+	}
+}
+
+func writeVerifyResult(result map[string]interface{}, jsonOut bool) {
+	if jsonOut {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		enc.Encode(result)
+		return
+	}
+
+	fmt.Printf("\n=== Verify Results ===\n")
+	if method, ok := result["method"].(string); ok && method != "" {
+		fmt.Printf("Method:         %s\n", method)
+	}
+	fmt.Printf("Truth log keys: %d\n", resultInt(result["total_keys_in_truth"]))
+	fmt.Printf("Sampled:        %d\n", resultInt(result["sampled"]))
+	fmt.Printf("Matches:        %d\n", resultInt(result["matches"]))
+	fmt.Printf("Mismatches:     %d\n", resultInt(result["mismatches"]))
+	fmt.Printf("Missing:        %d\n", resultInt(result["missing"]))
+	fmt.Printf("Uncertain miss: %d\n", resultInt(result["uncertain_missing"]))
+	fmt.Printf("Errors:         %d\n", resultInt(result["errors"]))
+	if ambiguous := resultInt(result["ambiguous_sampled"]); ambiguous > 0 {
+		fmt.Printf("Ambiguous:      %d\n", ambiguous)
+	}
+	if pass, _ := result["pass"].(bool); pass {
+		fmt.Println("Result:         PASS")
+	} else {
+		fmt.Println("Result:         FAIL")
+		if details, ok := result["details"].([]mismatchDetail); ok {
+			for _, d := range details {
+				fmt.Printf("  %s: %s\n", d.Key, d.Reason)
+			}
+		} else if details, ok := result["details"].([]map[string]interface{}); ok {
+			for _, d := range details {
+				fmt.Printf("  %v\n", d)
+			}
+		}
+	}
+	fmt.Println()
+}
+
+func resultInt(v interface{}) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case uint64:
+		return int(n)
+	case float64:
+		return int(n)
+	default:
+		return 0
 	}
 }
 

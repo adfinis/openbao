@@ -441,6 +441,50 @@ func drStatusScore(status *DRStatusResponse) int {
 	return score
 }
 
+type DRCheckpointVerificationResponse struct {
+	Pass             bool                     `json:"pass"`
+	Reason           string                   `json:"reason"`
+	State            string                   `json:"state"`
+	RelationshipID   string                   `json:"relationship_id"`
+	CheckpointID     string                   `json:"checkpoint_id"`
+	CheckpointIndex  int64                    `json:"checkpoint_index"`
+	AccumulatorIndex int64                    `json:"accumulator_index"`
+	RangeCount       int                      `json:"range_count"`
+	MatchedRanges    int                      `json:"matched_ranges"`
+	MismatchedRanges int                      `json:"mismatched_ranges"`
+	MissingRanges    int                      `json:"missing_ranges"`
+	Mismatches       []map[string]interface{} `json:"mismatches,omitempty"`
+}
+
+type drCheckpointVerificationEnvelope struct {
+	Data   json.RawMessage `json:"data"`
+	Errors []string        `json:"errors,omitempty"`
+}
+
+func (c *BaoClient) DRVerifyCheckpoint(ctx context.Context) (*DRCheckpointVerificationResponse, int, error) {
+	code, body, err := c.do(ctx, http.MethodGet, "/v1/sys/replication/dr/secondary/verify-checkpoint", nil)
+	if err != nil {
+		return nil, code, err
+	}
+	if code != http.StatusOK {
+		var envelope drCheckpointVerificationEnvelope
+		if json.Unmarshal(body, &envelope) == nil && len(envelope.Errors) > 0 {
+			return nil, code, fmt.Errorf("DR checkpoint verification returned %d: %s", code, strings.Join(envelope.Errors, "; "))
+		}
+		return nil, code, fmt.Errorf("DR checkpoint verification returned %d", code)
+	}
+
+	var envelope drCheckpointVerificationEnvelope
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return nil, code, fmt.Errorf("decode DR checkpoint verification envelope: %w", err)
+	}
+	var result DRCheckpointVerificationResponse
+	if err := json.Unmarshal(envelope.Data, &result); err != nil {
+		return nil, code, fmt.Errorf("decode DR checkpoint verification data: %w", err)
+	}
+	return &result, code, nil
+}
+
 // StepDown requests a leader stepdown on the node.
 func (c *BaoClient) StepDown(ctx context.Context) (int, error) {
 	code, _, err := c.do(ctx, http.MethodPost, "/v1/sys/step-down", nil)

@@ -76,6 +76,32 @@ func (e *drIndexedBucketRepairProofMismatchError) Unwrap() error {
 	return errDRIndexedBucketRepairProofMismatch
 }
 
+type DRSecondaryCheckpointVerificationMismatch struct {
+	RangeID          uint64
+	LocalCount       uint64
+	RemoteCount      uint64
+	LocalChecksum    uint64
+	RemoteChecksum   uint64
+	MissingRemote    bool
+	ChecksumMismatch bool
+	CountMismatch    bool
+}
+
+type DRSecondaryCheckpointVerificationResult struct {
+	Pass             bool
+	Reason           string
+	State            string
+	RelationshipID   string
+	CheckpointID     string
+	CheckpointIndex  uint64
+	AccumulatorIndex uint64
+	RangeCount       int
+	MatchedRanges    int
+	MismatchedRanges int
+	MissingRanges    int
+	Mismatches       []DRSecondaryCheckpointVerificationMismatch
+}
+
 func atomicMaxUint64(target *atomic.Uint64, value uint64) {
 	for {
 		current := target.Load()
@@ -427,6 +453,11 @@ type drReplicationSecondary struct {
 
 	// relationshipID identifies this DR relationship.
 	relationshipID string
+
+	// clusterID is the primary DR cluster ID for this relationship. It is
+	// copied from the manager config so optimizer persistence does not need to
+	// call back into the relationship manager while manager locks are held.
+	clusterID string
 
 	// replSalt is the shared HMAC key for KID derivation.
 	replSalt []byte
@@ -1173,6 +1204,122 @@ func (s *drReplicationSecondary) localKIDIndexOptimizerStatus() (fallbackReason,
 	s.optimizerStatusMu.RLock()
 	defer s.optimizerStatusMu.RUnlock()
 	return s.lastLocalKIDIndexFallbackScanReason, s.lastLocalKIDIndexInvalidationReason
+}
+
+func (s *drReplicationSecondary) VerifyCheckpoint(ctx context.Context) (*DRSecondaryCheckpointVerificationResult, error) {
+	result := &DRSecondaryCheckpointVerificationResult{
+		State:          s.State().String(),
+		RelationshipID: s.relationshipID,
+		RangeCount:     drRangeMaxTotalRanges,
+	}
+	if s.State() != DRSecondaryStreaming {
+		result.Reason = "secondary_not_streaming"
+		return result, nil
+	}
+	if s.client == nil {
+		result.Reason = "missing_primary_client"
+		return result, nil
+	}
+	if s.rangeAccumulator == nil {
+		result.Reason = "missing_flat_accumulator"
+		return result, nil
+	}
+
+	accumulatorIndex, localBuckets, ok := s.rangeAccumulator.snapshot()
+	result.AccumulatorIndex = accumulatorIndex
+	if !ok {
+		result.Reason = "flat_accumulator_unavailable"
+		return result, nil
+	}
+
+	checkpointCtx, checkpointCancel := context.WithTimeout(ctx, drDefaultCheckpointRPCTimeout)
+	checkpoint, err := s.client.RequestCheckpoint(checkpointCtx, &CheckpointRequest{
+		RelationshipId: s.relationshipID,
+	})
+	checkpointCancel()
+	if err != nil {
+		return result, fmt.Errorf("checkpoint verification request checkpoint: %w", err)
+	}
+	if checkpoint == nil || checkpoint.CheckpointId == "" || checkpoint.CommitIndex == 0 {
+		result.Reason = "invalid_checkpoint"
+		return result, nil
+	}
+	result.CheckpointID = checkpoint.CheckpointId
+	result.CheckpointIndex = checkpoint.CommitIndex
+
+	if accumulatorIndex != checkpoint.CommitIndex {
+		result.Reason = "accumulator_checkpoint_index_mismatch"
+		return result, nil
+	}
+
+	rangeIDs := make([]uint64, drRangeMaxTotalRanges)
+	for i := range rangeIDs {
+		rangeIDs[i] = uint64(i)
+	}
+
+	rpcCtx, cancel := context.WithTimeout(ctx, drDefaultCheckpointRPCTimeout)
+	csumResp, err := s.client.ExchangeRangeChecksums(rpcCtx, &RangeChecksumRequest{
+		RelationshipId:  s.relationshipID,
+		CheckpointId:    checkpoint.CheckpointId,
+		CheckpointIndex: checkpoint.CommitIndex,
+		RangeIds:        rangeIDs,
+	})
+	cancel()
+	if err != nil {
+		return result, fmt.Errorf("checkpoint verification range checksums: %w", err)
+	}
+	if csumResp == nil {
+		result.Reason = "missing_remote_checksums"
+		return result, nil
+	}
+
+	remoteChecksums := make(map[uint64]*RangeChecksum, len(csumResp.GetChecksums()))
+	for _, remote := range csumResp.GetChecksums() {
+		if remote == nil {
+			continue
+		}
+		remoteChecksums[remote.GetRangeId()] = remote
+	}
+
+	for rangeID := 0; rangeID < drRangeMaxTotalRanges; rangeID++ {
+		local := localBuckets[rangeID]
+		remote, ok := remoteChecksums[uint64(rangeID)]
+		if !ok {
+			result.MissingRanges++
+			result.MismatchedRanges++
+			result.Mismatches = append(result.Mismatches, DRSecondaryCheckpointVerificationMismatch{
+				RangeID:       uint64(rangeID),
+				LocalCount:    local.count,
+				LocalChecksum: local.checksum,
+				MissingRemote: true,
+			})
+			continue
+		}
+		countMismatch := remote.GetCount() != local.count
+		checksumMismatch := remote.GetChecksum() != local.checksum
+		if countMismatch || checksumMismatch {
+			result.MismatchedRanges++
+			result.Mismatches = append(result.Mismatches, DRSecondaryCheckpointVerificationMismatch{
+				RangeID:          uint64(rangeID),
+				LocalCount:       local.count,
+				RemoteCount:      remote.GetCount(),
+				LocalChecksum:    local.checksum,
+				RemoteChecksum:   remote.GetChecksum(),
+				CountMismatch:    countMismatch,
+				ChecksumMismatch: checksumMismatch,
+			})
+			continue
+		}
+		result.MatchedRanges++
+	}
+
+	if result.MismatchedRanges > 0 {
+		result.Reason = "range_checksum_mismatch"
+		return result, nil
+	}
+	result.Pass = true
+	result.Reason = "ok"
+	return result, nil
 }
 
 func (s *drReplicationSecondary) recordIndexedRepairProofMismatch(err error) {

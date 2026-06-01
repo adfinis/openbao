@@ -93,6 +93,39 @@ func TestKVGetChoosesActiveFromAddressList(t *testing.T) {
 	}
 }
 
+func TestDRVerifyCheckpointParsesControlPlaneResult(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/sys/replication/dr/secondary/verify-checkpoint" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if r.Method != http.MethodGet {
+			t.Fatalf("unexpected method: %s", r.Method)
+		}
+		fmt.Fprint(w, `{"data":{"pass":true,"reason":"ok","state":"streaming","relationship_id":"rel-1","checkpoint_id":"cp-1","checkpoint_index":42,"accumulator_index":42,"range_count":1024,"matched_ranges":1024,"mismatched_ranges":0,"missing_ranges":0}}`)
+	}))
+	defer server.Close()
+
+	cfg := DefaultConfig()
+	client, err := NewBaoClient(NodeConfig{
+		Addr:  server.URL,
+		Token: "test-token",
+	}, cfg)
+	if err != nil {
+		t.Fatalf("NewBaoClient returned error: %v", err)
+	}
+
+	resp, code, err := client.DRVerifyCheckpoint(context.Background())
+	if err != nil {
+		t.Fatalf("DRVerifyCheckpoint returned error: %v", err)
+	}
+	if code != http.StatusOK {
+		t.Fatalf("code = %d, want %d", code, http.StatusOK)
+	}
+	if resp == nil || !resp.Pass || resp.Reason != "ok" || resp.CheckpointIndex != 42 || resp.AccumulatorIndex != 42 || resp.MatchedRanges != 1024 {
+		t.Fatalf("unexpected checkpoint verification response: %+v", resp)
+	}
+}
+
 func TestParseAddrsTrimsEmptyParts(t *testing.T) {
 	got := parseAddrs(" http://one:8200/, ,http://two:8200/ ")
 	want := []string{"http://one:8200", "http://two:8200"}

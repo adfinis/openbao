@@ -5,11 +5,15 @@ package vault
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
+	"time"
 
 	"github.com/openbao/openbao/sdk/v2/framework"
 	"github.com/openbao/openbao/sdk/v2/logical"
@@ -50,6 +54,67 @@ func (b *SystemBackend) drReplicationPaths() []*framework.Path {
 
 			HelpSynopsis:    "Check the DR replication status of this cluster",
 			HelpDescription: "Returns the current DR replication mode and status.",
+		},
+
+		// --- Secondary Checkpoint Verification ---
+		{
+			Pattern: "replication/dr/secondary/verify-checkpoint$",
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: "replication-dr-secondary",
+				OperationVerb:   "verify-checkpoint",
+			},
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.ReadOperation: &framework.PathOperation{
+					Callback: b.handleDRSecondaryVerifyCheckpoint,
+					Summary:  "Verify DR secondary storage convergence against a primary checkpoint without serving replicated data.",
+					Responses: map[int][]framework.Response{
+						http.StatusOK: {{
+							Description: "OK",
+							Fields: map[string]*framework.FieldSchema{
+								"pass": {
+									Type:     framework.TypeBool,
+									Required: true,
+								},
+								"reason": {
+									Type: framework.TypeString,
+								},
+								"state": {
+									Type: framework.TypeString,
+								},
+								"relationship_id": {
+									Type: framework.TypeString,
+								},
+								"checkpoint_id": {
+									Type: framework.TypeString,
+								},
+								"checkpoint_index": {
+									Type: framework.TypeInt,
+								},
+								"accumulator_index": {
+									Type: framework.TypeInt,
+								},
+								"matched_ranges": {
+									Type: framework.TypeInt,
+								},
+								"mismatched_ranges": {
+									Type: framework.TypeInt,
+								},
+								"missing_ranges": {
+									Type: framework.TypeInt,
+								},
+								"mismatches": {
+									Type: framework.TypeSlice,
+								},
+							},
+						}},
+					},
+				},
+			},
+
+			HelpSynopsis:    "Verify DR secondary checkpoint convergence",
+			HelpDescription: "Requests an immutable primary checkpoint and compares all top-level range checksums with the secondary's local flat accumulator. This is a DR control-plane verification endpoint and does not expose replicated secret values.",
 		},
 
 		// --- Enable Primary ---
@@ -137,6 +202,206 @@ func (b *SystemBackend) drReplicationPaths() []*framework.Path {
 
 			HelpSynopsis:    "Generate DR secondary activation token",
 			HelpDescription: "Generates a token that a secondary cluster uses to establish a DR replication relationship with this primary.",
+		},
+
+		// --- Primary Pre-Seed Manifest ---
+		{
+			Pattern: "replication/dr/primary/preseed/manifest$",
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: "replication-dr-primary-preseed",
+				OperationVerb:   "generate-manifest",
+			},
+
+			Fields: map[string]*framework.FieldSchema{
+				"relationship_id": {
+					Type:        framework.TypeString,
+					Description: "The pending, registered, or active DR relationship ID this seed bundle is bound to.",
+					Required:    true,
+				},
+				"bundle_integrity_sha256": {
+					Type:        framework.TypeString,
+					Description: "Hex-encoded SHA-256 digest of the out-of-band seed bundle.",
+					Required:    true,
+				},
+				"ttl_seconds": {
+					Type:        framework.TypeInt,
+					Default:     int((24 * time.Hour).Seconds()),
+					Description: "Manifest validity window in seconds. Set to 0 for no expiry.",
+				},
+			},
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback:                  b.handleDRPrimaryPreSeedManifest,
+					Summary:                   "Generate a relationship-bound DR pre-seed manifest.",
+					ForwardPerformanceStandby: true,
+				},
+			},
+
+			HelpSynopsis:    "Generate DR pre-seed manifest",
+			HelpDescription: "Cuts a primary checkpoint and returns a DR pre-seed manifest that binds an out-of-band seed bundle to the relationship, range/checksum versions, local-only scrub metadata, and checkpoint identity.",
+		},
+
+		// --- Primary Pre-Seed Export ---
+		{
+			Pattern: "replication/dr/primary/preseed/export$",
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: "replication-dr-primary-preseed",
+				OperationVerb:   "export",
+			},
+
+			Fields: map[string]*framework.FieldSchema{
+				"relationship_id": {
+					Type:        framework.TypeString,
+					Description: "The pending, registered, or active DR relationship ID this seed bundle is bound to.",
+					Required:    true,
+				},
+				"ttl_seconds": {
+					Type:        framework.TypeInt,
+					Default:     int((24 * time.Hour).Seconds()),
+					Description: "Manifest validity window in seconds. Set to 0 for no expiry.",
+				},
+			},
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback:                  b.handleDRPrimaryPreSeedExport,
+					Summary:                   "Export a relationship-bound DR pre-seed bundle.",
+					ForwardPerformanceStandby: true,
+					Responses: map[int][]framework.Response{
+						http.StatusOK: {{
+							Description: "OK",
+							Fields: map[string]*framework.FieldSchema{
+								"bundle": {
+									Type:     framework.TypeString,
+									Required: true,
+									DisplayAttrs: &framework.DisplayAttributes{
+										Sensitive: true,
+									},
+								},
+								"manifest": {
+									Type: framework.TypeString,
+								},
+								"relationship_id": {
+									Type: framework.TypeString,
+								},
+								"checkpoint_id": {
+									Type: framework.TypeString,
+								},
+								"checkpoint_index": {
+									Type: framework.TypeInt,
+								},
+								"entry_count": {
+									Type: framework.TypeInt,
+								},
+								"bundle_integrity_sha256": {
+									Type: framework.TypeString,
+								},
+								"expires_at_unix": {
+									Type: framework.TypeInt,
+								},
+							},
+						}},
+					},
+				},
+			},
+
+			HelpSynopsis:    "Export DR pre-seed bundle",
+			HelpDescription: "Cuts a primary checkpoint and returns a JSON DR pre-seed bundle containing replicated below-barrier storage entries plus a relationship-bound manifest. The bundle is intended for operator transfer into a disabled secondary.",
+		},
+
+		// --- Secondary Pre-Seed Accept ---
+		{
+			Pattern: "replication/dr/secondary/preseed/accept$",
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: "replication-dr-secondary-preseed",
+				OperationVerb:   "accept",
+			},
+
+			Fields: map[string]*framework.FieldSchema{
+				"token": {
+					Type:        framework.TypeString,
+					Description: "The DR activation token from the primary cluster.",
+					Required:    true,
+					DisplayAttrs: &framework.DisplayAttributes{
+						Sensitive: true,
+					},
+				},
+				"manifest": {
+					Type:        framework.TypeString,
+					Description: "The JSON DR pre-seed manifest generated by the primary.",
+					Required:    true,
+				},
+				"confirm_storage_restored": {
+					Type:        framework.TypeBool,
+					Default:     false,
+					Description: "Operator confirmation that the seed bundle has already been restored into this disabled secondary cluster.",
+				},
+				"confirm_local_only_scrubbed": {
+					Type:        framework.TypeBool,
+					Default:     false,
+					Description: "Operator confirmation that local-only paths from the seed manifest have been scrubbed or preserved with local secondary values.",
+				},
+			},
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback:                  b.handleDRSecondaryPreSeedAccept,
+					Summary:                   "Accept a restored DR pre-seed manifest before enabling secondary mode.",
+					ForwardPerformanceStandby: true,
+				},
+			},
+
+			HelpSynopsis:    "Accept DR pre-seed manifest",
+			HelpDescription: "Validates and records a restored DR pre-seed manifest. The accepted checkpoint baseline is applied when the same activation token is used to enable secondary mode.",
+		},
+
+		// --- Secondary Pre-Seed Import ---
+		{
+			Pattern: "replication/dr/secondary/preseed/import$",
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: "replication-dr-secondary-preseed",
+				OperationVerb:   "import",
+			},
+
+			Fields: map[string]*framework.FieldSchema{
+				"token": {
+					Type:        framework.TypeString,
+					Description: "The DR activation token from the primary cluster.",
+					Required:    true,
+					DisplayAttrs: &framework.DisplayAttributes{
+						Sensitive: true,
+					},
+				},
+				"bundle": {
+					Type:        framework.TypeString,
+					Description: "The JSON DR pre-seed bundle generated by the primary.",
+					Required:    true,
+					DisplayAttrs: &framework.DisplayAttributes{
+						Sensitive: true,
+					},
+				},
+				"confirm_replace_replicated_storage": {
+					Type:        framework.TypeBool,
+					Default:     false,
+					Description: "Operator confirmation that importing this bundle may replace the disabled secondary's replicated storage plane while preserving cluster-local paths.",
+				},
+			},
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback:                  b.handleDRSecondaryPreSeedImport,
+					Summary:                   "Import a DR pre-seed bundle before enabling secondary mode.",
+					ForwardPerformanceStandby: true,
+				},
+			},
+
+			HelpSynopsis:    "Import DR pre-seed bundle",
+			HelpDescription: "Validates a DR pre-seed bundle, replaces the disabled secondary's replicated storage plane with the bundle entries, preserves cluster-local paths, and records the checkpoint baseline for secondary enable.",
 		},
 
 		// --- Enable Secondary ---
@@ -904,6 +1169,55 @@ func (b *SystemBackend) handleDRStatus(ctx context.Context, req *logical.Request
 	}, nil
 }
 
+func (b *SystemBackend) handleDRSecondaryVerifyCheckpoint(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	mgr := b.Core.drManager
+	if mgr == nil || !secondaryLocalControlTokenMatches(mgr.Config(), req.ClientToken) {
+		return nil, logical.ErrPermissionDenied
+	}
+	sec := mgr.Secondary()
+	if sec == nil {
+		return logical.ErrorResponse("cluster is not running as a DR secondary"), nil
+	}
+
+	result, err := sec.VerifyCheckpoint(ctx)
+	if err != nil {
+		return logical.ErrorResponse(err.Error()), nil
+	}
+
+	data := map[string]interface{}{
+		"pass":              result.Pass,
+		"reason":            result.Reason,
+		"state":             result.State,
+		"relationship_id":   result.RelationshipID,
+		"checkpoint_id":     result.CheckpointID,
+		"checkpoint_index":  result.CheckpointIndex,
+		"accumulator_index": result.AccumulatorIndex,
+		"range_count":       result.RangeCount,
+		"matched_ranges":    result.MatchedRanges,
+		"mismatched_ranges": result.MismatchedRanges,
+		"missing_ranges":    result.MissingRanges,
+	}
+
+	if len(result.Mismatches) > 0 {
+		mismatches := make([]map[string]interface{}, 0, len(result.Mismatches))
+		for _, mismatch := range result.Mismatches {
+			mismatches = append(mismatches, map[string]interface{}{
+				"range_id":          mismatch.RangeID,
+				"local_count":       mismatch.LocalCount,
+				"remote_count":      mismatch.RemoteCount,
+				"local_checksum":    mismatch.LocalChecksum,
+				"remote_checksum":   mismatch.RemoteChecksum,
+				"missing_remote":    mismatch.MissingRemote,
+				"checksum_mismatch": mismatch.ChecksumMismatch,
+				"count_mismatch":    mismatch.CountMismatch,
+			})
+		}
+		data["mismatches"] = mismatches
+	}
+
+	return &logical.Response{Data: data}, nil
+}
+
 func (b *SystemBackend) handleDRPrimaryEnable(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
 	mgr := b.Core.drManager
 	if mgr == nil {
@@ -953,6 +1267,204 @@ func (b *SystemBackend) handleDRPrimaryGenerateToken(ctx context.Context, req *l
 	}, nil
 }
 
+func (b *SystemBackend) handleDRPrimaryPreSeedManifest(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	mgr := b.Core.drManager
+	if mgr == nil {
+		return logical.ErrorResponse("DR replication not initialized"), nil
+	}
+
+	relationshipIDRaw, ok := d.GetOk("relationship_id")
+	if !ok {
+		return logical.ErrorResponse("relationship_id is required"), nil
+	}
+	relationshipID, _ := relationshipIDRaw.(string)
+	relationshipID = strings.TrimSpace(relationshipID)
+	if relationshipID == "" {
+		return logical.ErrorResponse("relationship_id is required"), nil
+	}
+
+	bundleHashRaw, ok := d.GetOk("bundle_integrity_sha256")
+	if !ok {
+		return logical.ErrorResponse("bundle_integrity_sha256 is required"), nil
+	}
+	bundleHashText, _ := bundleHashRaw.(string)
+	bundleHash, err := hex.DecodeString(strings.TrimSpace(bundleHashText))
+	if err != nil || len(bundleHash) != sha256.Size {
+		return logical.ErrorResponse("bundle_integrity_sha256 must be a hex-encoded SHA-256 digest"), nil
+	}
+
+	ttlSeconds := d.Get("ttl_seconds").(int)
+	if ttlSeconds < 0 {
+		return logical.ErrorResponse("ttl_seconds must be >= 0"), nil
+	}
+	manifest, err := mgr.GeneratePreSeedManifest(ctx, relationshipID, bundleHash, time.Duration(ttlSeconds)*time.Second)
+	if err != nil {
+		return logical.ErrorResponse(err.Error()), nil
+	}
+	manifestJSON, err := json.Marshal(manifest)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal DR pre-seed manifest: %w", err)
+	}
+	return &logical.Response{
+		Data: map[string]interface{}{
+			"manifest":         string(manifestJSON),
+			"relationship_id":  manifest.RelationshipID,
+			"checkpoint_id":    manifest.CheckpointID,
+			"checkpoint_index": manifest.CheckpointIndex,
+			"expires_at_unix":  manifest.ExpiresAtUnix,
+		},
+	}, nil
+}
+
+func (b *SystemBackend) handleDRPrimaryPreSeedExport(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	mgr := b.Core.drManager
+	if mgr == nil {
+		return logical.ErrorResponse("DR replication not initialized"), nil
+	}
+
+	relationshipIDRaw, ok := d.GetOk("relationship_id")
+	if !ok {
+		return logical.ErrorResponse("relationship_id is required"), nil
+	}
+	relationshipID, _ := relationshipIDRaw.(string)
+	relationshipID = strings.TrimSpace(relationshipID)
+	if relationshipID == "" {
+		return logical.ErrorResponse("relationship_id is required"), nil
+	}
+
+	ttlSeconds := d.Get("ttl_seconds").(int)
+	if ttlSeconds < 0 {
+		return logical.ErrorResponse("ttl_seconds must be >= 0"), nil
+	}
+	bundle, err := mgr.GeneratePreSeedBundle(ctx, relationshipID, time.Duration(ttlSeconds)*time.Second)
+	if err != nil {
+		return logical.ErrorResponse(err.Error()), nil
+	}
+	bundleJSON, err := json.Marshal(bundle)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal DR pre-seed bundle: %w", err)
+	}
+	manifestJSON, err := json.Marshal(bundle.Manifest)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal DR pre-seed manifest: %w", err)
+	}
+	return &logical.Response{
+		Data: map[string]interface{}{
+			"bundle":                  string(bundleJSON),
+			"manifest":                string(manifestJSON),
+			"relationship_id":         bundle.Manifest.RelationshipID,
+			"checkpoint_id":           bundle.Manifest.CheckpointID,
+			"checkpoint_index":        bundle.Manifest.CheckpointIndex,
+			"entry_count":             bundle.EntryCount,
+			"bundle_integrity_sha256": hex.EncodeToString(bundle.Manifest.BundleIntegritySHA256),
+			"expires_at_unix":         bundle.Manifest.ExpiresAtUnix,
+		},
+	}, nil
+}
+
+func (b *SystemBackend) handleDRSecondaryPreSeedAccept(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	mgr := b.Core.drManager
+	if mgr == nil {
+		return logical.ErrorResponse("DR replication not initialized"), nil
+	}
+
+	tokenRaw, ok := d.GetOk("token")
+	if !ok {
+		return logical.ErrorResponse("token is required"), nil
+	}
+	tokenStr, ok := tokenRaw.(string)
+	if !ok || tokenStr == "" {
+		return logical.ErrorResponse("token must be a non-empty string"), nil
+	}
+	if len(tokenStr) > drActivationTokenMaxBytes {
+		return logical.ErrorResponse("activation token exceeds maximum size %d", drActivationTokenMaxBytes), nil
+	}
+	var token DRActivationToken
+	if err := json.Unmarshal([]byte(tokenStr), &token); err != nil {
+		return logical.ErrorResponse("invalid activation token: %s", err.Error()), nil
+	}
+
+	manifestRaw, ok := d.GetOk("manifest")
+	if !ok {
+		return logical.ErrorResponse("manifest is required"), nil
+	}
+	manifestStr, ok := manifestRaw.(string)
+	if !ok || manifestStr == "" {
+		return logical.ErrorResponse("manifest must be a non-empty string"), nil
+	}
+	var manifest DRPreSeedManifest
+	if err := json.Unmarshal([]byte(manifestStr), &manifest); err != nil {
+		return logical.ErrorResponse("invalid pre-seed manifest: %s", err.Error()), nil
+	}
+
+	confirmStorageRestored := d.Get("confirm_storage_restored").(bool)
+	confirmLocalOnlyScrubbed := d.Get("confirm_local_only_scrubbed").(bool)
+	if err := mgr.AcceptPreSeedManifest(ctx, &manifest, &token, time.Now().UTC(), confirmStorageRestored, confirmLocalOnlyScrubbed); err != nil {
+		return logical.ErrorResponse(err.Error()), nil
+	}
+	return &logical.Response{
+		Data: map[string]interface{}{
+			"message":          "DR pre-seed manifest accepted",
+			"relationship_id":  manifest.RelationshipID,
+			"checkpoint_id":    manifest.CheckpointID,
+			"checkpoint_index": manifest.CheckpointIndex,
+		},
+	}, nil
+}
+
+func (b *SystemBackend) handleDRSecondaryPreSeedImport(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	mgr := b.Core.drManager
+	if mgr == nil {
+		return logical.ErrorResponse("DR replication not initialized"), nil
+	}
+
+	tokenRaw, ok := d.GetOk("token")
+	if !ok {
+		return logical.ErrorResponse("token is required"), nil
+	}
+	tokenStr, ok := tokenRaw.(string)
+	if !ok || tokenStr == "" {
+		return logical.ErrorResponse("token must be a non-empty string"), nil
+	}
+	if len(tokenStr) > drActivationTokenMaxBytes {
+		return logical.ErrorResponse("activation token exceeds maximum size %d", drActivationTokenMaxBytes), nil
+	}
+	var token DRActivationToken
+	if err := json.Unmarshal([]byte(tokenStr), &token); err != nil {
+		return logical.ErrorResponse("invalid activation token: %s", err.Error()), nil
+	}
+
+	bundleRaw, ok := d.GetOk("bundle")
+	if !ok {
+		return logical.ErrorResponse("bundle is required"), nil
+	}
+	bundleStr, ok := bundleRaw.(string)
+	if !ok || bundleStr == "" {
+		return logical.ErrorResponse("bundle must be a non-empty string"), nil
+	}
+	if len(bundleStr) > drPreSeedBundleMaxBytes {
+		return logical.ErrorResponse("pre-seed bundle exceeds maximum size %d", drPreSeedBundleMaxBytes), nil
+	}
+	var bundle DRPreSeedBundle
+	if err := json.Unmarshal([]byte(bundleStr), &bundle); err != nil {
+		return logical.ErrorResponse("invalid pre-seed bundle: %s", err.Error()), nil
+	}
+
+	confirmReplace := d.Get("confirm_replace_replicated_storage").(bool)
+	if err := mgr.ImportPreSeedBundle(ctx, &bundle, &token, time.Now().UTC(), confirmReplace); err != nil {
+		return logical.ErrorResponse(err.Error()), nil
+	}
+	return &logical.Response{
+		Data: map[string]interface{}{
+			"message":          "DR pre-seed bundle imported",
+			"relationship_id":  bundle.Manifest.RelationshipID,
+			"checkpoint_id":    bundle.Manifest.CheckpointID,
+			"checkpoint_index": bundle.Manifest.CheckpointIndex,
+			"entry_count":      bundle.EntryCount,
+		},
+	}, nil
+}
+
 func (b *SystemBackend) handleDRSecondaryEnable(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
 	mgr := b.Core.drManager
 	if mgr == nil {
@@ -992,7 +1504,7 @@ func (b *SystemBackend) handleDRSecondaryEnable(ctx context.Context, req *logica
 		return logical.ErrorResponse("activation token has invalid repl_salt (expected %d bytes, got %d)", drReplSaltLen, len(token.ReplSalt)), nil
 	}
 
-	if err := mgr.EnableSecondary(ctx, &token); err != nil {
+	if err := mgr.EnableSecondary(ctx, &token, req.ClientToken); err != nil {
 		return logical.ErrorResponse(err.Error()), nil
 	}
 

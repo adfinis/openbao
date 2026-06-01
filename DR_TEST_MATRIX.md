@@ -96,6 +96,8 @@ flowchart TD
 | A27 | DR tuning validation and rollback | `go test ./vault -run 'TestDRRelationshipManager_UpdateTuning|TestDRSystemBackend_DRTuningRejectsInvalidInputs|TestDRPrimary_AllowWriteRequest_BackpressureRejectsNonExempt|TestDRBackpressureExemptPath' -count=1` | Pass |
 | A28 | DR flat accumulator persistence, durable stream-applied index, delta replay, local KID index repair, and stream transaction coalescing | `go test ./vault -run 'TestDR(CoalesceStreamTxnBatch|FlatRangeAccumulator_ResetAndApplyDeltas|SecondaryFlatAccumulatorAdvancesOnStreamApply|SecondaryStreamTxnPersistsFlatAccumulator|SecondaryLoadsPersistentStreamAppliedIndex|SecondaryStreamApplyWorkerRetriesTransactionalCommitFailure|SecondaryStreamApplyWorkerTransactionalFailureDoesNotFallbackSequentially|LocalKIDIndexChangesRequireCompleteBaseline|IndexedRepairProofMismatchObservability|LocalKIDIndexLoadReasons|SecondaryStreamTxnCadenceReplaysPersistedAccumulatorDeltas|SecondaryStreamTxnCadenceMissingDeltasFailsClosed|SecondaryApplyWorkerStopPersistsFinalFlatAccumulatorSnapshot|SecondaryQuiescentReconnectUsesFlatAccumulatorFastPath|FlatAccumulatorEmptyBucketRepairAvoidsLocalScan|FlatAccumulatorIndexedBucketRepairAvoidsLocalScan|FlatAccumulatorIndexedBucketRepairFullBucketFallbackAvoidsLocalScan|RangeReconciliationSeedsFlatAccumulatorOnPhaseAMatch|RangeReconciliationSeedsFlatAccumulatorAfterRepair|SystemBackend_StatusIncludesStreamOptimizationCounters)' -count=1` | Pass |
 | A29 | DR HA standby runtime transition deferral | `go test ./vault -run 'TestInvalidation_(DRReadOnlyStandbyTransitionFailureDefers|DRActiveTransitionFailureDoesNotDefer|TransientDecryptFailureClassifier)|TestShouldRunSecondaryControllerLocked|TestDRSecondaryControllerRunWasStable' -count=1` | Pass; read-only HA standby keyring-missing/read-only transition failures defer without sealing; active transition failures remain fail-closed; secondary controller does not run on HA standbys |
+| A30 | DR strict-secondary checkpoint verification | `go test ./vault -run 'TestDRSecondaryVerifyCheckpoint' -count=1 && (cd scripts/dr-stress && go test . -run 'TestDRVerifyCheckpointParsesControlPlaneResult' -count=1)` | Pass; strict secondaries can be verified through checkpoint proofs without serving replicated data reads |
+| A31 | DR pre-seed manifest, bundle export/import, and accept/apply lifecycle | `go test ./vault -run 'TestDRPreSeed|TestDRRelationshipManager.*PreSeed|TestSystemBackend_DRSpecialPaths|TestSystemBackend_DRSensitiveFields' -count=1` | Pass; pre-seed manifests are relationship-bound, reject stale lineage, relationship mismatch, algorithm mismatch, missing local-only scrub metadata, and expired material; bundle validation rejects integrity drift and local-only paths; primary export uses checkpoint artifacts and excludes local-only paths; secondary import requires explicit replacement confirmation, replaces replicated storage while preserving cluster-local paths, and applies the checkpoint baseline only when secondary mode is enabled or restored with the same relationship material |
 
 Recommended compile pre-step:
 
@@ -139,9 +141,9 @@ scripts/dr_local_test.sh --topology ha quiescent-reconnect-smoke
 scripts/dr_local_test.sh --topology ha accumulator-cold-restart-smoke
 scripts/dr_local_test.sh --topology ha smoke --duration 900 --concurrency 48 --stepdown-interval 300
 scripts/dr_local_test.sh --topology ha indexed-repair-smoke
-# If secondary data read-serving is enabled:
-# scripts/dr_local_test.sh --topology ha verify --sample 0
-# Otherwise use the supported storage/checkpoint/promoted verification path.
+scripts/dr_local_test.sh --topology ha verify --sample 0
+# To force legacy secondary API reads for a read-serving experiment:
+# scripts/dr_local_test.sh --topology ha verify --sample 0 --secondary-method api
 scripts/dr_local_test.sh --topology ha smoke --duration 7200 --concurrency 24 --put-percent 55 --get-primary-percent 25 --status-s1-percent 10 --status-s2-percent 10 --max-wait-seconds 600 --progress-interval 30
 scripts/dr_local_test.sh --topology ha failover-smoke
 scripts/dr_local_test.sh --topology ha promoted-durability-smoke
@@ -164,6 +166,7 @@ make dr-test-status
 make dr-test-smoke
 make dr-test-verify
 make dr-test-engine-matrix
+make dr-test-preseed-smoke
 make dr-test-down
 make dr-test-ha-reset
 make dr-test-ha-smoke
@@ -173,6 +176,7 @@ make dr-test-ha-engine-lifecycle-matrix
 make dr-test-ha-failover-smoke
 make dr-test-ha-promoted-durability-smoke
 make dr-test-ha-reseed-secondary-smoke
+make dr-test-ha-preseed-smoke
 make dr-test-ha-indexed-repair-smoke
 make dr-test-ha-failover-load-lifecycle
 make dr-test-ha-down
@@ -183,12 +187,12 @@ make dr-test-ha-down
 | ID | Scenario | Steps | Expected |
 |---|---|---|---|
 | E1 | Baseline DR bootstrap | Enable primary, register/enable secondaries, wait for `streaming`. | Both secondaries: `mode=secondary`, `secondary_state=streaming`. |
-| E2 | Initial sync correctness | Verify the baseline dataset through the supported terminal verification path. If secondary read-serving is enabled, read the `kv/` mount on both secondaries; if not, use storage/checkpoint/promoted verification. | Baseline values are present with no confirmed missing keys or mismatches. |
-| E3 | Stream replication correctness | Write a new key on primary, wait for both secondaries to report `streaming` with lag 0, then verify through the supported terminal verification path. | The value is present with no confirmed missing key or mismatch. |
+| E2 | Initial sync correctness | Verify the baseline dataset through the supported terminal verification path: primary API reads plus secondary checkpoint verification by default. | Baseline values are present with no confirmed missing keys or checkpoint mismatches. |
+| E3 | Stream replication correctness | Write a new key on primary, wait for both secondaries to report `streaming` with lag 0, then verify through the supported terminal verification path. | The value is present on the primary verification path and both secondaries pass checkpoint verification. |
 | E4 | Revoke enforcement | Revoke one relationship while stream active. | Only revoked relationship terminated/denied; other remains healthy. |
 | E5 | Re-enable after revoke | Disable revoked secondary, issue new token, re-enable. | Secondary returns to `streaming`; new writes replicate. |
 | E6 | Disconnect + reconcile | Disrupt primary connectivity, continue writes, restore connectivity. | Secondary transitions through reconcile and converges. |
-| E7 | Secondary read-only gate | Attempt data write on secondary and DR control operation. | Data write denied; allowed control operation accepted. Data-read behavior before promotion follows the chosen secondary serving-surface decision. |
+| E7 | Secondary read-only gate | Attempt data write on secondary and DR control operation. | Data write denied; allowed control operation accepted. General data reads remain outside strict warm-standby semantics before promotion; checkpoint verification remains available. |
 | E8 | Failover path | Hard-stop old primary, promote secondary #1 with `accept_data_loss=true`, restart old primary, and compare key visibility. Use `scripts/dr_local_test.sh --topology ha failover-smoke`. | Forced promotion requires explicit acknowledgement; promoted cluster keeps its own post-promotion writes; resurrected old primary and non-promoted secondary form a separate timeline with no automatic merge. |
 | E9 | Promotion lineage fence | `go test ./vault -run 'TestDRRelationshipManager_EnableSecondaryRejectsStalePromotionLineage' -count=1`; also asserted by `scripts/dr_local_test.sh --topology ha failover-smoke`. | After promotion, stale activation tokens from the old primary cluster or old relationship cannot re-enable the promoted cluster as a secondary. Fresh lineage remains possible for explicit rebuild/reconfiguration flows. |
 | E10 | Promotion durability | Run after E8: `scripts/dr_local_test.sh --topology ha promoted-durability-smoke`. | Promoted HA cluster remains `mode=disabled` with the same promotion record, keeps all raft voters unsealed, preserves writes across full promoted-cluster restart, rejects stale old-primary tokens after restart, and accepts writes after HA active handoff. |
@@ -228,9 +232,8 @@ Live stream check:
 ```bash
 BAO_ADDR="$DR_PRIMARY_ADDR" BAO_TOKEN="$DR_PRIMARY_TOKEN" bao kv put kv/dr-live ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)" src=primary
 sleep 2
-# If secondary data read-serving is enabled:
-BAO_ADDR="$DR_SECONDARY1_ADDR" BAO_TOKEN="$DR_PRIMARY_TOKEN" bao read kv/data/dr-live
-BAO_ADDR="$DR_SECONDARY2_ADDR" BAO_TOKEN="$DR_PRIMARY_TOKEN" bao read kv/data/dr-live
+BAO_ADDR="$DR_SECONDARY1_ADDR" BAO_TOKEN="$DR_SECONDARY1_TOKEN" bao read sys/replication/dr/secondary/verify-checkpoint
+BAO_ADDR="$DR_SECONDARY2_ADDR" BAO_TOKEN="$DR_SECONDARY2_TOKEN" bao read sys/replication/dr/secondary/verify-checkpoint
 ```
 
 ---
@@ -268,9 +271,9 @@ docker logs --since=10m bao-primary-1 | rg 'dr-replication|checkpoint|change str
 - If both secondaries enter long `reconciling` with flat `last_applied_index`, reduce write pressure or increase secondary reconcile/stream batch tuning.
 - Strict TLS and relationship authz are fail-closed; stale bootstrap/tokens/certs correctly break reconnect.
 - Secondary API read verification may fail with `transaction is read-only` in
-  strict warm-standby mode. Do not treat that as a data mismatch. Either define
-  and validate secondary read-serving semantics, or use storage/checkpoint or
-  promoted-cluster verification for terminal data proof.
+  strict warm-standby mode. Do not treat that as a data mismatch. Use
+  secondary checkpoint verification or promoted-cluster API verification for
+  terminal data proof.
 - In the HA Docker topology, `api_addr` uses container DNS names. Host-side arbitrary-token lookup against a DR secondary can redirect to those internal names; the engine matrix uses service-token self lookup to verify replicated token usability without relying on host DNS for secondary leader redirects.
 - Direct-to-node HA tests should pass all nodes in a secondary cluster to `dr-stress` as a comma-separated address list when the active node can move during the test. The harness scores DR status responses and follows the node reporting current `streaming` state instead of relying on a fixed host port.
 - Forced out-of-horizon tests may shrink the stream buffer/journal, but `stream_buffer_max_entries` must remain at least the secondary's initial stream window. With the current defaults that means `>=1024`; smaller values exercise `ResourceExhausted` stream admission rather than journal-too-old replay fallback.
@@ -305,6 +308,10 @@ scripts remain available under `scripts/`.
 | S16 | HA secondary outage within journal horizon | `scripts/dr_local_test.sh --topology ha secondary-outage-smoke --duration 120 --concurrency 32 --outage-after 20 --outage-seconds 40 --progress-interval 10 --monitor-interval 2` | Stop all nodes in secondary #1 while writes continue, restart it before the stream journal horizon expires, and verify replay catch-up without reconciliation | Secondary #1 may elect a different active node after restart; the stress harness follows active DR status across the secondary node list. Both secondaries converge with nonzero `primary_index`, secondary #1 advances its flat accumulator cursor to the final applied index, `reconcile_count` remains zero after restart, `scan_failures_total`, `local_kid_index_fallback_scans_total`, full-bucket fallback, proof mismatches, and primary `journal_range_too_old_total` remain zero, and terminal verification passes through the supported verification path |
 | S17 | HA secondary outage beyond journal horizon | `scripts/dr_local_test.sh --topology ha secondary-outage-reconcile-smoke --progress-interval 10 --monitor-interval 2` | Shrink the primary stream buffer/journal for the test, stop all nodes in secondary #1 while writes continue, restart it after replay is no longer possible, and verify reconciliation repair | Primary `journal_range_too_old_total` increments, secondary #1 runs reconciliation and returns to `streaming` with `lag_entries=0`, `reconcile_phase=idle`, and final `last_applied_index=primary_index`; flat accumulator cursor covers the final applied index, scan failures, local KID fallback scans, full-bucket fallback, and indexed proof mismatches remain zero, and terminal verification passes through the supported verification path |
 | S18 | HA adaptive batching and standby key-transition regression | `scripts/dr_local_test.sh --topology ha reset --build && scripts/dr_local_test.sh --topology ha smoke --duration 900 --concurrency 48 --stepdown-interval 300 --progress-interval 30 --monitor-interval 5` | Validate adaptive batching, indexed repair after HA handoff, and read-only standby key-transition deferral under adversarial load | Workload exits cleanly; `status_fail=0`; dropped events are zero; both sentinels converge; both secondaries end `streaming` with lag 0; if reconciliation occurs, indexed repair has zero local KID fallback scans, zero full-bucket fallback, and zero proof mismatches; logs contain no `fatal DR key-transition resync error` and no `OpenBao is sealed`; keyring-missing standby transitions, if present, log `DR key transition deferred on read-only standby`; PUT/GET failures are availability/backpressure signals unless terminal verification shows missing or mismatched data |
+| S19 | Pre-seed/resnapshot lifecycle validation | `scripts/dr_local_test.sh preseed-smoke --build` or `make dr-test-preseed-smoke` | Validate the operator workflow for seeding a secondary from a primary-authorized base copy, then catching up only the delta through stream replay or checkpoint reconciliation | Primary inline bundle export cuts a checkpoint for a fresh relationship; secondary import requires explicit replacement confirmation while DR is disabled, validates bundle integrity, KID/VID projection, expiry, lineage, and local-only exclusions, replaces replicated storage while preserving cluster-local paths, and records the checkpoint baseline; the smoke writes a post-export delta before enable, secondary enable applies the imported checkpoint baseline before stream start, terminal checkpoint verification passes, both baseline and delta remain present on the primary, and replay/reconcile cost is proportional to the post-seed delta rather than the full dataset |
+| S20 | Reconcile budget exhaustion | TBD | Configure an intentionally low checkpoint-scoped secondary reconcile budget, force out-of-horizon divergence, and verify the secondary stops cleanly instead of saturating itself | Secondary reports `budget_exhausted` with phase, consumed bytes/entries/RPCs/retries, remains safe to retry after tuning changes, and does not advance the checkpoint cursor on an incomplete repair |
+| S21 | Primary checkpoint pressure bounds | TBD | Configure low primary checkpoint/digest/fetch limits, reconnect fragmented secondaries, and verify primary-side admission and rate limits fire predictably | Primary exposes checkpoint build/admission/digest/fetch pressure counters, secondaries receive bounded retryable failures, normal streaming subscribers remain protected, and no relationship can force unbounded primary CPU or artifact retention |
+| S22 | DR pre-seed manifest and bundle validation | `go test ./vault -run 'TestDRPreSeed|TestDRRelationshipManager.*PreSeed' -count=1` | Generate, export, accept, or import seed material with relationship, checkpoint, algorithm, lineage, expiry, integrity, KID/VID, and local-only scrub mismatches | Valid seed material is accepted only for the matching fresh relationship; stale lineage, wrong primary cluster, wrong relationship, wrong range/checksum version, missing scrub metadata, expired seed material, tampered bundle bytes, and local-only seed entries are rejected before trusting restored storage |
 
 ### Stress Run Examples
 
@@ -312,8 +319,7 @@ Local compose smoke:
 
 ```bash
 scripts/dr_local_test.sh smoke --duration 120 --concurrency 24
-# If secondary data read-serving is enabled:
-# scripts/dr_local_test.sh verify --sample 0
+scripts/dr_local_test.sh verify --sample 0
 ```
 
 Repo-local HA steady-state soak:
@@ -329,8 +335,7 @@ scripts/dr_local_test.sh --topology ha smoke \
   --status-s2-percent 10 \
   --max-wait-seconds 600 \
   --progress-interval 30
-# If secondary data read-serving is enabled:
-# scripts/dr_local_test.sh --topology ha verify <run-dir> --sample 0
+scripts/dr_local_test.sh --topology ha verify <run-dir> --sample 0
 ```
 
 Repo-local HA hot-key coalescing validation:
@@ -343,8 +348,7 @@ scripts/dr_local_test.sh --topology ha smoke \
   --stepdown-interval 100 \
   --progress-interval 10 \
   --monitor-interval 2
-# If secondary data read-serving is enabled:
-# scripts/dr_local_test.sh --topology ha verify <run-dir> --sample 0
+scripts/dr_local_test.sh --topology ha verify <run-dir> --sample 0
 ```
 
 Repo-local HA accumulator cold restart:

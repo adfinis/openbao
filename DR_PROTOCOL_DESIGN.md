@@ -93,6 +93,13 @@ correctness failure. Correctness depends on whether the primary can still prove
 journal or buffer coverage from the secondary cursor. If it cannot, the stream
 path terminates and reconciliation becomes mandatory.
 
+Stream journal retention is finite. The credit protocol protects an online
+stream from overrunning the secondary, but it does not imply that a primary
+retains days of mutation history for an offline secondary. If the secondary's
+cursor falls behind the oldest retained journal/buffer entry, replay must fail
+closed and the secondary must use checkpoint reconciliation, resnapshot, or an
+operator pre-seeded base copy.
+
 ```mermaid
 flowchart TD
     A["Secondary connection lost"] --> B["Reconnect with lastAppliedIndex"]
@@ -258,6 +265,30 @@ has a checkpoint-bound proof that skipped ranges were unchanged. The prototype
 uses the conservative rule: verify the complete top-level partition for each
 checkpoint reconciliation.
 
+## Strict Secondary Verification
+
+Strict warm-standby secondaries do not serve replicated secret data before
+promotion. Terminal correctness for a strict secondary is therefore proven
+through the DR control plane:
+
+1. The secondary requests an immutable primary checkpoint for its active
+   relationship.
+2. The secondary requires its local flat accumulator index to match the
+   checkpoint commit index.
+3. The secondary requests all top-level range checksums for the checkpoint
+   tuple.
+4. The secondary compares every checkpoint range with its local accumulator.
+
+The `sys/replication/dr/secondary/verify-checkpoint` endpoint returns only
+proof metadata: pass/fail, checkpoint identity, accumulator index, range
+counts, and mismatch summaries. It does not expose replicated keys or values.
+The endpoint is listed as unauthenticated in the framework only so strict
+secondaries can reach it without relying on the replicated token backend; the
+handler authenticates the caller with relationship-local control material that
+was captured when the secondary was enabled. This keeps verification aligned
+with warm-standby semantics while still giving the test harness a terminal
+data-correctness proof for secondaries.
+
 ## Mandatory Digest Drill-Down
 
 For each mismatched range, the secondary calls `ExchangeRangeDigests` with a
@@ -400,12 +431,118 @@ secondary performs a bounded full-bucket remote fetch. If that retry still
 cannot prove the bucket, the secondary invalidates the optimizer state and
 falls back to the full scan path.
 
-## Resnapshot
+## Resnapshot and Pre-Seed
 
 Resnapshot is an explicit fallback for cases where bounded reconciliation
 cannot converge or the operator wants a fresh base copy. It still uses
 checkpoint-fenced fetches and proof validation. It is not a way to bypass
 delete proof or local-only path exclusion.
+
+Resnapshot is online and DR-protocol driven: the secondary discards its
+replicated data plane, fetches checkpoint-scoped entries from the primary, and
+proves the resulting checkpoint before returning to streaming. It is suitable
+when the dataset is small enough, the network budget is acceptable, or the
+operator wants a simple repair path.
+
+For old primaries or very large clusters, operators should be able to choose a
+pre-seed workflow instead of forcing the first secondary to pull the whole
+dataset through normal reconciliation. The intended production shape is:
+
+1. create the DR relationship and activation material so the primary has the
+   relationship ID and replication salt that define KID/VID projection;
+2. capture a primary-authorized DR seed bundle at a known checkpoint boundary;
+3. restore that base copy into the new secondary cluster while DR is disabled;
+4. enable the secondary with the same fresh relationship material;
+5. seed or rebuild local optimizer metadata for the restored checkpoint; and
+6. catch up only the delta between the pre-seed checkpoint and the current
+   primary index through stream journal replay or checkpoint reconciliation.
+
+Pre-seed is an operator lifecycle optimization, not a different correctness
+authority. The secondary still must bind to a fresh relationship, prove
+checkpoint convergence before promotion, and reject stale lineage or local-only
+path drift.
+
+The prototype exposes a first-class lifecycle boundary for this workflow:
+
+- `sys/replication/dr/primary/preseed/manifest` cuts a primary checkpoint and
+  returns a relationship-bound manifest for an out-of-band seed bundle hash.
+- `sys/replication/dr/primary/preseed/export` cuts a primary checkpoint and
+  returns an inline JSON seed bundle containing checkpoint-artifact-backed
+  replicated storage entries plus the same relationship-bound manifest.
+- `sys/replication/dr/secondary/preseed/accept` validates the manifest against
+  the activation token while the secondary is still disabled and records the
+  operator confirmations that storage was restored and local-only paths were
+  scrubbed or preserved with local values.
+- `sys/replication/dr/secondary/preseed/import` validates the bundle against
+  the activation token, bundle integrity hash, KID/VID projections, and
+  local-only exclusion rules; replaces the disabled secondary's replicated
+  storage plane while preserving cluster-local paths; and records the accepted
+  checkpoint baseline.
+- `sys/replication/dr/secondary/enable` consumes the accepted manifest only
+  when the same activation token is used, applies the checkpoint high-water mark
+  and durable stream cursor baseline, and then starts normal stream/reconcile
+  catch-up from that checkpoint.
+- If the process crashes after secondary config is persisted but before the
+  accepted pre-seed record is consumed, config restore applies the same baseline
+  before starting the secondary controller.
+
+The current inline bundle format is a prototype artifact format. It is useful
+for lifecycle validation because export, transfer, import, and baseline
+application are all explicit and testable. A production shape should use a
+segmented or streaming artifact with resumable transfer, stronger provenance,
+and external storage support rather than returning very large datasets inside a
+single API response.
+
+```mermaid
+flowchart TD
+    A["Primary has existing dataset"] --> B["Create DR relationship<br/>and activation material"]
+    B --> C["Primary cuts seed checkpoint"]
+    C --> D["Build DR seed bundle<br/>replicated paths only"]
+    D --> E["Operator transfers bundle<br/>out of band"]
+    E --> F["Restore into disabled secondary"]
+    F --> G["Enable secondary with<br/>matching relationship material"]
+    G --> H["Validate seed manifest<br/>and local-only scrub"]
+    H --> I{"Seed checkpoint proven?"}
+    I -->|"No"| J["Reject seed<br/>require resnapshot or scan"]
+    I -->|"Yes"| K["Set baseline cursor<br/>rebuild optimizer metadata as needed"]
+    K --> L["Replay or reconcile<br/>post-seed delta"]
+    L --> M["Checkpoint verification passes"]
+    M --> N["Strict standby streaming"]
+```
+
+A production DR seed bundle should carry a manifest that is validated before
+the secondary trusts the restored base:
+
+- primary cluster ID and relationship ID
+- checkpoint ID, checkpoint commit index, and checkpoint creation time
+- projection parameters: replication salt identity, range version, range bits,
+  digest/checksum algorithm versions, and local-only exclusion version
+- top-level range counts and checksums for the checkpoint
+- optional flat accumulator snapshot and local KID index metadata version
+- replicated-path coverage metadata and explicit local-only scrub list version
+- bundle integrity hash and primary-authorized signature or equivalent
+  provenance for each segment or the complete artifact
+- expiration or operator acknowledgement policy for stale seed material
+
+The prototype manifest covers the relationship binding, checkpoint identity,
+projection versions, local-only scrub metadata, optimizer metadata versions,
+bundle SHA-256 integrity, and expiry. The prototype inline bundle contains
+replicated checkpoint artifact entries with key, value, seal-wrap flag, KID,
+and VID. Import recomputes the KID/VID projection and bundle hash before any
+storage mutation. It does not yet include a segmented transfer format, primary
+signature format, or checkpoint bucket checksums as importable optimizer state.
+
+The clean design is to generate the seed after relationship creation. A raw
+backup captured before relationship creation can still pre-populate storage,
+but it cannot safely seed KID/VID optimizer metadata because the replication
+salt and relationship binding are not known.
+
+Pre-seed validation must fail closed when the manifest does not match the
+activation token, primary cluster identity, checkpoint tuple, range algorithm,
+or local-only exclusion version. It must also reject seed material from a
+stale pre-promotion lineage. Restoring a generic physical snapshot without a
+DR-aware scrub step is unsafe because it can duplicate local cluster identity,
+HA coordination state, local audit assumptions, or DR relationship metadata.
 
 Before non-atomic reconciliation repair or resnapshot mutation, the secondary
 invalidates persisted accumulator/index state. If it crashes mid-repair,
@@ -417,9 +554,12 @@ The protocol needs bounded:
 
 - checkpoint artifact retention
 - checkpoint build concurrency
+- checkpoint build CPU and scan cadence on the primary
 - stream buffer and journal retention
 - stream initial window and credit updates
 - reconcile in-flight work
+- per-relationship digest/fetch RPC rate
+- per-checkpoint secondary compute, byte, entry, retry, and wall-time budgets
 - digest split depth and split count
 - fetch request selectors
 - fetch response bytes
@@ -431,6 +571,40 @@ The protocol needs bounded:
 Tuning inputs must be validated before persistence or runtime apply. Cross
 field invariants matter: for example, the primary stream buffer must be at
 least as large as the secondary's effective initial stream window.
+
+Capacity modeling must separate three costs: primary checkpoint construction,
+primary digest/fetch serving, and secondary reconcile execution. The secondary
+coordinates reconciliation, but a massively fragmented reconnect can still
+consume primary CPU and I/O through checkpoint materialization, child digest
+lookups, fetch serialization, and TLS/gRPC overhead. Production defaults should
+therefore include per-relationship admission limits and status counters for
+primary checkpoint pressure, not only secondary lag.
+
+On the secondary, reconcile should use a first-class budget ledger rather than
+implicit goroutine or timeout limits. When the ledger is exhausted, the
+secondary should stop with an observable `budget_exhausted` reason and wait for
+operator tuning, resnapshot, or pre-seed instead of continuing until it harms
+the local cluster.
+
+The budget ledger should be checkpoint-scoped and relationship-scoped. At
+minimum it should account for:
+
+- wall-clock reconcile time
+- range checksum and child digest RPC count
+- fetched bytes and fetched entries
+- fetched delete candidates
+- local KID-index bucket loads and fallback scans
+- apply batches, physical mutations, and delete batches
+- retry count by phase
+- primary checkpoint artifact build attempts caused by the relationship
+
+Primary-side pressure must be enforced independently from secondary-side
+cooperation. A secondary cannot be allowed to request unbounded child digests
+or checkpoint artifacts simply because it has local CPU available. The primary
+should cap build concurrency, checkpoint rebuild frequency, digest/fetch RPC
+rate, response byte budget, and retained checkpoint artifacts per
+relationship. When these limits fire, the secondary receives a bounded failure
+and reports the phase and budget that stopped progress.
 
 ## Observability
 

@@ -9,7 +9,7 @@ import (
 	"time"
 
 	metrics "github.com/hashicorp/go-metrics/compat"
-	"github.com/openbao/openbao/sdk/v2/logical"
+	"github.com/openbao/openbao/sdk/v2/physical"
 )
 
 type drReconcileFailureClass string
@@ -94,16 +94,22 @@ func (s *drReplicationSecondary) persistCheckpointHighWaterMark(index uint64) er
 	if s.checkpointHighWaterMarkPersistHook != nil {
 		return s.checkpointHighWaterMarkPersistHook(index)
 	}
+	if s.core == nil || s.core.physical == nil {
+		return nil
+	}
 	data := fmt.Sprintf("%d", index)
-	entry := &logical.StorageEntry{
+	entry := &physical.Entry{
 		Key:   drCheckpointHWMPath,
 		Value: []byte(data),
 	}
-	return s.core.barrier.Put(s.core.activeContext.Load(), entry)
+	return s.core.physical.Put(s.core.activeContext.Load(), entry)
 }
 
 func (s *drReplicationSecondary) loadCheckpointHighWaterMark() {
-	entry, err := s.core.barrier.Get(s.core.activeContext.Load(), drCheckpointHWMPath)
+	if s.core == nil || s.core.physical == nil {
+		return
+	}
+	entry, err := s.core.physical.Get(s.core.activeContext.Load(), drCheckpointHWMPath)
 	if err != nil || entry == nil {
 		return
 	}

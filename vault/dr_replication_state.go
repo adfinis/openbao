@@ -113,6 +113,11 @@ type DRConfig struct {
 	// RelationshipID is the active relationship ID on secondary nodes.
 	RelationshipID string `json:"relationship_id,omitempty"`
 
+	// SecondaryLocalControlTokenHash authenticates local DR control-plane
+	// reads that must remain available on strict warm-standby secondaries even
+	// though the replicated token backend is not a valid local authority.
+	SecondaryLocalControlTokenHash string `json:"secondary_local_control_token_hash,omitempty"`
+
 	// SecondaryKeyringBootstrapped records that the secondary has already
 	// adopted the primary root key/keyring. This makes HA active restore skip
 	// the one-time SyncKeyring bootstrap for an already-active relationship.
@@ -901,6 +906,7 @@ func (m *drRelationshipManager) LoadConfig(ctx context.Context) error {
 			config.RelationshipID,
 			m.logger,
 		)
+		m.secondary.clusterID = config.ClusterID
 		if config.SecondaryKeyringBootstrapped {
 			m.secondary.keyringBootstrapped.Store(true)
 		}
@@ -914,6 +920,24 @@ func (m *drRelationshipManager) LoadConfig(ctx context.Context) error {
 			if err := m.secondary.setClientCertificate(config.SecondaryClientCert, config.SecondaryClientKeyPEM); err != nil {
 				return fmt.Errorf("invalid DR secondary client certificate: %w", err)
 			}
+		}
+		if acceptedPreSeed, ok, err := m.loadAcceptedPreSeedLocked(ctx); err != nil {
+			return err
+		} else if ok {
+			token := &DRActivationToken{
+				ClusterID:      config.ClusterID,
+				RelationshipID: config.RelationshipID,
+				PrimaryAddr:    config.PrimaryAddr,
+				PrimaryAddrs:   config.PrimaryAddrs,
+				ReplSalt:       config.ReplSalt,
+			}
+			if err := m.applyAcceptedPreSeedLocked(ctx, acceptedPreSeed, token); err != nil {
+				return fmt.Errorf("failed to apply accepted DR pre-seed baseline during config restore: %w", err)
+			}
+			m.logger.Info("DR secondary pre-seed baseline accepted during restore",
+				"relationship_id", config.RelationshipID,
+				"checkpoint_id", acceptedPreSeed.Manifest.CheckpointID,
+				"checkpoint_index", acceptedPreSeed.Manifest.CheckpointIndex)
 		}
 
 		m.core.replicationState.Store(uint32(consts.ReplicationDRSecondary))
@@ -1222,7 +1246,7 @@ func (m *drRelationshipManager) DisablePrimary(ctx context.Context) error {
 }
 
 // EnableSecondary enables DR secondary mode using an activation token.
-func (m *drRelationshipManager) EnableSecondary(ctx context.Context, token *DRActivationToken) error {
+func (m *drRelationshipManager) EnableSecondary(ctx context.Context, token *DRActivationToken, localControlTokens ...string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -1252,6 +1276,21 @@ func (m *drRelationshipManager) EnableSecondary(ctx context.Context, token *DRAc
 		return fmt.Errorf("failed to generate DR secondary client certificate: %w", err)
 	}
 
+	localControlToken := ""
+	if len(localControlTokens) > 0 {
+		localControlToken = localControlTokens[0]
+	}
+
+	acceptedPreSeed, hasAcceptedPreSeed, err := m.loadAcceptedPreSeedLocked(ctx)
+	if err != nil {
+		return err
+	}
+	if hasAcceptedPreSeed {
+		if err := validateDRPreSeedManifest(&acceptedPreSeed.Manifest, token, m.config.Promotion, time.Now().UTC()); err != nil {
+			return fmt.Errorf("accepted DR pre-seed record is incompatible with activation token: %w", err)
+		}
+	}
+
 	oldConfig := m.config
 	m.config = &DRConfig{
 		Mode:                  DRModeSecondary,
@@ -1273,6 +1312,13 @@ func (m *drRelationshipManager) EnableSecondary(ctx context.Context, token *DRAc
 		FallbackFailureThreshold: drDefaultFallbackFailureThreshold,
 		FallbackCooldownSeconds:  int64(drDefaultFallbackCooldown / time.Second),
 		FallbackMaxPerHour:       drDefaultFallbackMaxPerHour,
+	}
+	if localControlToken != "" {
+		m.config.SecondaryLocalControlTokenHash = hashDRSecondaryLocalControlToken(
+			m.config.ClusterID,
+			m.config.RelationshipID,
+			localControlToken,
+		)
 	}
 	if len(m.config.PrimaryAPICACert) == 0 {
 		m.config.PrimaryAPICACert = token.DRTransportCACert
@@ -1298,11 +1344,25 @@ func (m *drRelationshipManager) EnableSecondary(ctx context.Context, token *DRAc
 		token.RelationshipID,
 		m.logger,
 	)
+	m.secondary.clusterID = token.ClusterID
 	m.applySecondaryTunablesLocked()
 	m.secondary.primaryCACert = token.DRTransportCACert
 	if err := m.secondary.setClientCertificate(secondaryClientCert, secondaryClientKeyPEM); err != nil {
 		m.config = oldConfig
+		m.stopSecondaryRuntimeLocked()
 		return fmt.Errorf("failed to configure DR secondary client certificate: %w", err)
+	}
+	if hasAcceptedPreSeed {
+		if err := m.applyAcceptedPreSeedLocked(ctx, acceptedPreSeed, token); err != nil {
+			m.config = oldConfig
+			m.stopSecondaryRuntimeLocked()
+			_ = m.saveConfig(ctx)
+			return err
+		}
+		m.logger.Info("DR secondary pre-seed baseline accepted",
+			"relationship_id", token.RelationshipID,
+			"checkpoint_id", acceptedPreSeed.Manifest.CheckpointID,
+			"checkpoint_index", acceptedPreSeed.Manifest.CheckpointIndex)
 	}
 
 	m.core.replicationState.Store(uint32(consts.ReplicationDRSecondary))
@@ -1366,6 +1426,9 @@ func (m *drRelationshipManager) clearSecondaryCheckpointCursor(ctx context.Conte
 		return fmt.Errorf("failed to clear DR secondary checkpoint cursor: %w", err)
 	}
 	if m.core.physical != nil {
+		if err := m.core.physical.Delete(ctx, drCheckpointHWMPath); err != nil {
+			return fmt.Errorf("failed to clear DR secondary physical checkpoint cursor: %w", err)
+		}
 		if err := m.core.physical.Delete(ctx, drFlatAccumulatorStoragePath); err != nil {
 			return fmt.Errorf("failed to clear DR secondary flat accumulator: %w", err)
 		}

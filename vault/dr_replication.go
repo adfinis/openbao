@@ -4,11 +4,13 @@
 package vault
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/crc64"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1091,6 +1093,137 @@ func (s *drReplicationPrimary) RequestCheckpoint(ctx context.Context, req *Check
 	}
 }
 
+// BuildPreSeedCheckpoint cuts an immutable checkpoint for an operator-driven
+// DR pre-seed bundle. Relationship state is authorized by the system API before
+// this helper is called; this path intentionally does not require an active
+// mTLS secondary stream because pre-seed happens before the secondary is
+// enabled.
+func (s *drReplicationPrimary) BuildPreSeedCheckpoint(ctx context.Context, relationshipID string) (*CheckpointResponse, error) {
+	if err := s.requireActiveNode(); err != nil {
+		return nil, err
+	}
+	if relationshipID == "" {
+		return nil, status.Error(codes.InvalidArgument, "relationship_id is required")
+	}
+
+	var commitIndex uint64
+	if rb, ok := s.core.underlyingPhysical.(*raft.RaftBackend); ok {
+		commitIndex = rb.AppliedIndex()
+	}
+	if commitIndex == 0 {
+		commitIndex = s.indexApplied.Load()
+	}
+	if commitIndex == 0 {
+		return nil, status.Error(codes.FailedPrecondition, "primary applied index is not available")
+	}
+
+	for {
+		if resp, ok := s.reuseCheckpointResponse(relationshipID, commitIndex); ok {
+			return resp, nil
+		}
+		if throttle, reason := s.shouldThrottleCheckpointBuild(); throttle {
+			s.checkpointThrottleTotal.Add(1)
+			metrics.IncrCounter([]string{"replication", "dr", "checkpoint", "throttled"}, 1)
+			return nil, status.Errorf(codes.FailedPrecondition, "budget_exceeded: primary stream pressure (%s); retry", reason)
+		}
+
+		wait, owner, err := s.claimCheckpointBuild(relationshipID)
+		if err != nil {
+			return nil, err
+		}
+		if !owner {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-wait.done:
+				if wait.err != nil {
+					return nil, wait.err
+				}
+				continue
+			}
+		}
+
+		resp, err := s.buildAndCacheCheckpoint(ctx, relationshipID, commitIndex)
+		s.finishCheckpointBuild(relationshipID, wait, resp, err)
+		if err != nil {
+			return nil, err
+		}
+		return resp, nil
+	}
+}
+
+// BuildPreSeedBundle cuts a checkpoint and exports all checkpoint artifact
+// entries for an operator-driven DR seed bundle.
+func (s *drReplicationPrimary) BuildPreSeedBundle(ctx context.Context, relationshipID string) (*CheckpointResponse, []DRPreSeedBundleEntry, error) {
+	checkpoint, err := s.BuildPreSeedCheckpoint(ctx, relationshipID)
+	if err != nil {
+		return nil, nil, err
+	}
+	cp, releaseCheckpoint, err := s.getCheckpointLease(checkpoint.GetCheckpointId())
+	if err != nil {
+		return nil, nil, status.Errorf(codes.NotFound, "checkpoint not found: %v", err)
+	}
+	defer releaseCheckpoint()
+	if err := validateCheckpointRelationship(relationshipID, cp); err != nil {
+		return nil, nil, err
+	}
+	if err := validateCheckpointTuple(checkpoint.GetCheckpointId(), checkpoint.GetCommitIndex(), cp); err != nil {
+		return nil, nil, status.Errorf(codes.FailedPrecondition, "invalid checkpoint tuple: %v", err)
+	}
+	if s.checkpointArtifacts == nil {
+		return nil, nil, status.Error(codes.FailedPrecondition, "checkpoint_artifact_missing: checkpoint artifacts are not enabled")
+	}
+
+	kids := make([][32]byte, 0, len(cp.kidToVID))
+	for kid := range cp.kidToVID {
+		kids = append(kids, kid)
+	}
+	sort.Slice(kids, func(i, j int) bool {
+		return bytes.Compare(kids[i][:], kids[j][:]) < 0
+	})
+
+	entries := make([]DRPreSeedBundleEntry, 0, len(kids))
+	for _, kid := range kids {
+		select {
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		default:
+		}
+		rec, found, err := s.checkpointArtifacts.getRecord(cp.checkpoint.ID, kid)
+		if err != nil {
+			return nil, nil, status.Errorf(codes.FailedPrecondition, "checkpoint_artifact_missing: %v", err)
+		}
+		if !found {
+			return nil, nil, status.Error(codes.FailedPrecondition, "checkpoint_artifact_missing: live checkpoint key has no artifact record")
+		}
+		if rec.Tombstone {
+			return nil, nil, status.Error(codes.FailedPrecondition, "checkpoint_provenance_mismatch: live checkpoint key has tombstone artifact")
+		}
+		if rec.Key == "" {
+			return nil, nil, status.Errorf(codes.FailedPrecondition, "checkpoint artifact contains invalid pre-seed key %q", rec.Key)
+		}
+		if isDRPreSeedBulkExcludedPath(rec.Key) {
+			continue
+		}
+		value, err := s.checkpointArtifacts.readValue(cp.checkpoint.ID, rec.ValueRef)
+		if err != nil {
+			return nil, nil, status.Errorf(codes.FailedPrecondition, "checkpoint_artifact_missing: %v", err)
+		}
+		cpVID, ok := cp.kidToVID[kid]
+		if !ok || cpVID != rec.VID {
+			return nil, nil, status.Error(codes.FailedPrecondition, "checkpoint_provenance_mismatch: artifact VID does not match checkpoint metadata")
+		}
+		entries = append(entries, DRPreSeedBundleEntry{
+			Key:      rec.Key,
+			Value:    append([]byte(nil), value...),
+			SealWrap: rec.SealWrap,
+			KID:      append([]byte(nil), rec.KID[:]...),
+			VID:      append([]byte(nil), rec.VID[:]...),
+		})
+	}
+	return checkpoint, entries, nil
+}
+
 // ExchangeDirtyBitmap implements DRReplicationServer.ExchangeDirtyBitmap.
 func (s *drReplicationPrimary) ExchangeDirtyBitmap(ctx context.Context, req *DirtyBitmapMessage) (*DirtyBitmapMessage, error) {
 	if err := s.requireActiveNode(); err != nil {
@@ -2007,11 +2140,13 @@ func (s *drReplicationPrimary) snapshotIndexCheckpointSet(commitIndex uint64) (*
 		return nil, false
 	}
 	kidToVID := make(map[[32]byte][32]byte, len(s.indexKIDToVID))
-	for kid, vid := range s.indexKIDToVID {
-		kidToVID[kid] = vid
-	}
 	kidToKey := make(map[[32]byte]string, len(s.indexKIDToKey))
-	for kid, key := range s.indexKIDToKey {
+	for kid, vid := range s.indexKIDToVID {
+		key, ok := s.indexKIDToKey[kid]
+		if !ok || key == "" || isDRReconcileExcludedPath(key) {
+			continue
+		}
+		kidToVID[kid] = vid
 		kidToKey[kid] = key
 	}
 	rs := &reconciler.ReconciliationSet{

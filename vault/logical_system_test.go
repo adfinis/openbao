@@ -74,10 +74,14 @@ func TestSystemBackend_RootPaths(t *testing.T) {
 		"replication/dr/primary/enable",
 		"replication/dr/primary/disable",
 		"replication/dr/primary/secondary-token",
+		"replication/dr/primary/preseed/export",
+		"replication/dr/primary/preseed/manifest",
 		"replication/dr/primary/relationships",
 		"replication/dr/primary/relationships/*",
 		"replication/dr/secondary/enable",
 		"replication/dr/secondary/disable",
+		"replication/dr/secondary/preseed/accept",
+		"replication/dr/secondary/preseed/import",
 		"replication/dr/secondary/rotate-certificate",
 		"replication/dr/secondary/promote",
 		"replication/dr/secondary/resnapshot",
@@ -99,10 +103,14 @@ func TestSystemBackend_DRSpecialPaths(t *testing.T) {
 		"replication/dr/primary/enable",
 		"replication/dr/primary/disable",
 		"replication/dr/primary/secondary-token",
+		"replication/dr/primary/preseed/export",
+		"replication/dr/primary/preseed/manifest",
 		"replication/dr/primary/relationships",
 		"replication/dr/primary/relationships/*",
 		"replication/dr/secondary/enable",
 		"replication/dr/secondary/disable",
+		"replication/dr/secondary/preseed/accept",
+		"replication/dr/secondary/preseed/import",
 		"replication/dr/secondary/rotate-certificate",
 		"replication/dr/secondary/promote",
 		"replication/dr/secondary/resnapshot",
@@ -130,6 +138,7 @@ func TestSystemBackend_DRSpecialPaths(t *testing.T) {
 		"replication/dr/primary/register-secondary",
 		"replication/dr/primary/rotate-secondary-certificate",
 		"replication/dr/primary/confirm-secondary-certificate",
+		"replication/dr/secondary/verify-checkpoint",
 	}
 	for _, path := range expectedDRUnauthPaths {
 		if !strListContains(unauthPaths, path) {
@@ -178,7 +187,11 @@ func TestSystemBackend_DRSensitiveFields(t *testing.T) {
 	}
 
 	requireSensitiveDRResponseField("replication/dr/primary/secondary-token$", logical.UpdateOperation, http.StatusOK, "token")
+	requireSensitiveDRResponseField("replication/dr/primary/preseed/export$", logical.UpdateOperation, http.StatusOK, "bundle")
 	requireSensitiveDRField("replication/dr/secondary/enable$", "token")
+	requireSensitiveDRField("replication/dr/secondary/preseed/accept$", "token")
+	requireSensitiveDRField("replication/dr/secondary/preseed/import$", "token")
+	requireSensitiveDRField("replication/dr/secondary/preseed/import$", "bundle")
 	requireSensitiveDRField("replication/dr/primary/register-secondary$", "bootstrap_token")
 	requireSensitiveDRField("replication/dr/primary/register-secondary$", "secondary_ca_cert")
 	for _, pattern := range []string{
@@ -213,6 +226,25 @@ func TestSystemBackend_DRAuditHMACsBootstrapAndRotationMaterial(t *testing.T) {
 				"signature":         "rotation-signature-raw-value-that-must-not-appear",
 			},
 		},
+		{
+			Operation: logical.UpdateOperation,
+			Path:      "sys/replication/dr/secondary/preseed/accept",
+			Data: map[string]interface{}{
+				"token":                       "preseed-activation-token-raw-value-that-must-not-appear",
+				"manifest":                    "{}",
+				"confirm_storage_restored":    true,
+				"confirm_local_only_scrubbed": true,
+			},
+		},
+		{
+			Operation: logical.UpdateOperation,
+			Path:      "sys/replication/dr/secondary/preseed/import",
+			Data: map[string]interface{}{
+				"token":                              "preseed-import-token-raw-value-that-must-not-appear",
+				"bundle":                             "preseed-import-bundle-raw-value-that-must-not-appear",
+				"confirm_replace_replicated_storage": true,
+			},
+		},
 	}
 
 	for _, req := range requests {
@@ -236,6 +268,9 @@ func TestSystemBackend_DRAuditHMACsBootstrapAndRotationMaterial(t *testing.T) {
 		"registration-cert-raw-value-that-must-not-appear",
 		"rotation-cert-raw-value-that-must-not-appear",
 		"rotation-signature-raw-value-that-must-not-appear",
+		"preseed-activation-token-raw-value-that-must-not-appear",
+		"preseed-import-token-raw-value-that-must-not-appear",
+		"preseed-import-bundle-raw-value-that-must-not-appear",
 	} {
 		if strings.Contains(string(body), raw) {
 			t.Fatalf("audit record exposed raw DR secret material %q: %s", raw, string(body))
