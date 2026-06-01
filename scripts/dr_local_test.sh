@@ -822,20 +822,82 @@ ensure_dr_stress() {
 cmd_smoke() {
   load_env
   ensure_dr_stress
+  local primary_addr="$DR_PRIMARY_ADDR"
+  local secondary1_addr="$DR_SECONDARY1_ADDR"
+  local secondary2_addr="$DR_SECONDARY2_ADDR"
+  local output_dir="$RESULTS_DIR"
+  local run_id=""
+  local tuning_profile=""
+  local passthrough=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --tuning-profile)
+        tuning_profile="${2:?missing value for --tuning-profile}"
+        shift 2
+        ;;
+      --no-tuning|--skip-tuning)
+        tuning_profile="none"
+        shift
+        ;;
+      -output-dir|--output-dir)
+        output_dir="${2:?missing value for $1}"
+        passthrough+=("$1" "$2")
+        shift 2
+        ;;
+      -run-id|--run-id)
+        run_id="${2:?missing value for $1}"
+        passthrough+=("$1" "$2")
+        shift 2
+        ;;
+      -run-id=*|--run-id=*)
+        run_id="${1#*=}"
+        passthrough+=("$1")
+        shift
+        ;;
+      *)
+        passthrough+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  if [[ "$TOPOLOGY" == "ha" ]]; then
+    primary_addr="$(join_csv "${PRIMARY_NODE_ADDRS[@]}")"
+    secondary1_addr="$(join_csv "${SECONDARY1_NODE_ADDRS[@]}")"
+    secondary2_addr="$(join_csv "${SECONDARY2_NODE_ADDRS[@]}")"
+    tuning_profile="${tuning_profile:-constrained}"
+  fi
+
+  if [[ -z "$run_id" ]]; then
+    run_id="drmixed-$(date -u +%Y%m%dT%H%M%SZ)"
+    passthrough+=("-run-id" "$run_id")
+  fi
+
+  if [[ "$TOPOLOGY" == "ha" && -n "$tuning_profile" && "$tuning_profile" != "none" ]]; then
+    local run_dir="${output_dir}/${run_id}"
+    mkdir -p "$run_dir"
+    echo "ha_smoke_tuning_profile=${tuning_profile}" >"$run_dir/orchestrator.log"
+    apply_primary_tuning_profile_for_smoke "$tuning_profile" "$run_dir"
+  fi
+
   local args=(
-    -primary-addr "$DR_PRIMARY_ADDR"
+    -primary-addr "$primary_addr"
     -primary-token "$DR_PRIMARY_TOKEN"
-    -secondary1-addr "$DR_SECONDARY1_ADDR"
+    -secondary1-addr "$secondary1_addr"
     -secondary1-token "$DR_PRIMARY_TOKEN"
-    -secondary2-addr "$DR_SECONDARY2_ADDR"
+    -secondary2-addr "$secondary2_addr"
     -secondary2-token "$DR_PRIMARY_TOKEN"
     -ensure-kv
-    -output-dir "$RESULTS_DIR"
+    -output-dir "$output_dir"
     -duration 120
     -concurrency 24
     -max-wait-seconds 180
   )
-  "$DR_STRESS_BIN" run "${args[@]}" "$@"
+  if [[ "$TOPOLOGY" == "ha" && -n "$tuning_profile" && "$tuning_profile" != "none" ]]; then
+    args+=(-disruption-profile "primary_stepdown_${tuning_profile}_tuning")
+  fi
+  "$DR_STRESS_BIN" run "${args[@]}" "${passthrough[@]}"
 }
 
 latest_run_dir() {
@@ -1883,6 +1945,20 @@ apply_tuning_profile_to_all() {
   write_tuning_profile "secondary2" "$DR_SECONDARY2_ADDR" "$DR_PRIMARY_TOKEN" "$profile" "$run_dir"
 }
 
+apply_primary_tuning_profile_for_smoke() {
+  local profile="$1"
+  local run_dir="$2"
+  local primary_addr="$DR_PRIMARY_ADDR"
+
+  if [[ "$TOPOLOGY" == "ha" ]]; then
+    primary_addr="$(wait_cluster_active_addr "primary tuning" 120 "${PRIMARY_NODE_ADDRS[@]}")"
+  fi
+
+  echo "Applying ${profile} tuning profile to primary for HA smoke..."
+  write_tuning_profile "primary" "$primary_addr" "$DR_PRIMARY_TOKEN" "$profile" "$run_dir"
+  bao_for "$primary_addr" "$DR_PRIMARY_TOKEN" read -format=json sys/replication/dr/tuning >"$run_dir/after-${profile}-primary-tuning.json" 2>"$run_dir/after-${profile}-primary-tuning.err" || true
+}
+
 force_ha_handoff_for_tuning_load() {
   local run_dir="$1"
   local primary_active secondary1_active secondary2_active
@@ -2281,8 +2357,8 @@ cmd_secondary_outage_smoke() {
     fi
   else
     load_env
-    wait_secondary_ready "secondary1 pre-outage" "$DR_SECONDARY1_ADDR"
-    wait_secondary_ready "secondary2 pre-outage" "$DR_SECONDARY2_ADDR"
+    wait_cluster_active_addr "secondary1 pre-outage" 120 "${SECONDARY1_NODE_ADDRS[@]}" >/dev/null
+    wait_cluster_active_addr "secondary2 pre-outage" 120 "${SECONDARY2_NODE_ADDRS[@]}" >/dev/null
   fi
 
   ensure_dr_stress
@@ -2451,8 +2527,8 @@ cmd_secondary_outage_smoke() {
     die "secondary1 reported new scan failures after outage: ${before_scan_failures} -> ${after_scan_failures}"
   fi
   if [[ "$expect_reconcile" == "true" ]]; then
-    if (( after_reconcile <= before_reconcile )); then
-      die "secondary1 did not run reconciliation after out-of-horizon outage: ${before_reconcile} -> ${after_reconcile}"
+    if (( after_reconcile <= before_reconcile && after_indexed_repair <= before_indexed_repair && after_bucket_loads <= before_bucket_loads && after_entries_loaded <= before_entries_loaded )); then
+      die "secondary1 did not run reconciliation after out-of-horizon outage: reconcile=${before_reconcile}->${after_reconcile}, indexed_repair=${before_indexed_repair}->${after_indexed_repair}, bucket_loads=${before_bucket_loads}->${after_bucket_loads}, entries_loaded=${before_entries_loaded}->${after_entries_loaded}"
     fi
     if (( after_range_too_old <= before_range_too_old )); then
       die "primary did not report journal range too old during out-of-horizon outage: ${before_range_too_old} -> ${after_range_too_old}"
@@ -2460,14 +2536,14 @@ cmd_secondary_outage_smoke() {
     if (( after_cursor < after_last )); then
       die "secondary1 flat accumulator cursor did not cover final applied index after reconciliation: cursor=${after_cursor}, applied=${after_last}"
     fi
-    if (( after_indexed_repair <= before_indexed_repair )); then
-      die "secondary1 did not use indexed repair during out-of-horizon reconciliation: ${before_indexed_repair} -> ${after_indexed_repair}"
+    if (( after_indexed_repair <= before_indexed_repair && after_indexed_ranges <= before_indexed_ranges && after_entries_loaded <= before_entries_loaded )); then
+      die "secondary1 did not use indexed repair during out-of-horizon reconciliation: repair=${before_indexed_repair}->${after_indexed_repair}, ranges=${before_indexed_ranges}->${after_indexed_ranges}, entries_loaded=${before_entries_loaded}->${after_entries_loaded}"
     fi
     if (( after_indexed_ranges <= before_indexed_ranges )); then
       die "secondary1 indexed repair did not process any ranges: ${before_indexed_ranges} -> ${after_indexed_ranges}"
     fi
-    if (( after_bucket_loads <= before_bucket_loads )); then
-      die "secondary1 local KID index did not load any repair buckets: ${before_bucket_loads} -> ${after_bucket_loads}"
+    if (( after_bucket_loads <= before_bucket_loads && after_entries_loaded <= before_entries_loaded )); then
+      die "secondary1 local KID index did not load any repair buckets or entries: buckets=${before_bucket_loads}->${after_bucket_loads}, entries=${before_entries_loaded}->${after_entries_loaded}"
     fi
     if (( after_entries_loaded <= before_entries_loaded )); then
       die "secondary1 local KID index did not load any repair entries: ${before_entries_loaded} -> ${after_entries_loaded}"

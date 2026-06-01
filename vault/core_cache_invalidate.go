@@ -343,6 +343,16 @@ func isReadOnlyStorageError(err error) bool {
 	})
 }
 
+func isKeyringUnexpectedlyMissingError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	return errorChainContains(err, func(cur error) bool {
+		return strings.Contains(strings.ToLower(cur.Error()), "keyring unexpectedly missing")
+	})
+}
+
 func isTransitionTransientInvalidationError(err error, transitionActive bool) bool {
 	if err == nil {
 		return false
@@ -354,6 +364,22 @@ func isTransitionTransientInvalidationError(err error, transitionActive bool) bo
 		return true
 	}
 	return transitionActive && errors.Is(err, errLoadAuditFailed)
+}
+
+func isReadOnlyStandbyDRKeyTransitionError(err error) bool {
+	return isTransitionTransientInvalidationError(err, true) ||
+		isReadOnlyStorageError(err) ||
+		isKeyringUnexpectedlyMissingError(err)
+}
+
+func (c *Core) isDRSecondaryReadOnlyStandby() bool {
+	if c == nil || !c.standby.Load() || c.heldHALock != nil || c.drManager == nil {
+		return false
+	}
+
+	c.drManager.mu.RLock()
+	defer c.drManager.mu.RUnlock()
+	return c.drManager.config != nil && c.drManager.config.Mode == DRModeSecondary
 }
 
 func (c *Core) beginDRKeyTransition(reason string) (uint64, bool) {
@@ -610,16 +636,16 @@ func (c *Core) snapshotDeferredInvalidations(generation uint64) ([]string, bool)
 	return keys, true
 }
 
-func (c *Core) endDRKeyTransition(generation uint64) bool {
+func (c *Core) clearDRKeyTransition(generation uint64) (int, bool) {
 	if c == nil {
-		return false
+		return 0, false
 	}
 
 	state := &c.drSecondaryKeyTransition
 	state.mu.Lock()
 	if !state.active || state.generation != generation {
 		state.mu.Unlock()
-		return false
+		return 0, false
 	}
 
 	deferredCount := len(state.deferredKeys)
@@ -633,6 +659,15 @@ func (c *Core) endDRKeyTransition(generation uint64) bool {
 	state.mu.Unlock()
 
 	metrics.SetGauge([]string{"replication", "dr", "secondary", "key_transition_deferred_keys_current"}, 0)
+	return deferredCount, true
+}
+
+func (c *Core) endDRKeyTransition(generation uint64) bool {
+	deferredCount, ok := c.clearDRKeyTransition(generation)
+	if !ok {
+		return false
+	}
+
 	c.logger.Info("DR key transition completed", "generation", generation, "deferred_keys", deferredCount)
 	return true
 }
@@ -785,6 +820,7 @@ func (im *invalidationManager) runDRKeyTransitionWorker(generation uint64) {
 	defer im.core.markDRKeyTransitionWorkerStopped(generation)
 
 	backoff := drKeyTransitionBackoffMin
+	var lastErr error
 	for {
 		deadline, ok := im.core.drKeyTransitionDeadline(generation)
 		if !ok {
@@ -792,6 +828,9 @@ func (im *invalidationManager) runDRKeyTransitionWorker(generation uint64) {
 		}
 
 		if time.Now().After(deadline) {
+			if im.deferDRKeyTransitionOnReadOnlyStandby(generation, lastErr, "timeout") {
+				return
+			}
 			metrics.IncrCounter([]string{"replication", "dr", "secondary", "key_transition_timeout_total"}, 1)
 			im.dispacherLogger.Error("DR key transition timed out; failing closed",
 				"generation", generation, "deadline", deadline)
@@ -806,10 +845,14 @@ func (im *invalidationManager) runDRKeyTransitionWorker(generation uint64) {
 			im.replayDeferredInvalidations(generation)
 			return
 		}
+		lastErr = err
 
 		im.dispacherLogger.Warn("DR key-transition resync attempt failed",
 			"generation", generation, "error", err)
 		if !isTransitionTransientInvalidationError(err, true) {
+			if im.deferDRKeyTransitionOnReadOnlyStandby(generation, err, "resync_error") {
+				return
+			}
 			im.dispacherLogger.Error("fatal DR key-transition resync error; failing closed",
 				"generation", generation, "error", err)
 			im.core.restart()
@@ -824,6 +867,21 @@ func (im *invalidationManager) runDRKeyTransitionWorker(generation uint64) {
 			backoff = drKeyTransitionBackoffMax
 		}
 	}
+}
+
+func (im *invalidationManager) deferDRKeyTransitionOnReadOnlyStandby(generation uint64, err error, reason string) bool {
+	if im == nil || im.core == nil || !im.core.isDRSecondaryReadOnlyStandby() || !isReadOnlyStandbyDRKeyTransitionError(err) {
+		return false
+	}
+
+	// HA standbys are read-only and will reload DR state during activation.
+	// Do not seal them for a transition resync that only an active node can
+	// complete safely.
+	deferredCount, _ := im.core.clearDRKeyTransition(generation)
+	metrics.IncrCounter([]string{"replication", "dr", "secondary", "key_transition_readonly_standby_deferred_total"}, 1)
+	im.dispacherLogger.Warn("DR key transition deferred on read-only standby",
+		"generation", generation, "deferred_keys", deferredCount, "reason", reason, "error", err)
+	return true
 }
 
 func (im *invalidationManager) drKeyTransitionWait(wait time.Duration) bool {
@@ -1094,6 +1152,9 @@ func (ij *invalidationJob) Execute() error {
 	case strings.HasPrefix(ij.key, "autopilot/") || ij.key == raftAutopilotConfigurationStoragePath:
 		// Raft context is reloaded when a standby becomes active, so it is
 		// safe to ignore changes to autopilot state.
+	case isDRClusterLocalOptimizerPath(key):
+		// DR optimizer state is read directly from physical storage by the
+		// DR subsystem. It has no route-backed or core cache to invalidate.
 	case isLoginMFA(ij.key):
 		ij.fatal = true
 		return ij.loginMFAInvalidation(ctx, ns)

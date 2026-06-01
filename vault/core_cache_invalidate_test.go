@@ -115,6 +115,53 @@ func TestInvalidation_TransientDecryptFailureClassifier(t *testing.T) {
 	require.False(t, isTransitionTransientInvalidationError(fmt.Errorf("wrapped audit load failure: %w", errLoadAuditFailed), false))
 	require.True(t, isTransitionTransientInvalidationError(logical.ErrReadOnly, true))
 	require.False(t, isTransitionTransientInvalidationError(logical.ErrReadOnly, false))
+	require.True(t, isKeyringUnexpectedlyMissingError(fmt.Errorf("failed to reload keyring: keyring unexpectedly missing")))
+	require.True(t, isReadOnlyStandbyDRKeyTransitionError(fmt.Errorf("failed to reload keyring: keyring unexpectedly missing")))
+}
+
+func TestInvalidation_DRReadOnlyStandbyTransitionFailureDefers(t *testing.T) {
+	t.Parallel()
+
+	core := &Core{logger: logger}
+	core.standby.Store(true)
+	core.drManager = &drRelationshipManager{
+		core:   core,
+		logger: logger,
+		config: &DRConfig{Mode: DRModeSecondary},
+	}
+	generation, started := core.beginDRKeyTransition("unit test")
+	require.True(t, started)
+	require.True(t, core.isDRSecondaryReadOnlyStandby())
+
+	im := &invalidationManager{
+		core:            core,
+		dispacherLogger: logger,
+	}
+	handled := im.deferDRKeyTransitionOnReadOnlyStandby(generation, fmt.Errorf("failed to reload keyring: keyring unexpectedly missing"), "resync_error")
+	require.True(t, handled)
+	require.False(t, core.isDRKeyTransitionActive())
+}
+
+func TestInvalidation_DRActiveTransitionFailureDoesNotDefer(t *testing.T) {
+	t.Parallel()
+
+	core := &Core{logger: logger}
+	core.drManager = &drRelationshipManager{
+		core:   core,
+		logger: logger,
+		config: &DRConfig{Mode: DRModeSecondary},
+	}
+	generation, started := core.beginDRKeyTransition("unit test")
+	require.True(t, started)
+	require.False(t, core.isDRSecondaryReadOnlyStandby())
+
+	im := &invalidationManager{
+		core:            core,
+		dispacherLogger: logger,
+	}
+	handled := im.deferDRKeyTransitionOnReadOnlyStandby(generation, fmt.Errorf("failed to reload keyring: keyring unexpectedly missing"), "resync_error")
+	require.False(t, handled)
+	require.True(t, core.isDRKeyTransitionActive())
 }
 
 func TestInvalidation_DRDecryptFailure_DefersDuringTransition(t *testing.T) {

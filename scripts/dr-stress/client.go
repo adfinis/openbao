@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -23,6 +24,8 @@ type BaoClient struct {
 	addr       string // e.g. "https://127.0.0.1:8200"
 	addrs      []string
 	token      string
+	activeMu   sync.RWMutex
+	activeAddr string
 }
 
 // NewBaoClient creates a BaoClient with a tuned http.Transport.
@@ -97,7 +100,44 @@ func parseAddrs(raw string) []string {
 // The caller is responsible for interpreting the body.  On non-2xx the body
 // is still returned (if available) so error details can be extracted.
 func (c *BaoClient) do(ctx context.Context, method, path string, body io.Reader) (int, []byte, error) {
-	return c.doAt(ctx, c.addr, method, path, body)
+	var bodyBytes []byte
+	if body != nil {
+		var err error
+		bodyBytes, err = io.ReadAll(body)
+		if err != nil {
+			return 0, nil, fmt.Errorf("read request body: %w", err)
+		}
+	}
+	bodyReader := func() io.Reader {
+		if body == nil {
+			return nil
+		}
+		return bytes.NewReader(bodyBytes)
+	}
+
+	if len(c.addrs) <= 1 {
+		return c.doAt(ctx, c.addr, method, path, bodyReader())
+	}
+
+	addr := c.cachedActiveAddr()
+	if addr == "" {
+		if resolved, err := c.resolveActiveAddr(ctx); err == nil && resolved != "" {
+			addr = resolved
+		} else {
+			addr = c.addr
+		}
+	}
+
+	code, resp, err := c.doAt(ctx, addr, method, path, bodyReader())
+	if err == nil {
+		return code, resp, nil
+	}
+
+	c.clearActiveAddr()
+	if resolved, resolveErr := c.resolveActiveAddr(ctx); resolveErr == nil && resolved != "" && resolved != addr {
+		return c.doAt(ctx, resolved, method, path, bodyReader())
+	}
+	return code, resp, err
 }
 
 func (c *BaoClient) doAt(ctx context.Context, addr, method, path string, body io.Reader) (int, []byte, error) {
@@ -125,6 +165,58 @@ func (c *BaoClient) doAt(ctx context.Context, addr, method, path string, body io
 	}
 
 	return resp.StatusCode, respBody, nil
+}
+
+func (c *BaoClient) cachedActiveAddr() string {
+	c.activeMu.RLock()
+	defer c.activeMu.RUnlock()
+	return c.activeAddr
+}
+
+func (c *BaoClient) setActiveAddr(addr string) {
+	c.activeMu.Lock()
+	defer c.activeMu.Unlock()
+	c.activeAddr = addr
+}
+
+func (c *BaoClient) clearActiveAddr() {
+	c.activeMu.Lock()
+	defer c.activeMu.Unlock()
+	c.activeAddr = ""
+}
+
+type leaderEnvelope struct {
+	Data struct {
+		IsSelf bool `json:"is_self"`
+	} `json:"data"`
+}
+
+func (c *BaoClient) resolveActiveAddr(ctx context.Context) (string, error) {
+	var lastErr error
+	for _, addr := range c.addrs {
+		code, body, err := c.doAt(ctx, addr, http.MethodGet, "/v1/sys/leader", nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if code != http.StatusOK {
+			lastErr = fmt.Errorf("leader lookup on %s returned %d", addr, code)
+			continue
+		}
+		var envelope leaderEnvelope
+		if err := json.Unmarshal(body, &envelope); err != nil {
+			lastErr = fmt.Errorf("decode leader response from %s: %w", addr, err)
+			continue
+		}
+		if envelope.Data.IsSelf {
+			c.setActiveAddr(addr)
+			return addr, nil
+		}
+	}
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", fmt.Errorf("no active node found")
 }
 
 // KVPutRequest is the payload for a KV v2 PUT.
@@ -352,6 +444,7 @@ func drStatusScore(status *DRStatusResponse) int {
 // StepDown requests a leader stepdown on the node.
 func (c *BaoClient) StepDown(ctx context.Context) (int, error) {
 	code, _, err := c.do(ctx, http.MethodPost, "/v1/sys/step-down", nil)
+	c.clearActiveAddr()
 	if err != nil {
 		return code, err
 	}

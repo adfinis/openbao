@@ -30,17 +30,19 @@ const (
 	drFlatAccumulatorDeltaVersion      = 1
 	drStreamAppliedIndexVersion        = 1
 	drFlatAccumulatorRangeBits         = 10
-	drFlatAccumulatorChecksumAlgorithm = "crc64-iso-xor-kid-vid-v1"
+	drFlatAccumulatorChecksumAlgorithm = "crc64-iso-xor-kid-vid-and-kid-membership-v2"
 )
 
 type drFlatAccumulatorBucket struct {
-	checksum uint64
-	count    uint64
+	checksum    uint64
+	kidChecksum uint64
+	count       uint64
 }
 
 type drFlatAccumulatorPersistedBucket struct {
-	Checksum uint64 `json:"checksum"`
-	Count    uint64 `json:"count"`
+	Checksum    uint64 `json:"checksum"`
+	KIDChecksum uint64 `json:"kid_checksum"`
+	Count       uint64 `json:"count"`
 }
 
 type drFlatAccumulatorPersistedSnapshot struct {
@@ -283,8 +285,9 @@ func (s *drReplicationSecondary) persistFlatAccumulatorSnapshot(
 	}
 	for i, bucket := range buckets {
 		snapshot.Buckets[i] = drFlatAccumulatorPersistedBucket{
-			Checksum: bucket.checksum,
-			Count:    bucket.count,
+			Checksum:    bucket.checksum,
+			KIDChecksum: bucket.kidChecksum,
+			Count:       bucket.count,
 		}
 	}
 	data, err := json.Marshal(snapshot)
@@ -753,8 +756,9 @@ func (s *drReplicationSecondary) loadPersistentFlatAccumulator(ctx context.Conte
 	var buckets [drRangeMaxTotalRanges]drFlatAccumulatorBucket
 	for i, bucket := range snapshot.Buckets {
 		buckets[i] = drFlatAccumulatorBucket{
-			checksum: bucket.Checksum,
-			count:    bucket.Count,
+			checksum:    bucket.Checksum,
+			kidChecksum: bucket.KIDChecksum,
+			count:       bucket.Count,
 		}
 	}
 	s.rangeAccumulator.replace(snapshot.CommitIndex, buckets)
@@ -777,8 +781,9 @@ func (s *drReplicationSecondary) replayPersistedFlatAccumulatorDeltas(
 	}
 	for i, bucket := range snapshot.Buckets {
 		buckets[i] = drFlatAccumulatorBucket{
-			checksum: bucket.Checksum,
-			count:    bucket.Count,
+			checksum:    bucket.Checksum,
+			kidChecksum: bucket.KIDChecksum,
+			count:       bucket.Count,
 		}
 	}
 
@@ -1103,16 +1108,34 @@ func (s *drReplicationSecondary) accumulatorDeltaForChange(
 
 func addFlatAccumulatorContribution(bucket *drFlatAccumulatorBucket, kid, vid [32]byte) {
 	bucket.count++
+	bucket.kidChecksum ^= flatAccumulatorKIDContribution(kid)
 	bucket.checksum ^= flatAccumulatorContribution(kid, vid)
 }
 
 func removeFlatAccumulatorContribution(bucket *drFlatAccumulatorBucket, kid, vid [32]byte) {
 	bucket.count--
+	bucket.kidChecksum ^= flatAccumulatorKIDContribution(kid)
 	bucket.checksum ^= flatAccumulatorContribution(kid, vid)
 }
 
 func flatAccumulatorContribution(kid, vid [32]byte) uint64 {
-	kSum := crc64.Checksum(kid[:], drFlatAccumulatorCRCTable)
+	kSum := flatAccumulatorKIDContribution(kid)
 	vSum := crc64.Checksum(vid[:], drFlatAccumulatorCRCTable)
 	return kSum ^ vSum
+}
+
+func flatAccumulatorKIDContribution(kid [32]byte) uint64 {
+	return crc64.Checksum(kid[:], drFlatAccumulatorCRCTable)
+}
+
+func computeFlatAccumulatorKIDMembershipChecksum(index *reconciler.RangeMapIndex, rangeID uint64) (uint64, uint64) {
+	if index == nil {
+		return 0, 0
+	}
+	keys := index.RangeKeys(reconciler.SpanFromRangeID(rangeID))
+	var checksum uint64
+	for _, kid := range keys {
+		checksum ^= flatAccumulatorKIDContribution(kid)
+	}
+	return checksum, uint64(len(keys))
 }

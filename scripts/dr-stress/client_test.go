@@ -49,6 +49,50 @@ func TestDRStatusChoosesActiveSecondaryFromAddressList(t *testing.T) {
 	}
 }
 
+func TestKVGetChoosesActiveFromAddressList(t *testing.T) {
+	standby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/sys/leader":
+			fmt.Fprint(w, `{"data":{"ha_enabled":true,"is_self":false}}`)
+		default:
+			t.Fatalf("unexpected standby path: %s", r.URL.Path)
+		}
+	}))
+	defer standby.Close()
+
+	active := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/sys/leader":
+			fmt.Fprint(w, `{"data":{"ha_enabled":true,"is_self":true}}`)
+		case "/v1/kv/data/dr-mixed/k1":
+			fmt.Fprint(w, `{"data":{"data":{"seq":42,"run_id":"run-1"},"metadata":{}}}`)
+		default:
+			t.Fatalf("unexpected active path: %s", r.URL.Path)
+		}
+	}))
+	defer active.Close()
+
+	cfg := DefaultConfig()
+	client, err := NewBaoClient(NodeConfig{
+		Addr:  standby.URL + "," + active.URL,
+		Token: "test-token",
+	}, cfg)
+	if err != nil {
+		t.Fatalf("NewBaoClient returned error: %v", err)
+	}
+
+	code, resp, err := client.KVGet(context.Background(), "kv", "dr-mixed/k1")
+	if err != nil {
+		t.Fatalf("KVGet returned error: %v", err)
+	}
+	if code != http.StatusOK {
+		t.Fatalf("code = %d, want %d", code, http.StatusOK)
+	}
+	if got := resp.Data.Data["seq"]; got != float64(42) {
+		t.Fatalf("seq = %v, want 42", got)
+	}
+}
+
 func TestParseAddrsTrimsEmptyParts(t *testing.T) {
 	got := parseAddrs(" http://one:8200/, ,http://two:8200/ ")
 	want := []string{"http://one:8200", "http://two:8200"}

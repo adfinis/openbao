@@ -4518,6 +4518,67 @@ func TestDRSecondaryStreamTxnPersistsFlatAccumulator(t *testing.T) {
 	}
 }
 
+func TestDRSecondaryStreamTxnCoalescedDeleteAbsentKey(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	replSalt := bytes.Repeat([]byte{0x46}, 32)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-flat-txn-absent-delete", core.logger)
+
+	txnBackend, ok := core.physical.(physical.TransactionalBackend)
+	if !ok {
+		t.Fatal("test core physical backend must support transactions")
+	}
+
+	localSet := &reconciler.ReconciliationSet{
+		KIDToVID: map[[32]byte][32]byte{},
+		KIDToKey: map[[32]byte]string{},
+	}
+	secondary.rangeAccumulator.resetFromSet(localSet, 10)
+	secondary.lastAppliedIndex.Store(10)
+	if err := secondary.resetAndPersistFlatAccumulatorFromSet(ctx, localSet, 10); err != nil {
+		t.Fatalf("failed to seed empty accumulator: %v", err)
+	}
+
+	key := "secret/flat-txn-transient-delete"
+	kid := secondary.scanner.ComputeKID(key)
+	if err := secondary.applyStreamTxn(ctx, txnBackend, []*EntryChange{{
+		OpType:    string(physical.PutOperation),
+		Key:       key,
+		Value:     []byte("transient"),
+		RaftIndex: 11,
+	}, {
+		OpType:    string(physical.DeleteOperation),
+		Key:       key,
+		RaftIndex: 12,
+	}}, false); err != nil {
+		t.Fatalf("stream txn failed for coalesced transient delete: %v", err)
+	}
+
+	if entry, err := core.physical.Get(ctx, key); err != nil {
+		t.Fatal(err)
+	} else if entry != nil {
+		t.Fatalf("expected transient key to be absent, got %#v", entry)
+	}
+	assertDRFlatAccumulatorMatchesSet(t, secondary.rangeAccumulator, 12, localSet)
+	if entry, err := core.physical.Get(ctx, drLocalKIDIndexEntryStoragePath(kid)); err != nil {
+		t.Fatal(err)
+	} else if entry != nil {
+		t.Fatalf("expected no local KID index entry for transient key, got %q", string(entry.Value))
+	}
+
+	buckets := drFlatAccumulatorBucketsFromSet(localSet)
+	loaded, ok, reason, err := secondary.loadLocalKIDIndexForRanges(ctx, core.physical, 12, []uint64{reconciler.RangeIDFromKID(kid)}, buckets)
+	if err != nil {
+		t.Fatalf("failed to load local KID index after transient delete: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected local KID index to remain usable after transient delete, reason=%q", reason)
+	}
+	if len(loaded.KIDToVID) != 0 {
+		t.Fatalf("expected no indexed entries after transient delete, got %d", len(loaded.KIDToVID))
+	}
+}
+
 func TestDRSecondaryLoadsPersistentStreamAppliedIndex(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	ctx := context.Background()
@@ -4618,8 +4679,8 @@ func TestDRLocalKIDIndexChangesRequireCompleteBaseline(t *testing.T) {
 	if err := secondary.persistLocalKIDIndexChanges(ctx, core.physical, 11, []*EntryChange{change}, []drFlatAccumulatorDelta{updateDelta}); err != nil {
 		t.Fatalf("failed to apply local KID index stream delta: %v", err)
 	}
-	if got := secondary.localKIDIndexUpdates.Load(); got != 0 {
-		t.Fatalf("expected value-only update not to rewrite local KID index, got %d updates", got)
+	if got := secondary.localKIDIndexUpdates.Load(); got != 1 {
+		t.Fatalf("expected value-only update to rewrite VID-bearing local KID index once, got %d updates", got)
 	}
 
 	metaEntry, err := core.physical.Get(ctx, drLocalKIDIndexMetaPath)
@@ -4633,8 +4694,8 @@ func TestDRLocalKIDIndexChangesRequireCompleteBaseline(t *testing.T) {
 	if err := json.Unmarshal(metaEntry.Value, &meta); err != nil {
 		t.Fatal(err)
 	}
-	if meta.CommitIndex != 10 {
-		t.Fatalf("expected value-only update to keep local KID index meta at key-set index 10, got %d", meta.CommitIndex)
+	if meta.CommitIndex != 11 {
+		t.Fatalf("expected value-only update to advance local KID index meta to 11, got %d", meta.CommitIndex)
 	}
 	indexEntry, err := core.physical.Get(ctx, drLocalKIDIndexEntryStoragePath(kid))
 	if err != nil {
@@ -4650,21 +4711,34 @@ func TestDRLocalKIDIndexChangesRequireCompleteBaseline(t *testing.T) {
 	if item.key != key {
 		t.Fatalf("expected indexed key %q, got %q", key, item.key)
 	}
-	if err := core.physical.Put(ctx, &physical.Entry{Key: key, Value: newValue}); err != nil {
-		t.Fatal(err)
+	if item.vid != expectedVID {
+		t.Fatalf("expected indexed VID %x, got %x", expectedVID, item.vid)
 	}
 	buckets := drFlatAccumulatorBucketsFromSet(&reconciler.ReconciliationSet{
 		KIDToVID: map[[32]byte][32]byte{kid: expectedVID},
 	})
 	loaded, ok, reason, err := secondary.loadLocalKIDIndexForRanges(ctx, core.physical, 11, []uint64{reconciler.RangeIDFromKID(kid)}, buckets)
 	if err != nil {
-		t.Fatalf("failed to load key-only local KID index: %v", err)
+		t.Fatalf("failed to load VID-bearing local KID index: %v", err)
 	}
 	if !ok {
-		t.Fatalf("expected key-only local KID index to load, reason=%q", reason)
+		t.Fatalf("expected VID-bearing local KID index to load, reason=%q", reason)
 	}
 	if got := loaded.KIDToVID[kid]; got != expectedVID {
-		t.Fatalf("expected recomputed indexed VID %x, got %x", expectedVID, got)
+		t.Fatalf("expected persisted indexed VID %x, got %x", expectedVID, got)
+	}
+	valueMismatchedBuckets := drFlatAccumulatorBucketsFromSet(&reconciler.ReconciliationSet{
+		KIDToVID: map[[32]byte][32]byte{kid: oldVID},
+	})
+	loaded, ok, reason, err = secondary.loadLocalKIDIndexForRanges(ctx, core.physical, 11, []uint64{reconciler.RangeIDFromKID(kid)}, valueMismatchedBuckets)
+	if err != nil {
+		t.Fatalf("expected key-membership proof to tolerate value checksum drift: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected key-membership proof to load despite value checksum drift, reason=%q", reason)
+	}
+	if got := loaded.KIDToVID[kid]; got != expectedVID {
+		t.Fatalf("expected persisted indexed VID after value checksum drift %x, got %x", expectedVID, got)
 	}
 
 	createKey := "secret/local-index-baseline-created"
@@ -4684,8 +4758,8 @@ func TestDRLocalKIDIndexChangesRequireCompleteBaseline(t *testing.T) {
 	if err := secondary.persistLocalKIDIndexChanges(ctx, core.physical, 12, []*EntryChange{createChange}, []drFlatAccumulatorDelta{createDelta}); err != nil {
 		t.Fatalf("failed to apply local KID index create delta: %v", err)
 	}
-	if got := secondary.localKIDIndexUpdates.Load(); got != 1 {
-		t.Fatalf("expected key-create update to rewrite local KID index once, got %d", got)
+	if got := secondary.localKIDIndexUpdates.Load(); got != 2 {
+		t.Fatalf("expected value update and key-create update to rewrite local KID index twice, got %d", got)
 	}
 	metaEntry, err = core.physical.Get(ctx, drLocalKIDIndexMetaPath)
 	if err != nil {
@@ -4703,6 +4777,63 @@ func TestDRLocalKIDIndexChangesRequireCompleteBaseline(t *testing.T) {
 	}
 	if createIndexEntry == nil {
 		t.Fatal("expected local KID index entry after key-create delta")
+	}
+	createItem, err := secondary.decodeLocalKIDIndexEntry(createIndexEntry.Value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if createItem.vid != createVID {
+		t.Fatalf("expected created indexed VID %x, got %x", createVID, createItem.vid)
+	}
+}
+
+func TestDRLocalKIDIndexInvalidatesOnDigestUnderflow(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	replSalt := bytes.Repeat([]byte{0x4a}, 32)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-local-index-underflow", core.logger)
+
+	key := "secret/local-index-underflow"
+	oldValue := []byte("old")
+	oldVID := secondary.scanner.ComputeVIDWithSealWrap(oldValue, false)
+	kid := secondary.scanner.ComputeKID(key)
+
+	if err := secondary.persistLocalKIDIndexMeta(ctx, core.physical, 10); err != nil {
+		t.Fatalf("failed to seed local KID index meta: %v", err)
+	}
+	if err := secondary.putLocalKIDIndexEntry(ctx, core.physical, kid, key, oldVID); err != nil {
+		t.Fatalf("failed to seed local KID index entry: %v", err)
+	}
+
+	change := &EntryChange{
+		OpType: string(physical.DeleteOperation),
+		Key:    key,
+	}
+	delta := drFlatAccumulatorDelta{
+		kid:       kid,
+		oldExists: true,
+		oldVID:    oldVID,
+	}
+	if err := secondary.persistLocalKIDIndexChanges(ctx, core.physical, 11, []*EntryChange{change}, []drFlatAccumulatorDelta{delta}); err != nil {
+		t.Fatalf("expected local KID index digest underflow to invalidate instead of failing: %v", err)
+	}
+
+	metaEntry, err := core.physical.Get(ctx, drLocalKIDIndexMetaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metaEntry != nil {
+		t.Fatalf("expected stale local KID index meta to be invalidated, got %q", string(metaEntry.Value))
+	}
+	if got := secondary.localKIDIndexInvalidations.Load(); got != 1 {
+		t.Fatalf("expected one local KID index invalidation, got %d", got)
+	}
+	_, invalidationReason := secondary.localKIDIndexOptimizerStatus()
+	if invalidationReason != "stream_leaf_digest_underflow" {
+		t.Fatalf("expected stream_leaf_digest_underflow invalidation reason, got %q", invalidationReason)
+	}
+	if got := secondary.localKIDIndexUpdates.Load(); got != 0 {
+		t.Fatalf("expected no successful local KID index updates after invalidation, got %d", got)
 	}
 }
 
@@ -4792,10 +4923,21 @@ func TestDRLocalKIDIndexLoadReasons(t *testing.T) {
 	if err := secondary.resetLocalKIDIndexFromSet(ctx, core.physical, 10, localSet); err != nil {
 		t.Fatal(err)
 	}
+	if err := secondary.persistFlatAccumulatorCursor(ctx, core.physical, 11, 10); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, reason, err := secondary.loadLocalKIDIndexForRanges(ctx, core.physical, 10, []uint64{reconciler.RangeIDFromKID(kid)}, buckets); err != nil {
+		t.Fatalf("expected cursor mismatch to be a non-invalidating fallback reason, got error: %v", err)
+	} else if ok || reason != "storage_index_mismatch" {
+		t.Fatalf("expected storage_index_mismatch for cursor/index skew, ok=%t reason=%q", ok, reason)
+	}
+	if err := core.physical.Delete(ctx, drFlatAccumulatorCursorStoragePath); err != nil {
+		t.Fatal(err)
+	}
 	if _, ok, reason, err := secondary.loadLocalKIDIndexForRanges(ctx, core.physical, 10, []uint64{reconciler.RangeIDFromKID(kid)}, buckets); err == nil {
-		t.Fatalf("expected bucket mismatch error, ok=%t reason=%q", ok, reason)
-	} else if reason != "bucket_mismatch" {
-		t.Fatalf("expected bucket_mismatch reason, got %q (err=%v)", reason, err)
+		t.Fatalf("expected membership mismatch error, ok=%t reason=%q", ok, reason)
+	} else if reason != "membership_mismatch" {
+		t.Fatalf("expected membership_mismatch reason, got %q (err=%v)", reason, err)
 	}
 }
 
@@ -5340,8 +5482,35 @@ func TestDRFlatAccumulatorIndexedBucketRepairAvoidsLocalScan(t *testing.T) {
 	if stableKey == "" {
 		t.Fatal("failed to find different-range stable key")
 	}
+	stableSameRangeKey := ""
+	var stableSameRangeKID [32]byte
+	stableSameRangeLeafID := uint64(0)
+	usedLeafIDs := map[uint64]struct{}{
+		drLocalKIDIndexLeafIDFromKID(kid):          {},
+		drLocalKIDIndexLeafIDFromKID(localOnlyKID): {},
+	}
+	for i := 0; i < 100000; i++ {
+		candidate := fmt.Sprintf("secret/flat-indexed-stable-same-range-%d", i)
+		candidateKID := secondary.scanner.ComputeKID(candidate)
+		candidateLeafID := drLocalKIDIndexLeafIDFromKID(candidateKID)
+		if candidate != key &&
+			candidate != localOnlyKey &&
+			reconciler.RangeIDFromKID(candidateKID) == rangeID {
+			if _, used := usedLeafIDs[candidateLeafID]; used {
+				continue
+			}
+			stableSameRangeKey = candidate
+			stableSameRangeKID = candidateKID
+			stableSameRangeLeafID = candidateLeafID
+			break
+		}
+	}
+	if stableSameRangeKey == "" {
+		t.Fatal("failed to find same-range stable key in a different 16-bit leaf")
+	}
 	localOnlyValue := []byte("delete-me")
 	stableValue := []byte("unchanged")
+	stableSameRangeValue := []byte("unchanged-same-range")
 	if err := core.physical.Put(ctx, &physical.Entry{Key: key, Value: oldValue}); err != nil {
 		t.Fatalf("failed to seed old physical entry: %v", err)
 	}
@@ -5351,23 +5520,29 @@ func TestDRFlatAccumulatorIndexedBucketRepairAvoidsLocalScan(t *testing.T) {
 	if err := core.physical.Put(ctx, &physical.Entry{Key: stableKey, Value: stableValue}); err != nil {
 		t.Fatalf("failed to seed stable physical entry: %v", err)
 	}
+	if err := core.physical.Put(ctx, &physical.Entry{Key: stableSameRangeKey, Value: stableSameRangeValue}); err != nil {
+		t.Fatalf("failed to seed same-range stable physical entry: %v", err)
+	}
 
 	oldVID := secondary.scanner.ComputeVIDWithSealWrap(oldValue, false)
 	newVID := secondary.scanner.ComputeVIDWithSealWrap(newValue, false)
 	localOnlyVID := secondary.scanner.ComputeVIDWithSealWrap(localOnlyValue, false)
 	stableVID := secondary.scanner.ComputeVIDWithSealWrap(stableValue, false)
+	stableSameRangeVID := secondary.scanner.ComputeVIDWithSealWrap(stableSameRangeValue, false)
 	localSet := &reconciler.ReconciliationSet{
 		Checkpoint: reconciler.Checkpoint{ID: "local-flat-indexed", CommitIndex: 10},
-		KeyCount:   3,
+		KeyCount:   4,
 		KIDToVID: map[[32]byte][32]byte{
-			kid:          oldVID,
-			localOnlyKID: localOnlyVID,
-			stableKID:    stableVID,
+			kid:                oldVID,
+			localOnlyKID:       localOnlyVID,
+			stableKID:          stableVID,
+			stableSameRangeKID: stableSameRangeVID,
 		},
 		KIDToKey: map[[32]byte]string{
-			kid:          key,
-			localOnlyKID: localOnlyKey,
-			stableKID:    stableKey,
+			kid:                key,
+			localOnlyKID:       localOnlyKey,
+			stableKID:          stableKey,
+			stableSameRangeKID: stableSameRangeKey,
 		},
 	}
 	if err := secondary.resetAndPersistFlatAccumulatorFromSet(ctx, localSet, 10); err != nil {
@@ -5379,14 +5554,16 @@ func TestDRFlatAccumulatorIndexedBucketRepairAvoidsLocalScan(t *testing.T) {
 	checkpoint := &CheckpointResponse{CheckpointId: "cp-flat-indexed-repair", CommitIndex: 11}
 	remoteSet := &reconciler.ReconciliationSet{
 		Checkpoint: reconciler.Checkpoint{ID: checkpoint.CheckpointId, CommitIndex: checkpoint.CommitIndex},
-		KeyCount:   2,
+		KeyCount:   3,
 		KIDToVID: map[[32]byte][32]byte{
-			kid:       newVID,
-			stableKID: stableVID,
+			kid:                newVID,
+			stableKID:          stableVID,
+			stableSameRangeKID: stableSameRangeVID,
 		},
 		KIDToKey: map[[32]byte]string{
-			kid:       key,
-			stableKID: stableKey,
+			kid:                key,
+			stableKID:          stableKey,
+			stableSameRangeKID: stableSameRangeKey,
 		},
 	}
 	remoteIndex := reconciler.NewRangeMapIndex(remoteSet.KIDToVID, nil)
@@ -5495,11 +5672,11 @@ func TestDRFlatAccumulatorIndexedBucketRepairAvoidsLocalScan(t *testing.T) {
 	if status.FlatAccumulatorEmptyRepairTotal != 0 {
 		t.Fatalf("expected empty repair total 0, got %d", status.FlatAccumulatorEmptyRepairTotal)
 	}
-	if status.LocalKIDIndexBucketLoadsTotal != 1 {
-		t.Fatalf("expected local KID index bucket loads 1, got %d", status.LocalKIDIndexBucketLoadsTotal)
+	if status.LocalKIDIndexBucketLoadsTotal == 0 || status.LocalKIDIndexBucketLoadsTotal >= uint64(1<<drRangeMaxSplitDepth) {
+		t.Fatalf("expected local KID index to load only mismatched leaf spans, got %d loads", status.LocalKIDIndexBucketLoadsTotal)
 	}
 	if status.LocalKIDIndexEntriesLoadedTotal != 2 {
-		t.Fatalf("expected local KID index entries loaded 2, got %d", status.LocalKIDIndexEntriesLoadedTotal)
+		t.Fatalf("expected local KID index to skip same-range stable leaf %d and load 2 repair entries, got %d", stableSameRangeLeafID, status.LocalKIDIndexEntriesLoadedTotal)
 	}
 	buckets, ok := secondary.rangeAccumulator.snapshotExact(checkpoint.CommitIndex)
 	if !ok {
@@ -5928,10 +6105,11 @@ func assertDRFlatAccumulatorMatchesSet(t *testing.T, accumulator *drFlatRangeAcc
 	rangeIndex := reconciler.NewRangeMapIndex(rs.KIDToVID, nil)
 	for rangeID := uint64(0); rangeID < drRangeMaxTotalRanges; rangeID++ {
 		wantChecksum, wantCount := reconciler.ComputeRangeChecksum(rangeIndex, rangeID)
+		wantKIDChecksum, wantKIDCount := computeFlatAccumulatorKIDMembershipChecksum(rangeIndex, rangeID)
 		got := buckets[rangeID]
-		if got.checksum != wantChecksum || got.count != wantCount {
-			t.Fatalf("range %d mismatch: got checksum=%d count=%d, want checksum=%d count=%d",
-				rangeID, got.checksum, got.count, wantChecksum, wantCount)
+		if got.checksum != wantChecksum || got.kidChecksum != wantKIDChecksum || got.count != wantCount || got.count != wantKIDCount {
+			t.Fatalf("range %d mismatch: got checksum=%d kid_checksum=%d count=%d, want checksum=%d kid_checksum=%d count=%d",
+				rangeID, got.checksum, got.kidChecksum, got.count, wantChecksum, wantKIDChecksum, wantCount)
 		}
 	}
 }
@@ -9644,6 +9822,19 @@ func TestDRPrimaryAddrRing_AddHintAndSelect(t *testing.T) {
 	}
 	if ring.Current() != "https://127.0.0.9:8201" {
 		t.Fatalf("unexpected current after Use: %q", ring.Current())
+	}
+}
+
+func TestDRSecondaryControllerRunWasStable(t *testing.T) {
+	startedAt := time.Unix(100, 0)
+	if drSecondaryControllerRunWasStable(startedAt, startedAt.Add(drSecondaryControllerStableRunAfter-time.Nanosecond)) {
+		t.Fatal("run should not be stable before the stability threshold")
+	}
+	if !drSecondaryControllerRunWasStable(startedAt, startedAt.Add(drSecondaryControllerStableRunAfter)) {
+		t.Fatal("run should be stable at the stability threshold")
+	}
+	if drSecondaryControllerRunWasStable(time.Time{}, startedAt.Add(drSecondaryControllerStableRunAfter)) {
+		t.Fatal("zero start time should not be stable")
 	}
 }
 

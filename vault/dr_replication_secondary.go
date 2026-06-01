@@ -15,6 +15,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash/crc64"
 	"hash/fnv"
 	"io"
 	"runtime"
@@ -157,6 +158,8 @@ var drNeverReplicatePrefixes = []string{
 	"core/dr-replication/",
 }
 
+const drClusterLocalOptimizerPrefix = "core/cluster/local/dr/"
+
 // drReconcileExcludeExactPaths lists storage paths excluded from
 // reconciliation in addition to drNeverReplicate*.
 var drReconcileExcludeExactPaths = map[string]bool{
@@ -176,6 +179,10 @@ func isDRReconcileExcludedPath(path string) bool {
 		return true
 	}
 	return drPathMatches(path, drReconcileExcludeExactPaths, nil)
+}
+
+func isDRClusterLocalOptimizerPath(path string) bool {
+	return strings.HasPrefix(strings.Trim(path, "/"), drClusterLocalOptimizerPrefix)
 }
 
 func drPathMatches(path string, exact map[string]bool, prefixes []string) bool {
@@ -4274,10 +4281,10 @@ func (s *drReplicationSecondary) runReconciliation(ctx context.Context) error {
 		ID:          checkpoint.CheckpointId,
 		CommitIndex: checkpoint.CommitIndex,
 	}
-	localSet, err := s.scanner.Scan(reconcileCtx, s.core.barrier, localCheckpoint)
+	localSet, err := s.scanner.ScanPhysical(reconcileCtx, s.core.physical, localCheckpoint)
 	if err != nil {
 		s.scanFailures.Add(1)
-		return fmt.Errorf("failed to scan local storage: %w", err)
+		return fmt.Errorf("failed to scan local physical storage: %w", err)
 	}
 	s.logger.Info("local scan complete", "keys", localSet.KeyCount)
 
@@ -4375,12 +4382,18 @@ func (s *drReplicationSecondary) tryFlatAccumulatorReconciliation(ctx context.Co
 				nonEmptyRanges = append(nonEmptyRanges, mismatch.rangeID)
 			}
 		}
+		var digestSource *drLocalKIDIndexDigestSource
 		if len(nonEmptyRanges) > 0 {
-			indexSet, ok, reason, err := s.loadLocalKIDIndexForRanges(ctx, s.core.physical, accumulatorIndex, nonEmptyRanges, localBuckets)
+			source, ok, reason, err := s.prepareLocalKIDIndexDigestSource(ctx, s.core.physical, accumulatorIndex, nonEmptyRanges, localBuckets)
 			if err != nil {
 				s.localKIDIndexLoadFailures.Add(1)
 				s.recordLocalKIDIndexFallbackScan(reason)
-				s.logger.Warn("local KID index could not be loaded; falling back to local scan", "reason", reason, "error", err)
+				s.logger.Warn("local KID index digest source could not be loaded; falling back to local scan",
+					"reason", reason,
+					"accumulator_index", accumulatorIndex,
+					"checkpoint_index", checkpoint.CommitIndex,
+					"last_applied_index", s.lastAppliedIndex.Load(),
+					"error", err)
 				if deleteErr := s.invalidatePersistedLocalKIDIndexWithReason(ctx, s.core.physical, "load_failed_"+reason); deleteErr != nil {
 					return true, fmt.Errorf("invalidate stale local KID index after load failure: %w", deleteErr)
 				}
@@ -4388,15 +4401,17 @@ func (s *drReplicationSecondary) tryFlatAccumulatorReconciliation(ctx context.Co
 			}
 			if !ok {
 				s.recordLocalKIDIndexFallbackScan(reason)
-				s.logger.Info("local KID index unavailable for flat accumulator repair; falling back to local scan",
+				s.logger.Info("local KID index digest source unavailable for flat accumulator repair; falling back to local scan",
 					"reason", reason,
 					"ranges", len(nonEmptyRanges),
-					"accumulator_index", accumulatorIndex)
+					"accumulator_index", accumulatorIndex,
+					"checkpoint_index", checkpoint.CommitIndex,
+					"last_applied_index", s.lastAppliedIndex.Load())
 				return false, nil
 			}
-			localSet = indexSet
+			digestSource = source
 		}
-		if err := s.runFlatAccumulatorIndexedBucketRepair(ctx, checkpoint, localBuckets, mismatches, localSet, startTime); err != nil {
+		if err := s.runFlatAccumulatorIndexedBucketRepair(ctx, checkpoint, accumulatorIndex, localBuckets, mismatches, localSet, digestSource, startTime); err != nil {
 			if errors.Is(err, errDRIndexedBucketRepairProofMismatch) {
 				s.recordIndexedRepairProofMismatch(err)
 				s.recordLocalKIDIndexFallbackScan("indexed_repair_proof_mismatch")
@@ -4455,9 +4470,11 @@ func (s *drReplicationSecondary) tryFlatAccumulatorReconciliation(ctx context.Co
 func (s *drReplicationSecondary) runFlatAccumulatorIndexedBucketRepair(
 	ctx context.Context,
 	checkpoint *CheckpointResponse,
+	accumulatorIndex uint64,
 	baseBuckets [drRangeMaxTotalRanges]drFlatAccumulatorBucket,
 	mismatches []drFlatAccumulatorMismatch,
 	localSet *reconciler.ReconciliationSet,
+	digestSource *drLocalKIDIndexDigestSource,
 	startTime time.Time,
 ) error {
 	if len(mismatches) == 0 {
@@ -4484,7 +4501,6 @@ func (s *drReplicationSecondary) runFlatAccumulatorIndexedBucketRepair(
 		maxRPCBytes: s.reconcileMaxRPCBytes,
 		maxWallTime: s.reconcileMaxWallTime,
 	}
-	localIndex := reconciler.NewRangeMapIndex(localSet.KIDToVID, nil)
 	mutationTracker := newDRReconciliationSetMutationTracker(s)
 	applyPipeline, err := newDRPutApplyPipeline(ctx, s, localSet.KIDToKey, s.markReconcileActivityNow, mutationTracker, true)
 	if err != nil {
@@ -4497,8 +4513,10 @@ func (s *drReplicationSecondary) runFlatAccumulatorIndexedBucketRepair(
 	if s.rangeAccumulator != nil {
 		s.rangeAccumulator.invalidate()
 	}
+	nextBuckets := baseBuckets
 	appliedFetchedEntries := make([]*EntryChange, 0)
 	pendingDeletes := make(map[string]struct{})
+	repairedSpans := make([]reconciler.RangeSpan, 0)
 	for i, mismatch := range mismatches {
 		if err := budget.check(); err != nil {
 			return fmt.Errorf("reconcile failure [budget_exceeded]: %w", err)
@@ -4511,10 +4529,11 @@ func (s *drReplicationSecondary) runFlatAccumulatorIndexedBucketRepair(
 				span:    reconciler.SpanFromRangeID(mismatch.rangeID),
 			},
 		}
-		result := s.processRangeTask(ctx, checkpoint, localIndex, localSet.KIDToKey, task)
+		result := s.processIndexedRangeTask(ctx, checkpoint, accumulatorIndex, digestSource, task)
 		if result.err != nil {
 			return result.err
 		}
+		mergeReconciliationSet(localSet, result.localSet)
 		if len(result.removedKeys) > 0 {
 			for _, key := range result.removedKeys {
 				pendingDeletes[key] = struct{}{}
@@ -4538,6 +4557,16 @@ func (s *drReplicationSecondary) runFlatAccumulatorIndexedBucketRepair(
 					return fmt.Errorf("fetched kid %x mapped to range %d outside requested range %d", kid, rangeID, mismatch.rangeID)
 				}
 			}
+		}
+		for _, repair := range result.spanRepairs {
+			if repair.rangeID >= uint64(len(nextBuckets)) {
+				return fmt.Errorf("indexed repair span range %d outside bucket array", repair.rangeID)
+			}
+			if err := nextBuckets[repair.rangeID].removeBucket(repair.localBucket); err != nil {
+				return err
+			}
+			nextBuckets[repair.rangeID].addBucket(repair.remoteBucket)
+			repairedSpans = append(repairedSpans, repair.span)
 		}
 	}
 
@@ -4563,9 +4592,6 @@ func (s *drReplicationSecondary) runFlatAccumulatorIndexedBucketRepair(
 		mutationTracker.recordRemovedKeys(keys)
 	}
 	mutationTracker.applyToSet(localSet)
-
-	nextBuckets := baseBuckets
-	repairedBuckets := drFlatAccumulatorBucketsFromSet(localSet)
 	repairedRanges := make([]uint64, 0, len(mismatches))
 	proofMismatches := make([]drFlatAccumulatorMismatch, 0)
 	emptyOnly := true
@@ -4574,7 +4600,6 @@ func (s *drReplicationSecondary) runFlatAccumulatorIndexedBucketRepair(
 			emptyOnly = false
 		}
 		repairedRanges = append(repairedRanges, mismatch.rangeID)
-		nextBuckets[mismatch.rangeID] = repairedBuckets[mismatch.rangeID]
 		remoteCount := uint64(0)
 		remoteChecksum := uint64(0)
 		if mismatch.remote != nil {
@@ -4586,10 +4611,15 @@ func (s *drReplicationSecondary) runFlatAccumulatorIndexedBucketRepair(
 		}
 	}
 	if len(proofMismatches) > 0 {
+		fullFetchSet, err := s.loadLocalKIDIndexForProofMismatches(ctx, accumulatorIndex, proofMismatches)
+		if err != nil {
+			return err
+		}
+		mergeReconciliationSet(localSet, fullFetchSet)
 		if err := s.repairIndexedBucketProofMismatchesWithFullFetch(ctx, checkpoint, localSet, proofMismatches, budget); err != nil {
 			return err
 		}
-		repairedBuckets = drFlatAccumulatorBucketsFromSet(localSet)
+		repairedBuckets := drFlatAccumulatorBucketsFromSet(localSet)
 		for _, mismatch := range proofMismatches {
 			nextBuckets[mismatch.rangeID] = repairedBuckets[mismatch.rangeID]
 			remoteCount := uint64(0)
@@ -4621,7 +4651,11 @@ func (s *drReplicationSecondary) runFlatAccumulatorIndexedBucketRepair(
 			"error", err)
 	}
 	indexCtx, indexCancel := context.WithTimeout(ctx, s.reconcileOptimizerPersistTimeout())
-	err = s.resetLocalKIDIndexRangesFromSet(indexCtx, s.core.physical, checkpoint.CommitIndex, localSet, repairedRanges)
+	if len(proofMismatches) > 0 {
+		err = s.resetLocalKIDIndexRangesFromSet(indexCtx, s.core.physical, checkpoint.CommitIndex, localSet, repairedRanges)
+	} else {
+		err = s.resetLocalKIDIndexSpansFromSet(indexCtx, s.core.physical, checkpoint.CommitIndex, localSet, repairedSpans)
+	}
 	indexCancel()
 	if err != nil {
 		s.logger.Warn("failed to persist local KID index after indexed-bucket repair",
@@ -4767,6 +4801,30 @@ func (s *drReplicationSecondary) repairIndexedBucketProofMismatchesWithFullFetch
 	return nil
 }
 
+func (s *drReplicationSecondary) loadLocalKIDIndexForProofMismatches(ctx context.Context, accumulatorIndex uint64, mismatches []drFlatAccumulatorMismatch) (*reconciler.ReconciliationSet, error) {
+	if len(mismatches) == 0 {
+		return &reconciler.ReconciliationSet{
+			Checkpoint: reconciler.Checkpoint{CommitIndex: accumulatorIndex},
+			KIDToVID:   make(map[[32]byte][32]byte),
+			KIDToKey:   make(map[[32]byte]string),
+		}, nil
+	}
+	ranges := make([]uint64, 0, len(mismatches))
+	var buckets [drRangeMaxTotalRanges]drFlatAccumulatorBucket
+	for _, mismatch := range mismatches {
+		ranges = append(ranges, mismatch.rangeID)
+		buckets[mismatch.rangeID] = mismatch.local
+	}
+	set, ok, reason, err := s.loadLocalKIDIndexForRanges(ctx, s.core.physical, accumulatorIndex, ranges, buckets)
+	if err != nil {
+		return nil, fmt.Errorf("load local KID index for full-bucket proof fallback [%s]: %w", reason, err)
+	}
+	if !ok {
+		return nil, fmt.Errorf("load local KID index for full-bucket proof fallback unavailable [%s]", reason)
+	}
+	return set, nil
+}
+
 type drRangeTask struct {
 	span    reconciler.RangeSpan
 	rangeID uint64
@@ -4803,7 +4861,16 @@ type drRangeTaskResult struct {
 	rpcBytes       uint64
 	fetchedEntries []*EntryChange
 	removedKeys    []string
+	localSet       *reconciler.ReconciliationSet
+	spanRepairs    []drSpanRepairContribution
 	err            error
+}
+
+type drSpanRepairContribution struct {
+	span         reconciler.RangeSpan
+	rangeID      uint64
+	localBucket  drFlatAccumulatorBucket
+	remoteBucket drFlatAccumulatorBucket
 }
 
 type drReconciliationSetPutMutation struct {
@@ -5825,6 +5892,52 @@ func (s *drReplicationSecondary) processRangeTask(ctx context.Context, checkpoin
 	return s.processFetchSpans(ctx, checkpoint, localIndex, kidToKey, queued, fetchSpans)
 }
 
+func (s *drReplicationSecondary) processIndexedRangeTask(ctx context.Context, checkpoint *CheckpointResponse, accumulatorIndex uint64, source *drLocalKIDIndexDigestSource, queued drQueuedRangeTask) drRangeTaskResult {
+	task := queued.task
+	result := drRangeTaskResult{
+		id:   queued.id,
+		task: task,
+	}
+	if source == nil {
+		emptyIndex := reconciler.NewRangeMapIndex(nil, nil)
+		return s.processRangeTask(ctx, checkpoint, emptyIndex, nil, queued)
+	}
+
+	fetchSpans, err := s.runRangeDrillDownWithDigestFunc(ctx, checkpoint, task.span, source.RangeDigest)
+	if err != nil {
+		result.err = err
+		return result
+	}
+	if fetchSpans == nil {
+		result.err = fmt.Errorf("drill-down did not return a fetch plan")
+		return result
+	}
+	if len(fetchSpans) == 0 {
+		return result
+	}
+
+	spans := rangeSpansFromFetchSpans(fetchSpans)
+	localSet, ok, reason, err := s.loadLocalKIDIndexForSpans(ctx, s.core.physical, accumulatorIndex, spans, source)
+	if err != nil {
+		result.err = fmt.Errorf("local KID index span load failed [%s]: %w", reason, err)
+		return result
+	}
+	if !ok {
+		result.err = fmt.Errorf("local KID index span load unavailable [%s]", reason)
+		return result
+	}
+	localIndex := reconciler.NewRangeMapIndex(localSet.KIDToVID, nil)
+	result = s.processFetchSpans(ctx, checkpoint, localIndex, localSet.KIDToKey, queued, fetchSpans)
+	if result.err != nil {
+		return result
+	}
+	result.localSet = localSet
+	for i := range result.spanRepairs {
+		result.spanRepairs[i].localBucket = flatAccumulatorBucketForSpan(localSet.KIDToVID, result.spanRepairs[i].span)
+	}
+	return result
+}
+
 func (s *drReplicationSecondary) processFullRangeFetchTask(ctx context.Context, checkpoint *CheckpointResponse, localIndex *reconciler.RangeMapIndex, kidToKey map[[32]byte]string, queued drQueuedRangeTask) drRangeTaskResult {
 	result := drRangeTaskResult{
 		id:   queued.id,
@@ -5879,6 +5992,7 @@ func (s *drReplicationSecondary) processFetchSpans(
 	remoteKIDs := make(map[[32]byte]struct{})
 	seenRemoteKIDs := make(map[[32]byte]struct{})
 	accumulators := make([]drFetchedRangeAccumulator, len(fetchSpans))
+	remoteBuckets := make([]drFlatAccumulatorBucket, len(fetchSpans))
 
 	for {
 		batch, err := stream.Recv()
@@ -5922,6 +6036,7 @@ func (s *drReplicationSecondary) processFetchSpans(
 				return result
 			}
 			accumulators[spanIndex].add(kid, vid)
+			remoteBuckets[spanIndex].addItem(kid, vid)
 			remoteKIDs[kid] = struct{}{}
 			seenRemoteKIDs[kid] = struct{}{}
 			result.fetchedEntries = append(result.fetchedEntries, cloneEntryChange(e))
@@ -5940,6 +6055,13 @@ func (s *drReplicationSecondary) processFetchSpans(
 		return result
 	}
 	result.removedKeys = removedKeys
+	for i, fetchSpan := range fetchSpans {
+		result.spanRepairs = append(result.spanRepairs, drSpanRepairContribution{
+			span:         fetchSpan.span,
+			rangeID:      reconciler.RangeIDFromKID(fetchSpan.span.StartKID),
+			remoteBucket: remoteBuckets[i],
+		})
+	}
 
 	return result
 }
@@ -5992,6 +6114,59 @@ func (a *drFetchedRangeAccumulator) add(kid, vid [32]byte) {
 	var elem [32]byte
 	copy(elem[:], h.Sum(nil))
 	xorHash32(&a.xorValueHash, elem)
+}
+
+func (b *drFlatAccumulatorBucket) addItem(kid, vid [32]byte) {
+	kSum := crc64.Checksum(kid[:], drFlatAccumulatorCRCTable)
+	vSum := crc64.Checksum(vid[:], drFlatAccumulatorCRCTable)
+	b.checksum ^= (kSum ^ vSum)
+	b.kidChecksum ^= kSum
+	b.count++
+}
+
+func (b *drFlatAccumulatorBucket) removeBucket(other drFlatAccumulatorBucket) error {
+	if b.count < other.count {
+		return fmt.Errorf("flat accumulator bucket underflow: count=%d remove=%d", b.count, other.count)
+	}
+	b.checksum ^= other.checksum
+	b.kidChecksum ^= other.kidChecksum
+	b.count -= other.count
+	return nil
+}
+
+func (b *drFlatAccumulatorBucket) addBucket(other drFlatAccumulatorBucket) {
+	b.checksum ^= other.checksum
+	b.kidChecksum ^= other.kidChecksum
+	b.count += other.count
+}
+
+func flatAccumulatorBucketForSpan(kidToVID map[[32]byte][32]byte, span reconciler.RangeSpan) drFlatAccumulatorBucket {
+	var bucket drFlatAccumulatorBucket
+	for kid, vid := range kidToVID {
+		if span.Contains(kid) {
+			bucket.addItem(kid, vid)
+		}
+	}
+	return bucket
+}
+
+func mergeReconciliationSet(dst, src *reconciler.ReconciliationSet) {
+	if dst == nil || src == nil {
+		return
+	}
+	if dst.KIDToVID == nil {
+		dst.KIDToVID = make(map[[32]byte][32]byte)
+	}
+	if dst.KIDToKey == nil {
+		dst.KIDToKey = make(map[[32]byte]string)
+	}
+	for kid, vid := range src.KIDToVID {
+		dst.KIDToVID[kid] = vid
+	}
+	for kid, key := range src.KIDToKey {
+		dst.KIDToKey[kid] = key
+	}
+	dst.KeyCount = len(dst.KIDToVID)
 }
 
 func validateFetchedRangeProofs(fetchSpans []drFetchSpan, accumulators []drFetchedRangeAccumulator) error {
@@ -6293,6 +6468,17 @@ func (s *drReplicationSecondary) runRangeDrillDown(
 	localIndex *reconciler.RangeMapIndex,
 	parentSpan reconciler.RangeSpan,
 ) ([]drFetchSpan, error) {
+	return s.runRangeDrillDownWithDigestFunc(ctx, checkpoint, parentSpan, func(_ context.Context, span reconciler.RangeSpan) (reconciler.RangeDescriptor, error) {
+		return reconciler.BuildRangeDigestFromIndex(localIndex, span), nil
+	})
+}
+
+func (s *drReplicationSecondary) runRangeDrillDownWithDigestFunc(
+	ctx context.Context,
+	checkpoint *CheckpointResponse,
+	parentSpan reconciler.RangeSpan,
+	localDigest func(context.Context, reconciler.RangeSpan) (reconciler.RangeDescriptor, error),
+) ([]drFetchSpan, error) {
 	// Work queue of spans to drill into.
 	pending := []drFetchSpan{{span: parentSpan}}
 	var mismatched []drFetchSpan
@@ -6335,7 +6521,10 @@ func (s *drReplicationSecondary) runRangeDrillDown(
 
 		for _, child := range children {
 			// Compute local RangeDescriptor for this sub-range.
-			localDesc := reconciler.BuildRangeDigestFromIndex(localIndex, child.span)
+			localDesc, err := localDigest(ctx, child.span)
+			if err != nil {
+				return nil, fmt.Errorf("local drill-down digest failed for span depth=%d: %w", child.span.SplitDepth, err)
+			}
 
 			// Phase B authoritative equality: compare (count, XORKeyHash,
 			// XORValueHash). These are 256-bit SHA256-XOR accumulators,
@@ -6349,7 +6538,7 @@ func (s *drReplicationSecondary) runRangeDrillDown(
 
 			splits++
 			// Sub-range mismatched -- drill deeper or mark for fetch.
-			if child.span.SplitDepth < uint32(drRangeMaxSplitDepth) && child.proof.count > 1 {
+			if child.span.SplitDepth < uint32(drRangeMaxSplitDepth) && (child.proof.count > 1 || localDesc.Count > 1) {
 				pending = append(pending, child)
 			} else {
 				mismatched = append(mismatched, child)

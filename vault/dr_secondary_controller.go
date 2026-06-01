@@ -12,6 +12,12 @@ import (
 	metrics "github.com/hashicorp/go-metrics/compat"
 )
 
+const (
+	drSecondaryControllerInitialBackoff = 500 * time.Millisecond
+	drSecondaryControllerMaxBackoff     = 30 * time.Second
+	drSecondaryControllerStableRunAfter = 10 * time.Second
+)
+
 type drPrimaryAddrRing struct {
 	candidates []string
 	index      map[string]int
@@ -119,8 +125,7 @@ func (m *drRelationshipManager) startSecondaryControllerLocked() {
 			m.mu.Unlock()
 		}()
 
-		backoff := 500 * time.Millisecond
-		const maxBackoff = 30 * time.Second
+		backoff := drSecondaryControllerInitialBackoff
 		addrRing := newDRPrimaryAddrRing(initialPrimaryAddrs)
 		if addrRing.Size() == 0 {
 			m.logger.Warn("DR secondary controller has no primary addresses; exiting")
@@ -166,8 +171,8 @@ func (m *drRelationshipManager) startSecondaryControllerLocked() {
 						return // context cancelled during backoff
 					}
 					backoff *= 2
-					if backoff > maxBackoff {
-						backoff = maxBackoff
+					if backoff > drSecondaryControllerMaxBackoff {
+						backoff = drSecondaryControllerMaxBackoff
 					}
 				} else {
 					metrics.SetGauge([]string{"replication", "dr", "secondary", "connect_backoff_seconds"}, 0)
@@ -175,11 +180,19 @@ func (m *drRelationshipManager) startSecondaryControllerLocked() {
 				continue
 			}
 
-			addrRing.MarkSuccess()
-			backoff = 500 * time.Millisecond
-			metrics.SetGauge([]string{"replication", "dr", "secondary", "connect_backoff_seconds"}, float32(backoff.Seconds()))
+			startedAt := time.Now()
+			metrics.SetGauge([]string{"replication", "dr", "secondary", "connect_backoff_seconds"}, 0)
 			err := secondary.Start(loopCtx)
+			if err == nil {
+				addrRing.MarkSuccess()
+				backoff = drSecondaryControllerInitialBackoff
+				continue
+			}
 			if err != nil && loopCtx.Err() == nil {
+				if drSecondaryControllerRunWasStable(startedAt, time.Now()) {
+					addrRing.MarkSuccess()
+					backoff = drSecondaryControllerInitialBackoff
+				}
 				// If Start() returned a redirect, update the target address
 				// so the next Connect() goes to the actual leader.
 				var redirect *errDRRedirect
@@ -202,8 +215,8 @@ func (m *drRelationshipManager) startSecondaryControllerLocked() {
 						} else {
 							redirectBackoff *= 2
 						}
-						if redirectBackoff > maxBackoff {
-							redirectBackoff = maxBackoff
+						if redirectBackoff > drSecondaryControllerMaxBackoff {
+							redirectBackoff = drSecondaryControllerMaxBackoff
 						}
 						m.logger.Warn("redirect rate limit exceeded; applying backoff",
 							"redirects_in_window", len(redirectTimestamps),
@@ -253,8 +266,8 @@ func (m *drRelationshipManager) startSecondaryControllerLocked() {
 							return // context cancelled during backoff
 						}
 						backoff *= 2
-						if backoff > maxBackoff {
-							backoff = maxBackoff
+						if backoff > drSecondaryControllerMaxBackoff {
+							backoff = drSecondaryControllerMaxBackoff
 						}
 					}
 					continue
@@ -266,12 +279,16 @@ func (m *drRelationshipManager) startSecondaryControllerLocked() {
 					return // context cancelled during backoff
 				}
 				backoff *= 2
-				if backoff > maxBackoff {
-					backoff = maxBackoff
+				if backoff > drSecondaryControllerMaxBackoff {
+					backoff = drSecondaryControllerMaxBackoff
 				}
 			}
 		}
 	}()
+}
+
+func drSecondaryControllerRunWasStable(startedAt, endedAt time.Time) bool {
+	return !startedAt.IsZero() && !endedAt.Before(startedAt.Add(drSecondaryControllerStableRunAfter))
 }
 
 func (m *drRelationshipManager) shouldRunSecondaryControllerLocked() bool {
