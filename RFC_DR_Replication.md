@@ -541,8 +541,8 @@ direction blockers for this RFC:
 - finish the operator pre-seed and resnapshot lifecycle for very large clusters
   where initial full reconciliation would be operationally expensive; the
   current prototype has inline export/import and secondary-enable baseline
-  application, but still needs segmented production artifacts, optimizer
-  seeding, and an end-to-end delta catch-up smoke
+  application with local HA delta catch-up and post-accept handoff validation,
+  but still needs segmented production artifacts and optimizer seeding
 - define availability targets for HA active handoff under sustained DR backlog
   pressure
 - validate WAN latency, packet loss, proxy, and load-balancer behavior

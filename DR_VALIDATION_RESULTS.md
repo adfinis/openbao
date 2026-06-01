@@ -52,6 +52,7 @@ Orchestrated smokes add scenario-specific files such as
 | Secondary outage within journal horizon | `secondary-outage-20260531T211438Z` | Pass with expected client transients | 120s, 32 workers, secondary #1 stopped for 40s and recovered via journal replay. No reconciliation, no fallback scan, no journal-too-old increment, zero PUT/status failures, zero dropped events, and exhaustive verification passed on all three clusters across 2,143 truth-log keys. |
 | Accumulator cold restart | `accumulator-cold-restart-20260531T205052Z` | Pass | Full secondary #1 restart restored `flat_accumulator_cursor_index=56113` and `flat_accumulator_snapshot_index=56113`, kept `reconcile_count=0`, and observed no scan/fallback/proof-mismatch counters. |
 | Quiescent reconnect | `quiescent-reconnect-20260531T204826Z` | Pass | Forced primary active handoff from `http://localhost:8800` to `http://localhost:8802`; both secondaries remained streaming with lag 0 and no reconciliation count increase. |
+| HA pre-seed with post-accept handoff | `preseed-smoke-20260601T181124Z` | Pass | HA topology exported a checkpoint-bound pre-seed bundle for a fresh relationship, disabled secondary #2, imported the bundle, enabled the secondary from the accepted baseline, replayed the post-export delta, and passed checkpoint verification at index 52. The smoke then forced primary and secondary #2 active handoff, after which secondary #2 returned to `streaming` with `lag_entries=0`, `last_applied_index=58`, `primary_index=58`, zero scan failures, zero local KID-index fallback scans, and post-handoff checkpoint verification passed with zero missing or mismatched ranges. |
 | Engine/runtime lifecycle matrix | `engine-matrix-20260530161139` | Pass | Covered namespaces, KV v1/v2, transit, PKI, SSH, TOTP, database, userpass, AppRole, cert, JWT, token roles, policies, and identity across pre-failover, promoted secondary, and reseeded secondary phases. |
 | Failover under load lifecycle | `failover-load-20260530T114237Z` | Pass with expected primary loss | Hard-stopped old primary mid-run, required explicit forced-promotion acknowledgement, verified promoted secondary truth log with zero confirmed missing/mismatched keys, then passed promoted durability and promoted-authority reseed follow-up smokes. Client PUT/GET failures are expected after the old authority is removed. |
 
@@ -71,6 +72,9 @@ The curated set supports these current claims:
   and zero indexed proof mismatches.
 - Persisted flat accumulators can be restored across a secondary-cluster cold
   restart without forcing a local full scan.
+- The pre-seed lifecycle now has an HA evidence point covering accepted
+  baseline application, delta catch-up, primary active handoff, secondary
+  active handoff, and checkpoint verification after the handoff.
 - Read-only HA standbys can see transient keyring-missing state during DR
   key-transition refresh. The current implementation defers that standby-local
   transition instead of sealing, while the active path remains fail-closed.
@@ -177,19 +181,11 @@ behavior without explaining their age and purpose.
 - Re-run the indexed-repair smoke after the latest standby key-transition and
   adaptive batching fixes to compare fallback scans, proof mismatches, and
   exhaustive verification.
-- Add a pre-seed/resnapshot lifecycle validation target before making
-  scalability claims for old or very large primary clusters. Journal retention
-  is finite, so secondaries offline beyond the replay horizon must converge
-  through bounded reconciliation, resnapshot, or operator pre-seeding. The
-  prototype now has primary manifest generation, inline bundle export,
-  disabled-secondary bundle import or manifest acceptance,
-  activation-token-bound baseline application during secondary enable and
-  config restore, and
-  unit coverage for stale lineage, relationship mismatch, algorithm mismatch,
-  expired material, local-only scrub metadata, bundle integrity, local-only
-  path rejection, replicated-storage replacement, and checkpoint-artifact
-  export. The remaining gap is an end-to-end local topology smoke proving
-  post-seed delta catch-up and terminal checkpoint verification.
+- Extend pre-seed evidence from inline smoke coverage to production-scale
+  artifact behavior: segmented/resumable export, provenance/signature handling,
+  interrupted import recovery, and larger datasets. The local HA smoke now
+  covers post-seed delta catch-up, checkpoint verification, and post-accept HA
+  handoff for the prototype inline artifact.
 - Add explicit reconcile-budget and primary checkpoint-pressure validation
   targets. The current stress results show promising convergence behavior, but
   they are not yet a worst-case model for fragmented reconnects or maliciously

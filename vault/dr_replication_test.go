@@ -3822,6 +3822,24 @@ func TestDRSecondaryAppliedInvalidationSkipsDuringCoreTeardown(t *testing.T) {
 	secondary.invalidateAppliedStorageKey(context.Background(), "sys/policy/dr-teardown")
 }
 
+func TestDRRelationshipManager_StopSecondaryRuntimeCancelsStaleControllerWithoutSecondary(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	mgr := &drRelationshipManager{
+		secondaryLoopCancel: cancel,
+	}
+
+	mgr.stopSecondaryRuntimeLocked()
+
+	if mgr.secondaryLoopCancel != nil {
+		t.Fatal("expected stale secondary controller cancel to be cleared")
+	}
+	select {
+	case <-ctx.Done():
+	default:
+		t.Fatal("expected stale secondary controller context to be canceled")
+	}
+}
+
 // --- Unit Tests for DR Failover ---
 
 func stopDRSecondaryControllerForTest(t *testing.T, mgr *drRelationshipManager) {

@@ -647,6 +647,27 @@ wait_cluster_active_addr() {
   done
 }
 
+wait_cluster_active_change() {
+  local name="$1"
+  local old_active="$2"
+  local timeout="$3"
+  shift 3
+  local deadline=$(( $(date +%s) + timeout ))
+  local active=""
+
+  while true; do
+    active="$(cluster_active_addr "$@" || true)"
+    if [[ -n "$active" && "$active" != "$old_active" ]]; then
+      printf "%s\n" "$active"
+      return 0
+    fi
+    if (( $(date +%s) >= deadline )); then
+      die "timed out waiting for ${name} active handoff away from ${old_active}"
+    fi
+    sleep 2
+  done
+}
+
 assert_secret_mount_present() {
   local label="$1"
   local addr="$2"
@@ -1037,6 +1058,7 @@ cmd_preseed_smoke() {
   fi
 
   local run_id run_dir token relationship_id export_json bundle_file import_json verify_json status_json_file
+  local post_handoff_verify_json post_handoff_status_json_file
   local base_key delta_key
   run_id="preseed-smoke-$(date -u +%Y%m%dT%H%M%SZ)"
   run_dir="${RESULTS_DIR}/${run_id}"
@@ -1045,6 +1067,8 @@ cmd_preseed_smoke() {
   import_json="${run_dir}/import.json"
   verify_json="${run_dir}/verify-secondary2.json"
   status_json_file="${run_dir}/secondary2-status.json"
+  post_handoff_verify_json="${run_dir}/verify-secondary2-post-handoff.json"
+  post_handoff_status_json_file="${run_dir}/secondary2-status-post-handoff.json"
   base_key="${run_id}/base"
   delta_key="${run_id}/delta-after-export"
   mkdir -p "$run_dir"
@@ -1108,11 +1132,46 @@ cmd_preseed_smoke() {
   assert_kv_present "primary" "$primary_addr" "$DR_PRIMARY_TOKEN" "$base_key"
   assert_kv_present "primary" "$primary_addr" "$DR_PRIMARY_TOKEN" "$delta_key"
 
+  if [[ "$TOPOLOGY" == "ha" ]]; then
+    local primary_before_handoff secondary2_before_handoff primary_after_handoff secondary2_after_handoff
+
+    primary_before_handoff="$primary_addr"
+    secondary2_before_handoff="$secondary2_addr"
+    echo "Forcing HA handoff after pre-seed accept: primary=${primary_before_handoff} secondary2=${secondary2_before_handoff}" | tee -a "${run_dir}/orchestrator.log"
+    bao_for "$primary_before_handoff" "$DR_PRIMARY_TOKEN" write -f sys/step-down >"${run_dir}/stepdown-primary.out" 2>"${run_dir}/stepdown-primary.err" || true
+    bao_for "$secondary2_before_handoff" "$DR_PRIMARY_TOKEN" write -f sys/step-down >"${run_dir}/stepdown-secondary2.out" 2>"${run_dir}/stepdown-secondary2.err" || true
+
+    primary_after_handoff="$(wait_cluster_active_change "primary" "$primary_before_handoff" 120 "${PRIMARY_NODE_ADDRS[@]}")"
+    secondary2_after_handoff="$(wait_cluster_active_change "secondary2" "$secondary2_before_handoff" 120 "${SECONDARY2_NODE_ADDRS[@]}")"
+    primary_addr="$primary_after_handoff"
+    secondary2_addr="$secondary2_after_handoff"
+    echo "HA handoff complete after pre-seed accept: primary=${primary_addr} secondary2=${secondary2_addr}" | tee -a "${run_dir}/orchestrator.log"
+
+    wait_secondary_ready "secondary2-preseed-post-handoff" "$secondary2_addr" "$timeout"
+    bao_for "$secondary2_addr" "$DR_PRIMARY_TOKEN" read -format=json sys/replication/dr/secondary/verify-checkpoint >"$post_handoff_verify_json"
+    jq -e '.data.pass == true and .data.mismatched_ranges == 0 and .data.missing_ranges == 0' "$post_handoff_verify_json" >/dev/null || {
+      jq '.data // .' "$post_handoff_verify_json" >&2
+      die "pre-seed checkpoint verification failed after HA handoff"
+    }
+
+    bao_for "$secondary2_addr" "$DR_PRIMARY_TOKEN" read -format=json sys/replication/dr/status >"$post_handoff_status_json_file"
+    jq -e '.data.secondary_state == "streaming" and .data.lag_entries == 0' "$post_handoff_status_json_file" >/dev/null || {
+      jq '.data // .' "$post_handoff_status_json_file" >&2
+      die "pre-seed secondary did not remain streaming with lag 0 after HA handoff"
+    }
+
+    assert_kv_present "primary after handoff" "$primary_addr" "$DR_PRIMARY_TOKEN" "$base_key"
+    assert_kv_present "primary after handoff" "$primary_addr" "$DR_PRIMARY_TOKEN" "$delta_key"
+  fi
+
   {
     echo "relationship_id=${relationship_id}"
     echo "entry_count=$(jq -r '.data.entry_count' "$export_json")"
     echo "checkpoint_index=$(jq -r '.data.checkpoint_index' "$export_json")"
     echo "verified_checkpoint_index=$(jq -r '.data.checkpoint_index' "$verify_json")"
+    if [[ -f "$post_handoff_verify_json" ]]; then
+      echo "post_handoff_verified_checkpoint_index=$(jq -r '.data.checkpoint_index' "$post_handoff_verify_json")"
+    fi
     echo "completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   } | tee -a "${run_dir}/orchestrator.log"
 

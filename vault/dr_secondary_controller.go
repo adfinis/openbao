@@ -184,9 +184,9 @@ func (m *drRelationshipManager) startSecondaryControllerLocked() {
 			metrics.SetGauge([]string{"replication", "dr", "secondary", "connect_backoff_seconds"}, 0)
 			err := secondary.Start(loopCtx)
 			if err == nil {
-				addrRing.MarkSuccess()
-				backoff = drSecondaryControllerInitialBackoff
-				continue
+				// A nil return means the runtime was stopped or promoted.
+				// Do not reconnect a stopped secondary in a tight loop.
+				return
 			}
 			if err != nil && loopCtx.Err() == nil {
 				if drSecondaryControllerRunWasStable(startedAt, time.Now()) {

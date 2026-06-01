@@ -1540,12 +1540,12 @@ func (m *drRelationshipManager) promoteSecondary(ctx context.Context, promotion 
 }
 
 func (m *drRelationshipManager) stopSecondaryRuntimeLocked() {
-	if m.secondary == nil {
-		return
-	}
 	if m.secondaryLoopCancel != nil {
 		m.secondaryLoopCancel()
 		m.secondaryLoopCancel = nil
+	}
+	if m.secondary == nil {
+		return
 	}
 	m.secondary.Stop()
 	m.secondary = nil

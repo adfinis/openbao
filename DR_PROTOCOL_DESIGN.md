@@ -485,6 +485,9 @@ The prototype exposes a first-class lifecycle boundary for this workflow:
 - If the process crashes after secondary config is persisted but before the
   accepted pre-seed record is consumed, config restore applies the same baseline
   before starting the secondary controller.
+- The local HA smoke validates the inline lifecycle across accept, post-export
+  delta catch-up, primary active handoff, secondary active handoff, and
+  checkpoint verification after the handoff.
 
 The current inline bundle format is a prototype artifact format. It is useful
 for lifecycle validation because export, transfer, import, and baseline
