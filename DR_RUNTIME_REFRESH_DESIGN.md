@@ -69,6 +69,24 @@ reconciliation repair. Paths are classified into refresh triggers:
 The refresh runs after storage commit. If storage commit fails, no runtime
 refresh is allowed to expose partial state.
 
+## HA Standby Key Transitions
+
+Keyring and root-key invalidations start a DR key transition. The active DR
+secondary must resync root-key, keyring, Raft TLS, and DR runtime configuration
+before relying on refreshed state. An unrecoverable active-node transition
+failure remains fail-closed.
+
+HA standbys are read-only for replicated storage. During a replicated keyring
+change they can temporarily observe keyring-missing or read-only transition
+errors that only the active node can resolve. A read-only DR standby must defer
+and clear its local transition state instead of sealing the process for that
+standby-only resync failure. If the standby later becomes active, activation
+and post-unseal paths must reload current replicated state before it streams or
+serves as the active secondary.
+
+The current HA smoke evidence hit this path on standby nodes with
+keyring-missing transition errors and observed no sealed/fatal logs.
+
 ## Refresh Order
 
 The normative order is:

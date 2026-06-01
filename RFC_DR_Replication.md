@@ -10,7 +10,10 @@ description: |-
 data-correctness validation across streaming, reconciliation, HA handoff,
 promotion, reseed, runtime refresh, and P0 security boundaries. Availability
 under adversarial HA handoff, production defaults, rolling upgrades,
-dependency-backed engine profiles, and operator UX still need hardening.
+dependency-backed engine profiles, and operator UX still need hardening. Recent
+HA validation also separates DR convergence from secondary API read-serving:
+strict warm-standby secondaries converge and reconcile, but general pre-promotion
+data reads still need an explicit product decision and validation path.
 
 ## Summary
 
@@ -76,7 +79,10 @@ This RFC is asking for maintainer feedback on:
 6. Whether the replication domain is correct: ciphertext physical storage plus
    runtime metadata, with cluster-local paths excluded and runtime refresh
    required before serving from replicated state.
-7. What validation evidence maintainers would require before this moves from
+7. Whether the secondary serving surface should remain DR status/control only
+   before promotion, or whether a supported read-only data API should be part
+   of the first version.
+8. What validation evidence maintainers would require before this moves from
    RFC/design review toward production implementation.
 
 ## Problem statement
@@ -103,6 +109,10 @@ In normal operation, clients write to the primary. The secondary is read-only
 for replicated state and applies ordered ciphertext storage changes from the
 primary. The secondary exposes status for state, lag, last applied index,
 stream/reconnect/reconcile activity, and safety counters.
+
+Whether secondaries expose a general read-only replicated data API before
+promotion is a production semantics question. This RFC currently treats DR
+convergence and secondary API read-serving as separate validation surfaces.
 
 If the stream disconnects and the primary can prove replay coverage from the
 secondary's last applied index, the secondary resumes streaming. If replay
@@ -451,9 +461,10 @@ profiles.
 
 1. Should planned switchover be part of the first version, or should the first
    version only support disaster promotion?
-2. Should secondaries remain strict warm standbys for replicated state in the
-   first version, or should any stale/read-only replicated API be supported?
-   This RFC currently recommends strict standby semantics.
+2. What exact secondary serving surface should the first version expose before
+   promotion: DR status/control only, or a supported read-only data API with
+   defined cache and transaction semantics? This RFC currently recommends
+   strict warm-standby semantics until read-serving is validated.
 3. What rolling-upgrade and protocol-version compatibility guarantees must the
    first production version support?
 4. How should DR transport CA rotation work without requiring full
@@ -472,9 +483,13 @@ direction blockers for this RFC:
 - define availability targets for HA active handoff under sustained DR backlog
   pressure
 - validate WAN latency, packet loss, proxy, and load-balancer behavior
+- define and validate secondary pre-promotion read-serving semantics, or add a
+  storage/checkpoint verification path for strict warm-standby deployments
 - add dependency-backed engine profiles for auth/secret engines that require
   external services
 - add a deterministic audit-device topology profile for audit-table validation
+- keep HA standby key-transition deferral paired with active-node fail-closed
+  tests
 - run larger-scale keyspace validation, including billion-key-oriented
   reconciliation and accumulator stress tests
 

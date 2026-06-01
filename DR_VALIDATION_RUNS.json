@@ -168,7 +168,7 @@
       "notes": "Validates the key-only local KID index under adversarial HA handoff load. Indexed repair completed with zero fallback scans, zero proof mismatches, and exhaustive verification remained clean. Client-facing PUT/GET failures occurred during active movement."
     },
     {
-      "scenario_id": "S18",
+      "scenario_id": "S18-previous",
       "scenario": "HA mixed load after adaptive stream batching",
       "run_id": "drmixed-20260531T235152Z",
       "path": "dr-stress-results/drmixed-20260531T235152Z",
@@ -232,6 +232,77 @@
         }
       },
       "notes": "Validates bounded adaptive stream batching. The result artifact predates the dr-stress parser update for adaptive fields, so adaptive level/wait values were observed from live status immediately after the run. Stream transactions and cursor writes dropped materially. Secondary1 required one bucket_mismatch fallback scan during reconciliation after HA handoff; terminal verification remained clean."
+    },
+    {
+      "scenario_id": "S18",
+      "scenario": "HA mixed load after adaptive batching and standby key-transition deferral",
+      "run_id": "drmixed-20260601T114049Z",
+      "path": "dr-stress-results/drmixed-20260601T114049Z",
+      "topology": "ha-primary-plus-two-secondaries",
+      "command_shape": "scripts/dr_local_test.sh --topology ha reset --build && scripts/dr_local_test.sh --topology ha smoke --duration 900 --concurrency 48 --stepdown-interval 300",
+      "result": "pass_with_expected_client_transients_secondary_api_verify_blocked",
+      "duration_seconds": 900,
+      "concurrency": 48,
+      "operations_total": 111169,
+      "operations_per_second": 122.70241334208973,
+      "put_fail": 2015,
+      "get_fail": 76,
+      "status_fail": 0,
+      "events_dropped": 0,
+      "sentinel_converged": {
+        "secondary1_seconds": 1.007503417,
+        "secondary2_seconds": 1.006726541
+      },
+      "verification": {
+        "primary": { "pass": true, "sampled": 9192, "missing": 0, "mismatches": 0, "errors": 0 },
+        "secondary1_api": { "pass": false, "sampled": 9192, "missing": 0, "mismatches": 0, "errors": 9192, "reason": "KV reads against DR secondary returned transaction is read-only" },
+        "secondary2_api": { "pass": false, "sampled": 9192, "missing": 0, "mismatches": 0, "errors": 9192, "reason": "KV reads against DR secondary returned transaction is read-only" }
+      },
+      "optimization_validation": {
+        "secondary1": {
+          "stream_txn_batches_total": 4425,
+          "stream_txn_physical_entries_total": 164252,
+          "stream_txn_average_entries": 37.238,
+          "stream_txn_commit_milliseconds_average": 87.18,
+          "stream_txn_commit_milliseconds_max": 1944.17,
+          "stream_batch_adaptive_level": 2,
+          "stream_batch_effective_max_wait_milliseconds": 100,
+          "flat_accumulator_cursor_writes_total": 4432,
+          "flat_accumulator_snapshot_persists_total": 174,
+          "flat_accumulator_snapshot_skipped_total": 4258,
+          "flat_accumulator_indexed_repair_ranges_total": 1024,
+          "local_kid_index_updates_total": 164231,
+          "local_kid_index_bucket_loads_total": 10405,
+          "local_kid_index_entries_loaded_total": 12703,
+          "local_kid_index_fallback_scans_total": 0,
+          "flat_accumulator_indexed_proof_mismatches_total": 0
+        },
+        "secondary2": {
+          "stream_txn_batches_total": 4392,
+          "stream_txn_physical_entries_total": 163021,
+          "stream_txn_average_entries": 37.239,
+          "stream_txn_commit_milliseconds_average": 86.54,
+          "stream_txn_commit_milliseconds_max": 2203.60,
+          "stream_batch_adaptive_level": 2,
+          "stream_batch_effective_max_wait_milliseconds": 100,
+          "flat_accumulator_cursor_writes_total": 4399,
+          "flat_accumulator_snapshot_persists_total": 172,
+          "flat_accumulator_snapshot_skipped_total": 4227,
+          "flat_accumulator_indexed_repair_ranges_total": 1024,
+          "local_kid_index_updates_total": 163016,
+          "local_kid_index_bucket_loads_total": 11072,
+          "local_kid_index_entries_loaded_total": 13183,
+          "local_kid_index_fallback_scans_total": 0,
+          "flat_accumulator_indexed_proof_mismatches_total": 0
+        }
+      },
+      "standby_key_transition_validation": {
+        "fatal_or_sealed_log_matches": 0,
+        "secondary1_standby_deferrals": 2,
+        "secondary2_standby_deferrals": 3,
+        "notes": "Read-only HA standbys hit keyring unexpectedly missing during DR key transition and deferred instead of sealing."
+      },
+      "notes": "Clears the prior adaptive-run bucket_mismatch fallback for this HA smoke shape: both secondaries used indexed repair over all 1024 top-level ranges with zero fallback scans and zero proof mismatches. Primary API verification passed; secondary API verification is blocked by strict read-only transaction behavior and should not be cited as terminal secondary API correctness."
     },
     {
       "scenario_id": "S15",

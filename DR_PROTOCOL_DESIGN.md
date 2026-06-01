@@ -447,6 +447,8 @@ Protocol status should distinguish:
 - delete safety failure
 - budget exhaustion
 - backpressure
+- HA standby key-transition deferral versus active-node fail-closed transition
+  failure
 
 The prototype exposes stream transaction shape, flush reasons, apply and commit
 timing, flat-accumulator cursor/snapshot/delta state, local KID index load and
@@ -466,3 +468,6 @@ rates so stress runs can measure both correctness and optimization behavior.
   version, algorithm, snapshot, delta, and bucket proofs validate.
 - Optimizer failure degrades to scan/reconcile; it must not produce committed
   convergence by itself.
+- HA standby runtime/key-transition deferral is not authority. Active and
+  activation paths must reload current replicated state before streaming,
+  promotion, or any supported data-serving path.
