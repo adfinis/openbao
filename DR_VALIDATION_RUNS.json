@@ -168,6 +168,72 @@
       "notes": "Validates the key-only local KID index under adversarial HA handoff load. Indexed repair completed with zero fallback scans, zero proof mismatches, and exhaustive verification remained clean. Client-facing PUT/GET failures occurred during active movement."
     },
     {
+      "scenario_id": "S18",
+      "scenario": "HA mixed load after adaptive stream batching",
+      "run_id": "drmixed-20260531T235152Z",
+      "path": "dr-stress-results/drmixed-20260531T235152Z",
+      "topology": "ha-primary-plus-two-secondaries",
+      "command_shape": "scripts/dr_local_test.sh --topology ha reset --build && scripts/dr_local_test.sh --topology ha smoke --duration 900 --concurrency 48 --stepdown-interval 300 --progress-interval 30 --monitor-interval 5 && verify --sample 0",
+      "result": "pass_with_expected_client_transients_and_optimizer_fallback",
+      "duration_seconds": 900,
+      "concurrency": 48,
+      "operations_total": 126106,
+      "operations_per_second": 139.4215992588121,
+      "put_fail": 365,
+      "get_fail": 224,
+      "status_fail": 0,
+      "events_dropped": 0,
+      "sentinel_converged": {
+        "secondary1_seconds": 1.002987625,
+        "secondary2_seconds": 1.001487459
+      },
+      "verification": {
+        "primary": { "pass": true, "sampled": 10184, "missing": 0, "mismatches": 0, "errors": 0 },
+        "secondary1": { "pass": true, "sampled": 10184, "missing": 0, "mismatches": 0, "errors": 0 },
+        "secondary2": { "pass": true, "sampled": 10184, "missing": 0, "mismatches": 0, "errors": 0 }
+      },
+      "optimization_validation": {
+        "secondary1": {
+          "stream_txn_batches_total": 4361,
+          "stream_txn_physical_entries_total": 188852,
+          "stream_txn_average_entries": 43.36780554918597,
+          "stream_txn_commit_milliseconds_average": 92.5828704143545,
+          "stream_txn_commit_milliseconds_max": 2239.516171,
+          "stream_batch_adaptive_adjustments_total": 6,
+          "stream_batch_adaptive_level": 2,
+          "stream_batch_effective_max_wait_milliseconds": 100,
+          "flat_accumulator_cursor_writes_total": 4367,
+          "flat_accumulator_snapshot_persists_total": 175,
+          "flat_accumulator_snapshot_skipped_total": 4192,
+          "flat_accumulator_indexed_repair_ranges_total": 0,
+          "local_kid_index_updates_total": 130955,
+          "local_kid_index_bucket_loads_total": 0,
+          "local_kid_index_entries_loaded_total": 0,
+          "local_kid_index_fallback_scans_total": 1,
+          "local_kid_index_fallback_scan_reason_last": "bucket_mismatch"
+        },
+        "secondary2": {
+          "stream_txn_batches_total": 4401,
+          "stream_txn_physical_entries_total": 190505,
+          "stream_txn_average_entries": 43.356509884117244,
+          "stream_txn_commit_milliseconds_average": 92.28794083935469,
+          "stream_txn_commit_milliseconds_max": 2238.069675,
+          "stream_batch_adaptive_adjustments_total": 6,
+          "stream_batch_adaptive_level": 2,
+          "stream_batch_effective_max_wait_milliseconds": 100,
+          "flat_accumulator_cursor_writes_total": 4407,
+          "flat_accumulator_snapshot_persists_total": 177,
+          "flat_accumulator_snapshot_skipped_total": 4230,
+          "flat_accumulator_indexed_repair_ranges_total": 372,
+          "local_kid_index_updates_total": 132102,
+          "local_kid_index_bucket_loads_total": 372,
+          "local_kid_index_entries_loaded_total": 8416,
+          "local_kid_index_fallback_scans_total": 0
+        }
+      },
+      "notes": "Validates bounded adaptive stream batching. The result artifact predates the dr-stress parser update for adaptive fields, so adaptive level/wait values were observed from live status immediately after the run. Stream transactions and cursor writes dropped materially. Secondary1 required one bucket_mismatch fallback scan during reconciliation after HA handoff; terminal verification remained clean."
+    },
+    {
       "scenario_id": "S15",
       "scenario": "HA indexed repair beyond journal horizon",
       "run_id": "indexed-repair-20260531T224314Z",

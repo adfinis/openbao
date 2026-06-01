@@ -21,7 +21,7 @@ func TestDRStatusChoosesActiveSecondaryFromAddressList(t *testing.T) {
 		if r.URL.Path != "/v1/sys/replication/dr/status" {
 			t.Fatalf("unexpected active path: %s", r.URL.Path)
 		}
-		fmt.Fprint(w, `{"data":{"mode":"secondary","secondary_state":"streaming","lag_entries":0,"last_applied_index":101,"primary_index":100}}`)
+		fmt.Fprint(w, `{"data":{"mode":"secondary","secondary_state":"streaming","lag_entries":0,"last_applied_index":101,"primary_index":100,"stream_batch_adaptive_adjustments_total":6,"stream_batch_adaptive_level":2,"stream_batch_effective_max_entries":256,"stream_batch_effective_max_wait_milliseconds":100}}`)
 	}))
 	defer active.Close()
 
@@ -43,6 +43,9 @@ func TestDRStatusChoosesActiveSecondaryFromAddressList(t *testing.T) {
 	}
 	if status.SecondaryState != "streaming" || status.PrimaryIndex != 100 || status.LastAppliedIndex != 101 {
 		t.Fatalf("selected status = %+v, want active streaming status", status)
+	}
+	if status.StreamBatchAdaptiveAdjustments != 6 || status.StreamBatchAdaptiveLevel != 2 || status.StreamBatchEffectiveMaxEntries != 256 || status.StreamBatchEffectiveMaxWaitMS != 100 {
+		t.Fatalf("adaptive stream batch status = %+v, want parsed adaptive counters", status)
 	}
 }
 

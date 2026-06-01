@@ -46,6 +46,7 @@ Orchestrated smokes add scenario-specific files such as
 | HA steady-state soak | `drsoak-20260530T115719Z` | Pass | 7,200s, 24 workers, 855,321 operations, zero PUT/GET/status failures, zero dropped events, 1s/1s sentinel convergence, exhaustive verification passed on all three clusters across 20,024 truth-log keys. |
 | HA mixed load with primary handoff | `drmixed-20260531T214747Z` | Pass with expected client transients | 900s, 48 workers, primary stepdown every 300s, 88,023 operations, zero status failures, zero dropped events, 1s/1s sentinel convergence, exhaustive verification passed on all three clusters across 7,744 truth-log keys. PUT/GET failures were client-facing HA disruption noise. |
 | HA mixed load after key-only KID index | `drmixed-20260531T231905Z` | Pass with expected client transients | 900s, 48 workers, primary stepdown every 300s, 133,318 operations, zero status failures, zero dropped events, 1s/1s sentinel convergence, exhaustive verification passed on all three clusters across 10,430 truth-log keys. Indexed repair loaded 558/298 ranges with zero fallback scans or proof mismatches. |
+| HA mixed load after adaptive stream batching | `drmixed-20260531T235152Z` | Pass with expected client transients and one optimizer fallback | 900s, 48 workers, primary stepdown every 300s, 126,106 operations, zero status failures, zero dropped events, 1s/1s sentinel convergence, exhaustive verification passed on all three clusters across 10,184 truth-log keys. Stream transaction count dropped by roughly 55%, but secondary #1 hit one `bucket_mismatch` local KID-index fallback scan during reconciliation. |
 | Indexed repair beyond journal horizon | `indexed-repair-20260531T224314Z` | Pass with expected client transients | Forced secondary #1 outage beyond journal horizon. Primary `journal_range_too_old_total=2`; secondary #1 reached indexed repair total 2, 1,825 indexed ranges, 1,773 bucket loads, and 9,867 loaded KID-index entries with zero fallback scans, proof mismatches, full-bucket fallback, scan failures, or load failures. Exhaustive verification passed on all three clusters across 3,261 truth-log keys. |
 | Secondary outage within journal horizon | `secondary-outage-20260531T211438Z` | Pass with expected client transients | 120s, 32 workers, secondary #1 stopped for 40s and recovered via journal replay. No reconciliation, no fallback scan, no journal-too-old increment, zero PUT/status failures, zero dropped events, and exhaustive verification passed on all three clusters across 2,143 truth-log keys. |
 | Accumulator cold restart | `accumulator-cold-restart-20260531T205052Z` | Pass | Full secondary #1 restart restored `flat_accumulator_cursor_index=56113` and `flat_accumulator_snapshot_index=56113`, kept `reconcile_count=0`, and observed no scan/fallback/proof-mismatch counters. |
@@ -106,6 +107,21 @@ that the index no longer tracks every value mutation: local KID-index updates
 were about 69% of physical entries while indexed repair still completed without
 local full scans.
 
+The first adaptive stream batching validation run is `drmixed-20260531T235152Z`.
+Both secondaries adapted from the 25ms baseline to a 100ms effective wait
+window (`stream_batch_adaptive_level=2`, six adjustments observed live after
+the run). This roughly halved the number of secondary stream transactions and
+cursor writes:
+
+| Node | Stream Txns | Physical Entries | Avg Entries/Txn | Avg Commit ms | Max Commit ms | Cursor Writes | Snapshot Persists | Snapshot Skips | Local KID Updates | Indexed Ranges | Fallback Scans |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| secondary1 | 4,361 | 188,852 | 43.37 | 92.58 | 2,239.52 | 4,367 | 175 | 4,192 | 130,955 | 0 | 1 |
+| secondary2 | 4,401 | 190,505 | 43.36 | 92.29 | 2,238.07 | 4,407 | 177 | 4,230 | 132,102 | 372 | 0 |
+
+The transaction-pressure result is positive, but the single secondary #1
+`bucket_mismatch` fallback scan means the key-only local KID index still needs
+a follow-up pass under reconciliation-after-handoff pressure.
+
 The curated set does not prove:
 
 - Production availability SLOs under active handoff.
@@ -129,8 +145,12 @@ behavior without explaining their age and purpose.
 
 ## Next Evidence Targets
 
-- Re-run the curated HA hard smoke and indexed-repair smoke after any secondary
-  storage transaction-pressure optimization.
+- Investigate the single adaptive-run `bucket_mismatch` fallback scan and
+  tighten the local KID-index/flat-accumulator proof path under reconciliation
+  after HA handoff.
+- Re-run the curated HA hard smoke and indexed-repair smoke after that fix to
+  compare stream transaction count, cursor writes, effective wait level,
+  convergence, fallback scans, and exhaustive verification.
 - Add a current dynamic tuning validation run once tuning defaults stabilize.
 - Add a current 1-hour no-stepdown stream-apply baseline with the latest code.
 - Add dependency-backed engine profiles when their services are available in the

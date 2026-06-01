@@ -2765,6 +2765,10 @@ func TestDRSecondaryStatus(t *testing.T) {
 	sec.streamBatchFlushMaxBytes.Store(5)
 	sec.streamBatchFlushMaxWait.Store(6)
 	sec.streamBatchFlushShutdown.Store(7)
+	sec.streamBatchAdaptiveAdjustments.Store(33)
+	sec.streamBatchAdaptiveLevel.Store(2)
+	sec.streamBatchEffectiveMaxEntries.Store(256)
+	sec.streamBatchEffectiveMaxWaitMillis.Store(100)
 	sec.flatAccumulatorCursorWrites.Store(8)
 	sec.flatAccumulatorCursorIndex.Store(41)
 	sec.flatAccumulatorSnapshotCount.Store(2)
@@ -2903,6 +2907,18 @@ func TestDRSecondaryStatus(t *testing.T) {
 	if status.StreamBatchFlushMaxWaitTotal != 6 {
 		t.Fatalf("expected stream batch max-wait flush total 6, got %d", status.StreamBatchFlushMaxWaitTotal)
 	}
+	if status.StreamBatchAdaptiveAdjustmentsTotal != 33 {
+		t.Fatalf("expected stream batch adaptive adjustments 33, got %d", status.StreamBatchAdaptiveAdjustmentsTotal)
+	}
+	if status.StreamBatchAdaptiveLevel != 2 {
+		t.Fatalf("expected stream batch adaptive level 2, got %d", status.StreamBatchAdaptiveLevel)
+	}
+	if status.StreamBatchEffectiveMaxEntries != 256 {
+		t.Fatalf("expected stream batch effective max entries 256, got %d", status.StreamBatchEffectiveMaxEntries)
+	}
+	if status.StreamBatchEffectiveMaxWaitMillis != 100 {
+		t.Fatalf("expected stream batch effective max wait 100ms, got %d", status.StreamBatchEffectiveMaxWaitMillis)
+	}
 	if status.FlatAccumulatorCursorWritesTotal != 8 {
 		t.Fatalf("expected flat accumulator cursor writes total 8, got %d", status.FlatAccumulatorCursorWritesTotal)
 	}
@@ -2984,6 +3000,10 @@ func TestDRSystemBackend_StatusIncludesStreamOptimizationCounters(t *testing.T) 
 	secondary.streamTxnMaxEntries.Store(9)
 	secondary.streamTxnMaxPhysicalEntries.Store(8)
 	secondary.streamBatchFlushMaxWait.Store(5)
+	secondary.streamBatchAdaptiveAdjustments.Store(6)
+	secondary.streamBatchAdaptiveLevel.Store(2)
+	secondary.streamBatchEffectiveMaxEntries.Store(256)
+	secondary.streamBatchEffectiveMaxWaitMillis.Store(100)
 	secondary.flatAccumulatorCursorWrites.Store(3)
 	secondary.flatAccumulatorCursorIndex.Store(15)
 	secondary.flatAccumulatorSnapshotCount.Store(2)
@@ -3087,6 +3107,18 @@ func TestDRSystemBackend_StatusIncludesStreamOptimizationCounters(t *testing.T) 
 	}
 	if got := resp.Data["stream_batch_flush_max_wait_total"]; got != uint64(5) {
 		t.Fatalf("expected stream_batch_flush_max_wait_total=5, got %#v", got)
+	}
+	if got := resp.Data["stream_batch_adaptive_adjustments_total"]; got != uint64(6) {
+		t.Fatalf("expected stream_batch_adaptive_adjustments_total=6, got %#v", got)
+	}
+	if got := resp.Data["stream_batch_adaptive_level"]; got != uint64(2) {
+		t.Fatalf("expected stream_batch_adaptive_level=2, got %#v", got)
+	}
+	if got := resp.Data["stream_batch_effective_max_entries"]; got != uint64(256) {
+		t.Fatalf("expected stream_batch_effective_max_entries=256, got %#v", got)
+	}
+	if got := resp.Data["stream_batch_effective_max_wait_milliseconds"]; got != uint64(100) {
+		t.Fatalf("expected stream_batch_effective_max_wait_milliseconds=100, got %#v", got)
 	}
 	if got := resp.Data["flat_accumulator_cursor_writes_total"]; got != uint64(3) {
 		t.Fatalf("expected flat_accumulator_cursor_writes_total=3, got %#v", got)
@@ -3485,6 +3517,7 @@ type drCommitFailingTransactionalBackend struct {
 
 	mu          sync.Mutex
 	failCommits int
+	commitDelay time.Duration
 }
 
 func (b *drCommitFailingTransactionalBackend) BeginReadOnlyTx(ctx context.Context) (physical.Transaction, error) {
@@ -3514,7 +3547,17 @@ func (t *drCommitFailingTransaction) Commit(ctx context.Context) error {
 		t.parent.mu.Unlock()
 		return physical.ErrTransactionCommitFailure
 	}
+	delay := t.parent.commitDelay
 	t.parent.mu.Unlock()
+	if delay > 0 {
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		}
+	}
 	return t.Transaction.Commit(ctx)
 }
 
@@ -3651,6 +3694,69 @@ func TestDRSecondaryStreamApplyMaxWaitStartsWithBatch(t *testing.T) {
 	}
 	if got := secondary.streamBatchFlushMaxWait.Load(); got != 1 {
 		t.Fatalf("expected one max-wait flush, got %d", got)
+	}
+
+	close(applyCh)
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("stream apply worker returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for stream apply worker")
+	}
+}
+
+func TestDRSecondaryStreamApplyAdaptiveWaitIncreasesUnderCommitPressure(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	txnBackend, ok := core.physical.(physical.Transactional)
+	if !ok {
+		t.Fatal("test core physical backend must support transactions")
+	}
+	core.physical = &drCommitFailingTransactionalBackend{
+		Backend:     core.physical,
+		txn:         txnBackend,
+		commitDelay: 20 * time.Millisecond,
+	}
+
+	replSalt := bytes.Repeat([]byte{0x71}, drReplSaltLen)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-batch-adaptive-wait", log.NewNullLogger())
+	secondary.streamBatchMaxEntries = 128
+	secondary.streamBatchMaxBytes = 1 << 20
+	secondary.streamBatchMaxWait = 5 * time.Millisecond
+
+	applyCh := make(chan []*EntryChange)
+	creditCh := make(chan uint64, 8)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- secondary.runStreamApplyWorker(ctx, applyCh, creditCh)
+	}()
+
+	applyCh <- []*EntryChange{{
+		OpType:    string(physical.PutOperation),
+		Key:       "secret/dr-batch-adaptive-wait/a",
+		Value:     []byte("a"),
+		RaftIndex: 1,
+	}}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && secondary.lastAppliedIndex.Load() < 1 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := secondary.lastAppliedIndex.Load(); got != 1 {
+		t.Fatalf("expected lastAppliedIndex=1, got %d", got)
+	}
+	if got := secondary.streamBatchAdaptiveAdjustments.Load(); got == 0 {
+		t.Fatal("expected stream batch adaptive adjustment under commit pressure")
+	}
+	if got := secondary.streamBatchAdaptiveLevel.Load(); got == 0 {
+		t.Fatal("expected stream batch adaptive level to increase")
+	}
+	if got := secondary.streamBatchEffectiveMaxWaitMillis.Load(); got <= 5 {
+		t.Fatalf("expected effective max wait to increase beyond 5ms, got %d", got)
 	}
 
 	close(applyCh)

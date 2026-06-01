@@ -222,6 +222,12 @@ in-memory stream buffer and a disk-backed stream journal; if either proves
 coverage from the secondary cursor, reconnect can resume without
 reconciliation.
 
+Secondary stream apply uses transactional batching and may adapt its local
+flush cadence under backlog or commit pressure. The adaptive wait window is
+bounded and only changes how many already-ordered stream entries are committed
+per secondary transaction; it does not change the ordering, relationship
+authorization, accumulator/cursor atomicity, or reconciliation semantics.
+
 When replay coverage cannot be proven, reconciliation is mandatory. A
 checkpoint gives the secondary a stable primary view. Every range checksum,
 range digest, fetched entry batch, and delete decision is bound to the

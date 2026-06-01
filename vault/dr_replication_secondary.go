@@ -304,6 +304,8 @@ const (
 	drDefaultStreamBatchMaxEntries              = 256
 	drDefaultStreamBatchMaxBytes                = 1 << 20 // 1 MiB
 	drDefaultStreamBatchMaxWait                 = 25 * time.Millisecond
+	drStreamBatchAdaptiveMaxWaitCap             = 100 * time.Millisecond
+	drStreamBatchAdaptiveQuietFlushes           = 16
 	drDefaultFlatAccumulatorSnapshotMinEntries  = 4096
 	drDefaultFlatAccumulatorSnapshotMinInterval = 5 * time.Second
 	drDefaultReconcileApplyWorkers              = 16
@@ -498,6 +500,10 @@ type drReplicationSecondary struct {
 	streamBatchFlushMaxBytes                          atomic.Uint64
 	streamBatchFlushMaxWait                           atomic.Uint64
 	streamBatchFlushShutdown                          atomic.Uint64
+	streamBatchAdaptiveAdjustments                    atomic.Uint64
+	streamBatchAdaptiveLevel                          atomic.Uint64
+	streamBatchEffectiveMaxEntries                    atomic.Uint64
+	streamBatchEffectiveMaxWaitMillis                 atomic.Uint64
 	flatAccumulatorCursorWrites                       atomic.Uint64
 	flatAccumulatorCursorIndex                        atomic.Uint64
 	flatAccumulatorSnapshotCount                      atomic.Uint64
@@ -1770,6 +1776,10 @@ func (s *drReplicationSecondary) Status() DRSecondaryStatus {
 		StreamBatchFlushMaxBytesTotal:         s.streamBatchFlushMaxBytes.Load(),
 		StreamBatchFlushMaxWaitTotal:          s.streamBatchFlushMaxWait.Load(),
 		StreamBatchFlushShutdownTotal:         s.streamBatchFlushShutdown.Load(),
+		StreamBatchAdaptiveAdjustmentsTotal:   s.streamBatchAdaptiveAdjustments.Load(),
+		StreamBatchAdaptiveLevel:              s.streamBatchAdaptiveLevel.Load(),
+		StreamBatchEffectiveMaxEntries:        s.streamBatchEffectiveMaxEntries.Load(),
+		StreamBatchEffectiveMaxWaitMillis:     s.streamBatchEffectiveMaxWaitMillis.Load(),
 		FlatAccumulatorCursorWritesTotal:      s.flatAccumulatorCursorWrites.Load(),
 		FlatAccumulatorCursorIndex:            s.flatAccumulatorCursorIndex.Load(),
 		FlatAccumulatorSnapshotPersistsTotal:  flatAccumulatorSnapshotCount,
@@ -1884,6 +1894,10 @@ type DRSecondaryStatus struct {
 	StreamBatchFlushMaxBytesTotal                     uint64
 	StreamBatchFlushMaxWaitTotal                      uint64
 	StreamBatchFlushShutdownTotal                     uint64
+	StreamBatchAdaptiveAdjustmentsTotal               uint64
+	StreamBatchAdaptiveLevel                          uint64
+	StreamBatchEffectiveMaxEntries                    uint64
+	StreamBatchEffectiveMaxWaitMillis                 uint64
 	FlatAccumulatorCursorWritesTotal                  uint64
 	FlatAccumulatorCursorIndex                        uint64
 	FlatAccumulatorSnapshotPersistsTotal              uint64
@@ -3116,6 +3130,43 @@ func (s *drReplicationSecondary) recordStreamBatchFlush(reason drStreamBatchFlus
 	}
 }
 
+func drStreamBatchAdaptiveMaxWait(base time.Duration) time.Duration {
+	if base <= 0 {
+		base = drDefaultStreamBatchMaxWait
+	}
+	cap := base * 4
+	if cap < base {
+		cap = base
+	}
+	if base < drStreamBatchAdaptiveMaxWaitCap && cap > drStreamBatchAdaptiveMaxWaitCap {
+		cap = drStreamBatchAdaptiveMaxWaitCap
+	}
+	return cap
+}
+
+func (s *drReplicationSecondary) recordStreamBatchAdaptiveState(maxEntries int, maxWait time.Duration, level uint64, adjusted bool) {
+	if s == nil {
+		return
+	}
+	if maxEntries < 0 {
+		maxEntries = 0
+	}
+	waitMillis := int64(maxWait / time.Millisecond)
+	if waitMillis < 0 {
+		waitMillis = 0
+	}
+	s.streamBatchEffectiveMaxEntries.Store(uint64(maxEntries))
+	s.streamBatchEffectiveMaxWaitMillis.Store(uint64(waitMillis))
+	s.streamBatchAdaptiveLevel.Store(level)
+	metrics.SetGauge([]string{"replication", "dr", "secondary", "stream_batch_effective_max_entries"}, float32(maxEntries))
+	metrics.SetGauge([]string{"replication", "dr", "secondary", "stream_batch_effective_max_wait_milliseconds"}, float32(waitMillis))
+	metrics.SetGauge([]string{"replication", "dr", "secondary", "stream_batch_adaptive_level"}, float32(level))
+	if adjusted {
+		s.streamBatchAdaptiveAdjustments.Add(1)
+		metrics.IncrCounter([]string{"replication", "dr", "secondary", "stream_batch_adaptive_adjustments_total"}, 1)
+	}
+}
+
 func (s *drReplicationSecondary) recordStreamTxnStats(logicalEntries, physicalEntries int, applyDuration, commitDuration time.Duration) {
 	if s == nil || logicalEntries <= 0 {
 		return
@@ -3166,6 +3217,11 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 	if maxWait <= 0 {
 		maxWait = drDefaultStreamBatchMaxWait
 	}
+	baseMaxWait := maxWait
+	adaptiveMaxWait := drStreamBatchAdaptiveMaxWait(baseMaxWait)
+	adaptiveLevel := uint64(0)
+	quietFlushes := 0
+	s.recordStreamBatchAdaptiveState(maxEntries, maxWait, adaptiveLevel, false)
 
 	batch := make([]*EntryChange, 0, maxEntries)
 	batchBytes := 0
@@ -3197,6 +3253,49 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 		maxWaitC = maxWaitTimer.C
 	}
 	defer stopMaxWaitTimer()
+
+	tuneBatchCadence := func(reason drStreamBatchFlushReason, flushedCount int, flushDuration time.Duration) {
+		if reason == drStreamBatchFlushShutdown {
+			return
+		}
+		backlog := len(applyCh)
+		pressure := backlog > 0 || flushDuration >= maxWait
+		if pressure && maxWait < adaptiveMaxWait {
+			nextWait := maxWait * 2
+			if nextWait < maxWait || nextWait > adaptiveMaxWait {
+				nextWait = adaptiveMaxWait
+			}
+			if nextWait > maxWait {
+				maxWait = nextWait
+				adaptiveLevel++
+				quietFlushes = 0
+				s.recordStreamBatchAdaptiveState(maxEntries, maxWait, adaptiveLevel, true)
+			}
+			return
+		}
+
+		if backlog == 0 && flushDuration < baseMaxWait && reason == drStreamBatchFlushMaxWait && flushedCount < maxEntries/2 {
+			quietFlushes++
+		} else {
+			quietFlushes = 0
+		}
+		if quietFlushes < drStreamBatchAdaptiveQuietFlushes || maxWait <= baseMaxWait {
+			return
+		}
+
+		nextWait := maxWait / 2
+		if nextWait < baseMaxWait {
+			nextWait = baseMaxWait
+		}
+		if nextWait < maxWait {
+			maxWait = nextWait
+			if adaptiveLevel > 0 {
+				adaptiveLevel--
+			}
+			quietFlushes = 0
+			s.recordStreamBatchAdaptiveState(maxEntries, maxWait, adaptiveLevel, true)
+		}
+	}
 
 	// pendingCredits accumulates credit counts that could not be sent
 	// to the credit-sender goroutine because creditReplenishCh was full.
@@ -3274,10 +3373,13 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 
 		if txnSupported {
 			if err := s.applyStreamTxnWithRetry(ctx, txnBackend, batch, reason == drStreamBatchFlushShutdown); err == nil {
+				flushDuration := time.Since(applyStart)
 				txnLogOnce.Do(func() {
 					s.logger.Info("stream apply using transactional batching",
 						"batch_max_entries", maxEntries,
-						"batch_max_bytes", maxBytes)
+						"batch_max_bytes", maxBytes,
+						"batch_base_max_wait", baseMaxWait,
+						"batch_adaptive_max_wait", adaptiveMaxWait)
 				})
 				s.recordStreamBatchFlush(reason)
 				metrics.IncrCounter([]string{"replication", "dr", "secondary", "stream_txn_success"}, 1)
@@ -3287,6 +3389,7 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 				batch = batch[:0]
 				batchBytes = 0
 				replenishCredits(flushedCount)
+				tuneBatchCadence(reason, flushedCount, flushDuration)
 				applyYield()
 				return nil
 			} else {
@@ -3330,6 +3433,7 @@ func (s *drReplicationSecondary) runStreamApplyWorker(ctx context.Context, apply
 		s.recordStreamBatchFlush(reason)
 		discardBatch()
 		replenishCredits(flushedCount)
+		tuneBatchCadence(reason, flushedCount, time.Since(applyStart))
 		applyYield()
 		return nil
 	}

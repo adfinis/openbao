@@ -54,6 +54,14 @@ mutations for the same physical key inside one streamed transaction. Only the
 final put or delete for a key is materialized. This is safe because the batch
 is applied atomically and intermediate states are not externally visible.
 
+The secondary apply worker also adapts its local flush cadence. The configured
+stream batch wait remains the low-load baseline. When the worker observes
+backlog or commit pressure, it can temporarily stretch the wait window up to a
+bounded cap so more received stream batches coalesce into each secondary
+transaction. Under quiet conditions it decays back toward the baseline. This
+reduces cursor, accumulator, and local index write amplification without
+changing ordering or crash-atomic apply semantics.
+
 ```mermaid
 flowchart TB
     A["Primary Raft-applied physical mutation"] --> B{"Replicated path?"}
@@ -416,6 +424,7 @@ The protocol needs bounded:
 - fetch request selectors
 - fetch response bytes
 - apply batch entries and bytes
+- adaptive stream apply wait cadence
 - wall-clock reconciliation time
 - primary-side backpressure when secondaries cannot converge
 

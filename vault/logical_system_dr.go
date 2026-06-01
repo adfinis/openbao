@@ -782,6 +782,10 @@ func (b *SystemBackend) handleDRStatus(ctx context.Context, req *logical.Request
 		data["stream_batch_flush_max_bytes_total"] = status.StreamBatchFlushMaxBytesTotal
 		data["stream_batch_flush_max_wait_total"] = status.StreamBatchFlushMaxWaitTotal
 		data["stream_batch_flush_shutdown_total"] = status.StreamBatchFlushShutdownTotal
+		data["stream_batch_adaptive_adjustments_total"] = status.StreamBatchAdaptiveAdjustmentsTotal
+		data["stream_batch_adaptive_level"] = status.StreamBatchAdaptiveLevel
+		data["stream_batch_effective_max_entries"] = status.StreamBatchEffectiveMaxEntries
+		data["stream_batch_effective_max_wait_milliseconds"] = status.StreamBatchEffectiveMaxWaitMillis
 		data["flat_accumulator_cursor_writes_total"] = status.FlatAccumulatorCursorWritesTotal
 		data["flat_accumulator_cursor_index"] = status.FlatAccumulatorCursorIndex
 		data["flat_accumulator_snapshot_persists_total"] = status.FlatAccumulatorSnapshotPersistsTotal

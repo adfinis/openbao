@@ -221,6 +221,10 @@ type DRStatusResponse struct {
 	StreamFlushMaxBytes             int64   `json:"stream_batch_flush_max_bytes_total"`
 	StreamFlushMaxWait              int64   `json:"stream_batch_flush_max_wait_total"`
 	StreamFlushShutdown             int64   `json:"stream_batch_flush_shutdown_total"`
+	StreamBatchAdaptiveAdjustments  int64   `json:"stream_batch_adaptive_adjustments_total"`
+	StreamBatchAdaptiveLevel        int64   `json:"stream_batch_adaptive_level"`
+	StreamBatchEffectiveMaxEntries  int64   `json:"stream_batch_effective_max_entries"`
+	StreamBatchEffectiveMaxWaitMS   int64   `json:"stream_batch_effective_max_wait_milliseconds"`
 	FlatAccCursorWrites             int64   `json:"flat_accumulator_cursor_writes_total"`
 	FlatAccCursorIndex              int64   `json:"flat_accumulator_cursor_index"`
 	FlatAccSnapshotsTotal           int64   `json:"flat_accumulator_snapshot_persists_total"`
