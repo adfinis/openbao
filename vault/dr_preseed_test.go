@@ -79,6 +79,24 @@ func TestDRPreSeedManifestValidationRejectsExpiredManifest(t *testing.T) {
 	}
 }
 
+func TestDRPreSeedManifestValidationRejectsInvalidSegmentMetadata(t *testing.T) {
+	token, manifest, now := testDRPreSeedManifestFixture()
+	manifest.BundleFormat = drPreSeedBundleFormatSegmentedV1
+	manifest.BundleSegments = []DRPreSeedSegmentDescriptor{{
+		Index:      1,
+		EntryCount: 1,
+		ByteCount:  1,
+		SHA256:     make([]byte, sha256.Size),
+		FirstKey:   "secret/data/a",
+		LastKey:    "secret/data/a",
+	}}
+
+	err := validateDRPreSeedManifest(manifest, token, nil, now)
+	if err == nil || !strings.Contains(err.Error(), "segment index mismatch") {
+		t.Fatalf("expected segment metadata rejection, got: %v", err)
+	}
+}
+
 func TestDRRelationshipManagerValidatePreSeedManifestUsesPreservedPromotionLineage(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	token, manifest, now := testDRPreSeedManifestFixture()
@@ -106,6 +124,46 @@ func TestDRPreSeedBundleValidationRejectsIntegrityMismatch(t *testing.T) {
 	err := validateDRPreSeedBundle(bundle, token, nil, now)
 	if err == nil || !strings.Contains(err.Error(), "integrity mismatch") {
 		t.Fatalf("expected integrity mismatch, got: %v", err)
+	}
+}
+
+func TestDRPreSeedBundleValidationAcceptsSegmentedMetadata(t *testing.T) {
+	token, bundle, now := testDRPreSeedBundleFixture(t)
+	segments, err := buildDRPreSeedBundleSegmentPlan(bundle, testDRPreSeedMaxSingleSegmentBytes(t, bundle.Entries))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle.Manifest.BundleFormat = drPreSeedBundleFormatSegmentedV1
+	bundle.Manifest.BundleSegments = segments
+	sum, err := computeDRPreSeedBundleIntegrity(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle.Manifest.BundleIntegritySHA256 = sum
+
+	if err := validateDRPreSeedBundle(bundle, token, nil, now); err != nil {
+		t.Fatalf("expected segmented pre-seed bundle to validate, got: %v", err)
+	}
+}
+
+func TestDRPreSeedBundleValidationRejectsSegmentMetadataMismatch(t *testing.T) {
+	token, bundle, now := testDRPreSeedBundleFixture(t)
+	segments, err := buildDRPreSeedBundleSegmentPlan(bundle, testDRPreSeedMaxSingleSegmentBytes(t, bundle.Entries))
+	if err != nil {
+		t.Fatal(err)
+	}
+	segments[0].ByteCount++
+	bundle.Manifest.BundleFormat = drPreSeedBundleFormatSegmentedV1
+	bundle.Manifest.BundleSegments = segments
+	sum, err := computeDRPreSeedBundleIntegrity(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle.Manifest.BundleIntegritySHA256 = sum
+
+	err = validateDRPreSeedBundle(bundle, token, nil, now)
+	if err == nil || !strings.Contains(err.Error(), "segment 0 metadata mismatch") {
+		t.Fatalf("expected segment metadata mismatch, got: %v", err)
 	}
 }
 
@@ -158,6 +216,50 @@ func TestDRPreSeedBundleValidationRejectsBootstrapOwnedRootKey(t *testing.T) {
 	err = validateDRPreSeedBundle(bundle, token, nil, now)
 	if err == nil || !strings.Contains(err.Error(), "local-only or excluded") {
 		t.Fatalf("expected root-key path rejection, got: %v", err)
+	}
+}
+
+func TestDRPreSeedSegmentPlanIsDeterministic(t *testing.T) {
+	_, bundle, _ := testDRPreSeedBundleFixture(t)
+	maxSegmentBytes := testDRPreSeedMaxSingleSegmentBytes(t, bundle.Entries)
+
+	want, err := buildDRPreSeedBundleSegmentPlan(bundle, maxSegmentBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(want) != len(bundle.Entries) {
+		t.Fatalf("expected one segment per fixture entry, got %d segments for %d entries", len(want), len(bundle.Entries))
+	}
+
+	shuffled := *bundle
+	shuffled.Entries = append([]DRPreSeedBundleEntry(nil), bundle.Entries...)
+	for i, j := 0, len(shuffled.Entries)-1; i < j; i, j = i+1, j-1 {
+		shuffled.Entries[i], shuffled.Entries[j] = shuffled.Entries[j], shuffled.Entries[i]
+	}
+	got, err := buildDRPreSeedBundleSegmentPlan(&shuffled, maxSegmentBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantJSON, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotJSON, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotJSON) != string(wantJSON) {
+		t.Fatalf("segment plan changed after entry reorder\ngot:  %s\nwant: %s", gotJSON, wantJSON)
+	}
+}
+
+func TestDRPreSeedSegmentPlanRejectsOversizedEntry(t *testing.T) {
+	_, bundle, _ := testDRPreSeedBundleFixture(t)
+
+	_, err := buildDRPreSeedBundleSegmentPlan(bundle, 1)
+	if err == nil || !strings.Contains(err.Error(), "exceeds segment max bytes") {
+		t.Fatalf("expected oversized entry rejection, got: %v", err)
 	}
 }
 
@@ -517,6 +619,7 @@ func testDRPreSeedManifestFixture() (*DRActivationToken, *DRPreSeedManifest, tim
 		LocalOnlyPrefixes:        currentDRPreSeedLocalOnlyPrefixes(),
 		AccumulatorSnapshotVer:   drFlatAccumulatorSnapshotVersion,
 		LocalKIDIndexVersion:     drLocalKIDIndexVersion,
+		BundleFormat:             drPreSeedBundleFormatInlineJSONV1,
 		BundleIntegrityAlgorithm: drPreSeedBundleIntegrityAlgorithm,
 		BundleIntegritySHA256:    bundleHash[:],
 	}
@@ -560,4 +663,23 @@ func testDRPreSeedBundleFixture(t *testing.T) (*DRActivationToken, *DRPreSeedBun
 	}
 	bundle.Manifest.BundleIntegritySHA256 = sum
 	return token, bundle, now
+}
+
+func testDRPreSeedMaxSingleSegmentBytes(t *testing.T, entries []DRPreSeedBundleEntry) int {
+	t.Helper()
+
+	maxBytes := uint64(0)
+	for i, entry := range canonicalDRPreSeedBundleEntries(entries) {
+		descriptor, err := buildDRPreSeedSegmentDescriptor(i, []DRPreSeedBundleEntry{entry})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if descriptor.ByteCount > maxBytes {
+			maxBytes = descriptor.ByteCount
+		}
+	}
+	if maxBytes == 0 {
+		t.Fatal("expected non-empty fixture entries")
+	}
+	return int(maxBytes)
 }

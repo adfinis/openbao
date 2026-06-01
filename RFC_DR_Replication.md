@@ -88,8 +88,9 @@ This RFC is asking for maintainer feedback on:
    checkpoint-bound manifest generation, inline bundle export/import, disabled
    secondary acceptance, replicated-storage replacement with local-only
    preservation, and baseline application on secondary enable. The remaining
-   design question is the production artifact shape: segmented transfer,
-   resumability, provenance, and optimizer seeding.
+   design question is the production artifact lifecycle around the new
+   segmented metadata boundary: resumable transfer, durable import staging,
+   provenance, and optimizer seeding.
 9. Whether the proposed resource model is acceptable: finite journal
    retention, bounded checkpoint build/digest/fetch work on the primary, and a
    checkpoint-scoped reconcile budget ledger on the secondary.
@@ -335,8 +336,14 @@ storage is intended; and secondary enable consumes the accepted baseline only
 with the same activation token before starting normal stream/reconcile
 catch-up. Config restore also consumes a still-pending accepted manifest before
 starting the secondary controller, closing the mid-enable crash window. The
-inline bundle is a PoC artifact format; production still needs segmented or
-streaming transfer, resumability, provenance, and optional optimizer seeding.
+inline bundle is a PoC artifact format. The manifest now names the artifact
+format explicitly and can carry deterministic segment descriptors for a
+future `segmented-json-v1` artifact. Segment descriptors bind ordinal, entry
+count, canonical byte count, digest, and key bounds to the same sorted
+KID/VID/value-hash projection used by whole-bundle validation. Production
+still needs the transfer and recovery pieces around that metadata: segmented
+or streaming export/import, resumability, provenance, durable import staging,
+and optional optimizer seeding.
 
 ### Runtime refresh
 
@@ -520,9 +527,11 @@ profiles.
    first production version support?
 4. How should DR transport CA rotation work without requiring full
    relationship replacement?
-5. What should the production bulk pre-seed artifact format be? The prototype
-   exposes inline JSON export/import for lifecycle validation, but not a
-   segmented, resumable, signed artifact provenance model.
+5. What should the production bulk pre-seed artifact lifecycle be? The
+   prototype exposes inline JSON export/import and a versioned segmented
+   metadata model for lifecycle validation, but not resumable segment
+   transfer, signed artifact provenance, or durable interrupted-import
+   recovery.
 6. What final UI/API wording should be used for planned authority transfer,
    disaster promotion, forced-promotion reasons, and data-loss estimate basis?
 
@@ -542,7 +551,9 @@ direction blockers for this RFC:
   where initial full reconciliation would be operationally expensive; the
   current prototype has inline export/import and secondary-enable baseline
   application with local HA delta catch-up and post-accept handoff validation,
-  but still needs segmented production artifacts and optimizer seeding
+  plus deterministic segmented artifact descriptors, but still needs resumable
+  segment transfer, interrupted import recovery, provenance, and optimizer
+  seeding
 - define availability targets for HA active handoff under sustained DR backlog
   pressure
 - validate WAN latency, packet loss, proxy, and load-balancer behavior

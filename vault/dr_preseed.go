@@ -23,6 +23,8 @@ const (
 	drPreSeedAcceptedRecordVersion    = 1
 	drPreSeedLocalOnlyScrubVersion    = 1
 	drPreSeedBundleIntegrityAlgorithm = "sha256"
+	drPreSeedBundleFormatInlineJSONV1 = "inline-json-v1"
+	drPreSeedBundleFormatSegmentedV1  = "segmented-json-v1"
 	drPreSeedAcceptedStoragePath      = "core/cluster/local/dr/preseed/accepted"
 	drPreSeedBundleMaxBytes           = 512 << 20
 )
@@ -39,26 +41,28 @@ func isDRPreSeedBulkExcludedPath(path string) bool {
 // restore a DR-aware base copy before the secondary catches up through normal
 // stream replay or checkpoint reconciliation.
 type DRPreSeedManifest struct {
-	Version                  int      `json:"version"`
-	PrimaryClusterID         string   `json:"primary_cluster_id"`
-	RelationshipID           string   `json:"relationship_id"`
-	CheckpointID             string   `json:"checkpoint_id"`
-	CheckpointIndex          uint64   `json:"checkpoint_index"`
-	CreatedAtUnix            int64    `json:"created_at_unix"`
-	ExpiresAtUnix            int64    `json:"expires_at_unix,omitempty"`
-	ReplSaltSHA256           []byte   `json:"repl_salt_sha256"`
-	RangePlanVersion         uint32   `json:"range_plan_version"`
-	RangeBits                int      `json:"range_bits"`
-	RangeCount               int      `json:"range_count"`
-	ChecksumAlgorithm        string   `json:"checksum_algorithm"`
-	ValueDomain              string   `json:"value_domain"`
-	LocalOnlyScrubVersion    int      `json:"local_only_scrub_version"`
-	LocalOnlyExactPaths      []string `json:"local_only_exact_paths"`
-	LocalOnlyPrefixes        []string `json:"local_only_prefixes"`
-	AccumulatorSnapshotVer   int      `json:"accumulator_snapshot_version,omitempty"`
-	LocalKIDIndexVersion     int      `json:"local_kid_index_version,omitempty"`
-	BundleIntegrityAlgorithm string   `json:"bundle_integrity_algorithm"`
-	BundleIntegritySHA256    []byte   `json:"bundle_integrity_sha256"`
+	Version                  int                          `json:"version"`
+	PrimaryClusterID         string                       `json:"primary_cluster_id"`
+	RelationshipID           string                       `json:"relationship_id"`
+	CheckpointID             string                       `json:"checkpoint_id"`
+	CheckpointIndex          uint64                       `json:"checkpoint_index"`
+	CreatedAtUnix            int64                        `json:"created_at_unix"`
+	ExpiresAtUnix            int64                        `json:"expires_at_unix,omitempty"`
+	ReplSaltSHA256           []byte                       `json:"repl_salt_sha256"`
+	RangePlanVersion         uint32                       `json:"range_plan_version"`
+	RangeBits                int                          `json:"range_bits"`
+	RangeCount               int                          `json:"range_count"`
+	ChecksumAlgorithm        string                       `json:"checksum_algorithm"`
+	ValueDomain              string                       `json:"value_domain"`
+	LocalOnlyScrubVersion    int                          `json:"local_only_scrub_version"`
+	LocalOnlyExactPaths      []string                     `json:"local_only_exact_paths"`
+	LocalOnlyPrefixes        []string                     `json:"local_only_prefixes"`
+	AccumulatorSnapshotVer   int                          `json:"accumulator_snapshot_version,omitempty"`
+	LocalKIDIndexVersion     int                          `json:"local_kid_index_version,omitempty"`
+	BundleFormat             string                       `json:"bundle_format,omitempty"`
+	BundleSegments           []DRPreSeedSegmentDescriptor `json:"bundle_segments,omitempty"`
+	BundleIntegrityAlgorithm string                       `json:"bundle_integrity_algorithm"`
+	BundleIntegritySHA256    []byte                       `json:"bundle_integrity_sha256"`
 }
 
 // DRPreSeedBundle is a checkpoint-bound, relationship-bound physical seed
@@ -78,6 +82,15 @@ type DRPreSeedBundleEntry struct {
 	VID      []byte `json:"vid"`
 }
 
+type DRPreSeedSegmentDescriptor struct {
+	Index      int    `json:"index"`
+	EntryCount int    `json:"entry_count"`
+	ByteCount  uint64 `json:"byte_count"`
+	SHA256     []byte `json:"sha256"`
+	FirstKey   string `json:"first_key,omitempty"`
+	LastKey    string `json:"last_key,omitempty"`
+}
+
 type drPreSeedAcceptedRecord struct {
 	Version                  int               `json:"version"`
 	AcceptedAtUnix           int64             `json:"accepted_at_unix"`
@@ -92,6 +105,8 @@ type drPreSeedBundleIntegrityPayload struct {
 	RelationshipID   string                                 `json:"relationship_id"`
 	CheckpointID     string                                 `json:"checkpoint_id"`
 	CheckpointIndex  uint64                                 `json:"checkpoint_index"`
+	BundleFormat     string                                 `json:"bundle_format"`
+	BundleSegments   []DRPreSeedSegmentDescriptor           `json:"bundle_segments,omitempty"`
 	EntryCount       int                                    `json:"entry_count"`
 	Entries          []drPreSeedBundleIntegrityPayloadEntry `json:"entries"`
 }
@@ -418,6 +433,9 @@ func validateDRPreSeedManifest(manifest *DRPreSeedManifest, token *DRActivationT
 	if manifest.LocalKIDIndexVersion != 0 && manifest.LocalKIDIndexVersion != drLocalKIDIndexVersion {
 		return fmt.Errorf("local_kid_index_version mismatch")
 	}
+	if err := validateDRPreSeedBundleArtifactMetadata(manifest); err != nil {
+		return err
+	}
 	if manifest.BundleIntegrityAlgorithm != drPreSeedBundleIntegrityAlgorithm {
 		return fmt.Errorf("bundle_integrity_algorithm mismatch")
 	}
@@ -490,6 +508,9 @@ func validateDRPreSeedBundle(bundle *DRPreSeedBundle, token *DRActivationToken, 
 			return fmt.Errorf("pre-seed bundle entry %q vid mismatch", entry.Key)
 		}
 	}
+	if err := validateDRPreSeedBundleSegments(bundle); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -514,6 +535,7 @@ func newDRPreSeedManifest(clusterID, relationshipID string, replSalt []byte, che
 		LocalOnlyPrefixes:        currentDRPreSeedLocalOnlyPrefixes(),
 		AccumulatorSnapshotVer:   drFlatAccumulatorSnapshotVersion,
 		LocalKIDIndexVersion:     drLocalKIDIndexVersion,
+		BundleFormat:             drPreSeedBundleFormatInlineJSONV1,
 		BundleIntegrityAlgorithm: drPreSeedBundleIntegrityAlgorithm,
 		BundleIntegritySHA256:    append([]byte(nil), bundleIntegritySHA256...),
 	}
@@ -560,6 +582,88 @@ func validateDRPreSeedLocalOnlyScrub(manifest *DRPreSeedManifest) error {
 	}
 	if missing := missingStrings(currentDRPreSeedLocalOnlyPrefixes(), manifest.LocalOnlyPrefixes); len(missing) > 0 {
 		return fmt.Errorf("local-only scrub metadata missing prefix %q", missing[0])
+	}
+	return nil
+}
+
+func normalizedDRPreSeedBundleFormat(format string) string {
+	if format == "" {
+		return drPreSeedBundleFormatInlineJSONV1
+	}
+	return format
+}
+
+func validateDRPreSeedBundleArtifactMetadata(manifest *DRPreSeedManifest) error {
+	switch normalizedDRPreSeedBundleFormat(manifest.BundleFormat) {
+	case drPreSeedBundleFormatInlineJSONV1:
+		if len(manifest.BundleSegments) != 0 {
+			return fmt.Errorf("inline pre-seed bundle must not declare segment metadata")
+		}
+		return nil
+	case drPreSeedBundleFormatSegmentedV1:
+		return validateDRPreSeedSegmentDescriptors(manifest.BundleSegments)
+	default:
+		return fmt.Errorf("unsupported pre-seed bundle format %q", manifest.BundleFormat)
+	}
+}
+
+func validateDRPreSeedSegmentDescriptors(segments []DRPreSeedSegmentDescriptor) error {
+	if len(segments) == 0 {
+		return fmt.Errorf("segmented pre-seed bundle requires segment metadata")
+	}
+	var previousLastKey string
+	for i, segment := range segments {
+		if segment.Index != i {
+			return fmt.Errorf("pre-seed bundle segment index mismatch at offset %d", i)
+		}
+		if segment.EntryCount <= 0 {
+			return fmt.Errorf("pre-seed bundle segment %d has invalid entry_count", i)
+		}
+		if segment.ByteCount == 0 {
+			return fmt.Errorf("pre-seed bundle segment %d has invalid byte_count", i)
+		}
+		if len(segment.SHA256) != sha256.Size {
+			return fmt.Errorf("pre-seed bundle segment %d has invalid sha256", i)
+		}
+		if segment.FirstKey == "" || segment.LastKey == "" {
+			return fmt.Errorf("pre-seed bundle segment %d is missing key bounds", i)
+		}
+		if segment.FirstKey > segment.LastKey {
+			return fmt.Errorf("pre-seed bundle segment %d has invalid key bounds", i)
+		}
+		if i > 0 && previousLastKey >= segment.FirstKey {
+			return fmt.Errorf("pre-seed bundle segment %d key bounds overlap previous segment", i)
+		}
+		previousLastKey = segment.LastKey
+	}
+	return nil
+}
+
+func validateDRPreSeedBundleSegments(bundle *DRPreSeedBundle) error {
+	if normalizedDRPreSeedBundleFormat(bundle.Manifest.BundleFormat) != drPreSeedBundleFormatSegmentedV1 {
+		return nil
+	}
+
+	entries := canonicalDRPreSeedBundleEntries(bundle.Entries)
+	offset := 0
+	for _, expected := range bundle.Manifest.BundleSegments {
+		if expected.EntryCount > len(entries)-offset {
+			return fmt.Errorf("pre-seed bundle segment %d entry_count exceeds bundle entries", expected.Index)
+		}
+		actual, err := buildDRPreSeedSegmentDescriptor(expected.Index, entries[offset:offset+expected.EntryCount])
+		if err != nil {
+			return err
+		}
+		if expected.ByteCount != actual.ByteCount ||
+			expected.FirstKey != actual.FirstKey ||
+			expected.LastKey != actual.LastKey ||
+			!bytes.Equal(expected.SHA256, actual.SHA256) {
+			return fmt.Errorf("pre-seed bundle segment %d metadata mismatch", expected.Index)
+		}
+		offset += expected.EntryCount
+	}
+	if offset != len(entries) {
+		return fmt.Errorf("pre-seed bundle segment metadata does not cover all entries")
 	}
 	return nil
 }
@@ -682,18 +786,115 @@ func drPreSeedScanner(replSalt []byte, logger log.Logger) *reconciler.Scanner {
 	return reconciler.NewScanner(config)
 }
 
-func computeDRPreSeedBundleIntegrity(bundle *DRPreSeedBundle) ([]byte, error) {
+func buildDRPreSeedBundleSegmentPlan(bundle *DRPreSeedBundle, maxSegmentBytes int) ([]DRPreSeedSegmentDescriptor, error) {
 	if bundle == nil {
 		return nil, fmt.Errorf("pre-seed bundle is nil")
 	}
-	entries := make([]DRPreSeedBundleEntry, 0, len(bundle.Entries))
-	entries = append(entries, bundle.Entries...)
+	if maxSegmentBytes <= 0 {
+		return nil, fmt.Errorf("pre-seed segment max bytes must be positive")
+	}
+	entries := canonicalDRPreSeedBundleEntries(bundle.Entries)
+	if len(entries) == 0 {
+		return nil, nil
+	}
+
+	segments := make([]DRPreSeedSegmentDescriptor, 0)
+	current := make([]DRPreSeedBundleEntry, 0)
+	for _, entry := range entries {
+		candidate := append(append([]DRPreSeedBundleEntry(nil), current...), entry)
+		candidateDescriptor, err := buildDRPreSeedSegmentDescriptor(len(segments), candidate)
+		if err != nil {
+			return nil, err
+		}
+		if len(current) > 0 && candidateDescriptor.ByteCount > uint64(maxSegmentBytes) {
+			descriptor, err := buildDRPreSeedSegmentDescriptor(len(segments), current)
+			if err != nil {
+				return nil, err
+			}
+			segments = append(segments, descriptor)
+			current = []DRPreSeedBundleEntry{entry}
+			candidateDescriptor, err = buildDRPreSeedSegmentDescriptor(len(segments), current)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			current = candidate
+		}
+		if candidateDescriptor.ByteCount > uint64(maxSegmentBytes) {
+			return nil, fmt.Errorf("pre-seed bundle entry %q exceeds segment max bytes", entry.Key)
+		}
+	}
+	if len(current) > 0 {
+		descriptor, err := buildDRPreSeedSegmentDescriptor(len(segments), current)
+		if err != nil {
+			return nil, err
+		}
+		segments = append(segments, descriptor)
+	}
+	return segments, nil
+}
+
+func buildDRPreSeedSegmentDescriptor(index int, entries []DRPreSeedBundleEntry) (DRPreSeedSegmentDescriptor, error) {
+	if len(entries) == 0 {
+		return DRPreSeedSegmentDescriptor{}, fmt.Errorf("pre-seed segment %d has no entries", index)
+	}
+	data, err := marshalDRPreSeedSegmentPayload(entries)
+	if err != nil {
+		return DRPreSeedSegmentDescriptor{}, err
+	}
+	sum := sha256.Sum256(data)
+	return DRPreSeedSegmentDescriptor{
+		Index:      index,
+		EntryCount: len(entries),
+		ByteCount:  uint64(len(data)),
+		SHA256:     sum[:],
+		FirstKey:   entries[0].Key,
+		LastKey:    entries[len(entries)-1].Key,
+	}, nil
+}
+
+func marshalDRPreSeedSegmentPayload(entries []DRPreSeedBundleEntry) ([]byte, error) {
+	payload := struct {
+		Version int                                    `json:"version"`
+		Entries []drPreSeedBundleIntegrityPayloadEntry `json:"entries"`
+	}{
+		Version: drPreSeedBundleVersion,
+		Entries: make([]drPreSeedBundleIntegrityPayloadEntry, 0, len(entries)),
+	}
+	for _, entry := range entries {
+		valueHash := sha256.Sum256(entry.Value)
+		payload.Entries = append(payload.Entries, drPreSeedBundleIntegrityPayloadEntry{
+			Key:         entry.Key,
+			SealWrap:    entry.SealWrap,
+			KID:         append([]byte(nil), entry.KID...),
+			VID:         append([]byte(nil), entry.VID...),
+			ValueSHA256: valueHash[:],
+		})
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal pre-seed segment payload: %w", err)
+	}
+	return data, nil
+}
+
+func canonicalDRPreSeedBundleEntries(raw []DRPreSeedBundleEntry) []DRPreSeedBundleEntry {
+	entries := make([]DRPreSeedBundleEntry, 0, len(raw))
+	entries = append(entries, raw...)
 	sort.SliceStable(entries, func(i, j int) bool {
 		if entries[i].Key != entries[j].Key {
 			return entries[i].Key < entries[j].Key
 		}
 		return bytes.Compare(entries[i].KID, entries[j].KID) < 0
 	})
+	return entries
+}
+
+func computeDRPreSeedBundleIntegrity(bundle *DRPreSeedBundle) ([]byte, error) {
+	if bundle == nil {
+		return nil, fmt.Errorf("pre-seed bundle is nil")
+	}
+	entries := canonicalDRPreSeedBundleEntries(bundle.Entries)
 
 	payload := drPreSeedBundleIntegrityPayload{
 		Version:          bundle.Version,
@@ -701,6 +902,8 @@ func computeDRPreSeedBundleIntegrity(bundle *DRPreSeedBundle) ([]byte, error) {
 		RelationshipID:   bundle.Manifest.RelationshipID,
 		CheckpointID:     bundle.Manifest.CheckpointID,
 		CheckpointIndex:  bundle.Manifest.CheckpointIndex,
+		BundleFormat:     normalizedDRPreSeedBundleFormat(bundle.Manifest.BundleFormat),
+		BundleSegments:   append([]DRPreSeedSegmentDescriptor(nil), bundle.Manifest.BundleSegments...),
 		EntryCount:       bundle.EntryCount,
 		Entries:          make([]drPreSeedBundleIntegrityPayloadEntry, 0, len(entries)),
 	}

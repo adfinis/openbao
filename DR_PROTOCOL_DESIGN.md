@@ -496,6 +496,16 @@ segmented or streaming artifact with resumable transfer, stronger provenance,
 and external storage support rather than returning very large datasets inside a
 single API response.
 
+The manifest format now has an explicit artifact-format boundary. Existing
+exports use `inline-json-v1` for compatibility with the smoke lifecycle. The
+protocol model also defines `segmented-json-v1` metadata: each segment
+descriptor carries its ordinal, entry count, canonical payload byte count,
+SHA-256 digest, and key bounds. Bundle validation recomputes descriptors from
+the canonical sorted KID/VID/value-hash projection and rejects stale or
+tampered segment metadata. This is intentionally not a resumable transfer API
+yet; it is the validation foundation for chunked export/import without making
+the whole seed a single JSON response.
+
 ```mermaid
 flowchart TD
     A["Primary has existing dataset"] --> B["Create DR relationship<br/>and activation material"]

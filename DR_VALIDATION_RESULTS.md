@@ -75,6 +75,9 @@ The curated set supports these current claims:
 - The pre-seed lifecycle now has an HA evidence point covering accepted
   baseline application, delta catch-up, primary active handoff, secondary
   active handoff, and checkpoint verification after the handoff.
+- The pre-seed artifact model now validates an explicit artifact format and
+  deterministic segment descriptors, but resumable transfer and interrupted
+  import recovery remain future validation targets.
 - Read-only HA standbys can see transient keyring-missing state during DR
   key-transition refresh. The current implementation defers that standby-local
   transition instead of sealing, while the active path remains fail-closed.
@@ -181,11 +184,11 @@ behavior without explaining their age and purpose.
 - Re-run the indexed-repair smoke after the latest standby key-transition and
   adaptive batching fixes to compare fallback scans, proof mismatches, and
   exhaustive verification.
-- Extend pre-seed evidence from inline smoke coverage to production-scale
-  artifact behavior: segmented/resumable export, provenance/signature handling,
-  interrupted import recovery, and larger datasets. The local HA smoke now
-  covers post-seed delta catch-up, checkpoint verification, and post-accept HA
-  handoff for the prototype inline artifact.
+- Extend pre-seed evidence from inline smoke coverage and segmented descriptor
+  validation to production-scale artifact behavior: resumable export/import,
+  provenance/signature handling, interrupted import recovery, and larger
+  datasets. The local HA smoke now covers post-seed delta catch-up, checkpoint
+  verification, and post-accept HA handoff for the prototype inline artifact.
 - Add explicit reconcile-budget and primary checkpoint-pressure validation
   targets. The current stress results show promising convergence behavior, but
   they are not yet a worst-case model for fragmented reconnects or maliciously
