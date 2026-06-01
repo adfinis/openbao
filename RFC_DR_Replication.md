@@ -55,6 +55,30 @@ Validation evidence and reproducibility live separately:
 - [DR_TEST_MATRIX.md](DR_TEST_MATRIX.md)
 - [DR_BUG_TRACKER.md](DR_BUG_TRACKER.md)
 
+## Review questions for maintainers
+
+This RFC is asking for maintainer feedback on:
+
+1. Whether native DR replication between independent Raft-backed clusters is an
+   acceptable direction for OpenBao.
+2. Whether the proposed first scope is correct: single primary, one or more
+   warm-standby secondaries, integrated storage/Raft first, no active-active,
+   no automatic failback, and no automatic merge.
+3. Whether the correctness boundary is acceptable: ordered streaming when
+   replay coverage exists, checkpoint-fenced reconciliation when it does not,
+   and proof-before-delete for inferred deletes.
+4. Whether the security model is acceptable: single-use bootstrap, mTLS
+   relationship authorization, certificate fingerprint binding, `SyncKeyring`
+   wrapping, fail-closed revocation, and generic unauthenticated errors.
+5. Whether the authority/failover model is acceptable: planned switchover,
+   clean disaster promotion, forced disaster promotion, explicit
+   acknowledgements, stale-lineage fencing, and explicit reseed.
+6. Whether the replication domain is correct: ciphertext physical storage plus
+   runtime metadata, with cluster-local paths excluded and runtime refresh
+   required before serving from replicated state.
+7. What validation evidence maintainers would require before this moves from
+   RFC/design review toward production implementation.
+
 ## Problem statement
 
 OpenBao does not currently provide native cross-cluster DR replication. Users
@@ -197,6 +221,21 @@ flowchart LR
     SRuntime --> SAPI
 ```
 
+### State transition sketch
+
+The detailed relationship and promotion state machines live in the protocol,
+security, and failover notes. The core review invariants are:
+
+| From | Event | To | Allowed? | Notes |
+| --- | --- | --- | --- | --- |
+| pending bootstrap | register secondary certificate | registered | yes | Bootstrap token is single-use and expiry-bound. |
+| registered | `SyncKeyring` succeeds | active secondary | yes | This is the relationship activation point. |
+| active relationship | revoke | revoked | yes | Active streams and reconnects must fail closed. |
+| secondary streaming | planned switchover | promoted | yes | Requires authority-transfer confirmation and final drain proof. |
+| secondary streaming | clean disaster promotion | promoted | yes | Requires primary-unreachable confirmation and clean promotion proof. |
+| secondary reconciling | clean promotion | promoted | no | Forced promotion only, with data-loss acknowledgement. |
+| promoted | old token, cert, or relationship reused | rejected | yes | Stale lineage fence prevents old authority revival. |
+
 ### Replication domain
 
 DR operates below the barrier in the ciphertext storage domain. The replicated
@@ -276,7 +315,9 @@ returns, is a separate possible authority and must not automatically reconnect
 or merge.
 
 The design distinguishes planned switchover, clean disaster promotion, and
-forced disaster promotion. Forced promotion requires explicit data-loss
+forced disaster promotion. Planned switchover confirms authority transfer while
+the primary is reachable. Disaster promotion confirms primary unreachability.
+Forced disaster promotion additionally requires explicit data-loss
 acknowledgement even when the observed primary/secondary index gap is zero if
 the secondary cannot provide a clean promotion proof.
 
@@ -408,22 +449,34 @@ profiles.
 
 ## Unresolved questions
 
-1. What production defaults should be used for checkpoint retention, journal
-   retention, backpressure, split depth, fetch batch sizing, and resource
-   budgets?
-2. How should DR transport CA rotation work without requiring full
+1. Should planned switchover be part of the first version, or should the first
+   version only support disaster promotion?
+2. Should secondaries remain strict warm standbys for replicated state in the
+   first version, or should any stale/read-only replicated API be supported?
+   This RFC currently recommends strict standby semantics.
+3. What rolling-upgrade and protocol-version compatibility guarantees must the
+   first production version support?
+4. How should DR transport CA rotation work without requiring full
    relationship replacement?
-3. What rolling-upgrade guarantees should the first production version support?
-4. Should secondaries ever serve stale replicated reads, or remain standby
-   only?
-5. What availability target is realistic during HA active handoff under
-   sustained DR backlog pressure?
-6. Which dependency-backed engines belong in mandatory validation, and which
-   should remain opt-in profiles?
-7. What audit-device topology should the local harness support for deterministic
-   audit-table validation?
-8. What final UI/API wording should be used for forced-promotion reasons and
-   data-loss estimate basis?
+5. What final UI/API wording should be used for planned authority transfer,
+   disaster promotion, forced-promotion reasons, and data-loss estimate basis?
+
+## Productionization and validation follow-ups
+
+These items are important before production use, but they are not design
+direction blockers for this RFC:
+
+- choose production defaults for checkpoint retention, journal retention,
+  backpressure, split depth, fetch batch sizing, adaptive stream batching, and
+  resource budgets
+- define availability targets for HA active handoff under sustained DR backlog
+  pressure
+- validate WAN latency, packet loss, proxy, and load-balancer behavior
+- add dependency-backed engine profiles for auth/secret engines that require
+  external services
+- add a deterministic audit-device topology profile for audit-table validation
+- run larger-scale keyspace validation, including billion-key-oriented
+  reconciliation and accumulator stress tests
 
 ## Related issues
 

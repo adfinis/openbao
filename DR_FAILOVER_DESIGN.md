@@ -55,8 +55,8 @@ stateDiagram-v2
     SecondaryStreaming --> CleanCandidate: lag 0 and stable streaming proof
     SecondaryStreaming --> ForcedCandidate: proof unavailable or reconciling
 
-    PlannedSwitchover --> PromotedAuthority: final drain proof
-    CleanCandidate --> PromotedAuthority: promote with unreachable confirmation
+    PlannedSwitchover --> PromotedAuthority: confirm authority transfer + final drain proof
+    CleanCandidate --> PromotedAuthority: confirm primary unreachable + clean proof
     ForcedCandidate --> AwaitingAck: require accept_data_loss
     AwaitingAck --> PromotedAuthority: acknowledgement accepted
     AwaitingAck --> SecondaryStreaming: operator aborts
@@ -71,8 +71,20 @@ stateDiagram-v2
 
 ## Promotion Preconditions
 
-Every promotion requires `confirm_primary_unreachable=true` or an equivalent
-operator confirmation that this cluster should become authority.
+Promotion acknowledgement should distinguish planned authority transfer from
+disaster promotion:
+
+- `confirm_authority_transfer=true`: the operator intentionally transfers
+  write authority while the primary is reachable.
+- `confirm_primary_unreachable=true`: the operator confirms the old primary is
+  unreachable for disaster promotion.
+- `accept_data_loss=true`: the operator accepts forced-promotion risk when a
+  clean proof is unavailable.
+
+Planned switchover requires `confirm_authority_transfer=true` and a final drain
+proof. Clean disaster promotion requires `confirm_primary_unreachable=true` and
+a clean promotion proof. Forced disaster promotion requires
+`confirm_primary_unreachable=true` and `accept_data_loss=true`.
 
 Clean promotion additionally requires:
 
@@ -86,9 +98,6 @@ If the secondary disconnects, reconnects, enters reconciliation, or cannot keep
 the stable proof across the quiesce window, promotion is forced even if the
 observed primary/secondary index gap is zero.
 
-Forced promotion requires a second acknowledgement such as
-`accept_data_loss=true`.
-
 ## Promotion Response Contract
 
 Promotion responses should include enough information for operator audit and
@@ -97,6 +106,8 @@ automation:
 - `promotion_class`
 - `clean_promotion_eligible`
 - `clean_promotion_proof_available`
+- `authority_transfer_confirmed`
+- `primary_unreachable_confirmed`
 - `forced_promotion_requires_acknowledgement`
 - `forced_promotion_reason_codes`
 - `forced_promotion_reason_details`
