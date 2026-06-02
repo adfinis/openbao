@@ -2250,7 +2250,9 @@ func TestDRIntegration_PathExclusions(t *testing.T) {
 	// Reconcile-only exclusions: excluded from scanner but not from stream.
 	reconcileOnlyPaths := []string{
 		"core/keyring",
+		"core/root-key",
 		"namespaces/00000000-0000-0000-0000-000000000000/core/keyring",
+		"namespaces/00000000-0000-0000-0000-000000000000/core/root-key",
 	}
 	for _, p := range reconcileOnlyPaths {
 		if isDRNeverReplicatePath(p) {
@@ -2266,9 +2268,9 @@ func TestDRIntegration_PathExclusions(t *testing.T) {
 		"logical/secret/foo",
 		"core/mounts",
 		"sys/policy/default",
-		"core/root-key",
 		"logical/secret/core/raft/foo",
 		"logical/secret/team/core/keyring",
+		"logical/secret/team/core/root-key",
 		"logical/secret/team/core/dr-replication/config",
 		"logical/secret/team/namespaces/00000000-0000-0000-0000-000000000000/core/local-mounts/abc",
 	}

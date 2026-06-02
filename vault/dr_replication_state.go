@@ -494,6 +494,9 @@ type drRelationshipManager struct {
 	// latestSeenAt keeps an in-memory timestamp for near-real-time status.
 	latestSeenAt map[string]int64
 
+	preSeedPlanMu   sync.Mutex
+	preSeedPlanJobs map[string]*drPreSeedExportPlanJob
+
 	lastPendingCleanupAt time.Time
 }
 
@@ -548,6 +551,7 @@ func newDRRelationshipManager(core *Core, logger log.Logger) *drRelationshipMana
 		dispatcher:      dispatcher,
 		lastSeenWriteAt: make(map[string]time.Time),
 		latestSeenAt:    make(map[string]int64),
+		preSeedPlanJobs: make(map[string]*drPreSeedExportPlanJob),
 	}
 }
 
@@ -1331,7 +1335,11 @@ func (m *drRelationshipManager) EnableSecondary(ctx context.Context, token *DRAc
 		m.config = oldConfig
 		return err
 	}
-	if err := m.clearSecondaryCheckpointCursor(ctx); err != nil {
+	preservePreSeedOptimizerState := false
+	if hasAcceptedPreSeed {
+		preservePreSeedOptimizerState = m.hasCompatibleAcceptedPreSeedOptimizerBaselineLocked(ctx, acceptedPreSeed, token)
+	}
+	if err := m.clearSecondaryCheckpointCursorWithOptions(ctx, preservePreSeedOptimizerState); err != nil {
 		m.config = oldConfig
 		_ = m.saveConfig(ctx)
 		return err
@@ -1419,6 +1427,10 @@ func (m *drRelationshipManager) DisableSecondary(ctx context.Context) error {
 }
 
 func (m *drRelationshipManager) clearSecondaryCheckpointCursor(ctx context.Context) error {
+	return m.clearSecondaryCheckpointCursorWithOptions(ctx, false)
+}
+
+func (m *drRelationshipManager) clearSecondaryCheckpointCursorWithOptions(ctx context.Context, preserveOptimizerState bool) error {
 	if m == nil || m.core == nil || m.core.barrier == nil {
 		return nil
 	}
@@ -1429,29 +1441,94 @@ func (m *drRelationshipManager) clearSecondaryCheckpointCursor(ctx context.Conte
 		if err := m.core.physical.Delete(ctx, drCheckpointHWMPath); err != nil {
 			return fmt.Errorf("failed to clear DR secondary physical checkpoint cursor: %w", err)
 		}
-		if err := m.core.physical.Delete(ctx, drFlatAccumulatorStoragePath); err != nil {
-			return fmt.Errorf("failed to clear DR secondary flat accumulator: %w", err)
-		}
-		if err := m.core.physical.Delete(ctx, drFlatAccumulatorCursorStoragePath); err != nil {
-			return fmt.Errorf("failed to clear DR secondary flat accumulator cursor: %w", err)
-		}
-		if err := deletePersistedStreamAppliedIndex(ctx, m.core.physical); err != nil {
-			return fmt.Errorf("failed to clear DR secondary stream applied index: %w", err)
-		}
-		keys, err := m.core.physical.List(ctx, drFlatAccumulatorDeltaStoragePath)
-		if err != nil {
-			return fmt.Errorf("failed to list DR secondary flat accumulator deltas: %w", err)
-		}
-		for _, key := range keys {
-			if err := m.core.physical.Delete(ctx, drFlatAccumulatorDeltaStoragePath+key); err != nil {
-				return fmt.Errorf("failed to clear DR secondary flat accumulator delta: %w", err)
+		if !preserveOptimizerState {
+			if err := m.core.physical.Delete(ctx, drFlatAccumulatorStoragePath); err != nil {
+				return fmt.Errorf("failed to clear DR secondary flat accumulator: %w", err)
 			}
-		}
-		if err := deletePersistedLocalKIDIndex(ctx, m.core.physical); err != nil {
-			return fmt.Errorf("failed to clear DR secondary local KID index: %w", err)
+			if err := m.core.physical.Delete(ctx, drFlatAccumulatorCursorStoragePath); err != nil {
+				return fmt.Errorf("failed to clear DR secondary flat accumulator cursor: %w", err)
+			}
+			if err := deletePersistedStreamAppliedIndex(ctx, m.core.physical); err != nil {
+				return fmt.Errorf("failed to clear DR secondary stream applied index: %w", err)
+			}
+			keys, err := m.core.physical.List(ctx, drFlatAccumulatorDeltaStoragePath)
+			if err != nil {
+				return fmt.Errorf("failed to list DR secondary flat accumulator deltas: %w", err)
+			}
+			for _, key := range keys {
+				if err := m.core.physical.Delete(ctx, drFlatAccumulatorDeltaStoragePath+key); err != nil {
+					return fmt.Errorf("failed to clear DR secondary flat accumulator delta: %w", err)
+				}
+			}
+			if err := deletePersistedLocalKIDIndex(ctx, m.core.physical); err != nil {
+				return fmt.Errorf("failed to clear DR secondary local KID index: %w", err)
+			}
 		}
 	}
 	return nil
+}
+
+func (m *drRelationshipManager) hasCompatibleAcceptedPreSeedOptimizerBaselineLocked(ctx context.Context, record *drPreSeedAcceptedRecord, token *DRActivationToken) bool {
+	if m == nil || m.core == nil || m.core.physical == nil || record == nil || token == nil {
+		return false
+	}
+	index := record.Manifest.CheckpointIndex
+	if index == 0 {
+		return false
+	}
+	secondary := newDRReplicationSecondary(m.core, token.ReplSalt, token.RelationshipID, m.logger)
+	secondary.clusterID = token.ClusterID
+
+	snapshotEntry, err := m.core.physical.Get(ctx, drFlatAccumulatorStoragePath)
+	if err != nil || snapshotEntry == nil || len(snapshotEntry.Value) == 0 {
+		return false
+	}
+	var snapshot drFlatAccumulatorPersistedSnapshot
+	if err := json.Unmarshal(snapshotEntry.Value, &snapshot); err != nil {
+		return false
+	}
+	if err := secondary.validateFlatAccumulatorSnapshot(&snapshot); err != nil || snapshot.CommitIndex != index {
+		return false
+	}
+
+	cursorEntry, err := m.core.physical.Get(ctx, drFlatAccumulatorCursorStoragePath)
+	if err != nil || cursorEntry == nil || len(cursorEntry.Value) == 0 {
+		return false
+	}
+	var cursor drFlatAccumulatorPersistedCursor
+	if err := json.Unmarshal(cursorEntry.Value, &cursor); err != nil {
+		return false
+	}
+	if err := secondary.validateFlatAccumulatorCursor(&cursor); err != nil ||
+		cursor.CommitIndex != index ||
+		cursor.SnapshotCommitIndex != index {
+		return false
+	}
+
+	streamEntry, err := m.core.physical.Get(ctx, drStreamAppliedIndexStoragePath)
+	if err != nil || streamEntry == nil || len(streamEntry.Value) == 0 {
+		return false
+	}
+	var streamMarker drPersistedStreamAppliedIndex
+	if err := json.Unmarshal(streamEntry.Value, &streamMarker); err != nil {
+		return false
+	}
+	if err := secondary.validateStreamAppliedIndex(&streamMarker); err != nil || streamMarker.CommitIndex != index {
+		return false
+	}
+
+	metaEntry, err := m.core.physical.Get(ctx, drLocalKIDIndexMetaPath)
+	if err != nil || metaEntry == nil || len(metaEntry.Value) == 0 {
+		return false
+	}
+	var meta drLocalKIDIndexMeta
+	if err := json.Unmarshal(metaEntry.Value, &meta); err != nil {
+		return false
+	}
+	if err := secondary.validateLocalKIDIndexMeta(&meta); err != nil || meta.CommitIndex != index {
+		return false
+	}
+	return true
 }
 
 // PromoteSecondary promotes this DR secondary to standalone mode.

@@ -178,7 +178,7 @@ func (s *drReplicationSecondary) persistLocalKIDIndexChanges(ctx context.Context
 
 	updates := 0
 	for _, change := range changes {
-		if change == nil || change.Key == "" || isDRNeverReplicatePath(change.Key) {
+		if change == nil || change.Key == "" || isDRReconcileExcludedPath(change.Key) {
 			continue
 		}
 		kid, ok := s.kidFromEntryChange(change)
@@ -503,7 +503,7 @@ func (s *drReplicationSecondary) resetLocalKIDIndexRangesFromSet(ctx context.Con
 		if key == "" {
 			return fmt.Errorf("local kid index reset missing key for kid %x", kid)
 		}
-		if isDRNeverReplicatePath(key) {
+		if isDRReconcileExcludedPath(key) {
 			continue
 		}
 		vid := rs.KIDToVID[kid]
@@ -567,7 +567,7 @@ func (s *drReplicationSecondary) resetLocalKIDIndexRangesFromSetTxn(ctx context.
 		if key == "" {
 			return fmt.Errorf("local kid index reset missing key for kid %x", kid)
 		}
-		if isDRNeverReplicatePath(key) {
+		if isDRReconcileExcludedPath(key) {
 			continue
 		}
 		vid := rs.KIDToVID[kid]
@@ -1139,7 +1139,7 @@ func (s *drReplicationSecondary) resetLocalKIDIndexSpansFromSet(ctx context.Cont
 		if key == "" {
 			return fmt.Errorf("local kid index span reset missing key for kid %x", kid)
 		}
-		if isDRNeverReplicatePath(key) {
+		if isDRReconcileExcludedPath(key) {
 			continue
 		}
 		vid := rs.KIDToVID[kid]
@@ -1198,7 +1198,7 @@ func (s *drReplicationSecondary) resetLocalKIDIndexSpansFromSetTxn(ctx context.C
 		if key == "" {
 			return fmt.Errorf("local kid index span reset missing key for kid %x", kid)
 		}
-		if isDRNeverReplicatePath(key) {
+		if isDRReconcileExcludedPath(key) {
 			continue
 		}
 		vid := rs.KIDToVID[kid]

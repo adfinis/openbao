@@ -4845,6 +4845,54 @@ func TestDRLocalKIDIndexChangesRequireCompleteBaseline(t *testing.T) {
 	}
 }
 
+func TestDRReconcileExcludedRootKeySkipsOptimizerState(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	replSalt := bytes.Repeat([]byte{0x49}, 32)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-root-key-optimizer-skip", core.logger)
+
+	if isDRNeverReplicatePath("core/root-key") {
+		t.Fatal("core/root-key must still be stream-replicable")
+	}
+	if !isDRReconcileExcludedPath("core/root-key") {
+		t.Fatal("core/root-key must be excluded from reconcile-plane digests")
+	}
+
+	secondary.rangeAccumulator.replace(10, [drRangeMaxTotalRanges]drFlatAccumulatorBucket{})
+	if err := core.physical.Put(ctx, &physical.Entry{
+		Key:   "core/root-key",
+		Value: []byte("old-root-key-entry"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	delta, ok, err := secondary.accumulatorDeltaForChange(ctx, core.physical, &EntryChange{
+		OpType: string(physical.PutOperation),
+		Key:    "core/root-key",
+		Value:  []byte("new-root-key-entry"),
+	}, "", make(map[string]drFlatAccumulatorPendingState))
+	if err != nil {
+		t.Fatalf("unexpected root-key accumulator delta error: %v", err)
+	}
+	if ok || delta.oldExists || delta.newExists {
+		t.Fatalf("expected root-key to skip accumulator delta, got ok=%v delta=%+v", ok, delta)
+	}
+
+	if err := secondary.persistLocalKIDIndexMeta(ctx, core.physical, 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := secondary.persistLocalKIDIndexChanges(ctx, core.physical, 11, []*EntryChange{{
+		OpType: string(physical.PutOperation),
+		Key:    "core/root-key",
+		Value:  []byte("new-root-key-entry"),
+	}}, nil); err != nil {
+		t.Fatalf("unexpected root-key local KID index update error: %v", err)
+	}
+	if got := secondary.localKIDIndexUpdates.Load(); got != 0 {
+		t.Fatalf("expected no local KID index updates for root-key, got %d", got)
+	}
+}
+
 func TestDRLocalKIDIndexInvalidatesOnDigestUnderflow(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	ctx := context.Background()
@@ -5476,6 +5524,86 @@ func TestDRSecondaryVerifyCheckpointDetectsMismatch(t *testing.T) {
 	mismatch := result.Mismatches[0]
 	if mismatch.RangeID != mismatchRange || !mismatch.ChecksumMismatch || mismatch.CountMismatch || mismatch.MissingRemote {
 		t.Fatalf("unexpected mismatch details: %#v", mismatch)
+	}
+}
+
+func TestDRSecondaryVerifyCheckpointReseedsOptimizerFromLocalScan(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	replSalt := bytes.Repeat([]byte{0x57}, 32)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-verify-checkpoint-reseed", core.logger)
+	secondary.setState(DRSecondaryStreaming)
+
+	if err := core.physical.Put(ctx, &physical.Entry{Key: "secret/verify-reseed/a", Value: []byte("a")}); err != nil {
+		t.Fatalf("failed to write local entry a: %v", err)
+	}
+	if err := core.physical.Put(ctx, &physical.Entry{Key: "secret/verify-reseed/b", Value: []byte("b")}); err != nil {
+		t.Fatalf("failed to write local entry b: %v", err)
+	}
+
+	checkpoint := &CheckpointResponse{CheckpointId: "cp-verify-checkpoint-reseed", CommitIndex: 44}
+	remoteSet, err := secondary.scanner.ScanPhysical(ctx, core.physical, reconciler.Checkpoint{
+		ID:          checkpoint.CheckpointId,
+		CommitIndex: checkpoint.CommitIndex,
+	})
+	if err != nil {
+		t.Fatalf("failed to build remote scan fixture: %v", err)
+	}
+	remoteBuckets := drFlatAccumulatorBucketsFromSet(remoteSet)
+
+	staleSet := &reconciler.ReconciliationSet{
+		KIDToVID: map[[32]byte][32]byte{},
+		KIDToKey: map[[32]byte]string{},
+	}
+	secondary.rangeAccumulator.resetFromSet(staleSet, checkpoint.CommitIndex)
+	secondary.setLastAppliedIndex(checkpoint.CommitIndex)
+
+	secondary.client = &drTestClient{
+		requestCheckpointFn: func(_ context.Context, req *CheckpointRequest, _ ...grpc.CallOption) (*CheckpointResponse, error) {
+			if req.GetRelationshipId() != secondary.relationshipID {
+				t.Fatalf("unexpected relationship id %q", req.GetRelationshipId())
+			}
+			return checkpoint, nil
+		},
+		exchangeRangeChecksumsFn: func(_ context.Context, req *RangeChecksumRequest, _ ...grpc.CallOption) (*RangeChecksumResponse, error) {
+			if req.GetRelationshipId() != secondary.relationshipID {
+				t.Fatalf("unexpected relationship id %q", req.GetRelationshipId())
+			}
+			if req.GetCheckpointId() != checkpoint.CheckpointId || req.GetCheckpointIndex() != checkpoint.CommitIndex {
+				t.Fatalf("unexpected checkpoint tuple %q/%d", req.GetCheckpointId(), req.GetCheckpointIndex())
+			}
+			resp := &RangeChecksumResponse{Checksums: make([]*RangeChecksum, 0, len(req.GetRangeIds()))}
+			for _, rangeID := range req.GetRangeIds() {
+				bucket := remoteBuckets[rangeID]
+				resp.Checksums = append(resp.Checksums, &RangeChecksum{
+					RangeId:  rangeID,
+					Checksum: bucket.checksum,
+					Count:    bucket.count,
+				})
+			}
+			return resp, nil
+		},
+	}
+
+	result, err := secondary.VerifyCheckpoint(ctx)
+	if err != nil {
+		t.Fatalf("VerifyCheckpoint returned error: %v", err)
+	}
+	if !result.Pass || result.Reason != "ok_local_scan_reseeded" {
+		t.Fatalf("expected reseeded passing verification, got %#v", result)
+	}
+	if !result.PhysicalScanUsed || !result.OptimizerReseeded {
+		t.Fatalf("expected physical scan reseed flags, got %#v", result)
+	}
+	assertDRFlatAccumulatorMatchesSet(t, secondary.rangeAccumulator, checkpoint.CommitIndex, remoteSet)
+
+	secondary.scanner = nil
+	result, err = secondary.VerifyCheckpoint(ctx)
+	if err != nil {
+		t.Fatalf("second VerifyCheckpoint returned error: %v", err)
+	}
+	if !result.Pass || result.Reason != "ok" || result.PhysicalScanUsed || result.OptimizerReseeded {
+		t.Fatalf("expected second verification to use fast path, got %#v", result)
 	}
 }
 
@@ -6436,16 +6564,102 @@ func TestDRPrimary_RevokeRelationshipTerminatesOnlyMatchingStreams(t *testing.T)
 	}
 }
 
-func TestDRPrimary_CheckpointCacheBudgetEnforced(t *testing.T) {
+func TestDRPrimary_CheckpointCacheAllowsSingleCheckpointOverPerRelationshipBudget(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := make([]byte, 32)
+	rand.Read(replSalt)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
+	primary.checkpointGlobalBudget = 4096
+	primary.checkpointPerRelationshipBudget = 128
+
+	if err := primary.cacheCheckpoint(&drCheckpointCacheEntry{
+		checkpoint:     reconciler.Checkpoint{ID: "cp-over", CommitIndex: 1},
+		relationshipID: "rel-1",
+		createdAt:      time.Now().UTC(),
+		kidToKey: map[[32]byte]string{
+			{1}: strings.Repeat("a", 256),
+		},
+	}); err != nil {
+		t.Fatalf("expected oversized single checkpoint to fit under global budget: %v", err)
+	}
+
+	primary.checkpointMu.RLock()
+	_, ok := primary.checkpoints["cp-over"]
+	bytes := primary.checkpointBytes
+	primary.checkpointMu.RUnlock()
+	if !ok {
+		t.Fatal("expected oversized checkpoint to be cached")
+	}
+	if bytes <= primary.checkpointPerRelationshipBudget {
+		t.Fatalf("test checkpoint was not oversized: bytes=%d per_rel=%d", bytes, primary.checkpointPerRelationshipBudget)
+	}
+}
+
+func TestDRPrimary_BuildCheckpointAllowsArtifactOverPerRelationshipBudget(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	replSalt := bytes.Repeat([]byte{0x5a}, 32)
+	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
+	primary.checkpointGlobalBudget = 1 << 20
+	primary.checkpointPerRelationshipBudget = 512
+	primary.checkpointArtifacts = newDRCheckpointArtifactStore(core.logger, t.TempDir())
+	primary.checkpointArtifacts.configure(true, time.Hour, 1<<20, 512, 4096)
+
+	value := bytes.Repeat([]byte("v"), 4096)
+	for i := 0; i < 16; i++ {
+		if err := core.physical.Put(ctx, &physical.Entry{
+			Key:   fmt.Sprintf("secret/oversized-checkpoint/%03d", i),
+			Value: value,
+		}); err != nil {
+			t.Fatalf("write fixture key %d: %v", i, err)
+		}
+	}
+
+	resp, err := primary.buildAndCacheCheckpoint(ctx, "rel-oversized-checkpoint", 0)
+	if err != nil {
+		t.Fatalf("expected checkpoint build over per-relationship budget to succeed: %v", err)
+	}
+	if resp == nil || resp.CheckpointId == "" {
+		t.Fatalf("expected checkpoint response with id, got %#v", resp)
+	}
+
+	primary.checkpointMu.RLock()
+	checkpointBytes := primary.checkpointBytes
+	_, hasCheckpoint := primary.checkpoints[resp.CheckpointId]
+	primary.checkpointMu.RUnlock()
+	if !hasCheckpoint {
+		t.Fatal("expected checkpoint metadata to be cached")
+	}
+	if checkpointBytes <= primary.checkpointPerRelationshipBudget {
+		t.Fatalf("test checkpoint metadata was not oversized: bytes=%d per_rel=%d", checkpointBytes, primary.checkpointPerRelationshipBudget)
+	}
+
+	artifactBytes, artifactItems, _, _, _ := primary.checkpointArtifacts.stats()
+	if artifactItems != 1 {
+		t.Fatalf("expected exactly one checkpoint artifact, got %d", artifactItems)
+	}
+	if artifactBytes <= primary.checkpointArtifacts.perRelBudget {
+		t.Fatalf("test checkpoint artifact was not oversized: bytes=%d per_rel=%d", artifactBytes, primary.checkpointArtifacts.perRelBudget)
+	}
+	records, err := primary.checkpointArtifacts.records(resp.CheckpointId)
+	if err != nil {
+		t.Fatalf("expected checkpoint artifact records: %v", err)
+	}
+	if len(records) < 16 {
+		t.Fatalf("expected at least 16 artifact records, got %d", len(records))
+	}
+}
+
+func TestDRPrimary_CheckpointCacheRejectsCheckpointOverGlobalBudget(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	replSalt := make([]byte, 32)
 	rand.Read(replSalt)
 	primary := NewDRReplicationPrimary(core, replSalt, core.logger, nil)
 	primary.checkpointGlobalBudget = 128
-	primary.checkpointPerRelationshipBudget = 128
+	primary.checkpointPerRelationshipBudget = 64
 
 	err := primary.cacheCheckpoint(&drCheckpointCacheEntry{
-		checkpoint:     reconciler.Checkpoint{ID: "cp-over", CommitIndex: 1},
+		checkpoint:     reconciler.Checkpoint{ID: "cp-over-global", CommitIndex: 1},
 		relationshipID: "rel-1",
 		createdAt:      time.Now().UTC(),
 		kidToKey: map[[32]byte]string{
@@ -6453,7 +6667,10 @@ func TestDRPrimary_CheckpointCacheBudgetEnforced(t *testing.T) {
 		},
 	})
 	if err == nil {
-		t.Fatal("expected checkpoint cache admission to fail when over budget")
+		t.Fatal("expected checkpoint cache admission to fail when over global budget")
+	}
+	if !strings.Contains(err.Error(), "global budget") {
+		t.Fatalf("expected global budget error, got: %v", err)
 	}
 }
 
@@ -7158,7 +7375,39 @@ func TestDRCheckpointArtifactStore_DoesNotEvictRetainedArtifact(t *testing.T) {
 	}
 }
 
-func TestDRCheckpointArtifactStore_RejectsOversizedArtifact(t *testing.T) {
+func TestDRCheckpointArtifactStore_AllowsSingleArtifactOverPerRelationshipBudget(t *testing.T) {
+	store := newDRCheckpointArtifactStore(log.NewNullLogger(), t.TempDir())
+	store.configure(true, time.Hour, 256, 64, 64)
+
+	path := filepath.Join(t.TempDir(), "cp-over-per-rel")
+	if err := os.MkdirAll(path, 0o750); err != nil {
+		t.Fatalf("mkdir artifact path: %v", err)
+	}
+	if err := store.putArtifact(&drCheckpointArtifact{
+		CheckpointID:    "cp-over-per-rel",
+		CheckpointIndex: 1,
+		RelationshipID:  "rel-1",
+		CreatedAt:       time.Now().UTC(),
+		Path:            path,
+		Bytes:           128,
+		Records:         map[[32]byte]drCheckpointArtifactRecord{},
+	}); err != nil {
+		t.Fatalf("expected oversized single artifact to fit under global budget: %v", err)
+	}
+
+	store.mu.RLock()
+	_, ok := store.artifacts["cp-over-per-rel"]
+	bytes := store.totalBytes
+	store.mu.RUnlock()
+	if !ok {
+		t.Fatal("expected oversized artifact to be retained")
+	}
+	if bytes <= store.perRelBudget {
+		t.Fatalf("test artifact was not oversized: bytes=%d per_rel=%d", bytes, store.perRelBudget)
+	}
+}
+
+func TestDRCheckpointArtifactStore_RejectsArtifactOverGlobalBudget(t *testing.T) {
 	store := newDRCheckpointArtifactStore(log.NewNullLogger(), t.TempDir())
 	store.configure(true, time.Hour, 64, 64, 64)
 
@@ -7176,10 +7425,10 @@ func TestDRCheckpointArtifactStore_RejectsOversizedArtifact(t *testing.T) {
 		Records:         map[[32]byte]drCheckpointArtifactRecord{},
 	})
 	if err == nil {
-		t.Fatal("expected oversized artifact to be rejected")
+		t.Fatal("expected artifact over global budget to be rejected")
 	}
-	if !strings.Contains(err.Error(), "budget") {
-		t.Fatalf("expected budget error, got: %v", err)
+	if !strings.Contains(err.Error(), "global budget") {
+		t.Fatalf("expected global budget error, got: %v", err)
 	}
 }
 
@@ -8029,8 +8278,12 @@ func TestDRPrimary_SyncKeyringRequiresRelationshipAuthorization(t *testing.T) {
 		t.Fatalf("expected SyncKeyring to mark relationship active, got %s", rel.State)
 	}
 
-	if _, err := primary.SyncKeyring(rpcCtx, req); status.Code(err) != codes.PermissionDenied {
-		t.Fatalf("expected PermissionDenied for replayed SyncKeyring after activation, got: %v (%v)", err, status.Code(err))
+	activeResp, err := primary.SyncKeyring(rpcCtx, req)
+	if err != nil {
+		t.Fatalf("expected active relationship SyncKeyring resync to succeed: %v", err)
+	}
+	if len(activeResp.WrappedRootKey) == 0 {
+		t.Fatal("expected wrapped root key in active relationship SyncKeyring response")
 	}
 
 	if err := mgr.RevokeRelationship(context.Background(), relationshipID); err != nil {
@@ -10025,24 +10278,33 @@ func TestDRSecondaryPrepareStateForConnectPreservesReconnectState(t *testing.T) 
 		from           DRSecondaryState
 		keyringReady   bool
 		lastAppliedIdx uint64
+		accumulator    bool
 		want           DRSecondaryState
 	}{
-		{"first connect", DRSecondaryIdle, false, 0, DRSecondaryBootstrapping},
-		{"restored cursor", DRSecondaryIdle, true, 42, DRSecondaryStreaming},
-		{"restored keyring without cursor", DRSecondaryIdle, true, 0, DRSecondaryBootstrapping},
-		{"bootstrapping", DRSecondaryBootstrapping, false, 0, DRSecondaryBootstrapping},
-		{"initial sync", DRSecondaryInitialSync, false, 0, DRSecondaryBootstrapping},
-		{"streaming", DRSecondaryStreaming, false, 0, DRSecondaryStreaming},
-		{"reconciling", DRSecondaryReconciling, false, 0, DRSecondaryReconciling},
-		{"resnapshotting", DRSecondaryResnapshotting, false, 0, DRSecondaryResnapshotting},
+		{"first connect", DRSecondaryIdle, false, 0, false, DRSecondaryBootstrapping},
+		{"restored cursor and accumulator", DRSecondaryIdle, true, 42, true, DRSecondaryStreaming},
+		{"restored cursor without accumulator", DRSecondaryIdle, true, 42, false, DRSecondaryBootstrapping},
+		{"restored keyring without cursor", DRSecondaryIdle, true, 0, false, DRSecondaryBootstrapping},
+		{"bootstrapping", DRSecondaryBootstrapping, false, 0, false, DRSecondaryBootstrapping},
+		{"initial sync", DRSecondaryInitialSync, false, 0, false, DRSecondaryBootstrapping},
+		{"streaming", DRSecondaryStreaming, false, 0, false, DRSecondaryStreaming},
+		{"reconciling", DRSecondaryReconciling, false, 0, false, DRSecondaryReconciling},
+		{"resnapshotting", DRSecondaryResnapshotting, false, 0, false, DRSecondaryResnapshotting},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			secondary := &drReplicationSecondary{logger: log.NewNullLogger()}
+			secondary := &drReplicationSecondary{
+				logger:           log.NewNullLogger(),
+				rangeAccumulator: newDRFlatRangeAccumulator(),
+			}
 			secondary.state.Store(int32(tt.from))
 			secondary.keyringBootstrapped.Store(tt.keyringReady)
 			secondary.lastAppliedIndex.Store(tt.lastAppliedIdx)
+			if tt.accumulator {
+				var buckets [drRangeMaxTotalRanges]drFlatAccumulatorBucket
+				secondary.rangeAccumulator.replace(tt.lastAppliedIdx, buckets)
+			}
 
 			secondary.prepareStateForConnect()
 
@@ -10050,6 +10312,24 @@ func TestDRSecondaryPrepareStateForConnectPreservesReconnectState(t *testing.T) 
 				t.Fatalf("prepareStateForConnect() state = %s, want %s", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestDRSecondaryHasInitialStreamBaselineRequiresCursorAndAccumulator(t *testing.T) {
+	secondary := &drReplicationSecondary{rangeAccumulator: newDRFlatRangeAccumulator()}
+	if secondary.hasInitialStreamBaseline() {
+		t.Fatal("empty secondary should not have initial stream baseline")
+	}
+
+	secondary.lastAppliedIndex.Store(42)
+	if secondary.hasInitialStreamBaseline() {
+		t.Fatal("stream marker without accumulator should not have initial stream baseline")
+	}
+
+	var buckets [drRangeMaxTotalRanges]drFlatAccumulatorBucket
+	secondary.rangeAccumulator.replace(42, buckets)
+	if !secondary.hasInitialStreamBaseline() {
+		t.Fatal("stream marker with initialized accumulator should have initial stream baseline")
 	}
 }
 
@@ -10067,7 +10347,7 @@ func TestDRSecondary_Start_ReconciliationTransportErrorDoesNotUseStaleLeaderHint
 	secondary.lastKnownLeaderAddr.Store(&hint)
 
 	secondary.client = &drTestClient{
-		requestCheckpointFn: func(context.Context, *CheckpointRequest, ...grpc.CallOption) (*CheckpointResponse, error) {
+		syncKeyringFn: func(context.Context, *SyncKeyringRequest, ...grpc.CallOption) (*SyncKeyringResponse, error) {
 			return nil, fmt.Errorf("rpc error: code = Unavailable desc = connection error: desc = \"transport: Error while dialing: remote error: tls: internal error\"")
 		},
 	}
@@ -10331,7 +10611,8 @@ func TestFilterDRReplicableEntries(t *testing.T) {
 // --- Journal-Based Index Warmup Tests ---
 
 // TestWarmIndexFromJournal verifies that replaying journal entries
-// produces the same KID/VID mappings as direct OnChange processing.
+// produces the same KID/VID mappings as direct OnChange processing, but
+// does not mark the index as a complete checkpoint source.
 func TestWarmIndexFromJournal(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	replSalt := make([]byte, 32)
@@ -10401,12 +10682,17 @@ func TestWarmIndexFromJournal(t *testing.T) {
 	}
 	newPrimary.indexMu.RUnlock()
 
-	// Verify initialized flag.
+	// A retained stream journal is not proof of complete physical storage
+	// coverage. The replayed entries are useful as a warm cache, but a full
+	// scan is still required before indexed checkpoints can be served.
 	newPrimary.indexMu.RLock()
-	if !newPrimary.indexInitialized {
-		t.Fatal("expected index to be marked as initialized")
+	if newPrimary.indexInitialized {
+		t.Fatal("journal-only warmup must not mark the index as initialized")
 	}
 	newPrimary.indexMu.RUnlock()
+	if _, ok := newPrimary.snapshotIndexCheckpointSet(13); ok {
+		t.Fatal("journal-only warmup must not serve an indexed checkpoint set")
+	}
 }
 
 // TestWarmIndexFromJournal_EmptyJournal verifies the error path when

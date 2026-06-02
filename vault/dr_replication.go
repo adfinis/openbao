@@ -1159,59 +1159,132 @@ func (s *drReplicationPrimary) BuildPreSeedBundle(ctx context.Context, relations
 	if err != nil {
 		return nil, nil, err
 	}
-	cp, releaseCheckpoint, err := s.getCheckpointLease(checkpoint.GetCheckpointId())
+	entries, err := s.BuildPreSeedBundleEntries(ctx, relationshipID, checkpoint.GetCheckpointId(), checkpoint.GetCommitIndex())
 	if err != nil {
-		return nil, nil, status.Errorf(codes.NotFound, "checkpoint not found: %v", err)
+		return nil, nil, err
+	}
+	return checkpoint, entries, nil
+}
+
+func (s *drReplicationPrimary) BuildPreSeedBundleEntries(ctx context.Context, relationshipID string, checkpointID string, checkpointIndex uint64) ([]DRPreSeedBundleEntry, error) {
+	records, err := s.preSeedArtifactRecords(ctx, relationshipID, checkpointID, checkpointIndex)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := s.preSeedEntriesFromArtifactRecords(ctx, checkpointID, records)
+	if err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
+func (s *drReplicationPrimary) BuildPreSeedBundleEntryMetadata(ctx context.Context, relationshipID string, checkpointID string, checkpointIndex uint64) ([]drPreSeedBundleIntegrityPayloadEntry, error) {
+	records, err := s.preSeedArtifactRecords(ctx, relationshipID, checkpointID, checkpointIndex)
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]drPreSeedBundleIntegrityPayloadEntry, 0, len(records))
+	for _, rec := range records {
+		entries = append(entries, drPreSeedBundleIntegrityPayloadEntry{
+			Key:         rec.Key,
+			SealWrap:    rec.SealWrap,
+			KID:         append([]byte(nil), rec.KID[:]...),
+			VID:         append([]byte(nil), rec.VID[:]...),
+			ValueSHA256: append([]byte(nil), rec.ValueSHA256[:]...),
+		})
+	}
+	return entries, nil
+}
+
+func (s *drReplicationPrimary) BuildPreSeedSegmentEntries(ctx context.Context, relationshipID string, checkpointID string, checkpointIndex uint64, segments []DRPreSeedSegmentDescriptor, segmentIndex int) ([]DRPreSeedBundleEntry, error) {
+	if segmentIndex < 0 || segmentIndex >= len(segments) {
+		return nil, status.Errorf(codes.InvalidArgument, "pre-seed segment index %d out of range", segmentIndex)
+	}
+	records, err := s.preSeedArtifactRecords(ctx, relationshipID, checkpointID, checkpointIndex)
+	if err != nil {
+		return nil, err
+	}
+	offset := 0
+	for i := 0; i < segmentIndex; i++ {
+		offset += segments[i].EntryCount
+	}
+	count := segments[segmentIndex].EntryCount
+	if count < 0 || offset+count > len(records) {
+		return nil, status.Errorf(codes.FailedPrecondition, "pre-seed segment %d entry_count exceeds checkpoint artifact records", segmentIndex)
+	}
+	return s.preSeedEntriesFromArtifactRecords(ctx, checkpointID, records[offset:offset+count])
+}
+
+func (s *drReplicationPrimary) preSeedArtifactRecords(ctx context.Context, relationshipID string, checkpointID string, checkpointIndex uint64) ([]drCheckpointArtifactRecord, error) {
+	cp, releaseCheckpoint, err := s.getCheckpointLease(checkpointID)
+	if err != nil {
+		return nil, status.Errorf(codes.NotFound, "checkpoint not found: %v", err)
 	}
 	defer releaseCheckpoint()
 	if err := validateCheckpointRelationship(relationshipID, cp); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	if err := validateCheckpointTuple(checkpoint.GetCheckpointId(), checkpoint.GetCommitIndex(), cp); err != nil {
-		return nil, nil, status.Errorf(codes.FailedPrecondition, "invalid checkpoint tuple: %v", err)
+	if err := validateCheckpointTuple(checkpointID, checkpointIndex, cp); err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "invalid checkpoint tuple: %v", err)
 	}
 	if s.checkpointArtifacts == nil {
-		return nil, nil, status.Error(codes.FailedPrecondition, "checkpoint_artifact_missing: checkpoint artifacts are not enabled")
+		return nil, status.Error(codes.FailedPrecondition, "checkpoint_artifact_missing: checkpoint artifacts are not enabled")
 	}
 
-	kids := make([][32]byte, 0, len(cp.kidToVID))
-	for kid := range cp.kidToVID {
-		kids = append(kids, kid)
+	rawRecords, err := s.checkpointArtifacts.records(cp.checkpoint.ID)
+	if err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "checkpoint_artifact_missing: %v", err)
 	}
-	sort.Slice(kids, func(i, j int) bool {
-		return bytes.Compare(kids[i][:], kids[j][:]) < 0
-	})
+	rawByKID := make(map[[32]byte]drCheckpointArtifactRecord, len(rawRecords))
+	for _, rec := range rawRecords {
+		rawByKID[rec.KID] = rec
+	}
 
-	entries := make([]DRPreSeedBundleEntry, 0, len(kids))
-	for _, kid := range kids {
+	records := make([]drCheckpointArtifactRecord, 0, len(cp.kidToVID))
+	for kid, cpVID := range cp.kidToVID {
 		select {
 		case <-ctx.Done():
-			return nil, nil, ctx.Err()
+			return nil, ctx.Err()
 		default:
 		}
-		rec, found, err := s.checkpointArtifacts.getRecord(cp.checkpoint.ID, kid)
-		if err != nil {
-			return nil, nil, status.Errorf(codes.FailedPrecondition, "checkpoint_artifact_missing: %v", err)
-		}
-		if !found {
-			return nil, nil, status.Error(codes.FailedPrecondition, "checkpoint_artifact_missing: live checkpoint key has no artifact record")
+		rec, ok := rawByKID[kid]
+		if !ok {
+			return nil, status.Error(codes.FailedPrecondition, "checkpoint_artifact_missing: checkpoint artifact record missing live key")
 		}
 		if rec.Tombstone {
-			return nil, nil, status.Error(codes.FailedPrecondition, "checkpoint_provenance_mismatch: live checkpoint key has tombstone artifact")
+			return nil, status.Error(codes.FailedPrecondition, "checkpoint_provenance_mismatch: live checkpoint key has tombstone artifact")
 		}
 		if rec.Key == "" {
-			return nil, nil, status.Errorf(codes.FailedPrecondition, "checkpoint artifact contains invalid pre-seed key %q", rec.Key)
+			return nil, status.Errorf(codes.FailedPrecondition, "checkpoint artifact contains invalid pre-seed key %q", rec.Key)
 		}
 		if isDRPreSeedBulkExcludedPath(rec.Key) {
 			continue
 		}
-		value, err := s.checkpointArtifacts.readValue(cp.checkpoint.ID, rec.ValueRef)
-		if err != nil {
-			return nil, nil, status.Errorf(codes.FailedPrecondition, "checkpoint_artifact_missing: %v", err)
+		if cpVID != rec.VID {
+			return nil, status.Error(codes.FailedPrecondition, "checkpoint_provenance_mismatch: artifact VID does not match checkpoint metadata")
 		}
-		cpVID, ok := cp.kidToVID[kid]
-		if !ok || cpVID != rec.VID {
-			return nil, nil, status.Error(codes.FailedPrecondition, "checkpoint_provenance_mismatch: artifact VID does not match checkpoint metadata")
+		records = append(records, rec)
+	}
+	sort.SliceStable(records, func(i, j int) bool {
+		if records[i].Key != records[j].Key {
+			return records[i].Key < records[j].Key
+		}
+		return bytes.Compare(records[i].KID[:], records[j].KID[:]) < 0
+	})
+	return records, nil
+}
+
+func (s *drReplicationPrimary) preSeedEntriesFromArtifactRecords(ctx context.Context, checkpointID string, records []drCheckpointArtifactRecord) ([]DRPreSeedBundleEntry, error) {
+	entries := make([]DRPreSeedBundleEntry, 0, len(records))
+	for _, rec := range records {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		value, err := s.checkpointArtifacts.readValue(checkpointID, rec.ValueRef)
+		if err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "checkpoint_artifact_missing: %v", err)
 		}
 		entries = append(entries, DRPreSeedBundleEntry{
 			Key:      rec.Key,
@@ -1221,7 +1294,7 @@ func (s *drReplicationPrimary) BuildPreSeedBundle(ctx context.Context, relations
 			VID:      append([]byte(nil), rec.VID[:]...),
 		})
 	}
-	return checkpoint, entries, nil
+	return entries, nil
 }
 
 // ExchangeDirtyBitmap implements DRReplicationServer.ExchangeDirtyBitmap.
@@ -1899,7 +1972,7 @@ func (s *drReplicationPrimary) SyncKeyring(ctx context.Context, req *SyncKeyring
 	s.syncKeyringMu.Lock()
 	defer s.syncKeyringMu.Unlock()
 
-	if err := s.authorizeRelationshipNoActivate(ctx, req.RelationshipId, DRRelationshipStateRegistered); err != nil {
+	if err := s.authorizeRelationshipNoActivate(ctx, req.RelationshipId, DRRelationshipStateRegistered, DRRelationshipStateActive); err != nil {
 		return nil, err
 	}
 
@@ -2096,13 +2169,13 @@ func (s *drReplicationPrimary) buildAndCacheCheckpoint(ctx context.Context, rela
 
 	s.logger.Info("checkpoint created",
 		"checkpoint_id", checkpointID,
-		"commit_index", commitIndex,
+		"commit_index", checkpoint.CommitIndex,
 		"relationship_id", relationshipID,
 		"keys", rs.KeyCount)
 
 	return &CheckpointResponse{
 		CheckpointId:     checkpointID,
-		CommitIndex:      commitIndex,
+		CommitIndex:      checkpoint.CommitIndex,
 		RangePlanVersion: reconciler.RangePlanVersion,
 	}, nil
 }
@@ -2178,12 +2251,12 @@ func (s *drReplicationPrimary) resetIndexFromSet(rs *reconciler.ReconciliationSe
 	s.indexLastFullScan = time.Now().UTC()
 }
 
-// WarmIndexFromJournal replays all available stream journal entries to
-// build the in-memory KID/VID index. This is dramatically faster than
-// a full storage scan because it only performs sequential reads on the
-// local journal segments. After a leader election the journal is already
-// populated (maintained by the drChangeStreamDispatcher on all nodes),
-// so the new leader can warm its index almost instantly.
+// WarmIndexFromJournal replays all available stream journal entries into
+// the in-memory KID/VID index as a partial warm cache. The stream journal
+// is retention-bound and does not prove coverage of the full physical
+// dataset, so this path must not mark the checkpoint index as initialized.
+// A full physical scan is still required before the index can be used as
+// an authoritative checkpoint source.
 //
 // Returns the number of entries replayed, or an error if the journal is
 // unavailable.
@@ -2198,6 +2271,9 @@ func (s *drReplicationPrimary) WarmIndexFromJournal(journal *drStreamJournal) (i
 	var count int
 	var lastIdx uint64
 	err := journal.replayAll(func(e physical.ChangeStreamEntry) error {
+		if isDRReconcileExcludedPath(e.Key) {
+			return nil
+		}
 		kid := s.scanner.ComputeKID(e.Key)
 		switch e.OpType {
 		case physical.PutOperation:
@@ -2217,8 +2293,6 @@ func (s *drReplicationPrimary) WarmIndexFromJournal(journal *drStreamJournal) (i
 		return 0, err
 	}
 
-	s.indexInitialized = true
-	s.indexLastFullScan = time.Now().UTC()
 	if lastIdx > 0 {
 		s.indexApplied.Store(lastIdx)
 	}
@@ -2226,11 +2300,10 @@ func (s *drReplicationPrimary) WarmIndexFromJournal(journal *drStreamJournal) (i
 }
 
 // WarmIndex proactively builds the in-memory KID/VID index. It first
-// attempts a fast path by replaying the local stream journal (sequential
-// disk reads). If that succeeds the index is immediately usable. A
-// background full physical scan is scheduled only when the journal is
-// unavailable or empty. This ensures that after a leader election the
-// new leader can serve checkpoints almost immediately.
+// replays the local stream journal as a partial warm cache, then schedules
+// the full physical scan that makes the index authoritative. Until the
+// full scan completes, checkpoint requests fall back to direct physical
+// scanning instead of serving a potentially incomplete journal-only index.
 func (s *drReplicationPrimary) WarmIndex(ctx context.Context) {
 	s.indexMu.RLock()
 	initialized := s.indexInitialized
@@ -2244,12 +2317,11 @@ func (s *drReplicationPrimary) WarmIndex(ctx context.Context) {
 		start := time.Now()
 		count, err := s.WarmIndexFromJournal(s.streamJournal)
 		if err == nil && count > 0 {
-			s.logger.Info("checkpoint index warmed from journal",
+			s.logger.Info("checkpoint index partially warmed from journal",
 				"keys", len(s.indexKIDToVID),
 				"journal_entries_replayed", count,
 				"duration", time.Since(start).Round(time.Millisecond))
 			metrics.SetGauge([]string{"replication", "dr", "checkpoint", "index_keys"}, float32(len(s.indexKIDToVID)))
-			return
 		}
 		if err != nil {
 			s.logger.Debug("journal-based index warmup unavailable, falling back to full scan", "error", err)
@@ -2613,15 +2685,14 @@ func (s *drReplicationPrimary) cacheCheckpoint(entry *drCheckpointCacheEntry) er
 	now := time.Now().UTC()
 	s.pruneCheckpointsLocked(now)
 
-	if entry.estimatedBytes > s.checkpointPerRelationshipBudget {
-		s.checkpointAdmissionFailures.Add(1)
-		s.setCheckpointCacheGaugesLocked()
-		return fmt.Errorf("size_exceeded: checkpoint size %d exceeds per-relationship budget %d", entry.estimatedBytes, s.checkpointPerRelationshipBudget)
-	}
 	if entry.estimatedBytes > s.checkpointGlobalBudget {
 		s.checkpointAdmissionFailures.Add(1)
 		s.setCheckpointCacheGaugesLocked()
 		return fmt.Errorf("size_exceeded: checkpoint size %d exceeds global budget %d", entry.estimatedBytes, s.checkpointGlobalBudget)
+	}
+	relationshipLimit := s.checkpointPerRelationshipBudget
+	if entry.estimatedBytes > relationshipLimit {
+		relationshipLimit = entry.estimatedBytes
 	}
 
 	for s.countRelationshipCheckpointsLocked(entry.relationshipID) >= s.maxCheckpointsPerRelationship {
@@ -2630,7 +2701,7 @@ func (s *drReplicationPrimary) cacheCheckpoint(entry *drCheckpointCacheEntry) er
 		}
 	}
 
-	for s.relationshipBytesLocked(entry.relationshipID)+entry.estimatedBytes > s.checkpointPerRelationshipBudget {
+	for s.relationshipBytesLocked(entry.relationshipID)+entry.estimatedBytes > relationshipLimit {
 		if !s.evictOldestInRelationshipLocked(entry.relationshipID) {
 			break
 		}
@@ -2642,7 +2713,7 @@ func (s *drReplicationPrimary) cacheCheckpoint(entry *drCheckpointCacheEntry) er
 		}
 	}
 
-	if s.relationshipBytesLocked(entry.relationshipID)+entry.estimatedBytes > s.checkpointPerRelationshipBudget {
+	if s.relationshipBytesLocked(entry.relationshipID)+entry.estimatedBytes > relationshipLimit {
 		s.checkpointAdmissionFailures.Add(1)
 		s.setCheckpointCacheGaugesLocked()
 		return fmt.Errorf("per_rel_budget_exhausted: per-relationship checkpoint budget exhausted")

@@ -75,13 +75,19 @@ func TestSystemBackend_RootPaths(t *testing.T) {
 		"replication/dr/primary/disable",
 		"replication/dr/primary/secondary-token",
 		"replication/dr/primary/preseed/export",
+		"replication/dr/primary/preseed/export-plan",
+		"replication/dr/primary/preseed/export-plan-status",
+		"replication/dr/primary/preseed/export-segment",
 		"replication/dr/primary/preseed/manifest",
 		"replication/dr/primary/relationships",
 		"replication/dr/primary/relationships/*",
 		"replication/dr/secondary/enable",
 		"replication/dr/secondary/disable",
 		"replication/dr/secondary/preseed/accept",
+		"replication/dr/secondary/preseed/import-begin",
+		"replication/dr/secondary/preseed/import-complete",
 		"replication/dr/secondary/preseed/import",
+		"replication/dr/secondary/preseed/import-segment",
 		"replication/dr/secondary/rotate-certificate",
 		"replication/dr/secondary/promote",
 		"replication/dr/secondary/resnapshot",
@@ -104,13 +110,19 @@ func TestSystemBackend_DRSpecialPaths(t *testing.T) {
 		"replication/dr/primary/disable",
 		"replication/dr/primary/secondary-token",
 		"replication/dr/primary/preseed/export",
+		"replication/dr/primary/preseed/export-plan",
+		"replication/dr/primary/preseed/export-plan-status",
+		"replication/dr/primary/preseed/export-segment",
 		"replication/dr/primary/preseed/manifest",
 		"replication/dr/primary/relationships",
 		"replication/dr/primary/relationships/*",
 		"replication/dr/secondary/enable",
 		"replication/dr/secondary/disable",
 		"replication/dr/secondary/preseed/accept",
+		"replication/dr/secondary/preseed/import-begin",
+		"replication/dr/secondary/preseed/import-complete",
 		"replication/dr/secondary/preseed/import",
+		"replication/dr/secondary/preseed/import-segment",
 		"replication/dr/secondary/rotate-certificate",
 		"replication/dr/secondary/promote",
 		"replication/dr/secondary/resnapshot",
@@ -188,10 +200,15 @@ func TestSystemBackend_DRSensitiveFields(t *testing.T) {
 
 	requireSensitiveDRResponseField("replication/dr/primary/secondary-token$", logical.UpdateOperation, http.StatusOK, "token")
 	requireSensitiveDRResponseField("replication/dr/primary/preseed/export$", logical.UpdateOperation, http.StatusOK, "bundle")
+	requireSensitiveDRResponseField("replication/dr/primary/preseed/export-segment$", logical.UpdateOperation, http.StatusOK, "segment")
 	requireSensitiveDRField("replication/dr/secondary/enable$", "token")
 	requireSensitiveDRField("replication/dr/secondary/preseed/accept$", "token")
+	requireSensitiveDRField("replication/dr/secondary/preseed/import-begin$", "token")
+	requireSensitiveDRField("replication/dr/secondary/preseed/import-complete$", "token")
 	requireSensitiveDRField("replication/dr/secondary/preseed/import$", "token")
 	requireSensitiveDRField("replication/dr/secondary/preseed/import$", "bundle")
+	requireSensitiveDRField("replication/dr/secondary/preseed/import-segment$", "token")
+	requireSensitiveDRField("replication/dr/secondary/preseed/import-segment$", "segment")
 	requireSensitiveDRField("replication/dr/primary/register-secondary$", "bootstrap_token")
 	requireSensitiveDRField("replication/dr/primary/register-secondary$", "secondary_ca_cert")
 	for _, pattern := range []string{
@@ -200,6 +217,29 @@ func TestSystemBackend_DRSensitiveFields(t *testing.T) {
 	} {
 		requireSensitiveDRField(pattern, "secondary_ca_cert")
 		requireSensitiveDRField(pattern, "signature")
+	}
+}
+
+func TestSystemBackend_DRPreSeedEnableSecondaryField(t *testing.T) {
+	b := testSystemBackend(t).(*SystemBackend)
+
+	for _, pattern := range []string{
+		"replication/dr/secondary/preseed/import$",
+		"replication/dr/secondary/preseed/import-complete$",
+	} {
+		p := findDRPathForTest(t, b, pattern)
+		schema, ok := p.Fields["enable_secondary"]
+		if !ok {
+			t.Fatalf("path %q missing enable_secondary field", pattern)
+		}
+		if schema.Type != framework.TypeBool {
+			t.Fatalf("path %q enable_secondary field type = %v, want %v", pattern, schema.Type, framework.TypeBool)
+		}
+	}
+
+	begin := findDRPathForTest(t, b, "replication/dr/secondary/preseed/import-begin$")
+	if _, ok := begin.Fields["enable_secondary"]; ok {
+		t.Fatal("import-begin must not expose enable_secondary; enable happens after staged segments are complete")
 	}
 }
 

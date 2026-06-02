@@ -88,18 +88,20 @@ type DRSecondaryCheckpointVerificationMismatch struct {
 }
 
 type DRSecondaryCheckpointVerificationResult struct {
-	Pass             bool
-	Reason           string
-	State            string
-	RelationshipID   string
-	CheckpointID     string
-	CheckpointIndex  uint64
-	AccumulatorIndex uint64
-	RangeCount       int
-	MatchedRanges    int
-	MismatchedRanges int
-	MissingRanges    int
-	Mismatches       []DRSecondaryCheckpointVerificationMismatch
+	Pass              bool
+	Reason            string
+	State             string
+	RelationshipID    string
+	CheckpointID      string
+	CheckpointIndex   uint64
+	AccumulatorIndex  uint64
+	RangeCount        int
+	MatchedRanges     int
+	MismatchedRanges  int
+	MissingRanges     int
+	Mismatches        []DRSecondaryCheckpointVerificationMismatch
+	PhysicalScanUsed  bool
+	OptimizerReseeded bool
 }
 
 func atomicMaxUint64(target *atomic.Uint64, value uint64) {
@@ -189,7 +191,8 @@ const drClusterLocalOptimizerPrefix = "core/cluster/local/dr/"
 // drReconcileExcludeExactPaths lists storage paths excluded from
 // reconciliation in addition to drNeverReplicate*.
 var drReconcileExcludeExactPaths = map[string]bool{
-	"core/keyring": true, // encrypted with root key; handled by SyncKeyring
+	"core/keyring":  true, // encrypted with root key; handled by SyncKeyring
+	"core/root-key": true, // local seal/keyring ownership; handled by SyncKeyring
 }
 
 // isDRNeverReplicatePath returns true if the path should never be
@@ -491,6 +494,10 @@ type drReplicationSecondary struct {
 
 	// keyringBootstrapped tracks whether the keyring has been synced.
 	keyringBootstrapped atomic.Bool
+
+	// preSeedBaselineIndex is set when this secondary starts from an imported
+	// pre-seed checkpoint instead of an empty local storage plane.
+	preSeedBaselineIndex atomic.Uint64
 
 	// transportReady indicates mTLS transport has been configured.
 	transportReady atomic.Bool
@@ -837,7 +844,7 @@ func (s *drReplicationSecondary) Connect(ctx context.Context, primaryAddr string
 func (s *drReplicationSecondary) prepareStateForConnect() {
 	switch s.State() {
 	case DRSecondaryIdle:
-		if s.keyringBootstrapped.Load() && s.lastAppliedIndex.Load() > 0 {
+		if s.keyringBootstrapped.Load() && s.hasInitialStreamBaseline() {
 			s.setState(DRSecondaryStreaming)
 			return
 		}
@@ -845,6 +852,13 @@ func (s *drReplicationSecondary) prepareStateForConnect() {
 	case DRSecondaryBootstrapping, DRSecondaryInitialSync:
 		s.setState(DRSecondaryBootstrapping)
 	}
+}
+
+func (s *drReplicationSecondary) hasInitialStreamBaseline() bool {
+	if s == nil || s.lastAppliedIndex.Load() == 0 {
+		return false
+	}
+	return s.rangeAccumulator != nil && s.rangeAccumulator.isInitialized()
 }
 
 // Start begins the replication loop: stream changes from the primary,
@@ -878,12 +892,41 @@ func (s *drReplicationSecondary) Start(ctx context.Context) error {
 		switch s.State() {
 		case DRSecondaryBootstrapping, DRSecondaryInitialSync:
 			// Bootstrap keyring from primary if not yet done.
+			bootstrappedNow := false
 			if !s.keyringBootstrapped.Load() {
 				if err := s.bootstrapKeyring(ctx); err != nil {
 					s.logger.Error("keyring bootstrap failed", "error", err)
+					if reconnectErr := drKeyringSyncReconnectError(err, "keyring bootstrap"); reconnectErr != nil {
+						return reconnectErr
+					}
 					time.Sleep(5 * time.Second)
 					continue
 				}
+				bootstrappedNow = true
+			}
+			if !bootstrappedNow {
+				if err := s.syncKeyringFromPrimary(ctx, false); err != nil {
+					s.logger.Error("keyring resync before reconciliation failed", "error", err)
+					if reconnectErr := drKeyringSyncReconnectError(err, "keyring resync"); reconnectErr != nil {
+						return reconnectErr
+					}
+					time.Sleep(5 * time.Second)
+					continue
+				}
+			}
+
+			if s.hasInitialStreamBaseline() {
+				s.logger.Info("durable DR secondary baseline present; attempting stream catch-up before initial reconciliation",
+					"last_applied_index", s.lastAppliedIndex.Load())
+				s.invalidateCoreCaches(ctx)
+				if err := s.reloadCoreState(ctx); err != nil {
+					s.logger.Error("failed to reload replicated core state before stream catch-up", "error", err)
+					time.Sleep(5 * time.Second)
+					continue
+				}
+				s.streamResumeAttempts = 0
+				s.setState(DRSecondaryStreaming)
+				continue
 			}
 
 			// Run initial reconciliation to sync from primary.
@@ -998,6 +1041,14 @@ func (s *drReplicationSecondary) Start(ctx context.Context) error {
 				s.setFallbackLastReason(reason)
 				continue
 			}
+			if err := s.syncKeyringFromPrimary(ctx, false); err != nil {
+				s.logger.Error("keyring resync before reconciliation failed", "error", err)
+				if reconnectErr := drKeyringSyncReconnectError(err, "keyring resync"); reconnectErr != nil {
+					return reconnectErr
+				}
+				time.Sleep(5 * time.Second)
+				continue
+			}
 			if err := s.runReconciliation(ctx); err != nil {
 				s.logger.Error("reconciliation failed", "error", err)
 
@@ -1089,6 +1140,19 @@ func (s *drReplicationSecondary) Start(ctx context.Context) error {
 			s.setState(DRSecondaryBootstrapping)
 		}
 	}
+}
+
+func drKeyringSyncReconnectError(err error, op string) error {
+	if err == nil {
+		return nil
+	}
+	if addr, ok := extractDRRedirect(err); ok {
+		return &errDRRedirect{LeaderAddr: addr}
+	}
+	if isDRTransportReconnectError(err) {
+		return fmt.Errorf("%s transport failure, reconnecting: %w", op, err)
+	}
+	return nil
 }
 
 // Stop gracefully stops the replication loop.
@@ -1281,13 +1345,51 @@ func (s *drReplicationSecondary) VerifyCheckpoint(ctx context.Context) (*DRSecon
 		remoteChecksums[remote.GetRangeId()] = remote
 	}
 
+	result.MatchedRanges, result.MismatchedRanges, result.MissingRanges, result.Mismatches = compareDRFlatAccumulatorBuckets(localBuckets, remoteChecksums)
+
+	if result.MismatchedRanges > 0 {
+		reseeded, err := s.verifyCheckpointWithLocalScan(ctx, checkpoint, remoteChecksums)
+		result.PhysicalScanUsed = true
+		if err != nil {
+			s.logger.Warn("checkpoint verification local scan failed after accumulator mismatch",
+				"checkpoint_id", checkpoint.CheckpointId,
+				"checkpoint_index", checkpoint.CommitIndex,
+				"error", err)
+		} else if reseeded {
+			result.Pass = true
+			result.Reason = "ok_local_scan_reseeded"
+			result.AccumulatorIndex = checkpoint.CommitIndex
+			result.MatchedRanges = drRangeMaxTotalRanges
+			result.MismatchedRanges = 0
+			result.MissingRanges = 0
+			result.Mismatches = nil
+			result.OptimizerReseeded = true
+			return result, nil
+		}
+		result.Reason = "range_checksum_mismatch"
+		return result, nil
+	}
+	result.Pass = true
+	result.Reason = "ok"
+	return result, nil
+}
+
+func compareDRFlatAccumulatorBuckets(
+	localBuckets [drRangeMaxTotalRanges]drFlatAccumulatorBucket,
+	remoteChecksums map[uint64]*RangeChecksum,
+) (int, int, int, []DRSecondaryCheckpointVerificationMismatch) {
+	matchedRanges := 0
+	mismatchedRanges := 0
+	missingRanges := 0
+	mismatches := make([]DRSecondaryCheckpointVerificationMismatch, 0)
+
 	for rangeID := 0; rangeID < drRangeMaxTotalRanges; rangeID++ {
 		local := localBuckets[rangeID]
 		remote, ok := remoteChecksums[uint64(rangeID)]
 		if !ok {
-			result.MissingRanges++
-			result.MismatchedRanges++
-			result.Mismatches = append(result.Mismatches, DRSecondaryCheckpointVerificationMismatch{
+			missingRanges++
+			mismatchedRanges++
+			mismatches = append(mismatches, DRSecondaryCheckpointVerificationMismatch{
 				RangeID:       uint64(rangeID),
 				LocalCount:    local.count,
 				LocalChecksum: local.checksum,
@@ -1298,8 +1400,8 @@ func (s *drReplicationSecondary) VerifyCheckpoint(ctx context.Context) (*DRSecon
 		countMismatch := remote.GetCount() != local.count
 		checksumMismatch := remote.GetChecksum() != local.checksum
 		if countMismatch || checksumMismatch {
-			result.MismatchedRanges++
-			result.Mismatches = append(result.Mismatches, DRSecondaryCheckpointVerificationMismatch{
+			mismatchedRanges++
+			mismatches = append(mismatches, DRSecondaryCheckpointVerificationMismatch{
 				RangeID:          uint64(rangeID),
 				LocalCount:       local.count,
 				RemoteCount:      remote.GetCount(),
@@ -1310,16 +1412,44 @@ func (s *drReplicationSecondary) VerifyCheckpoint(ctx context.Context) (*DRSecon
 			})
 			continue
 		}
-		result.MatchedRanges++
+		matchedRanges++
 	}
 
-	if result.MismatchedRanges > 0 {
-		result.Reason = "range_checksum_mismatch"
-		return result, nil
+	return matchedRanges, mismatchedRanges, missingRanges, mismatches
+}
+
+func (s *drReplicationSecondary) verifyCheckpointWithLocalScan(ctx context.Context, checkpoint *CheckpointResponse, remoteChecksums map[uint64]*RangeChecksum) (bool, error) {
+	if s == nil || s.scanner == nil || s.core == nil || s.core.physical == nil || checkpoint == nil {
+		return false, nil
 	}
-	result.Pass = true
-	result.Reason = "ok"
-	return result, nil
+
+	rs, err := s.scanner.ScanPhysical(ctx, s.core.physical, reconciler.Checkpoint{
+		ID:          checkpoint.CheckpointId,
+		CommitIndex: checkpoint.CommitIndex,
+	})
+	if err != nil {
+		s.scanFailures.Add(1)
+		metrics.IncrCounter([]string{"replication", "dr", "checkpoint", "scan_failures"}, 1)
+		return false, err
+	}
+
+	scanBuckets := drFlatAccumulatorBucketsFromSet(rs)
+	_, mismatched, _, _ := compareDRFlatAccumulatorBuckets(scanBuckets, remoteChecksums)
+	if mismatched > 0 {
+		return false, nil
+	}
+
+	if err := s.resetAndPersistFlatAccumulatorFromSet(ctx, rs, checkpoint.CommitIndex); err != nil {
+		return false, err
+	}
+	if s.lastAppliedIndex.Load() < checkpoint.CommitIndex {
+		s.setLastAppliedIndex(checkpoint.CommitIndex)
+	}
+	s.logger.Info("checkpoint verification reseeded DR optimizer state from local scan",
+		"checkpoint_id", checkpoint.CheckpointId,
+		"checkpoint_index", checkpoint.CommitIndex,
+		"keys", rs.KeyCount)
+	return true, nil
 }
 
 func (s *drReplicationSecondary) recordIndexedRepairProofMismatch(err error) {
@@ -2744,7 +2874,7 @@ func (s *drReplicationSecondary) performResnapshot(ctx context.Context, reason s
 
 	removeKeys := make([]string, 0, 256)
 	for _, key := range localSet.KIDToKey {
-		if key == "" || isDRNeverReplicatePath(key) {
+		if key == "" || isDRReconcileExcludedPath(key) {
 			continue
 		}
 		if _, ok := remoteKeys[key]; ok {
@@ -2814,7 +2944,15 @@ func (s *drReplicationSecondary) isStopped() bool {
 //     survives restarts (the operator still uses the secondary's own
 //     unseal keys, which decrypt to the primary's root key).
 func (s *drReplicationSecondary) bootstrapKeyring(ctx context.Context) error {
-	s.logger.Info("bootstrapping keyring from primary")
+	return s.syncKeyringFromPrimary(ctx, true)
+}
+
+func (s *drReplicationSecondary) syncKeyringFromPrimary(ctx context.Context, bootstrap bool) error {
+	if bootstrap {
+		s.logger.Info("bootstrapping keyring from primary")
+	} else {
+		s.logger.Info("syncing keyring from primary before reconciliation")
+	}
 
 	curve := ecdh.X25519()
 	clientPriv, err := curve.GenerateKey(rand.Reader)
@@ -2954,32 +3092,48 @@ func (s *drReplicationSecondary) bootstrapKeyring(ctx context.Context) error {
 	// encrypted with the old root key and can no longer be decrypted.
 	// Leaving them in storage causes API failures ("decryption failed")
 	// when OpenBao tries to read mount tables, tokens, etc.
-	if err := s.purgeStaleBarrierEntries(ctx); err != nil {
-		return fmt.Errorf("failed to purge stale entries: %w", err)
+	if bootstrap {
+		if s.preSeedBaselineIndex.Load() > 0 {
+			if err := s.purgePreSeedBootstrapLocalEntries(ctx); err != nil {
+				return fmt.Errorf("failed to purge stale pre-seed local entries: %w", err)
+			}
+		} else if err := s.purgeStaleBarrierEntries(ctx); err != nil {
+			return fmt.Errorf("failed to purge stale entries: %w", err)
+		}
 	}
 	if s.core.physicalCache != nil {
 		s.core.physicalCache.Purge(ctx)
 	}
-	if err := s.core.setupCluster(ctx); err != nil {
-		return fmt.Errorf("failed to recreate local cluster info after bootstrap purge: %w", err)
-	}
-	if mgr := s.core.drManager; mgr != nil {
-		if err := mgr.PersistSecondaryKeyringBootstrap(ctx); err != nil {
-			return fmt.Errorf("failed to persist DR keyring bootstrap state after purge: %w", err)
+	if bootstrap {
+		if err := s.core.setupCluster(ctx); err != nil {
+			return fmt.Errorf("failed to recreate local cluster info after bootstrap purge: %w", err)
 		}
-	} else {
-		return fmt.Errorf("failed to persist DR keyring bootstrap state after purge: DR manager unavailable")
+		if mgr := s.core.drManager; mgr != nil {
+			if err := mgr.PersistSecondaryKeyringBootstrap(ctx); err != nil {
+				return fmt.Errorf("failed to persist DR keyring bootstrap state after purge: %w", err)
+			}
+		} else {
+			return fmt.Errorf("failed to persist DR keyring bootstrap state after purge: DR manager unavailable")
+		}
+		if err := s.core.ensureRaftTLSKeyringForDRSecondary(ctx); err != nil {
+			return fmt.Errorf("failed to ensure raft TLS keyring after bootstrap purge: %w", err)
+		}
 	}
-	if err := s.core.ensureRaftTLSKeyringForDRSecondary(ctx); err != nil {
-		return fmt.Errorf("failed to ensure raft TLS keyring after bootstrap purge: %w", err)
+	transitionReason := "dr secondary keyring resync"
+	if bootstrap {
+		transitionReason = "dr secondary bootstrap key transition"
 	}
-	generation, _ := s.core.beginDRKeyTransition("dr secondary bootstrap key transition")
+	generation, _ := s.core.beginDRKeyTransition(transitionReason)
 	if s.core.invalidations != nil {
 		s.core.invalidations.ensureDRKeyTransitionWorker(generation)
 	}
 
 	s.keyringBootstrapped.Store(true)
-	s.logger.Info("keyring bootstrap complete")
+	if bootstrap {
+		s.logger.Info("keyring bootstrap complete")
+	} else {
+		s.logger.Info("keyring resync complete")
+	}
 	return nil
 }
 
@@ -3013,11 +3167,30 @@ func (s *drReplicationSecondary) purgeStaleBarrierEntries(ctx context.Context) e
 	return nil
 }
 
+func (s *drReplicationSecondary) purgePreSeedBootstrapLocalEntries(ctx context.Context) error {
+	s.logger.Info("purging stale pre-seed local barrier entries", "checkpoint_index", s.preSeedBaselineIndex.Load())
+
+	var deleted int
+	err := s.physicalRecursiveDeleteWhere(ctx, "", &deleted, shouldPurgePreSeedBootstrapLocalPath)
+	if err != nil {
+		return err
+	}
+
+	s.logger.Info("stale pre-seed local barrier entries purged", "deleted", deleted)
+	return nil
+}
+
 // physicalRecursiveDelete walks physical storage from the given prefix
 // and deletes all entries not in the preservation list. Entries listed
 // in drBootstrapPreservePaths are kept. Directories are listed
 // recursively.
 func (s *drReplicationSecondary) physicalRecursiveDelete(ctx context.Context, prefix string, deleted *int) error {
+	return s.physicalRecursiveDeleteWhere(ctx, prefix, deleted, func(path string) bool {
+		return !drBootstrapPreservePaths[strings.Trim(path, "/")]
+	})
+}
+
+func (s *drReplicationSecondary) physicalRecursiveDeleteWhere(ctx context.Context, prefix string, deleted *int, shouldDelete func(string) bool) error {
 	keys, err := s.core.physical.List(ctx, prefix)
 	if err != nil {
 		return fmt.Errorf("failed to list physical storage at %q: %w", prefix, err)
@@ -3028,14 +3201,16 @@ func (s *drReplicationSecondary) physicalRecursiveDelete(ctx context.Context, pr
 
 		// Recurse into directories (keys ending with /).
 		if strings.HasSuffix(key, "/") {
-			if err := s.physicalRecursiveDelete(ctx, fullPath, deleted); err != nil {
+			if shouldSkipPreSeedBootstrapPurgeSubtree(fullPath, shouldDelete) {
+				continue
+			}
+			if err := s.physicalRecursiveDeleteWhere(ctx, fullPath, deleted, shouldDelete); err != nil {
 				return err
 			}
 			continue
 		}
 
-		// Skip preserved paths.
-		if drBootstrapPreservePaths[fullPath] {
+		if !shouldDelete(fullPath) {
 			continue
 		}
 
@@ -3048,6 +3223,26 @@ func (s *drReplicationSecondary) physicalRecursiveDelete(ctx context.Context, pr
 	}
 
 	return nil
+}
+
+func shouldSkipPreSeedBootstrapPurgeSubtree(path string, shouldDelete func(string) bool) bool {
+	return shouldDelete != nil &&
+		!shouldDelete(path) &&
+		isDRClusterLocalOptimizerPath(path)
+}
+
+func shouldPurgePreSeedBootstrapLocalPath(path string) bool {
+	normalized := strings.Trim(path, "/")
+	if normalized == "" {
+		return false
+	}
+	if drBootstrapPreservePaths[normalized] {
+		return false
+	}
+	if isDRClusterLocalOptimizerPath(normalized) {
+		return false
+	}
+	return isDRNeverReplicatePath(normalized)
 }
 
 // invalidateCoreCaches flushes critical in-memory caches after the
@@ -5050,7 +5245,7 @@ func (m *drReconciliationSetMutationTracker) recordFetchedChanges(changes []*Ent
 		if change == nil {
 			continue
 		}
-		if change.Key != "" && isDRNeverReplicatePath(change.Key) {
+		if change.Key != "" && isDRReconcileExcludedPath(change.Key) {
 			continue
 		}
 		kid, ok := m.secondary.kidFromEntryChange(change)
@@ -5096,7 +5291,7 @@ func (m *drReconciliationSetMutationTracker) recordRemovedKeys(keys []string) {
 		return
 	}
 	for _, key := range keys {
-		if key == "" || isDRNeverReplicatePath(key) {
+		if key == "" || isDRReconcileExcludedPath(key) {
 			continue
 		}
 		kid := m.secondary.scanner.ComputeKID(key)
@@ -5665,7 +5860,7 @@ func drFetchedChangeAppliesToStorage(change *EntryChange, kidToKey map[[32]byte]
 		return false
 	}
 	if change.Key != "" {
-		return !isDRNeverReplicatePath(change.Key)
+		return !isDRReconcileExcludedPath(change.Key)
 	}
 	if physical.Operation(change.OpType) != physical.DeleteOperation || len(change.Kid) != 32 || kidToKey == nil {
 		return physical.Operation(change.OpType) == physical.PutOperation
@@ -5673,7 +5868,7 @@ func drFetchedChangeAppliesToStorage(change *EntryChange, kidToKey map[[32]byte]
 	var kid [32]byte
 	copy(kid[:], change.Kid)
 	key, ok := kidToKey[kid]
-	return ok && key != "" && !isDRNeverReplicatePath(key)
+	return ok && key != "" && !isDRReconcileExcludedPath(key)
 }
 
 func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, checkpoint *CheckpointResponse, localSet *reconciler.ReconciliationSet, startTime time.Time) error {
@@ -6379,7 +6574,7 @@ func localOnlyKeysForSpans(localIndex *reconciler.RangeMapIndex, kidToKey map[[3
 			if !ok || key == "" {
 				return nil, fmt.Errorf("local-only kid %x in reconcile span has no key mapping", kid)
 			}
-			if isDRNeverReplicatePath(key) {
+			if isDRReconcileExcludedPath(key) {
 				continue
 			}
 			seen[key] = struct{}{}
@@ -6493,7 +6688,7 @@ func (s *drReplicationSecondary) applyRemovedKeysWithLocalKIDIndexMode(ctx conte
 	// Filter out non-replicable paths.
 	filtered := make([]string, 0, len(keys))
 	for _, key := range keys {
-		if !isDRNeverReplicatePath(key) {
+		if !isDRReconcileExcludedPath(key) {
 			filtered = append(filtered, key)
 		}
 	}

@@ -7,6 +7,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -164,6 +166,162 @@ func TestDRPreSeedBundleValidationRejectsSegmentMetadataMismatch(t *testing.T) {
 	err = validateDRPreSeedBundle(bundle, token, nil, now)
 	if err == nil || !strings.Contains(err.Error(), "segment 0 metadata mismatch") {
 		t.Fatalf("expected segment metadata mismatch, got: %v", err)
+	}
+}
+
+func TestDRRelationshipManagerSegmentedPreSeedImportPersistsAcrossRestart(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	token, bundle, segments, now := testDRPreSeedSegmentedBundleFixture(t)
+	mgr := newDRRelationshipManager(core, core.logger)
+
+	if err := core.physical.Put(ctx, &physical.Entry{Key: "secret/data/stale-segmented", Value: []byte("stale")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.BeginPreSeedSegmentImport(ctx, &bundle.Manifest, token, now, true); err != nil {
+		t.Fatalf("begin segmented pre-seed import failed: %v", err)
+	}
+	received, expected, err := mgr.ImportPreSeedSegment(ctx, segments[0], token, now)
+	if err != nil {
+		t.Fatalf("import first segment failed: %v", err)
+	}
+	if received != 1 || expected != len(segments) {
+		t.Fatalf("unexpected received/expected after first segment: %d/%d", received, expected)
+	}
+	received, expected, err = mgr.ImportPreSeedSegment(ctx, segments[0], token, now)
+	if err != nil {
+		t.Fatalf("re-import first segment should be idempotent: %v", err)
+	}
+	if received != 1 || expected != len(segments) {
+		t.Fatalf("unexpected received/expected after idempotent segment: %d/%d", received, expected)
+	}
+
+	restored := newDRRelationshipManager(core, core.logger)
+	for _, segment := range segments[1:] {
+		if _, _, err := restored.ImportPreSeedSegment(ctx, segment, token, now); err != nil {
+			t.Fatalf("import segment %d after restart failed: %v", segment.SegmentIndex, err)
+		}
+	}
+	if err := restored.CompletePreSeedSegmentImport(ctx, token, now, true); err != nil {
+		t.Fatalf("complete segmented pre-seed import failed: %v", err)
+	}
+	stale, err := core.physical.Get(ctx, "secret/data/stale-segmented")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stale != nil {
+		t.Fatalf("expected stale replicated key to be removed, got %#v", stale)
+	}
+	for _, entry := range bundle.Entries {
+		got, err := core.physical.Get(ctx, entry.Key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got == nil || string(got.Value) != string(entry.Value) {
+			t.Fatalf("unexpected imported entry for %q: %#v", entry.Key, got)
+		}
+	}
+	if _, ok, err := loadPreSeedImportStageRecord(ctx, core.physical); err != nil {
+		t.Fatal(err)
+	} else if ok {
+		t.Fatal("expected staging record to be removed after completion")
+	}
+	accepted, err := core.physical.Get(ctx, drPreSeedAcceptedStoragePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accepted == nil {
+		t.Fatal("expected accepted pre-seed record after segmented import")
+	}
+}
+
+func TestDRPreSeedImportStageSegmentChunksLargeSegment(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	_, _, segments, _ := testDRPreSeedSegmentedBundleFixture(t)
+	segment := *segments[0]
+	segment.Entries = append([]DRPreSeedBundleEntry(nil), segments[0].Entries...)
+	segment.Entries[0].Value = []byte(strings.Repeat("x", drPreSeedImportStageSegmentChunkBytes*2))
+
+	raw, err := json.Marshal(&segment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) <= drPreSeedImportStageSegmentChunkBytes {
+		t.Fatalf("test segment was not large enough to require chunks: %d", len(raw))
+	}
+
+	backend := &maxValuePhysicalBackend{
+		Backend:       core.physical,
+		maxValueBytes: drPreSeedImportStageSegmentChunkBytes,
+	}
+	if err := savePreSeedImportStageSegment(ctx, backend, &segment); err != nil {
+		t.Fatalf("chunked stage save failed: %v", err)
+	}
+	chunks, err := core.physical.List(ctx, preSeedImportStageSegmentChunkPrefixForIndex(segment.SegmentIndex))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) < 2 {
+		t.Fatalf("expected multiple staged chunks, got %d", len(chunks))
+	}
+	count, err := countPreSeedImportStageSegments(ctx, core.physical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("expected one staged segment record, got %d", count)
+	}
+
+	loaded, ok, err := loadPreSeedImportStageSegment(ctx, core.physical, segment.SegmentIndex)
+	if err != nil {
+		t.Fatalf("chunked stage load failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected staged segment to load")
+	}
+	same, err := samePreSeedSegment(&segment, loaded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !same {
+		t.Fatal("loaded chunked segment differs from original")
+	}
+}
+
+func TestDRRelationshipManagerCompleteSegmentedPreSeedImportRejectsIncompleteStage(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	token, bundle, segments, now := testDRPreSeedSegmentedBundleFixture(t)
+	mgr := newDRRelationshipManager(core, core.logger)
+
+	if err := mgr.BeginPreSeedSegmentImport(ctx, &bundle.Manifest, token, now, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := mgr.ImportPreSeedSegment(ctx, segments[0], token, now); err != nil {
+		t.Fatal(err)
+	}
+	err := mgr.CompletePreSeedSegmentImport(ctx, token, now, true)
+	if err == nil || !strings.Contains(err.Error(), "missing segment") {
+		t.Fatalf("expected incomplete import rejection, got: %v", err)
+	}
+}
+
+func TestDRRelationshipManagerImportPreSeedSegmentRejectsTampering(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	token, bundle, segments, now := testDRPreSeedSegmentedBundleFixture(t)
+	mgr := newDRRelationshipManager(core, core.logger)
+
+	if err := mgr.BeginPreSeedSegmentImport(ctx, &bundle.Manifest, token, now, true); err != nil {
+		t.Fatal(err)
+	}
+	tampered := *segments[0]
+	tampered.Entries = append([]DRPreSeedBundleEntry(nil), segments[0].Entries...)
+	tampered.Entries[0].Value = []byte("tampered")
+	_, _, err := mgr.ImportPreSeedSegment(ctx, &tampered, token, now)
+	if err == nil || !strings.Contains(err.Error(), "metadata mismatch") {
+		t.Fatalf("expected tampered segment rejection, got: %v", err)
 	}
 }
 
@@ -344,6 +502,63 @@ func TestDRRelationshipManagerGeneratePreSeedBundleExportsCheckpointArtifact(t *
 	}
 }
 
+func TestDRRelationshipManagerGenerateSegmentedPreSeedManifestAndSegment(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	core.clusterAddr.Store("https://primary.test.local:8201")
+
+	mgr := newDRRelationshipManager(core, core.logger)
+	if err := mgr.EnablePrimary(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mgr.primary.checkpointArtifacts = newDRCheckpointArtifactStore(core.logger, t.TempDir())
+	mgr.primary.checkpointArtifacts.configure(true, time.Hour, drCheckpointArtifactDefaultGlobalBudget, drCheckpointArtifactDefaultPerRelBudget, drCheckpointArtifactDefaultSegmentBytes)
+	token, err := mgr.GenerateActivationToken(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	changes := make([]physical.ChangeStreamEntry, 0)
+	for i := 0; i < 12; i++ {
+		key := "secret/data/preseed-segmented-" + strconv.Itoa(i)
+		value := []byte(strings.Repeat("segmented-value-", 8) + strconv.Itoa(i))
+		if err := core.physical.Put(ctx, &physical.Entry{Key: key, Value: value}); err != nil {
+			t.Fatal(err)
+		}
+		changes = append(changes, physical.ChangeStreamEntry{
+			OpType:    physical.PutOperation,
+			Key:       key,
+			Value:     value,
+			RaftIndex: uint64(100 + i),
+		})
+	}
+	mgr.primary.OnChange(changes)
+
+	manifest, entryCount, err := mgr.GenerateSegmentedPreSeedManifest(ctx, token.RelationshipID, 1024, time.Hour)
+	if err != nil {
+		t.Fatalf("generate segmented pre-seed manifest failed: %v", err)
+	}
+	if entryCount == 0 {
+		t.Fatal("expected segmented export plan to include entries")
+	}
+	if normalizedDRPreSeedBundleFormat(manifest.BundleFormat) != drPreSeedBundleFormatSegmentedV1 {
+		t.Fatalf("expected segmented bundle format, got %q", manifest.BundleFormat)
+	}
+	if len(manifest.BundleSegments) < 2 {
+		t.Fatalf("expected multiple pre-seed segments, got %d", len(manifest.BundleSegments))
+	}
+	segment, err := mgr.GeneratePreSeedSegment(ctx, manifest, 0)
+	if err != nil {
+		t.Fatalf("generate pre-seed segment failed: %v", err)
+	}
+	if segment.SegmentIndex != 0 || segment.EntryCount != manifest.BundleSegments[0].EntryCount {
+		t.Fatalf("unexpected segment metadata: %#v", segment)
+	}
+	if err := validateDRPreSeedSegment(segment, manifest, token, nil, time.Now().UTC()); err != nil {
+		t.Fatalf("exported segment did not validate: %v", err)
+	}
+}
+
 func TestDRPrimaryBuildPreSeedBundleRejectsMissingCheckpointArtifactRecord(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	ctx := context.Background()
@@ -437,6 +652,7 @@ func TestDRRelationshipManagerImportPreSeedBundleReplacesReplicatedStorageAndAcc
 	if accepted == nil {
 		t.Fatal("expected accepted pre-seed record after import")
 	}
+	assertDRPreSeedOptimizerBaseline(t, ctx, core, token, bundle)
 
 	if err := mgr.EnableSecondary(ctx, token, "local-control"); err != nil {
 		t.Fatalf("enable secondary with imported pre-seed failed: %v", err)
@@ -445,6 +661,7 @@ func TestDRRelationshipManagerImportPreSeedBundleReplacesReplicatedStorageAndAcc
 	if got := mgr.Secondary().lastAppliedIndex.Load(); got != bundle.Manifest.CheckpointIndex {
 		t.Fatalf("expected last applied index %d, got %d", bundle.Manifest.CheckpointIndex, got)
 	}
+	assertDRPreSeedOptimizerBaseline(t, ctx, core, token, bundle)
 	accepted, err = core.physical.Get(ctx, drPreSeedAcceptedStoragePath)
 	if err != nil {
 		t.Fatal(err)
@@ -467,6 +684,33 @@ func TestDRRelationshipManagerAcceptPreSeedManifestRequiresConfirmations(t *test
 	err = mgr.AcceptPreSeedManifest(ctx, manifest, token, now, true, false)
 	if err == nil || !strings.Contains(err.Error(), "confirm_local_only_scrubbed") {
 		t.Fatalf("expected local-only scrub confirmation error, got: %v", err)
+	}
+}
+
+func TestDRPreSeedReconciliationSetFromBundle(t *testing.T) {
+	_, bundle, _ := testDRPreSeedBundleFixture(t)
+
+	rs, err := preSeedReconciliationSetFromBundle(bundle)
+	if err != nil {
+		t.Fatalf("build pre-seed reconciliation set failed: %v", err)
+	}
+	if rs.Checkpoint.ID != bundle.Manifest.CheckpointID || rs.Checkpoint.CommitIndex != bundle.Manifest.CheckpointIndex {
+		t.Fatalf("unexpected checkpoint: %#v", rs.Checkpoint)
+	}
+	if rs.KeyCount != len(bundle.Entries) || len(rs.KIDToVID) != len(bundle.Entries) || len(rs.KIDToKey) != len(bundle.Entries) {
+		t.Fatalf("unexpected set sizes: key_count=%d kid_to_vid=%d kid_to_key=%d entries=%d", rs.KeyCount, len(rs.KIDToVID), len(rs.KIDToKey), len(bundle.Entries))
+	}
+	for _, entry := range bundle.Entries {
+		var kid [32]byte
+		var vid [32]byte
+		copy(kid[:], entry.KID)
+		copy(vid[:], entry.VID)
+		if got := rs.KIDToKey[kid]; got != entry.Key {
+			t.Fatalf("unexpected key for kid %x: %q", kid, got)
+		}
+		if got := rs.KIDToVID[kid]; got != vid {
+			t.Fatalf("unexpected vid for kid %x: %x", kid, got)
+		}
 	}
 }
 
@@ -566,6 +810,9 @@ func TestDRRelationshipManagerLoadConfigAppliesAcceptedPreSeedBaseline(t *testin
 	if accepted != nil {
 		t.Fatalf("expected accepted pre-seed record to be consumed, got %#v", accepted)
 	}
+	if got := restored.Secondary().preSeedBaselineIndex.Load(); got != manifest.CheckpointIndex {
+		t.Fatalf("expected pre-seed baseline marker %d, got %d", manifest.CheckpointIndex, got)
+	}
 }
 
 func TestDRRelationshipManagerEnableSecondaryRejectsMismatchedAcceptedPreSeed(t *testing.T) {
@@ -585,6 +832,170 @@ func TestDRRelationshipManagerEnableSecondaryRejectsMismatchedAcceptedPreSeed(t 
 	}
 	if mgr.Mode() != DRModeDisabled {
 		t.Fatalf("expected mode to remain disabled after rejected pre-seed, got %s", mgr.Mode())
+	}
+}
+
+func TestDRPreSeedBootstrapPurgeKeepsImportedReplicatedPlane(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	token, _, _ := testDRPreSeedManifestFixture()
+	secondary := newDRReplicationSecondary(core, token.ReplSalt, token.RelationshipID, core.logger)
+	secondary.preSeedBaselineIndex.Store(42)
+
+	entries := map[string][]byte{
+		"logical/secret/data/imported":                 []byte("replicated-data"),
+		"core/mounts":                                  []byte("replicated-mounts"),
+		"core/keyring":                                 []byte("primary-keyring"),
+		"core/root-key":                                []byte("primary-root-key"),
+		"core/hsm/barrier-unseal-keys":                 []byte("seal-wrapped-root"),
+		"core/seal-config":                             []byte("seal-config"),
+		"core/cluster/local/dr/stream-applied-index":   []byte("stream-baseline"),
+		"core/cluster/local/dr/flat-accumulator":       []byte("optimizer-state"),
+		"core/local-mounts":                            []byte("stale-local-mounts"),
+		"core/local-mounts/6e0aa9a6-6259-7189-2294-f3": []byte("stale-local-mount"),
+		"core/local-auth":                              []byte("stale-local-auth"),
+		"core/local-audit":                             []byte("stale-local-audit"),
+		"core/cluster/local/info":                      []byte("stale-cluster-info"),
+		"core/leader/leader-uuid":                      []byte("stale-leader"),
+		"core/raft/tls":                                []byte("stale-raft-tls"),
+		"core/dr-replication/config":                   []byte("stale-dr-config"),
+	}
+	for key, value := range entries {
+		if err := core.physical.Put(ctx, &physical.Entry{Key: key, Value: value}); err != nil {
+			t.Fatalf("put %s: %v", key, err)
+		}
+	}
+
+	if err := secondary.purgePreSeedBootstrapLocalEntries(ctx); err != nil {
+		t.Fatalf("pre-seed bootstrap purge failed: %v", err)
+	}
+
+	for _, key := range []string{
+		"logical/secret/data/imported",
+		"core/mounts",
+		"core/keyring",
+		"core/root-key",
+		"core/hsm/barrier-unseal-keys",
+		"core/seal-config",
+		"core/cluster/local/dr/stream-applied-index",
+		"core/cluster/local/dr/flat-accumulator",
+	} {
+		entry, err := core.physical.Get(ctx, key)
+		if err != nil {
+			t.Fatalf("get preserved %s: %v", key, err)
+		}
+		if entry == nil {
+			t.Fatalf("expected %s to be preserved", key)
+		}
+	}
+
+	for _, key := range []string{
+		"core/local-mounts",
+		"core/local-mounts/6e0aa9a6-6259-7189-2294-f3",
+		"core/local-auth",
+		"core/local-audit",
+		"core/cluster/local/info",
+		"core/leader/leader-uuid",
+		"core/raft/tls",
+		"core/dr-replication/config",
+	} {
+		entry, err := core.physical.Get(ctx, key)
+		if err != nil {
+			t.Fatalf("get purged %s: %v", key, err)
+		}
+		if entry != nil {
+			t.Fatalf("expected %s to be purged", key)
+		}
+	}
+}
+
+func assertDRPreSeedOptimizerBaseline(t *testing.T, ctx context.Context, core *Core, token *DRActivationToken, bundle *DRPreSeedBundle) {
+	t.Helper()
+
+	rs, err := preSeedReconciliationSetFromBundle(bundle)
+	if err != nil {
+		t.Fatalf("build expected pre-seed set: %v", err)
+	}
+	expectedBuckets := drFlatAccumulatorBucketsFromSet(rs)
+	snapshotEntry, err := core.physical.Get(ctx, drFlatAccumulatorStoragePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshotEntry == nil {
+		t.Fatal("expected pre-seed import to persist flat accumulator snapshot")
+	}
+	var snapshot drFlatAccumulatorPersistedSnapshot
+	if err := json.Unmarshal(snapshotEntry.Value, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.RelationshipID != token.RelationshipID ||
+		snapshot.ClusterID != token.ClusterID ||
+		snapshot.CommitIndex != bundle.Manifest.CheckpointIndex ||
+		len(snapshot.Buckets) != drRangeMaxTotalRanges {
+		t.Fatalf("unexpected flat accumulator snapshot: %#v", snapshot)
+	}
+	for i, expected := range expectedBuckets {
+		got := snapshot.Buckets[i]
+		if got.Checksum != expected.checksum || got.KIDChecksum != expected.kidChecksum || got.Count != expected.count {
+			t.Fatalf("bucket %d mismatch: got %#v expected %#v", i, got, expected)
+		}
+	}
+
+	streamEntry, err := core.physical.Get(ctx, drStreamAppliedIndexStoragePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if streamEntry == nil {
+		t.Fatal("expected pre-seed import to persist stream applied index")
+	}
+	var streamMarker drPersistedStreamAppliedIndex
+	if err := json.Unmarshal(streamEntry.Value, &streamMarker); err != nil {
+		t.Fatal(err)
+	}
+	if streamMarker.RelationshipID != token.RelationshipID ||
+		streamMarker.ClusterID != token.ClusterID ||
+		streamMarker.CommitIndex != bundle.Manifest.CheckpointIndex {
+		t.Fatalf("unexpected stream marker: %#v", streamMarker)
+	}
+
+	metaEntry, err := core.physical.Get(ctx, drLocalKIDIndexMetaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metaEntry == nil {
+		t.Fatal("expected pre-seed import to persist local KID index metadata")
+	}
+	var meta drLocalKIDIndexMeta
+	if err := json.Unmarshal(metaEntry.Value, &meta); err != nil {
+		t.Fatal(err)
+	}
+	if meta.RelationshipID != token.RelationshipID ||
+		meta.ClusterID != token.ClusterID ||
+		meta.CommitIndex != bundle.Manifest.CheckpointIndex {
+		t.Fatalf("unexpected local KID index metadata: %#v", meta)
+	}
+	for _, entry := range bundle.Entries {
+		var kid [32]byte
+		var vid [32]byte
+		copy(kid[:], entry.KID)
+		copy(vid[:], entry.VID)
+		indexEntry, err := core.physical.Get(ctx, drLocalKIDIndexEntryStoragePath(kid))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if indexEntry == nil {
+			t.Fatalf("expected local KID index entry for %q", entry.Key)
+		}
+		var item drLocalKIDIndexEntry
+		if err := json.Unmarshal(indexEntry.Value, &item); err != nil {
+			t.Fatal(err)
+		}
+		if item.RelationshipID != token.RelationshipID ||
+			item.ClusterID != token.ClusterID ||
+			item.Key != entry.Key ||
+			string(item.VID) != string(vid[:]) {
+			t.Fatalf("unexpected local KID index entry for %q: %#v", entry.Key, item)
+		}
 	}
 }
 
@@ -665,6 +1076,40 @@ func testDRPreSeedBundleFixture(t *testing.T) (*DRActivationToken, *DRPreSeedBun
 	return token, bundle, now
 }
 
+func testDRPreSeedSegmentedBundleFixture(t *testing.T) (*DRActivationToken, *DRPreSeedBundle, []*DRPreSeedSegment, time.Time) {
+	t.Helper()
+
+	token, bundle, now := testDRPreSeedBundleFixture(t)
+	segments, err := buildDRPreSeedBundleSegmentPlan(bundle, testDRPreSeedMaxSingleSegmentBytes(t, bundle.Entries))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle.Manifest.BundleFormat = drPreSeedBundleFormatSegmentedV1
+	bundle.Manifest.BundleSegments = segments
+	bundle.Manifest.BundleIntegritySHA256 = make([]byte, sha256.Size)
+	sum, err := computeDRPreSeedBundleIntegrity(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle.Manifest.BundleIntegritySHA256 = sum
+
+	out := make([]*DRPreSeedSegment, 0, len(segments))
+	for i := range segments {
+		entries, err := preSeedSegmentEntries(bundle.Entries, segments, i)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, &DRPreSeedSegment{
+			Version:      drPreSeedBundleVersion,
+			Manifest:     bundle.Manifest,
+			SegmentIndex: i,
+			EntryCount:   len(entries),
+			Entries:      entries,
+		})
+	}
+	return token, bundle, out, now
+}
+
 func testDRPreSeedMaxSingleSegmentBytes(t *testing.T, entries []DRPreSeedBundleEntry) int {
 	t.Helper()
 
@@ -682,4 +1127,16 @@ func testDRPreSeedMaxSingleSegmentBytes(t *testing.T, entries []DRPreSeedBundleE
 		t.Fatal("expected non-empty fixture entries")
 	}
 	return int(maxBytes)
+}
+
+type maxValuePhysicalBackend struct {
+	physical.Backend
+	maxValueBytes int
+}
+
+func (b *maxValuePhysicalBackend) Put(ctx context.Context, entry *physical.Entry) error {
+	if entry != nil && len(entry.Value) > b.maxValueBytes {
+		return fmt.Errorf("test backend rejected value length %d above max %d", len(entry.Value), b.maxValueBytes)
+	}
+	return b.Backend.Put(ctx, entry)
 }

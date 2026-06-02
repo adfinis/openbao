@@ -104,6 +104,12 @@ func (b *SystemBackend) drReplicationPaths() []*framework.Path {
 								"missing_ranges": {
 									Type: framework.TypeInt,
 								},
+								"physical_scan_used": {
+									Type: framework.TypeBool,
+								},
+								"optimizer_reseeded": {
+									Type: framework.TypeBool,
+								},
 								"mismatches": {
 									Type: framework.TypeSlice,
 								},
@@ -312,6 +318,127 @@ func (b *SystemBackend) drReplicationPaths() []*framework.Path {
 			HelpDescription: "Cuts a primary checkpoint and returns a JSON DR pre-seed bundle containing replicated below-barrier storage entries plus a relationship-bound manifest. The bundle is intended for operator transfer into a disabled secondary.",
 		},
 
+		// --- Primary Segmented Pre-Seed Export Plan ---
+		{
+			Pattern: "replication/dr/primary/preseed/export-plan$",
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: "replication-dr-primary-preseed",
+				OperationVerb:   "export-plan",
+			},
+
+			Fields: map[string]*framework.FieldSchema{
+				"relationship_id": {
+					Type:        framework.TypeString,
+					Description: "The pending, registered, or active DR relationship ID this segmented seed bundle is bound to.",
+					Required:    true,
+				},
+				"ttl_seconds": {
+					Type:        framework.TypeInt,
+					Default:     int((24 * time.Hour).Seconds()),
+					Description: "Manifest validity window in seconds. Set to 0 for no expiry.",
+				},
+				"segment_max_bytes": {
+					Type:        framework.TypeInt,
+					Default:     drPreSeedDefaultSegmentBytes,
+					Description: "Maximum canonical segment payload size in bytes.",
+				},
+				"async": {
+					Type:        framework.TypeBool,
+					Default:     false,
+					Description: "Return a pollable pre-seed export plan job instead of waiting for checkpoint artifact planning to finish.",
+				},
+			},
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback:                  b.handleDRPrimaryPreSeedExportPlan,
+					Summary:                   "Create a segmented DR pre-seed export plan.",
+					ForwardPerformanceStandby: true,
+				},
+			},
+
+			HelpSynopsis:    "Create segmented DR pre-seed export plan",
+			HelpDescription: "Cuts a primary checkpoint and returns a relationship-bound manifest with deterministic segment descriptors for chunked operator transfer.",
+		},
+
+		// --- Primary Segmented Pre-Seed Export Plan Status ---
+		{
+			Pattern: "replication/dr/primary/preseed/export-plan-status$",
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: "replication-dr-primary-preseed",
+				OperationVerb:   "export-plan-status",
+			},
+
+			Fields: map[string]*framework.FieldSchema{
+				"plan_id": {
+					Type:        framework.TypeString,
+					Description: "The async pre-seed export plan ID returned by export-plan async=true.",
+					Required:    true,
+				},
+			},
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback:                  b.handleDRPrimaryPreSeedExportPlanStatus,
+					Summary:                   "Read a segmented DR pre-seed export plan job.",
+					ForwardPerformanceStandby: true,
+				},
+			},
+
+			HelpSynopsis:    "Read segmented DR pre-seed export plan status",
+			HelpDescription: "Returns the status of an async segmented DR pre-seed export plan and the manifest once planning has completed.",
+		},
+
+		// --- Primary Segmented Pre-Seed Export Segment ---
+		{
+			Pattern: "replication/dr/primary/preseed/export-segment$",
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: "replication-dr-primary-preseed",
+				OperationVerb:   "export-segment",
+			},
+
+			Fields: map[string]*framework.FieldSchema{
+				"manifest": {
+					Type:        framework.TypeString,
+					Description: "The JSON segmented DR pre-seed manifest returned by export-plan.",
+					Required:    true,
+				},
+				"segment_index": {
+					Type:        framework.TypeInt,
+					Description: "Zero-based segment index to export.",
+					Required:    true,
+				},
+			},
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback:                  b.handleDRPrimaryPreSeedExportSegment,
+					Summary:                   "Export one DR pre-seed segment.",
+					ForwardPerformanceStandby: true,
+					Responses: map[int][]framework.Response{
+						http.StatusOK: {{
+							Description: "OK",
+							Fields: map[string]*framework.FieldSchema{
+								"segment": {
+									Type:     framework.TypeString,
+									Required: true,
+									DisplayAttrs: &framework.DisplayAttributes{
+										Sensitive: true,
+									},
+								},
+							},
+						}},
+					},
+				},
+			},
+
+			HelpSynopsis:    "Export DR pre-seed segment",
+			HelpDescription: "Exports one checkpoint-bound DR pre-seed segment identified by a segmented pre-seed manifest and segment index.",
+		},
+
 		// --- Secondary Pre-Seed Accept ---
 		{
 			Pattern: "replication/dr/secondary/preseed/accept$",
@@ -390,6 +517,11 @@ func (b *SystemBackend) drReplicationPaths() []*framework.Path {
 					Default:     false,
 					Description: "Operator confirmation that importing this bundle may replace the disabled secondary's replicated storage plane while preserving cluster-local paths.",
 				},
+				"enable_secondary": {
+					Type:        framework.TypeBool,
+					Default:     false,
+					Description: "Enable DR secondary mode in the same authenticated request after accepting the imported pre-seed bundle.",
+				},
 			},
 
 			Operations: map[logical.Operation]framework.OperationHandler{
@@ -402,6 +534,130 @@ func (b *SystemBackend) drReplicationPaths() []*framework.Path {
 
 			HelpSynopsis:    "Import DR pre-seed bundle",
 			HelpDescription: "Validates a DR pre-seed bundle, replaces the disabled secondary's replicated storage plane with the bundle entries, preserves cluster-local paths, and records the checkpoint baseline for secondary enable.",
+		},
+
+		// --- Secondary Segmented Pre-Seed Import Begin ---
+		{
+			Pattern: "replication/dr/secondary/preseed/import-begin$",
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: "replication-dr-secondary-preseed",
+				OperationVerb:   "import-begin",
+			},
+
+			Fields: map[string]*framework.FieldSchema{
+				"token": {
+					Type:        framework.TypeString,
+					Description: "The DR activation token from the primary cluster.",
+					Required:    true,
+					DisplayAttrs: &framework.DisplayAttributes{
+						Sensitive: true,
+					},
+				},
+				"manifest": {
+					Type:        framework.TypeString,
+					Description: "The JSON segmented DR pre-seed manifest generated by the primary.",
+					Required:    true,
+				},
+				"confirm_replace_replicated_storage": {
+					Type:        framework.TypeBool,
+					Default:     false,
+					Description: "Operator confirmation that completing this import may replace the disabled secondary's replicated storage plane while preserving cluster-local paths.",
+				},
+			},
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback:                  b.handleDRSecondaryPreSeedImportBegin,
+					Summary:                   "Start a segmented DR pre-seed import.",
+					ForwardPerformanceStandby: true,
+				},
+			},
+
+			HelpSynopsis:    "Begin segmented DR pre-seed import",
+			HelpDescription: "Validates a segmented DR pre-seed manifest and records durable import staging before any replicated storage replacement happens.",
+		},
+
+		// --- Secondary Segmented Pre-Seed Import Segment ---
+		{
+			Pattern: "replication/dr/secondary/preseed/import-segment$",
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: "replication-dr-secondary-preseed",
+				OperationVerb:   "import-segment",
+			},
+
+			Fields: map[string]*framework.FieldSchema{
+				"token": {
+					Type:        framework.TypeString,
+					Description: "The DR activation token from the primary cluster.",
+					Required:    true,
+					DisplayAttrs: &framework.DisplayAttributes{
+						Sensitive: true,
+					},
+				},
+				"segment": {
+					Type:        framework.TypeString,
+					Description: "The JSON DR pre-seed segment generated by the primary.",
+					Required:    true,
+					DisplayAttrs: &framework.DisplayAttributes{
+						Sensitive: true,
+					},
+				},
+			},
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback:                  b.handleDRSecondaryPreSeedImportSegment,
+					Summary:                   "Stage one segmented DR pre-seed segment.",
+					ForwardPerformanceStandby: true,
+				},
+			},
+
+			HelpSynopsis:    "Import DR pre-seed segment",
+			HelpDescription: "Validates and durably stages one segmented DR pre-seed segment. Re-sending the same segment is idempotent.",
+		},
+
+		// --- Secondary Segmented Pre-Seed Import Complete ---
+		{
+			Pattern: "replication/dr/secondary/preseed/import-complete$",
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: "replication-dr-secondary-preseed",
+				OperationVerb:   "import-complete",
+			},
+
+			Fields: map[string]*framework.FieldSchema{
+				"token": {
+					Type:        framework.TypeString,
+					Description: "The DR activation token from the primary cluster.",
+					Required:    true,
+					DisplayAttrs: &framework.DisplayAttributes{
+						Sensitive: true,
+					},
+				},
+				"confirm_replace_replicated_storage": {
+					Type:        framework.TypeBool,
+					Default:     false,
+					Description: "Operator confirmation that completing this import may replace the disabled secondary's replicated storage plane while preserving cluster-local paths.",
+				},
+				"enable_secondary": {
+					Type:        framework.TypeBool,
+					Default:     false,
+					Description: "Enable DR secondary mode in the same authenticated request after accepting the staged pre-seed segments.",
+				},
+			},
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback:                  b.handleDRSecondaryPreSeedImportComplete,
+					Summary:                   "Complete a segmented DR pre-seed import.",
+					ForwardPerformanceStandby: true,
+				},
+			},
+
+			HelpSynopsis:    "Complete segmented DR pre-seed import",
+			HelpDescription: "Assembles staged DR pre-seed segments, validates the full bundle, replaces replicated storage, and records the checkpoint baseline for secondary enable.",
 		},
 
 		// --- Enable Secondary ---
@@ -1185,17 +1441,19 @@ func (b *SystemBackend) handleDRSecondaryVerifyCheckpoint(ctx context.Context, r
 	}
 
 	data := map[string]interface{}{
-		"pass":              result.Pass,
-		"reason":            result.Reason,
-		"state":             result.State,
-		"relationship_id":   result.RelationshipID,
-		"checkpoint_id":     result.CheckpointID,
-		"checkpoint_index":  result.CheckpointIndex,
-		"accumulator_index": result.AccumulatorIndex,
-		"range_count":       result.RangeCount,
-		"matched_ranges":    result.MatchedRanges,
-		"mismatched_ranges": result.MismatchedRanges,
-		"missing_ranges":    result.MissingRanges,
+		"pass":               result.Pass,
+		"reason":             result.Reason,
+		"state":              result.State,
+		"relationship_id":    result.RelationshipID,
+		"checkpoint_id":      result.CheckpointID,
+		"checkpoint_index":   result.CheckpointIndex,
+		"accumulator_index":  result.AccumulatorIndex,
+		"range_count":        result.RangeCount,
+		"matched_ranges":     result.MatchedRanges,
+		"mismatched_ranges":  result.MismatchedRanges,
+		"missing_ranges":     result.MissingRanges,
+		"physical_scan_used": result.PhysicalScanUsed,
+		"optimizer_reseeded": result.OptimizerReseeded,
 	}
 
 	if len(result.Mismatches) > 0 {
@@ -1362,6 +1620,143 @@ func (b *SystemBackend) handleDRPrimaryPreSeedExport(ctx context.Context, req *l
 	}, nil
 }
 
+func (b *SystemBackend) handleDRPrimaryPreSeedExportPlan(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	mgr := b.Core.drManager
+	if mgr == nil {
+		return logical.ErrorResponse("DR replication not initialized"), nil
+	}
+
+	relationshipIDRaw, ok := d.GetOk("relationship_id")
+	if !ok {
+		return logical.ErrorResponse("relationship_id is required"), nil
+	}
+	relationshipID, _ := relationshipIDRaw.(string)
+	relationshipID = strings.TrimSpace(relationshipID)
+	if relationshipID == "" {
+		return logical.ErrorResponse("relationship_id is required"), nil
+	}
+
+	ttlSeconds := d.Get("ttl_seconds").(int)
+	if ttlSeconds < 0 {
+		return logical.ErrorResponse("ttl_seconds must be >= 0"), nil
+	}
+	segmentMaxBytes := d.Get("segment_max_bytes").(int)
+	if segmentMaxBytes <= 0 {
+		return logical.ErrorResponse("segment_max_bytes must be > 0"), nil
+	}
+	if async := d.Get("async").(bool); async {
+		status, err := mgr.StartSegmentedPreSeedManifestPlan(ctx, relationshipID, segmentMaxBytes, time.Duration(ttlSeconds)*time.Second)
+		if err != nil {
+			return logical.ErrorResponse(err.Error()), nil
+		}
+		return drPreSeedExportPlanStatusResponse(status)
+	}
+	manifest, entryCount, err := mgr.GenerateSegmentedPreSeedManifest(ctx, relationshipID, segmentMaxBytes, time.Duration(ttlSeconds)*time.Second)
+	if err != nil {
+		return logical.ErrorResponse(err.Error()), nil
+	}
+	return drPreSeedExportPlanStatusResponse(&DRPreSeedExportPlanStatus{
+		State:      drPreSeedExportPlanStateComplete,
+		Manifest:   manifest,
+		EntryCount: entryCount,
+	})
+}
+
+func (b *SystemBackend) handleDRPrimaryPreSeedExportPlanStatus(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	mgr := b.Core.drManager
+	if mgr == nil {
+		return logical.ErrorResponse("DR replication not initialized"), nil
+	}
+
+	planIDRaw, ok := d.GetOk("plan_id")
+	if !ok {
+		return logical.ErrorResponse("plan_id is required"), nil
+	}
+	planID, _ := planIDRaw.(string)
+	planID = strings.TrimSpace(planID)
+	if planID == "" {
+		return logical.ErrorResponse("plan_id is required"), nil
+	}
+
+	status, err := mgr.GetSegmentedPreSeedManifestPlan(planID)
+	if err != nil {
+		return logical.ErrorResponse(err.Error()), nil
+	}
+	return drPreSeedExportPlanStatusResponse(status)
+}
+
+func drPreSeedExportPlanStatusResponse(status *DRPreSeedExportPlanStatus) (*logical.Response, error) {
+	if status == nil {
+		return nil, fmt.Errorf("DR pre-seed export plan status is nil")
+	}
+	data := map[string]interface{}{
+		"plan_id":           status.PlanID,
+		"state":             status.State,
+		"entry_count":       status.EntryCount,
+		"started_at_unix":   status.StartedAtUnix,
+		"completed_at_unix": status.CompletedAtUnix,
+	}
+	if status.Error != "" {
+		data["error"] = status.Error
+	}
+	if status.Manifest != nil {
+		manifestJSON, err := json.Marshal(status.Manifest)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal DR pre-seed manifest: %w", err)
+		}
+		data["manifest"] = string(manifestJSON)
+		data["relationship_id"] = status.Manifest.RelationshipID
+		data["checkpoint_id"] = status.Manifest.CheckpointID
+		data["checkpoint_index"] = status.Manifest.CheckpointIndex
+		data["segment_count"] = len(status.Manifest.BundleSegments)
+		data["bundle_integrity_sha256"] = hex.EncodeToString(status.Manifest.BundleIntegritySHA256)
+		data["expires_at_unix"] = status.Manifest.ExpiresAtUnix
+	}
+	return &logical.Response{Data: data}, nil
+}
+
+func (b *SystemBackend) handleDRPrimaryPreSeedExportSegment(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	mgr := b.Core.drManager
+	if mgr == nil {
+		return logical.ErrorResponse("DR replication not initialized"), nil
+	}
+
+	manifestRaw, ok := d.GetOk("manifest")
+	if !ok {
+		return logical.ErrorResponse("manifest is required"), nil
+	}
+	manifestStr, ok := manifestRaw.(string)
+	if !ok || manifestStr == "" {
+		return logical.ErrorResponse("manifest must be a non-empty string"), nil
+	}
+	var manifest DRPreSeedManifest
+	if err := json.Unmarshal([]byte(manifestStr), &manifest); err != nil {
+		return logical.ErrorResponse("invalid pre-seed manifest: %s", err.Error()), nil
+	}
+	segmentIndex := d.Get("segment_index").(int)
+	if segmentIndex < 0 {
+		return logical.ErrorResponse("segment_index must be >= 0"), nil
+	}
+	segment, err := mgr.GeneratePreSeedSegment(ctx, &manifest, segmentIndex)
+	if err != nil {
+		return logical.ErrorResponse(err.Error()), nil
+	}
+	segmentJSON, err := json.Marshal(segment)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal DR pre-seed segment: %w", err)
+	}
+	descriptor := manifest.BundleSegments[segmentIndex]
+	return &logical.Response{
+		Data: map[string]interface{}{
+			"segment":       string(segmentJSON),
+			"segment_index": segment.SegmentIndex,
+			"entry_count":   segment.EntryCount,
+			"byte_count":    descriptor.ByteCount,
+			"sha256":        hex.EncodeToString(descriptor.SHA256),
+		},
+	}, nil
+}
+
 func (b *SystemBackend) handleDRSecondaryPreSeedAccept(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
 	mgr := b.Core.drManager
 	if mgr == nil {
@@ -1454,6 +1849,13 @@ func (b *SystemBackend) handleDRSecondaryPreSeedImport(ctx context.Context, req 
 	if err := mgr.ImportPreSeedBundle(ctx, &bundle, &token, time.Now().UTC(), confirmReplace); err != nil {
 		return logical.ErrorResponse(err.Error()), nil
 	}
+	enabled := false
+	if d.Get("enable_secondary").(bool) {
+		if err := mgr.EnableSecondary(ctx, &token, req.ClientToken); err != nil {
+			return logical.ErrorResponse("pre-seed bundle imported but secondary enable failed: %s", err.Error()), nil
+		}
+		enabled = true
+	}
 	return &logical.Response{
 		Data: map[string]interface{}{
 			"message":          "DR pre-seed bundle imported",
@@ -1461,6 +1863,153 @@ func (b *SystemBackend) handleDRSecondaryPreSeedImport(ctx context.Context, req 
 			"checkpoint_id":    bundle.Manifest.CheckpointID,
 			"checkpoint_index": bundle.Manifest.CheckpointIndex,
 			"entry_count":      bundle.EntryCount,
+			"enabled":          enabled,
+		},
+	}, nil
+}
+
+func (b *SystemBackend) handleDRSecondaryPreSeedImportBegin(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	mgr := b.Core.drManager
+	if mgr == nil {
+		return logical.ErrorResponse("DR replication not initialized"), nil
+	}
+
+	tokenRaw, ok := d.GetOk("token")
+	if !ok {
+		return logical.ErrorResponse("token is required"), nil
+	}
+	tokenStr, ok := tokenRaw.(string)
+	if !ok || tokenStr == "" {
+		return logical.ErrorResponse("token must be a non-empty string"), nil
+	}
+	if len(tokenStr) > drActivationTokenMaxBytes {
+		return logical.ErrorResponse("activation token exceeds maximum size %d", drActivationTokenMaxBytes), nil
+	}
+	var token DRActivationToken
+	if err := json.Unmarshal([]byte(tokenStr), &token); err != nil {
+		return logical.ErrorResponse("invalid activation token: %s", err.Error()), nil
+	}
+
+	manifestRaw, ok := d.GetOk("manifest")
+	if !ok {
+		return logical.ErrorResponse("manifest is required"), nil
+	}
+	manifestStr, ok := manifestRaw.(string)
+	if !ok || manifestStr == "" {
+		return logical.ErrorResponse("manifest must be a non-empty string"), nil
+	}
+	var manifest DRPreSeedManifest
+	if err := json.Unmarshal([]byte(manifestStr), &manifest); err != nil {
+		return logical.ErrorResponse("invalid pre-seed manifest: %s", err.Error()), nil
+	}
+
+	confirmReplace := d.Get("confirm_replace_replicated_storage").(bool)
+	if err := mgr.BeginPreSeedSegmentImport(ctx, &manifest, &token, time.Now().UTC(), confirmReplace); err != nil {
+		return logical.ErrorResponse(err.Error()), nil
+	}
+	return &logical.Response{
+		Data: map[string]interface{}{
+			"message":          "DR pre-seed segment import started",
+			"relationship_id":  manifest.RelationshipID,
+			"checkpoint_id":    manifest.CheckpointID,
+			"checkpoint_index": manifest.CheckpointIndex,
+			"segment_count":    len(manifest.BundleSegments),
+		},
+	}, nil
+}
+
+func (b *SystemBackend) handleDRSecondaryPreSeedImportSegment(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	mgr := b.Core.drManager
+	if mgr == nil {
+		return logical.ErrorResponse("DR replication not initialized"), nil
+	}
+
+	tokenRaw, ok := d.GetOk("token")
+	if !ok {
+		return logical.ErrorResponse("token is required"), nil
+	}
+	tokenStr, ok := tokenRaw.(string)
+	if !ok || tokenStr == "" {
+		return logical.ErrorResponse("token must be a non-empty string"), nil
+	}
+	if len(tokenStr) > drActivationTokenMaxBytes {
+		return logical.ErrorResponse("activation token exceeds maximum size %d", drActivationTokenMaxBytes), nil
+	}
+	var token DRActivationToken
+	if err := json.Unmarshal([]byte(tokenStr), &token); err != nil {
+		return logical.ErrorResponse("invalid activation token: %s", err.Error()), nil
+	}
+
+	segmentRaw, ok := d.GetOk("segment")
+	if !ok {
+		return logical.ErrorResponse("segment is required"), nil
+	}
+	segmentStr, ok := segmentRaw.(string)
+	if !ok || segmentStr == "" {
+		return logical.ErrorResponse("segment must be a non-empty string"), nil
+	}
+	if len(segmentStr) > drPreSeedBundleMaxBytes {
+		return logical.ErrorResponse("pre-seed segment exceeds maximum size %d", drPreSeedBundleMaxBytes), nil
+	}
+	var segment DRPreSeedSegment
+	if err := json.Unmarshal([]byte(segmentStr), &segment); err != nil {
+		return logical.ErrorResponse("invalid pre-seed segment: %s", err.Error()), nil
+	}
+	received, expected, err := mgr.ImportPreSeedSegment(ctx, &segment, &token, time.Now().UTC())
+	if err != nil {
+		return logical.ErrorResponse(err.Error()), nil
+	}
+	return &logical.Response{
+		Data: map[string]interface{}{
+			"message":           "DR pre-seed segment staged",
+			"relationship_id":   segment.Manifest.RelationshipID,
+			"checkpoint_id":     segment.Manifest.CheckpointID,
+			"checkpoint_index":  segment.Manifest.CheckpointIndex,
+			"segment_index":     segment.SegmentIndex,
+			"received_segments": received,
+			"expected_segments": expected,
+		},
+	}, nil
+}
+
+func (b *SystemBackend) handleDRSecondaryPreSeedImportComplete(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	mgr := b.Core.drManager
+	if mgr == nil {
+		return logical.ErrorResponse("DR replication not initialized"), nil
+	}
+
+	tokenRaw, ok := d.GetOk("token")
+	if !ok {
+		return logical.ErrorResponse("token is required"), nil
+	}
+	tokenStr, ok := tokenRaw.(string)
+	if !ok || tokenStr == "" {
+		return logical.ErrorResponse("token must be a non-empty string"), nil
+	}
+	if len(tokenStr) > drActivationTokenMaxBytes {
+		return logical.ErrorResponse("activation token exceeds maximum size %d", drActivationTokenMaxBytes), nil
+	}
+	var token DRActivationToken
+	if err := json.Unmarshal([]byte(tokenStr), &token); err != nil {
+		return logical.ErrorResponse("invalid activation token: %s", err.Error()), nil
+	}
+
+	confirmReplace := d.Get("confirm_replace_replicated_storage").(bool)
+	if err := mgr.CompletePreSeedSegmentImport(ctx, &token, time.Now().UTC(), confirmReplace); err != nil {
+		return logical.ErrorResponse(err.Error()), nil
+	}
+	enabled := false
+	if d.Get("enable_secondary").(bool) {
+		if err := mgr.EnableSecondary(ctx, &token, req.ClientToken); err != nil {
+			return logical.ErrorResponse("pre-seed segment import completed but secondary enable failed: %s", err.Error()), nil
+		}
+		enabled = true
+	}
+	return &logical.Response{
+		Data: map[string]interface{}{
+			"message":         "DR pre-seed segment import completed",
+			"relationship_id": token.RelationshipID,
+			"enabled":         enabled,
 		},
 	}, nil
 }

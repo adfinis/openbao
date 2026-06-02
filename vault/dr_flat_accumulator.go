@@ -1069,7 +1069,7 @@ func (s *drReplicationSecondary) accumulatorDeltaForChange(
 	if key == "" {
 		key = change.Key
 	}
-	if key == "" || isDRNeverReplicatePath(key) {
+	if key == "" || isDRReconcileExcludedPath(key) {
 		return delta, false, nil
 	}
 

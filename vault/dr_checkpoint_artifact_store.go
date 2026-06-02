@@ -32,12 +32,13 @@ const (
 )
 
 type drCheckpointArtifactRecord struct {
-	KID       [32]byte
-	VID       [32]byte
-	Key       string
-	SealWrap  bool
-	Tombstone bool
-	ValueRef  string
+	KID         [32]byte
+	VID         [32]byte
+	Key         string
+	SealWrap    bool
+	Tombstone   bool
+	ValueRef    string
+	ValueSHA256 [32]byte
 }
 
 type drCheckpointArtifact struct {
@@ -133,6 +134,21 @@ func (s *drCheckpointArtifactStore) getRecord(checkpointID string, kid [32]byte)
 	}
 	rec, ok := art.Records[kid]
 	return rec, ok, nil
+}
+
+func (s *drCheckpointArtifactStore) records(checkpointID string) ([]drCheckpointArtifactRecord, error) {
+	s.mu.RLock()
+	art, ok := s.artifacts[checkpointID]
+	if !ok {
+		s.mu.RUnlock()
+		return nil, fmt.Errorf("checkpoint artifact missing")
+	}
+	records := make([]drCheckpointArtifactRecord, 0, len(art.Records))
+	for _, rec := range art.Records {
+		records = append(records, rec)
+	}
+	s.mu.RUnlock()
+	return records, nil
 }
 
 func (s *drCheckpointArtifactStore) readValue(checkpointID, valueRef string) ([]byte, error) {
@@ -266,20 +282,18 @@ func (s *drCheckpointArtifactStore) putArtifact(art *drCheckpointArtifact) error
 	if art == nil {
 		return fmt.Errorf("nil checkpoint artifact")
 	}
-	if art.Bytes > s.perRelBudget {
-		if art.Path != "" {
-			_ = os.RemoveAll(art.Path)
-		}
-		return fmt.Errorf("checkpoint artifact exceeds per-relationship budget")
-	}
 	if art.Bytes > s.globalBudget {
 		if art.Path != "" {
 			_ = os.RemoveAll(art.Path)
 		}
 		return fmt.Errorf("checkpoint artifact exceeds global budget")
 	}
+	relationshipLimit := s.perRelBudget
+	if art.Bytes > relationshipLimit {
+		relationshipLimit = art.Bytes
+	}
 
-	for s.relationshipBytesLocked(art.RelationshipID)+art.Bytes > s.perRelBudget {
+	for s.relationshipBytesLocked(art.RelationshipID)+art.Bytes > relationshipLimit {
 		if !s.evictOldestRelationshipLocked(art.RelationshipID) {
 			break
 		}
@@ -289,7 +303,7 @@ func (s *drCheckpointArtifactStore) putArtifact(art *drCheckpointArtifact) error
 			break
 		}
 	}
-	if s.relationshipBytesLocked(art.RelationshipID)+art.Bytes > s.perRelBudget {
+	if s.relationshipBytesLocked(art.RelationshipID)+art.Bytes > relationshipLimit {
 		if art.Path != "" {
 			_ = os.RemoveAll(art.Path)
 		}
@@ -395,6 +409,7 @@ func (s *drCheckpointArtifactStore) build(
 
 		rec.SealWrap = entry.SealWrap
 		rec.VID = scanner.ComputeVIDWithSealWrap(entry.Value, entry.SealWrap)
+		rec.ValueSHA256 = sha256.Sum256(entry.Value)
 		if expectedVID, ok := cp.kidToVID[kid]; ok && expectedVID != rec.VID {
 			s.storageDriftHit.Add(1)
 		}
