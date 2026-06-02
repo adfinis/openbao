@@ -1000,6 +1000,88 @@
       "notes": "Negative-path clustered smoke. Secondary1 is intentionally configured with a one-byte reconcile RPC budget and is expected not to converge; primary and secondary2 remain the correctness control path."
     },
     {
+      "scenario_id": "S23",
+      "scenario": "Clustered fragmented reconciliation fanout cap",
+      "run_id": "fragmented-fanout-20260602T134143Z",
+      "path": "dr-stress-results/fragmented-fanout-20260602T134143Z",
+      "topology": "ha-primary-plus-two-secondaries",
+      "command_shape": "scripts/dr_local_test.sh --topology ha fragmented-fanout-smoke",
+      "result": "pass_with_expected_client_transients",
+      "duration_seconds": 180,
+      "concurrency": 48,
+      "operations_total": 16798,
+      "operations_per_second": 81.92,
+      "put_fail": 0,
+      "get_fail": 6,
+      "status_fail": 0,
+      "sentinel_converged": {
+        "secondary1_seconds": 19.0,
+        "secondary2_seconds": 1.0
+      },
+      "fanout_cap": {
+        "secondary1_reconcile_max_range_drilldown_rpcs": 1,
+        "journal_range_too_old_delta": 3,
+        "primary_range_digest_requests_before": 32,
+        "primary_range_digest_requests_after": 2842,
+        "primary_range_digest_requests_delta": 2810,
+        "primary_fetch_requests_before": 32,
+        "primary_fetch_requests_after": 2842,
+        "primary_fetch_requests_delta": 2810,
+        "secondary1_range_drilldown_rpc_before": 16,
+        "secondary1_range_drilldown_rpc_after": 2810,
+        "secondary1_range_drilldown_rpc_delta": 2794,
+        "secondary1_coarse_fetch_before": 0,
+        "secondary1_coarse_fetch_after": 2730,
+        "secondary1_coarse_fetch_ranges_before": 0,
+        "secondary1_coarse_fetch_ranges_after": 4234
+      },
+      "status_after": {
+        "secondary1": {
+          "secondary_state": "streaming",
+          "lag_entries": 0,
+          "last_applied_index": 11912,
+          "primary_index": 11909,
+          "reconcile_count": 3,
+          "flat_accumulator_indexed_repair_total": 3,
+          "flat_accumulator_indexed_repair_ranges_total": 2810,
+          "local_kid_index_bucket_loads_total": 4658,
+          "local_kid_index_entries_loaded_total": 11276,
+          "local_kid_index_fallback_scans_total": 0,
+          "flat_accumulator_indexed_repair_full_bucket_fallback_total": 0,
+          "flat_accumulator_indexed_repair_proof_mismatches_total": 0,
+          "local_kid_index_load_failures_total": 0,
+          "scan_failures_total": 0
+        }
+      },
+      "verification": {
+        "primary": { "pass": true, "sampled": 2433, "missing": 0, "mismatches": 0, "errors": 0 },
+        "secondary1": {
+          "pass": true,
+          "method": "checkpoint",
+          "checkpoint_index": 11912,
+          "accumulator_index": 11912,
+          "matched_ranges": 1024,
+          "mismatched_ranges": 0,
+          "missing_ranges": 0,
+          "physical_scan_used": false,
+          "optimizer_reseeded": false
+        },
+        "secondary2": {
+          "pass": true,
+          "method": "checkpoint",
+          "checkpoint_index": 11912,
+          "accumulator_index": 11912,
+          "matched_ranges": 1024,
+          "mismatched_ranges": 0,
+          "missing_ranges": 0,
+          "physical_scan_used": false,
+          "optimizer_reseeded": false
+        }
+      },
+      "harness": "scripts/dr-harness",
+      "notes": "Clustered low-cap counterpart to the S23 unit test. Secondary1 is the intentionally disrupted low-fanout target; primary and secondary2 keep the normal out-of-horizon profile. GET failures are client-facing HA disruption noise; terminal primary API and strict-secondary checkpoint verification passed."
+    },
+    {
       "scenario_id": "E15",
       "scenario": "Engine/runtime lifecycle matrix",
       "run_id": "engine-matrix-20260530161139",

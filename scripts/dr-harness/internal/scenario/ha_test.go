@@ -22,6 +22,23 @@ func TestOversizedCheckpointTuningProfile(t *testing.T) {
 	}
 }
 
+func TestOutOfHorizonLowFanoutTuningProfile(t *testing.T) {
+	values, err := tuningProfileValues("out-of-horizon-low-fanout")
+	if err != nil {
+		t.Fatalf("tuningProfileValues returned error: %v", err)
+	}
+
+	if got, want := values["reconcile_max_range_drilldown_rpcs"], 1; got != want {
+		t.Fatalf("reconcile_max_range_drilldown_rpcs = %v, want %v", got, want)
+	}
+	if got, want := values["stream_journal_max_bytes"], 262144; got != want {
+		t.Fatalf("stream_journal_max_bytes = %v, want %v", got, want)
+	}
+	if got, want := values["reconcile_max_inflight_tasks"], 8; got != want {
+		t.Fatalf("reconcile_max_inflight_tasks = %v, want %v", got, want)
+	}
+}
+
 func TestCheckpointVerifyReasonRetryable(t *testing.T) {
 	tests := []struct {
 		name   string

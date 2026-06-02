@@ -415,6 +415,7 @@ type DRStatus struct {
 	FetchRequestsTotal                        int64   `json:"fetch_requests_total"`
 	FetchRequestRejectionsTotal               int64   `json:"fetch_request_rejections_total"`
 	FetchResponseBudgetRejectionsTotal        int64   `json:"fetch_response_budget_rejections_total"`
+	ReconcileMaxRangeDrillDownRPCs            int     `json:"reconcile_max_range_drilldown_rpcs"`
 }
 
 func (c *Client) DRStatus(ctx context.Context) (*DRStatus, []byte, error) {

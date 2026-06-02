@@ -97,7 +97,7 @@ The next scale work should focus on:
 - pre-seed external artifact lifecycle for large existing clusters;
 - optimizer seeding after pre-seed/resnapshot;
 - larger dataset fixtures beyond the current 100k evidence; and
-- clustered validation and default tuning for fragmented drill-down fanout caps.
+- production default tuning for fragmented drill-down fanout caps.
 
 ## Validation Backlog
 

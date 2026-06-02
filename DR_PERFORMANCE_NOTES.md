@@ -94,6 +94,14 @@ same checkpoint correctness boundary because each coarser span still carries a
 primary digest proof and the fetch verifier recomputes it before applying
 remote entries or inferring local-only deletes.
 
+The clustered low-cap smoke `fragmented-fanout-20260602T134143Z` exercised that
+path under HA outage load. With `reconcile_max_range_drilldown_rpcs=1` applied
+only to the disrupted secondary, primary range-digest request delta dropped to
+2,810 for the run, compared with the 17,740-request delta from the earlier
+default-cap indexed-repair smoke shape. The secondary used 2,730 coarse fetches,
+kept fallback/proof/load failure counters at zero, and checkpoint verification
+remained scan-free on both secondaries.
+
 ## Large Existing Clusters
 
 For an old primary with a very large dataset, the intended initial-sync path is
@@ -120,8 +128,8 @@ The strongest next optimizations are:
 - external, signed pre-seed artifact storage with resumable segment transfer;
 - optimizer seeding from verified checkpoint artifacts after pre-seed and
   resnapshot;
-- clustered validation and default tuning for bounded drill-down fanout under
-  highly fragmented reconnects;
+- production default tuning for bounded drill-down fanout under larger
+  fragmented reconnects;
 - more aggressive coalescing of secondary local metadata writes;
 - measured defaults for stream journal retention and adaptive batching; and
 - larger fixture profiles that validate key-count scaling separately from

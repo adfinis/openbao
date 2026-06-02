@@ -147,6 +147,7 @@ scripts/dr_local_test.sh --topology ha accumulator-cold-restart-smoke
 scripts/dr_local_test.sh --topology ha smoke --duration 900 --concurrency 48 --stepdown-interval 300
 scripts/dr_local_test.sh --topology ha tuning-load-smoke --duration 900 --concurrency 36 --stepdown-interval 90 --first-tune-after 60 --second-tune-after 180 --max-wait-seconds 900 --progress-interval 30 --monitor-interval 2
 scripts/dr_local_test.sh --topology ha indexed-repair-smoke
+scripts/dr_local_test.sh --topology ha fragmented-fanout-smoke
 scripts/dr_local_test.sh --topology ha reconcile-budget-smoke
 scripts/dr_local_test.sh --topology ha verify --sample 0
 # To force legacy secondary API reads for a read-serving experiment:
@@ -185,6 +186,7 @@ make dr-test-ha-promoted-durability-smoke
 make dr-test-ha-reseed-secondary-smoke
 make dr-test-ha-preseed-smoke
 make dr-test-ha-indexed-repair-smoke
+make dr-test-ha-fragmented-fanout-smoke
 make dr-test-ha-reconcile-budget-smoke
 make dr-test-ha-failover-load-lifecycle
 make dr-test-ha-down
@@ -301,8 +303,9 @@ scripts remain available under `scripts/`.
 The active local entrypoints for `smoke`, `preseed-smoke`,
 `quiescent-reconnect-smoke`, `accumulator-cold-restart-smoke`,
 `secondary-outage-smoke`, `secondary-outage-reconcile-smoke`, and
-`indexed-repair-smoke`, `reconcile-budget-smoke`, and `tuning-load-smoke` are
-backed by the typed Go harness in `scripts/dr-harness`.
+`indexed-repair-smoke`, `fragmented-fanout-smoke`,
+`reconcile-budget-smoke`, and `tuning-load-smoke` are backed by the typed Go
+harness in `scripts/dr-harness`.
 `scripts/dr_local_test.sh` remains the compatibility wrapper and retains legacy
 shell bodies under `_legacy` command functions while parity is being proven.
 
@@ -330,7 +333,7 @@ shell bodies under `_legacy` command functions while parity is being proven.
 | S20 | Reconcile budget exhaustion | `go test ./vault -run TestDRRangeReconciliationBudgetExhaustionDoesNotAdvanceCheckpoint -count=1`; clustered smoke: `scripts/dr_local_test.sh --topology ha reconcile-budget-smoke` | Configure an intentionally low checkpoint-scoped secondary reconcile budget and verify the secondary stops cleanly instead of saturating itself | Unit gate verifies `last_applied_index` and durable checkpoint high-water mark do not advance on incomplete repair. Clustered smoke verifies an HA secondary reports `budget_exhausted` with phase, consumed bytes, RPCs, retry snapshot, and visible lag while primary plus the healthy control secondary continue to validate terminal correctness |
 | S21 | Primary checkpoint pressure bounds | `go test ./vault -run 'TestDRPrimary_ExchangeRangeChecksumsRejectsOversizedRequests|TestDRPrimary_ExchangeRangeDigestsRejectsMalformedParentSpan|TestFetchEntriesRejectsOversizedAndMalformedRequests|TestFetchEntriesRejectsSingleEntryOverResponseByteBudget|TestDRPrimary_CheckpointBuildAdmissionLimitsCrossRelationshipConcurrency' -count=1` | Configure or trigger low primary checkpoint/digest/fetch limits and verify primary-side admission and request/response caps fire predictably | Primary exposes checkpoint build/admission, range-checksum, range-digest, fetch-request, and fetch-response budget counters; callers receive bounded retryable or invalid-request failures; no relationship can force unbounded checkpoint build concurrency, digest fanout, or fetch serialization in these covered paths |
 | S22 | DR pre-seed manifest and bundle validation | `go test ./vault -run 'TestDRPreSeed|TestDRRelationshipManager.*PreSeed' -count=1` | Generate, export, accept, stage, complete, or import seed material with relationship, checkpoint, algorithm, lineage, expiry, integrity, KID/VID, artifact-format, segment descriptor, and local-only scrub mismatches | Valid seed material is accepted only for the matching fresh relationship; stale lineage, wrong primary cluster, wrong relationship, wrong range/checksum version, missing scrub metadata, expired seed material, tampered bundle bytes, incomplete staged imports, invalid segment metadata, and local-only seed entries are rejected before trusting restored storage |
-| S23 | Fragmented reconciliation fanout cap | `go test ./vault -run TestDRRangeDrillDownFanoutLimitFallsBackToCoarseFetch -count=1` | Configure a low per-range drill-down RPC cap and force fragmented child spans | Secondary performs one child-digest RPC, stops further drill-down at the cap, returns coarser proof-bearing fetch spans, increments drill-down RPC/coarse-fetch status counters, and leaves correctness to the existing fetch digest verifier |
+| S23 | Fragmented reconciliation fanout cap | `go test ./vault -run TestDRRangeDrillDownFanoutLimitFallsBackToCoarseFetch -count=1`; clustered smoke: `scripts/dr_local_test.sh --topology ha fragmented-fanout-smoke` or `make dr-test-ha-fragmented-fanout-smoke` | Configure a low per-range drill-down RPC cap and force fragmented child spans | Unit gate verifies the secondary performs one child-digest RPC, stops further drill-down at the cap, returns coarser proof-bearing fetch spans, increments drill-down RPC/coarse-fetch status counters, and leaves correctness to the existing fetch digest verifier. Clustered smoke applies the low cap only to the disrupted HA secondary, requires coarse-fetch counters to increase, bounds primary range-digest fanout, keeps indexed repair fallback/proof/load failure counters at zero, and requires both secondaries to return to streaming with terminal verification passing through the supported verification path |
 
 ### Stress Run Examples
 

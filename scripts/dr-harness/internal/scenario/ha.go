@@ -47,6 +47,7 @@ type OutageConfig struct {
 	MaxWait          time.Duration
 	ExpectReconcile  bool
 	ExpectBudget     bool
+	LowFanout        bool
 	TuningProfile    string
 	RunPrefix        string
 }
@@ -397,7 +398,11 @@ func RunSecondaryOutage(ctx context.Context, cfg OutageConfig) error {
 		if err := applyReconcileBudgetPressureTuning(ctx, rt); err != nil {
 			return err
 		}
-	} else if cfg.TuningProfile != "" {
+	} else if cfg.LowFanout {
+		if err := applyLowFanoutTuning(ctx, rt); err != nil {
+			return err
+		}
+	} else if strings.TrimSpace(cfg.TuningProfile) != "" && strings.TrimSpace(cfg.TuningProfile) != "none" {
 		if err := applyTuningProfile(ctx, rt, cfg.TuningProfile); err != nil {
 			return err
 		}
@@ -415,6 +420,7 @@ func RunSecondaryOutage(ctx context.Context, cfg OutageConfig) error {
 	run.Logf("outage_seconds=%d", int(cfg.OutageSeconds.Seconds()))
 	run.Logf("expect_reconcile=%t", cfg.ExpectReconcile)
 	run.Logf("expect_budget=%t", cfg.ExpectBudget)
+	run.Logf("low_fanout=%t", cfg.LowFanout)
 	run.Logf("tuning_profile=%s", cfg.TuningProfile)
 
 	primaryActive, err := topology.WaitActiveAddr(ctx, rt.primary, "primary pre-outage", 120*time.Second)
@@ -580,34 +586,42 @@ func RunSecondaryOutage(ctx context.Context, cfg OutageConfig) error {
 	}
 
 	result := map[string]any{
-		"run_id":                           run.ID,
-		"expect_reconcile":                 cfg.ExpectReconcile,
-		"expect_budget":                    cfg.ExpectBudget,
-		"primary_active_final":             primaryActive,
-		"secondary1_active_final":          secondary1Active,
-		"last_applied_before_secondary1":   beforeSecondary1.LastAppliedIndex,
-		"last_applied_after_secondary1":    afterSecondary1.LastAppliedIndex,
-		"reconcile_before_secondary1":      beforeSecondary1.ReconcileCount,
-		"reconcile_after_secondary1":       afterSecondary1.ReconcileCount,
-		"budget_exhausted_before":          beforeSecondary1.ReconcileBudgetExhaustedTotal,
-		"budget_exhausted_after":           afterSecondary1.ReconcileBudgetExhaustedTotal,
-		"budget_exhausted_phase_last":      afterSecondary1.ReconcileBudgetExhaustedPhaseLast,
-		"budget_exhausted_reason_last":     afterSecondary1.ReconcileBudgetExhaustedReasonLast,
-		"budget_exhausted_rpc_bytes_last":  afterSecondary1.ReconcileBudgetExhaustedRPCBytesLast,
-		"budget_exhausted_max_rpc_bytes":   afterSecondary1.ReconcileBudgetExhaustedMaxRPCBytesLast,
-		"indexed_repair_before_secondary1": beforeSecondary1.FlatAccumulatorIndexedRepair,
-		"indexed_repair_after_secondary1":  afterSecondary1.FlatAccumulatorIndexedRepair,
-		"local_kid_fallback_before":        beforeSecondary1.LocalKIDIndexFallbackScans,
-		"local_kid_fallback_after":         afterSecondary1.LocalKIDIndexFallbackScans,
-		"journal_range_too_old_before":     beforePrimary.JournalRangeTooOldTotal,
-		"journal_range_too_old_after":      afterPrimary.JournalRangeTooOldTotal,
-		"range_checksum_requests_before":   beforePrimary.RangeChecksumRequestsTotal,
-		"range_checksum_requests_after":    afterPrimary.RangeChecksumRequestsTotal,
-		"range_digest_requests_before":     beforePrimary.RangeDigestRequestsTotal,
-		"range_digest_requests_after":      afterPrimary.RangeDigestRequestsTotal,
-		"fetch_requests_before":            beforePrimary.FetchRequestsTotal,
-		"fetch_requests_after":             afterPrimary.FetchRequestsTotal,
-		"completed_at":                     time.Now().UTC().Format(time.RFC3339),
+		"run_id":                             run.ID,
+		"expect_reconcile":                   cfg.ExpectReconcile,
+		"expect_budget":                      cfg.ExpectBudget,
+		"low_fanout":                         cfg.LowFanout,
+		"primary_active_final":               primaryActive,
+		"secondary1_active_final":            secondary1Active,
+		"last_applied_before_secondary1":     beforeSecondary1.LastAppliedIndex,
+		"last_applied_after_secondary1":      afterSecondary1.LastAppliedIndex,
+		"reconcile_before_secondary1":        beforeSecondary1.ReconcileCount,
+		"reconcile_after_secondary1":         afterSecondary1.ReconcileCount,
+		"budget_exhausted_before":            beforeSecondary1.ReconcileBudgetExhaustedTotal,
+		"budget_exhausted_after":             afterSecondary1.ReconcileBudgetExhaustedTotal,
+		"budget_exhausted_phase_last":        afterSecondary1.ReconcileBudgetExhaustedPhaseLast,
+		"budget_exhausted_reason_last":       afterSecondary1.ReconcileBudgetExhaustedReasonLast,
+		"budget_exhausted_rpc_bytes_last":    afterSecondary1.ReconcileBudgetExhaustedRPCBytesLast,
+		"budget_exhausted_max_rpc_bytes":     afterSecondary1.ReconcileBudgetExhaustedMaxRPCBytesLast,
+		"indexed_repair_before_secondary1":   beforeSecondary1.FlatAccumulatorIndexedRepair,
+		"indexed_repair_after_secondary1":    afterSecondary1.FlatAccumulatorIndexedRepair,
+		"local_kid_fallback_before":          beforeSecondary1.LocalKIDIndexFallbackScans,
+		"local_kid_fallback_after":           afterSecondary1.LocalKIDIndexFallbackScans,
+		"journal_range_too_old_before":       beforePrimary.JournalRangeTooOldTotal,
+		"journal_range_too_old_after":        afterPrimary.JournalRangeTooOldTotal,
+		"range_checksum_requests_before":     beforePrimary.RangeChecksumRequestsTotal,
+		"range_checksum_requests_after":      afterPrimary.RangeChecksumRequestsTotal,
+		"range_digest_requests_before":       beforePrimary.RangeDigestRequestsTotal,
+		"range_digest_requests_after":        afterPrimary.RangeDigestRequestsTotal,
+		"fetch_requests_before":              beforePrimary.FetchRequestsTotal,
+		"fetch_requests_after":               afterPrimary.FetchRequestsTotal,
+		"range_drilldown_rpc_before":         beforeSecondary1.RangeDrillDownRPCsTotal,
+		"range_drilldown_rpc_after":          afterSecondary1.RangeDrillDownRPCsTotal,
+		"coarse_fetch_before":                beforeSecondary1.RangeDrillDownCoarseFetchTotal,
+		"coarse_fetch_after":                 afterSecondary1.RangeDrillDownCoarseFetchTotal,
+		"coarse_fetch_ranges_before":         beforeSecondary1.RangeDrillDownCoarseFetchRangesTotal,
+		"coarse_fetch_ranges_after":          afterSecondary1.RangeDrillDownCoarseFetchRangesTotal,
+		"reconcile_max_range_drilldown_rpcs": afterSecondary1.ReconcileMaxRangeDrillDownRPCs,
+		"completed_at":                       time.Now().UTC().Format(time.RFC3339),
 	}
 	if err := run.WriteJSON("result.json", result); err != nil {
 		return err
@@ -1168,6 +1182,24 @@ func validateOutageCounters(cfg OutageConfig, before, after, beforePrimary, afte
 			after.LocalKIDIndexLoadFailures > before.LocalKIDIndexLoadFailures {
 			return fmt.Errorf("secondary1 indexed repair fallback/proof/load failure counters increased")
 		}
+		if cfg.LowFanout {
+			if after.ReconcileMaxRangeDrillDownRPCs != 1 {
+				return fmt.Errorf("secondary1 low-fanout tuning not active: reconcile_max_range_drilldown_rpcs=%d", after.ReconcileMaxRangeDrillDownRPCs)
+			}
+			if after.RangeDrillDownRPCsTotal <= before.RangeDrillDownRPCsTotal {
+				return fmt.Errorf("secondary1 low-fanout smoke did not perform drill-down RPCs: %d -> %d",
+					before.RangeDrillDownRPCsTotal, after.RangeDrillDownRPCsTotal)
+			}
+			if after.RangeDrillDownCoarseFetchTotal <= before.RangeDrillDownCoarseFetchTotal ||
+				after.RangeDrillDownCoarseFetchRangesTotal <= before.RangeDrillDownCoarseFetchRangesTotal {
+				return fmt.Errorf("secondary1 low-fanout smoke did not use coarse fetch fallback: fetch=%d -> %d ranges=%d -> %d",
+					before.RangeDrillDownCoarseFetchTotal, after.RangeDrillDownCoarseFetchTotal,
+					before.RangeDrillDownCoarseFetchRangesTotal, after.RangeDrillDownCoarseFetchRangesTotal)
+			}
+			if digestDelta := afterPrimary.RangeDigestRequestsTotal - beforePrimary.RangeDigestRequestsTotal; digestDelta > 8192 {
+				return fmt.Errorf("primary range digest request fanout exceeded low-fanout smoke bound: delta=%d max=8192", digestDelta)
+			}
+		}
 		return nil
 	}
 	if after.ReconcileCount != before.ReconcileCount {
@@ -1312,6 +1344,23 @@ func applyReconcileBudgetPressureTuning(ctx context.Context, rt *harnessRuntime)
 	starvedValues["reconcile_max_inflight_tasks"] = 1
 	if _, err := rt.secondary1DRRoot.WriteTuning(ctx, starvedValues); err != nil {
 		return fmt.Errorf("write secondary1 budget-pressure tuning: %w", err)
+	}
+	return nil
+}
+
+func applyLowFanoutTuning(ctx context.Context, rt *harnessRuntime) error {
+	controlValues := outOfHorizonTuning()
+	if _, err := rt.primary.WriteTuning(ctx, controlValues); err != nil {
+		return fmt.Errorf("write primary tuning: %w", err)
+	}
+	if _, err := rt.secondary2DRRoot.WriteTuning(ctx, controlValues); err != nil {
+		return fmt.Errorf("write secondary2 tuning: %w", err)
+	}
+
+	lowFanoutValues := outOfHorizonTuning()
+	lowFanoutValues["reconcile_max_range_drilldown_rpcs"] = 1
+	if _, err := rt.secondary1DRRoot.WriteTuning(ctx, lowFanoutValues); err != nil {
+		return fmt.Errorf("write secondary1 low-fanout tuning: %w", err)
 	}
 	return nil
 }
@@ -1515,6 +1564,10 @@ func tuningProfileValues(profile string) (map[string]any, error) {
 		return oversizedCheckpointTuning(), nil
 	case "out-of-horizon":
 		return outOfHorizonTuning(), nil
+	case "out-of-horizon-low-fanout":
+		values := outOfHorizonTuning()
+		values["reconcile_max_range_drilldown_rpcs"] = 1
+		return values, nil
 	case "relaxed":
 		return relaxedTuning(), nil
 	default:
