@@ -442,18 +442,20 @@ func drStatusScore(status *DRStatusResponse) int {
 }
 
 type DRCheckpointVerificationResponse struct {
-	Pass             bool                     `json:"pass"`
-	Reason           string                   `json:"reason"`
-	State            string                   `json:"state"`
-	RelationshipID   string                   `json:"relationship_id"`
-	CheckpointID     string                   `json:"checkpoint_id"`
-	CheckpointIndex  int64                    `json:"checkpoint_index"`
-	AccumulatorIndex int64                    `json:"accumulator_index"`
-	RangeCount       int                      `json:"range_count"`
-	MatchedRanges    int                      `json:"matched_ranges"`
-	MismatchedRanges int                      `json:"mismatched_ranges"`
-	MissingRanges    int                      `json:"missing_ranges"`
-	Mismatches       []map[string]interface{} `json:"mismatches,omitempty"`
+	Pass              bool                     `json:"pass"`
+	Reason            string                   `json:"reason"`
+	State             string                   `json:"state"`
+	RelationshipID    string                   `json:"relationship_id"`
+	CheckpointID      string                   `json:"checkpoint_id"`
+	CheckpointIndex   int64                    `json:"checkpoint_index"`
+	AccumulatorIndex  int64                    `json:"accumulator_index"`
+	RangeCount        int                      `json:"range_count"`
+	MatchedRanges     int                      `json:"matched_ranges"`
+	MismatchedRanges  int                      `json:"mismatched_ranges"`
+	MissingRanges     int                      `json:"missing_ranges"`
+	PhysicalScanUsed  bool                     `json:"physical_scan_used"`
+	OptimizerReseeded bool                     `json:"optimizer_reseeded"`
+	Mismatches        []map[string]interface{} `json:"mismatches,omitempty"`
 }
 
 type drCheckpointVerificationEnvelope struct {

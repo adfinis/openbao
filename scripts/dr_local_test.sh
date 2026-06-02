@@ -6,7 +6,10 @@ TOPOLOGY="${DR_TOPOLOGY:-single}"
 COMPOSE_FILE="${DR_COMPOSE_FILE:-}"
 ENV_FILE="${DR_LOCAL_ENV_FILE:-${ROOT_DIR}/.dr-test.env}"
 RESULTS_DIR="${DR_RESULTS_DIR:-${ROOT_DIR}/dr-stress-results}"
+FIXTURES_DIR="${DR_FIXTURES_DIR:-${RESULTS_DIR}/fixtures}"
+FIXTURE_HELPER_IMAGE="${DR_FIXTURE_HELPER_IMAGE:-alpine:3.20}"
 DR_STRESS_BIN="${DR_STRESS_BIN:-${ROOT_DIR}/bin/dr-stress}"
+DR_HARNESS_BIN="${DR_HARNESS_BIN:-${ROOT_DIR}/bin/dr-harness}"
 
 PRIMARY_ADDR="${DR_PRIMARY_ADDR:-http://localhost:8800}"
 SECONDARY1_ADDR="${DR_SECONDARY1_ADDR:-http://localhost:8900}"
@@ -30,7 +33,9 @@ Usage:
   scripts/dr_local_test.sh [--topology single|ha] status
   scripts/dr_local_test.sh [--topology single|ha] smoke [dr-stress flags...]
   scripts/dr_local_test.sh [--topology single|ha] verify [RUN_DIR] [--sample N] [--secondary-method api|checkpoint]
-  scripts/dr_local_test.sh [--topology single|ha] preseed-smoke [--no-reset] [--build]
+  scripts/dr_local_test.sh [--topology single|ha] dataset-fixture-create NAME [--build] [--seed-keys N] [--seed-concurrency N]
+  scripts/dr_local_test.sh [--topology single|ha] dataset-fixture-restore NAME [--build] [--primary-only]
+  scripts/dr_local_test.sh [--topology single|ha] preseed-smoke [--no-reset] [--build] [--dataset-fixture NAME] [--async-export-plan] [--seed-keys N] [--seed-concurrency N] [--segment-max-bytes N] [--post-export-write-keys N] [--post-export-write-concurrency N]
   scripts/dr_local_test.sh [--topology single|ha] engine-matrix
   scripts/dr_local_test.sh --topology ha engine-lifecycle-matrix
   scripts/dr_local_test.sh [--topology single|ha] failover-smoke
@@ -42,6 +47,7 @@ Usage:
   scripts/dr_local_test.sh --topology ha secondary-outage-reconcile-smoke [--duration N] [--concurrency N] [--outage-after N] [--outage-seconds N] [--no-reset] [--build]
   scripts/dr_local_test.sh --topology ha indexed-repair-smoke [--duration N] [--concurrency N] [--outage-after N] [--outage-seconds N] [--no-reset] [--build]
   scripts/dr_local_test.sh --topology ha tuning-load-smoke [--duration N] [--concurrency N] [--no-reset]
+  scripts/dr_local_test.sh --topology ha composite-lifecycle-soak [--duration N] [--concurrency N] [--seed-keys N] [--secondary2-outage-seconds N] [--no-reset]
   scripts/dr_local_test.sh --topology ha failover-load-lifecycle [--duration N] [--concurrency N] [--hard-stop-after N] [--no-reset]
   scripts/dr_local_test.sh [--topology single|ha] down
   scripts/dr_local_test.sh [--topology single|ha] logs [service]
@@ -70,7 +76,10 @@ HA topology:
   scripts/dr_local_test.sh --topology ha secondary-outage-reconcile-smoke
   scripts/dr_local_test.sh --topology ha indexed-repair-smoke
   scripts/dr_local_test.sh --topology ha tuning-load-smoke
+  scripts/dr_local_test.sh --topology ha composite-lifecycle-soak
   scripts/dr_local_test.sh --topology ha failover-load-lifecycle
+  scripts/dr_local_test.sh dataset-fixture-create primary-100k --seed-keys 100000 --seed-concurrency 64
+  scripts/dr_local_test.sh preseed-smoke --dataset-fixture primary-100k --async-export-plan --post-export-write-keys 20000
 USAGE
 }
 
@@ -142,6 +151,53 @@ compose() {
   docker compose -f "$COMPOSE_FILE" "$@"
 }
 
+compose_project_name() {
+  if [[ -n "${COMPOSE_PROJECT_NAME:-}" ]]; then
+    printf "%s" "$COMPOSE_PROJECT_NAME"
+    return
+  fi
+  printf "%s" "$(basename "$ROOT_DIR")" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-'
+}
+
+compose_volume_name() {
+  local volume="$1"
+  printf "%s_%s" "$(compose_project_name)" "$volume"
+}
+
+fixture_dir() {
+  local name="$1"
+  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "fixture name must contain only letters, numbers, dot, underscore, or dash"
+  printf "%s/%s" "$FIXTURES_DIR" "$name"
+}
+
+fixture_primary_archive() {
+  local name="$1"
+  printf "%s/primary-data.tgz" "$(fixture_dir "$name")"
+}
+
+archive_volume_to_fixture() {
+  local volume="$1"
+  local target_dir="$2"
+  mkdir -p "$target_dir"
+  docker run --rm \
+    -v "${volume}:/data:ro" \
+    -v "${target_dir}:/fixture" \
+    "$FIXTURE_HELPER_IMAGE" \
+    sh -c 'cd /data && tar czf /fixture/primary-data.tgz .'
+}
+
+restore_fixture_to_volume() {
+  local volume="$1"
+  local source_dir="$2"
+  [[ -s "${source_dir}/primary-data.tgz" ]] || die "missing fixture archive: ${source_dir}/primary-data.tgz"
+  docker volume create "$volume" >/dev/null
+  docker run --rm \
+    -v "${volume}:/data" \
+    -v "${source_dir}:/fixture:ro" \
+    "$FIXTURE_HELPER_IMAGE" \
+    sh -c 'find /data -mindepth 1 -maxdepth 1 -exec rm -rf {} + && cd /data && tar xzf /fixture/primary-data.tgz'
+}
+
 bao() {
   "$(bao_bin)" "$@"
 }
@@ -167,6 +223,38 @@ bao_for_ns() {
   else
     env BAO_ADDR="$addr" BAO_NAMESPACE="$ns" "$(bao_bin)" "$@"
   fi
+}
+
+api_write_json_file() {
+  local addr="$1"
+  local token="$2"
+  local path="$3"
+  local payload_file="$4"
+  local output_file="$5"
+
+  need_bin curl
+  curl -fsS --max-time 600 \
+    -H "X-Vault-Token: ${token}" \
+    -H "Content-Type: application/json" \
+    --request POST \
+    --data-binary "@${payload_file}" \
+    "${addr%/}/v1/${path}" >"$output_file"
+}
+
+write_preseed_import_segment_file() {
+  local addr="$1"
+  local auth_token="$2"
+  local activation_token="$3"
+  local segment_file="$4"
+  local output_file="$5"
+  local request_file="${output_file}.request.json"
+
+  need_bin jq
+  jq -n \
+    --arg token "$activation_token" \
+    --rawfile segment "$segment_file" \
+    '{token: $token, segment: $segment}' >"$request_file"
+  api_write_json_file "$addr" "$auth_token" "sys/replication/dr/secondary/preseed/import-segment" "$request_file" "$output_file"
 }
 
 status_json() {
@@ -431,6 +519,96 @@ wait_secondary_ready() {
     if (( $(date +%s) >= deadline )); then
       echo "$out" | jq '.data // {}' >&2 || true
       die "timed out waiting for ${name} to reach streaming lag=0 with a current primary index"
+    fi
+    sleep 2
+  done
+}
+
+wait_secondary_stream_quiescent() {
+  local name="$1"
+  local addr="$2"
+  local timeout="${3:-240}"
+  local required_stable="${4:-3}"
+  local deadline=$(( $(date +%s) + timeout ))
+  local out mode state lag primary_index last_applied entries_applied batches cursor
+  local prev_signature="" signature stable=0
+
+  while true; do
+    out="$(bao_for "$addr" "$DR_PRIMARY_TOKEN" read -format=json sys/replication/dr/status 2>/dev/null || true)"
+    mode="$(jq -r '.data.mode // ""' <<<"$out" 2>/dev/null || true)"
+    state="$(jq -r '.data.secondary_state // ""' <<<"$out" 2>/dev/null || true)"
+    lag="$(jq -r '.data.lag_entries // 0' <<<"$out" 2>/dev/null || echo 0)"
+    primary_index="$(jq -r '.data.primary_index // 0' <<<"$out" 2>/dev/null || echo 0)"
+    last_applied="$(jq -r '.data.last_applied_index // 0' <<<"$out" 2>/dev/null || echo 0)"
+    entries_applied="$(jq -r '.data.entries_applied // 0' <<<"$out" 2>/dev/null || echo 0)"
+    batches="$(jq -r '.data.stream_txn_batches_total // 0' <<<"$out" 2>/dev/null || echo 0)"
+    cursor="$(jq -r '.data.flat_accumulator_cursor_index // 0' <<<"$out" 2>/dev/null || echo 0)"
+
+    if [[ "$mode" == "secondary" && "$state" == "streaming" && "$lag" == "0" &&
+      "$primary_index" =~ ^[0-9]+$ && "$last_applied" =~ ^[0-9]+$ &&
+      "$entries_applied" =~ ^[0-9]+$ && "$batches" =~ ^[0-9]+$ && "$cursor" =~ ^[0-9]+$ &&
+      "$primary_index" -gt 0 && "$last_applied" -ge "$primary_index" ]]; then
+      signature="${last_applied}:${primary_index}:${entries_applied}:${batches}:${cursor}"
+      if [[ "$signature" == "$prev_signature" ]]; then
+        stable=$((stable + 1))
+      else
+        stable=1
+        prev_signature="$signature"
+      fi
+      if (( stable >= required_stable )); then
+        echo "${name} quiescent: state=${state} lag=${lag} applied=${last_applied} primary=${primary_index} batches=${batches}"
+        return 0
+      fi
+    else
+      stable=0
+      prev_signature=""
+    fi
+
+    if (( $(date +%s) >= deadline )); then
+      echo "$out" | jq '.data // {}' >&2 || true
+      die "timed out waiting for ${name} stream to quiesce"
+    fi
+    sleep 2
+  done
+}
+
+wait_verify_checkpoint_pass() {
+  local name="$1"
+  local addr="$2"
+  local out_file="$3"
+  local timeout="${4:-240}"
+  local token="${5:-$DR_PRIMARY_TOKEN}"
+  local deadline=$(( $(date +%s) + timeout ))
+  local tmp_file="${out_file}.tmp"
+  local pass reason mismatched missing
+
+  while true; do
+    if bao_for "$addr" "$token" read -format=json sys/replication/dr/secondary/verify-checkpoint >"$tmp_file" 2>"${tmp_file}.err"; then
+      pass="$(jq -r '.data.pass // false' "$tmp_file" 2>/dev/null || echo false)"
+      reason="$(jq -r '.data.reason // ""' "$tmp_file" 2>/dev/null || echo "")"
+      mismatched="$(jq -r '.data.mismatched_ranges // 0' "$tmp_file" 2>/dev/null || echo 0)"
+      missing="$(jq -r '.data.missing_ranges // 0' "$tmp_file" 2>/dev/null || echo 0)"
+      cp "$tmp_file" "$out_file"
+
+      if [[ "$pass" == "true" && "$mismatched" == "0" && "$missing" == "0" ]]; then
+        echo "${name} checkpoint verification passed"
+        rm -f "$tmp_file" "${tmp_file}.err"
+        return 0
+      fi
+
+      if [[ "$reason" != "accumulator_checkpoint_index_mismatch" && "$reason" != "secondary_not_streaming" ]]; then
+        cat "$out_file" | jq '.data // {}' >&2 || true
+        rm -f "$tmp_file" "${tmp_file}.err"
+        die "${name} checkpoint verification failed"
+      fi
+    else
+      cp "${tmp_file}.err" "${out_file}.err" 2>/dev/null || true
+    fi
+
+    if (( $(date +%s) >= deadline )); then
+      cat "$out_file" | jq '.data // {}' >&2 || true
+      rm -f "$tmp_file" "${tmp_file}.err"
+      die "timed out waiting for ${name} checkpoint verification to pass"
     fi
     sleep 2
   done
@@ -807,6 +985,15 @@ cmd_configure() {
   cmd_status
 }
 
+cmd_configure_primary_only() {
+  need_bin jq
+  load_env
+
+  echo "Enabling DR primary..."
+  call_idempotent "already enabled as primary" \
+    bao_for "$DR_PRIMARY_ADDR" "$DR_PRIMARY_TOKEN" write -f sys/replication/dr/primary/enable
+}
+
 cmd_reset() {
   if [[ "${1:-}" == "--build" ]]; then
     (cd "$ROOT_DIR" && make docker-dev)
@@ -815,6 +1002,148 @@ cmd_reset() {
   compose up -d
   cmd_bootstrap
   cmd_configure
+}
+
+cmd_bootstrap_with_primary_fixture() {
+  local primary_init="$1"
+  need_bin jq
+  [[ "$TOPOLOGY" == "single" ]] || die "dataset fixtures currently support --topology single only"
+  [[ -s "$primary_init" ]] || die "missing fixture primary init file: ${primary_init}"
+
+  local tmpdir secondary1_init secondary2_init primary_key
+  tmpdir="$(mktemp -d)"
+  secondary1_init="${tmpdir}/secondary1.json"
+  secondary2_init="${tmpdir}/secondary2.json"
+  primary_key="$(jq -r '.unseal_keys_b64[0]' "$primary_init")"
+  [[ -n "$primary_key" && "$primary_key" != "null" ]] || die "fixture primary init file does not include an unseal key"
+
+  unseal_with_key "primary" "$PRIMARY_ADDR" "$primary_key"
+  init_and_unseal "secondary1" "$SECONDARY1_ADDR" "$secondary1_init" "DR_SECONDARY1_UNSEAL_KEY"
+  init_and_unseal "secondary2" "$SECONDARY2_ADDR" "$secondary2_init" "DR_SECONDARY2_UNSEAL_KEY"
+  write_env_file "$primary_init" "$secondary1_init" "$secondary2_init"
+  rm -rf "$tmpdir"
+}
+
+cmd_reset_from_dataset_fixture() {
+  local name="$1"
+  local build="${2:-false}"
+  local configure_mode="${3:-full}"
+  [[ "$TOPOLOGY" == "single" ]] || die "dataset fixtures currently support --topology single only"
+  local dir primary_volume
+  dir="$(fixture_dir "$name")"
+  [[ -s "${dir}/primary-init.json" ]] || die "missing fixture init file: ${dir}/primary-init.json"
+  [[ -s "${dir}/primary-data.tgz" ]] || die "missing fixture archive: ${dir}/primary-data.tgz"
+
+  if [[ "$build" == "true" ]]; then
+    (cd "$ROOT_DIR" && make docker-dev)
+  fi
+  cmd_down
+  primary_volume="$(compose_volume_name primary-data)"
+  echo "Restoring primary dataset fixture ${name} into Docker volume ${primary_volume}..."
+  restore_fixture_to_volume "$primary_volume" "$dir"
+  compose up -d
+  cmd_bootstrap_with_primary_fixture "${dir}/primary-init.json"
+  case "$configure_mode" in
+    full)
+      cmd_configure
+      ;;
+    primary-only)
+      cmd_configure_primary_only
+      ;;
+    *)
+      die "unknown dataset fixture configure mode: ${configure_mode}"
+      ;;
+  esac
+}
+
+cmd_dataset_fixture_create() {
+  need_bin jq
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "dataset-fixture-create requires a fixture name"
+  shift
+  [[ "$TOPOLOGY" == "single" ]] || die "dataset fixtures currently support --topology single only"
+
+  local build=false
+  local seed_keys=100000
+  local seed_concurrency=64
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --build)
+        build=true
+        shift
+        ;;
+      --seed-keys)
+        seed_keys="${2:?missing value for --seed-keys}"
+        shift 2
+        ;;
+      --seed-concurrency)
+        seed_concurrency="${2:?missing value for --seed-concurrency}"
+        shift 2
+        ;;
+      *)
+        die "unknown dataset-fixture-create option: $1"
+        ;;
+    esac
+  done
+  [[ "$seed_keys" =~ ^[0-9]+$ && "$seed_keys" -ge 1 ]] || die "--seed-keys must be >= 1"
+  [[ "$seed_concurrency" =~ ^[0-9]+$ && "$seed_concurrency" -ge 1 ]] || die "--seed-concurrency must be >= 1"
+
+  local dir primary_init primary_token primary_volume
+  dir="$(fixture_dir "$name")"
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  primary_init="${dir}/primary-init.json"
+
+  if [[ "$build" == "true" ]]; then
+    (cd "$ROOT_DIR" && make docker-dev)
+  fi
+  cmd_down
+  compose up -d primary
+  init_and_unseal "primary" "$PRIMARY_ADDR" "$primary_init" "DR_PRIMARY_UNSEAL_KEY"
+  primary_token="$(jq -r '.root_token' "$primary_init")"
+  ensure_kv_mount_on "$PRIMARY_ADDR" "$primary_token"
+  kv_put "$PRIMARY_ADDR" "$primary_token" "fixture/${name}/marker" "fixture-marker" "$name"
+  kv_put_bulk "$PRIMARY_ADDR" "$primary_token" "fixture/${name}/seed" "fixture-seed" "$name" "$seed_keys" "$seed_concurrency" "${dir}/seed-bulk.log"
+
+  cat >"${dir}/metadata.json" <<EOF
+{
+  "name": "${name}",
+  "topology": "${TOPOLOGY}",
+  "seed_keys": ${seed_keys},
+  "seed_concurrency": ${seed_concurrency},
+  "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+
+  compose stop primary >/dev/null
+  primary_volume="$(compose_volume_name primary-data)"
+  echo "Archiving primary dataset fixture ${name} from Docker volume ${primary_volume}..."
+  archive_volume_to_fixture "$primary_volume" "$dir"
+  echo "Dataset fixture created: ${dir}"
+}
+
+cmd_dataset_fixture_restore() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "dataset-fixture-restore requires a fixture name"
+  shift
+  local build=false
+  local configure_mode="full"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --build)
+        build=true
+        shift
+        ;;
+      --primary-only)
+        configure_mode="primary-only"
+        shift
+        ;;
+      *)
+        die "unknown dataset-fixture-restore option: $1"
+        ;;
+    esac
+  done
+  cmd_reset_from_dataset_fixture "$name" "$build" "$configure_mode"
 }
 
 cmd_status() {
@@ -842,7 +1171,27 @@ ensure_dr_stress() {
   fi
 }
 
+ensure_dr_harness() {
+  if [[ ! -x "$DR_HARNESS_BIN" ]] || find "${ROOT_DIR}/scripts/dr-harness" -name '*.go' -newer "$DR_HARNESS_BIN" -print -quit | grep -q .; then
+    echo "Building dr-harness..."
+    mkdir -p "$(dirname "$DR_HARNESS_BIN")"
+    (cd "${ROOT_DIR}/scripts/dr-harness" && go build -o "$DR_HARNESS_BIN" ./cmd/dr-harness)
+  fi
+}
+
 cmd_smoke() {
+  ensure_dr_harness
+  ensure_dr_stress
+  "$DR_HARNESS_BIN" smoke \
+    --root "$ROOT_DIR" \
+    --topology "$TOPOLOGY" \
+    --env-file "$ENV_FILE" \
+    --results-dir "$RESULTS_DIR" \
+    --dr-stress-bin "$DR_STRESS_BIN" \
+    "$@"
+}
+
+cmd_smoke_legacy() {
   load_env
   ensure_dr_stress
   local primary_addr="$DR_PRIMARY_ADDR"
@@ -1006,8 +1355,13 @@ cmd_verify() {
   local secondary2_addr="$DR_SECONDARY2_ADDR"
   if [[ "$TOPOLOGY" == "ha" ]]; then
     primary_addr="$(join_csv "${PRIMARY_NODE_ADDRS[@]}")"
-    secondary1_addr="$(join_csv "${SECONDARY1_NODE_ADDRS[@]}")"
-    secondary2_addr="$(join_csv "${SECONDARY2_NODE_ADDRS[@]}")"
+    if [[ "$secondary_method" == "checkpoint" ]]; then
+      secondary1_addr="$(wait_cluster_active_addr "secondary1 verify" 120 "${SECONDARY1_NODE_ADDRS[@]}")"
+      secondary2_addr="$(wait_cluster_active_addr "secondary2 verify" 120 "${SECONDARY2_NODE_ADDRS[@]}")"
+    else
+      secondary1_addr="$(join_csv "${SECONDARY1_NODE_ADDRS[@]}")"
+      secondary2_addr="$(join_csv "${SECONDARY2_NODE_ADDRS[@]}")"
+    fi
   fi
 
   verify_one "primary" "$primary_addr" "$DR_PRIMARY_TOKEN" "$run_dir" "$sample" "api"
@@ -1015,11 +1369,90 @@ cmd_verify() {
   verify_one "secondary2" "$secondary2_addr" "$DR_SECONDARY2_TOKEN" "$run_dir" "$sample" "$secondary_method"
 }
 
+write_preseed_export_plan() {
+  local addr="$1"
+  local token="$2"
+  local relationship_id="$3"
+  local ttl_seconds="$4"
+  local segment_max_bytes="$5"
+  local async_export_plan="$6"
+  local output_file="$7"
+  local timeout="$8"
+
+  if [[ "$async_export_plan" != "true" ]]; then
+    bao_for "$addr" "$token" write -format=json \
+      sys/replication/dr/primary/preseed/export-plan \
+      relationship_id="$relationship_id" \
+      ttl_seconds="$ttl_seconds" \
+      segment_max_bytes="$segment_max_bytes" >"$output_file"
+    return 0
+  fi
+
+  local initial_json plan_id state deadline tmp_json
+  initial_json="${output_file}.initial"
+  tmp_json="${output_file}.tmp"
+  bao_for "$addr" "$token" write -format=json \
+    sys/replication/dr/primary/preseed/export-plan \
+    relationship_id="$relationship_id" \
+    ttl_seconds="$ttl_seconds" \
+    segment_max_bytes="$segment_max_bytes" \
+    async=true >"$initial_json"
+  plan_id="$(jq -r '.data.plan_id // empty' "$initial_json")"
+  [[ -n "$plan_id" ]] || die "async pre-seed export plan did not return plan_id"
+
+  deadline=$(( $(date +%s) + timeout ))
+  while true; do
+    bao_for "$addr" "$token" write -format=json \
+      sys/replication/dr/primary/preseed/export-plan-status \
+      plan_id="$plan_id" >"$tmp_json"
+    state="$(jq -r '.data.state // empty' "$tmp_json")"
+    case "$state" in
+      complete)
+        mv "$tmp_json" "$output_file"
+        return 0
+        ;;
+      failed)
+        cat "$tmp_json" >&2
+        die "async pre-seed export plan failed"
+        ;;
+      running)
+        ;;
+      *)
+        cat "$tmp_json" >&2
+        die "async pre-seed export plan returned unexpected state: ${state}"
+        ;;
+    esac
+    if (( $(date +%s) >= deadline )); then
+      cat "$tmp_json" >&2 || true
+      die "timed out waiting for async pre-seed export plan ${plan_id}"
+    fi
+    sleep 2
+  done
+}
+
 cmd_preseed_smoke() {
+  ensure_dr_harness
+  "$DR_HARNESS_BIN" preseed-smoke \
+    --root "$ROOT_DIR" \
+    --topology "$TOPOLOGY" \
+    --env-file "$ENV_FILE" \
+    --results-dir "$RESULTS_DIR" \
+    "$@"
+}
+
+cmd_preseed_smoke_legacy() {
   need_bin jq
   local do_reset=true
   local build=false
   local timeout=300
+  local seed_keys=64
+  local seed_keys_set=false
+  local seed_concurrency=32
+  local segment_max_bytes=8192
+  local post_export_write_keys=0
+  local post_export_write_concurrency=32
+  local dataset_fixture=""
+  local async_export_plan=false
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1035,34 +1468,85 @@ cmd_preseed_smoke() {
         timeout="${2:?missing value for --timeout}"
         shift 2
         ;;
+      --seed-keys)
+        seed_keys="${2:?missing value for --seed-keys}"
+        seed_keys_set=true
+        shift 2
+        ;;
+      --seed-concurrency)
+        seed_concurrency="${2:?missing value for --seed-concurrency}"
+        shift 2
+        ;;
+      --segment-max-bytes)
+        segment_max_bytes="${2:?missing value for --segment-max-bytes}"
+        shift 2
+        ;;
+      --post-export-write-keys)
+        post_export_write_keys="${2:?missing value for --post-export-write-keys}"
+        shift 2
+        ;;
+      --post-export-write-concurrency)
+        post_export_write_concurrency="${2:?missing value for --post-export-write-concurrency}"
+        shift 2
+        ;;
+      --dataset-fixture)
+        dataset_fixture="${2:?missing value for --dataset-fixture}"
+        shift 2
+        ;;
+      --async-export-plan)
+        async_export_plan=true
+        shift
+        ;;
       *)
         die "unknown preseed-smoke option: $1"
         ;;
     esac
   done
+  if [[ -n "$dataset_fixture" && "$seed_keys_set" == "false" ]]; then
+    seed_keys=0
+  fi
+  if [[ -n "$dataset_fixture" ]]; then
+    [[ "$seed_keys" =~ ^[0-9]+$ ]] || die "--seed-keys must be >= 0 with --dataset-fixture"
+  else
+    [[ "$seed_keys" =~ ^[0-9]+$ && "$seed_keys" -ge 1 ]] || die "--seed-keys must be >= 1"
+  fi
+  [[ "$seed_concurrency" =~ ^[0-9]+$ && "$seed_concurrency" -ge 1 ]] || die "--seed-concurrency must be >= 1"
+  [[ "$segment_max_bytes" =~ ^[0-9]+$ && "$segment_max_bytes" -ge 1 ]] || die "--segment-max-bytes must be >= 1"
+  [[ "$post_export_write_keys" =~ ^[0-9]+$ ]] || die "--post-export-write-keys must be >= 0"
+  [[ "$post_export_write_concurrency" =~ ^[0-9]+$ && "$post_export_write_concurrency" -ge 1 ]] || die "--post-export-write-concurrency must be >= 1"
 
   if [[ "$do_reset" == "true" ]]; then
-    if [[ "$build" == "true" ]]; then
-      cmd_reset --build
+    if [[ -n "$dataset_fixture" ]]; then
+      cmd_reset_from_dataset_fixture "$dataset_fixture" "$build" "primary-only"
     else
-      cmd_reset
+      if [[ "$build" == "true" ]]; then
+        cmd_reset --build
+      else
+        cmd_reset
+      fi
     fi
   fi
   load_env
 
   local primary_addr="$DR_PRIMARY_ADDR"
   local secondary2_addr="$DR_SECONDARY2_ADDR"
+  local secondary2_import_token="$DR_PRIMARY_TOKEN"
+  local secondary2_enable_token="$DR_PRIMARY_TOKEN"
+  if [[ -n "$dataset_fixture" ]]; then
+    secondary2_import_token="$DR_SECONDARY2_TOKEN"
+  fi
   if [[ "$TOPOLOGY" == "ha" ]]; then
     primary_addr="$(wait_cluster_active_addr "primary" 120 "${PRIMARY_NODE_ADDRS[@]}")"
     secondary2_addr="$(wait_cluster_active_addr "secondary2" 120 "${SECONDARY2_NODE_ADDRS[@]}")"
   fi
 
-  local run_id run_dir token relationship_id export_json bundle_file import_json verify_json status_json_file
+  local run_id run_dir token relationship_id export_json manifest_file import_json verify_json status_json_file
   local post_handoff_verify_json post_handoff_status_json_file
-  local base_key delta_key
+  local base_key delta_key segment_dir
   run_id="preseed-smoke-$(date -u +%Y%m%dT%H%M%SZ)"
   run_dir="${RESULTS_DIR}/${run_id}"
-  bundle_file="${run_dir}/bundle.json"
+  manifest_file="${run_dir}/manifest.json"
+  segment_dir="${run_dir}/segments"
   export_json="${run_dir}/export.json"
   import_json="${run_dir}/import.json"
   verify_json="${run_dir}/verify-secondary2.json"
@@ -1071,57 +1555,112 @@ cmd_preseed_smoke() {
   post_handoff_status_json_file="${run_dir}/secondary2-status-post-handoff.json"
   base_key="${run_id}/base"
   delta_key="${run_id}/delta-after-export"
-  mkdir -p "$run_dir"
+  mkdir -p "$run_dir" "$segment_dir"
 
   {
     echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "topology=${TOPOLOGY}"
     echo "primary_addr=${primary_addr}"
     echo "secondary2_addr=${secondary2_addr}"
+    echo "dataset_fixture=${dataset_fixture}"
+    echo "async_export_plan=${async_export_plan}"
+    echo "seed_keys=${seed_keys}"
+    echo "seed_concurrency=${seed_concurrency}"
+    echo "segment_max_bytes=${segment_max_bytes}"
+    echo "post_export_write_keys=${post_export_write_keys}"
+    echo "post_export_write_concurrency=${post_export_write_concurrency}"
   } >"${run_dir}/orchestrator.log"
 
   echo "Preparing primary baseline for ${run_id}..."
   ensure_kv_mount_on "$primary_addr" "$DR_PRIMARY_TOKEN"
   kv_put "$primary_addr" "$DR_PRIMARY_TOKEN" "$base_key" "base-before-preseed-export" "$run_id"
-  wait_secondary_ready "secondary2-original-lineage" "$secondary2_addr" 180
+  if (( seed_keys > 0 )); then
+    kv_put_bulk "$primary_addr" "$DR_PRIMARY_TOKEN" "${run_id}/seed" "seed-before-preseed-export" "$run_id" "$seed_keys" "$seed_concurrency" "${run_dir}/seed-bulk.log"
+  fi
+  if [[ -z "$dataset_fixture" ]]; then
+    wait_secondary_ready "secondary2-original-lineage" "$secondary2_addr" "$timeout"
+    wait_secondary_stream_quiescent "secondary2-original-lineage" "$secondary2_addr" "$timeout"
+  fi
 
   echo "Issuing fresh pre-seed activation token..."
   token="$(bao_for "$primary_addr" "$DR_PRIMARY_TOKEN" write -f -format=json sys/replication/dr/primary/secondary-token | jq -r '.data.token')"
   relationship_id="$(jq -r '.relationship_id' <<<"$token")"
   [[ -n "$relationship_id" && "$relationship_id" != "null" ]] || die "activation token did not include relationship_id"
 
-  echo "Exporting pre-seed bundle for relationship ${relationship_id}..."
-  bao_for "$primary_addr" "$DR_PRIMARY_TOKEN" write -format=json \
-    sys/replication/dr/primary/preseed/export \
-    relationship_id="$relationship_id" \
-    ttl_seconds=3600 >"$export_json"
-  jq -r '.data.bundle' "$export_json" >"$bundle_file"
-  jq -e '.version == 1 and (.entries | length) > 0' "$bundle_file" >/dev/null || die "pre-seed bundle is empty or malformed"
+  echo "Creating segmented pre-seed export plan for relationship ${relationship_id}..."
+  write_preseed_export_plan "$primary_addr" "$DR_PRIMARY_TOKEN" "$relationship_id" 3600 "$segment_max_bytes" "$async_export_plan" "$export_json" "$timeout"
+  jq -r '.data.manifest' "$export_json" >"$manifest_file"
+  jq -e '.version == 1 and .bundle_format == "segmented-json-v1" and (.bundle_segments | length) > 0' "$manifest_file" >/dev/null || die "pre-seed manifest is empty or malformed"
+  local segment_count
+  segment_count="$(jq -r '.data.segment_count' "$export_json")"
+  [[ "$segment_count" =~ ^[0-9]+$ && "$segment_count" -ge 2 ]] || die "pre-seed segmented smoke expected at least two segments, got ${segment_count}"
 
   echo "Writing post-export delta on primary..."
   kv_put "$primary_addr" "$DR_PRIMARY_TOKEN" "$delta_key" "delta-after-preseed-export" "$run_id"
+  if [[ -z "$dataset_fixture" ]]; then
+    wait_secondary_stream_quiescent "secondary2-post-export-delta" "$secondary2_addr" "$timeout"
 
-  echo "Disabling secondary2 from its existing relationship..."
-  call_idempotent "not in DR secondary mode" \
-    bao_for "$secondary2_addr" "$DR_PRIMARY_TOKEN" write -f sys/replication/dr/secondary/disable
+    echo "Disabling secondary2 from its existing relationship..."
+    call_idempotent "not in DR secondary mode" \
+      bao_for "$secondary2_addr" "$DR_PRIMARY_TOKEN" write -f sys/replication/dr/secondary/disable
+  else
+    echo "Using disabled secondary2 as fresh pre-seed target from dataset fixture."
+  fi
 
-  echo "Importing pre-seed bundle into disabled secondary2..."
-  bao_for "$secondary2_addr" "$DR_PRIMARY_TOKEN" write -format=json \
-    sys/replication/dr/secondary/preseed/import \
+  local post_export_writer_pid=""
+  if (( post_export_write_keys > 0 )); then
+    echo "Starting bounded post-export write pressure: keys=${post_export_write_keys} concurrency=${post_export_write_concurrency}"
+    kv_put_bulk "$primary_addr" "$DR_PRIMARY_TOKEN" "${run_id}/post-export" "post-export-adversarial" "$run_id" "$post_export_write_keys" "$post_export_write_concurrency" "${run_dir}/post-export-bulk.log" &
+    post_export_writer_pid="$!"
+  fi
+
+  echo "Starting segmented pre-seed import on disabled secondary2..."
+  bao_for "$secondary2_addr" "$secondary2_import_token" write -format=json \
+    sys/replication/dr/secondary/preseed/import-begin \
     token="$token" \
-    bundle="$(<"$bundle_file")" \
-    confirm_replace_replicated_storage=true >"$import_json"
+    manifest="$(<"$manifest_file")" \
+    confirm_replace_replicated_storage=true >"${run_dir}/import-begin.json"
 
-  echo "Enabling secondary2 from imported pre-seed baseline..."
-  bao_for "$secondary2_addr" "$DR_PRIMARY_TOKEN" write sys/replication/dr/secondary/enable token="$token"
+  echo "Exporting and staging ${segment_count} pre-seed segments..."
+  for ((i = 0; i < segment_count; i++)); do
+    local segment_export_json segment_file segment_import_json
+    segment_export_json="${segment_dir}/segment-${i}-export.json"
+    segment_file="${segment_dir}/segment-${i}.json"
+    segment_import_json="${segment_dir}/segment-${i}-import.json"
+    bao_for "$primary_addr" "$DR_PRIMARY_TOKEN" write -format=json \
+      sys/replication/dr/primary/preseed/export-segment \
+      manifest="$(<"$manifest_file")" \
+      segment_index="$i" >"$segment_export_json"
+    jq -r '.data.segment' "$segment_export_json" >"$segment_file"
+    jq -e --argjson idx "$i" '.version == 1 and .segment_index == $idx and (.entries | length) > 0' "$segment_file" >/dev/null || die "pre-seed segment ${i} is empty or malformed"
+    write_preseed_import_segment_file "$secondary2_addr" "$secondary2_import_token" "$token" "$segment_file" "$segment_import_json"
+  done
+
+  echo "Completing segmented pre-seed import on disabled secondary2..."
+  bao_for "$secondary2_addr" "$secondary2_import_token" write -format=json \
+    sys/replication/dr/secondary/preseed/import-complete \
+    token="$token" \
+    confirm_replace_replicated_storage=true \
+    enable_secondary=true >"$import_json"
+
+  if [[ -n "$post_export_writer_pid" ]]; then
+    echo "Waiting for bounded post-export write pressure to finish..."
+    if ! wait "$post_export_writer_pid"; then
+      die "post-export write pressure failed; see ${run_dir}/post-export-bulk.log"
+    fi
+  fi
+
+  if jq -e '.data.enabled == true' "$import_json" >/dev/null; then
+    echo "Secondary2 enabled from imported pre-seed baseline."
+  else
+    echo "Enabling secondary2 from imported pre-seed baseline..."
+    bao_for "$secondary2_addr" "$secondary2_enable_token" write sys/replication/dr/secondary/enable token="$token"
+  fi
   wait_secondary_ready "secondary2-preseed-lineage" "$secondary2_addr" "$timeout"
+  wait_secondary_stream_quiescent "secondary2-preseed-lineage" "$secondary2_addr" "$timeout"
 
   echo "Verifying secondary2 checkpoint convergence..."
-  bao_for "$secondary2_addr" "$DR_PRIMARY_TOKEN" read -format=json sys/replication/dr/secondary/verify-checkpoint >"$verify_json"
-  jq -e '.data.pass == true and .data.mismatched_ranges == 0 and .data.missing_ranges == 0' "$verify_json" >/dev/null || {
-    jq '.data // .' "$verify_json" >&2
-    die "pre-seed checkpoint verification failed"
-  }
+  wait_verify_checkpoint_pass "secondary2-preseed-lineage" "$secondary2_addr" "$verify_json" "$timeout" "$DR_PRIMARY_TOKEN"
 
   bao_for "$secondary2_addr" "$DR_PRIMARY_TOKEN" read -format=json sys/replication/dr/status >"$status_json_file"
   jq -e '.data.secondary_state == "streaming" and .data.lag_entries == 0' "$status_json_file" >/dev/null || {
@@ -1148,11 +1687,8 @@ cmd_preseed_smoke() {
     echo "HA handoff complete after pre-seed accept: primary=${primary_addr} secondary2=${secondary2_addr}" | tee -a "${run_dir}/orchestrator.log"
 
     wait_secondary_ready "secondary2-preseed-post-handoff" "$secondary2_addr" "$timeout"
-    bao_for "$secondary2_addr" "$DR_PRIMARY_TOKEN" read -format=json sys/replication/dr/secondary/verify-checkpoint >"$post_handoff_verify_json"
-    jq -e '.data.pass == true and .data.mismatched_ranges == 0 and .data.missing_ranges == 0' "$post_handoff_verify_json" >/dev/null || {
-      jq '.data // .' "$post_handoff_verify_json" >&2
-      die "pre-seed checkpoint verification failed after HA handoff"
-    }
+    wait_secondary_stream_quiescent "secondary2-preseed-post-handoff" "$secondary2_addr" "$timeout"
+    wait_verify_checkpoint_pass "secondary2-preseed-post-handoff" "$secondary2_addr" "$post_handoff_verify_json" "$timeout" "$DR_PRIMARY_TOKEN"
 
     bao_for "$secondary2_addr" "$DR_PRIMARY_TOKEN" read -format=json sys/replication/dr/status >"$post_handoff_status_json_file"
     jq -e '.data.secondary_state == "streaming" and .data.lag_entries == 0' "$post_handoff_status_json_file" >/dev/null || {
@@ -1167,6 +1703,8 @@ cmd_preseed_smoke() {
   {
     echo "relationship_id=${relationship_id}"
     echo "entry_count=$(jq -r '.data.entry_count' "$export_json")"
+    echo "segment_count=$(jq -r '.data.segment_count' "$export_json")"
+    echo "post_export_write_keys=${post_export_write_keys}"
     echo "checkpoint_index=$(jq -r '.data.checkpoint_index' "$export_json")"
     echo "verified_checkpoint_index=$(jq -r '.data.checkpoint_index' "$verify_json")"
     if [[ -f "$post_handoff_verify_json" ]]; then
@@ -1571,6 +2109,51 @@ kv_put() {
     fi
     sleep 2
   done
+}
+
+kv_put_bulk() {
+  local addr="$1"
+  local token="$2"
+  local key_prefix="$3"
+  local phase="$4"
+  local run_id="$5"
+  local count="$6"
+  local concurrency="$7"
+  local log_file="$8"
+
+  (( count > 0 )) || return 0
+  (( concurrency > 0 )) || die "bulk write concurrency must be > 0"
+  need_bin curl
+  mkdir -p "$(dirname "$log_file")"
+
+  local base_url="${addr%/}/v1/kv/data/${key_prefix}"
+  echo "Bulk writing ${count} keys to ${base_url}/k-<n> with concurrency ${concurrency}..."
+  export KV_BULK_BASE_URL="$base_url"
+  export KV_BULK_TOKEN="$token"
+  export KV_BULK_PHASE="$phase"
+  export KV_BULK_RUN_ID="$run_id"
+  if ! seq 0 "$((count - 1))" | xargs -n 1 -P "$concurrency" bash -c '
+        set -euo pipefail
+        idx="$1"
+        payload=$(printf "{\"data\":{\"phase\":\"%s\",\"run_id\":\"%s\",\"index\":%s}}" "$KV_BULK_PHASE" "$KV_BULK_RUN_ID" "$idx")
+        for attempt in 1 2 3 4 5; do
+          if curl -fsS --max-time 30 \
+            -H "X-Vault-Token: ${KV_BULK_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --request POST \
+            --data "$payload" \
+            "${KV_BULK_BASE_URL}/k-${idx}" >/dev/null; then
+            exit 0
+          fi
+          sleep "$attempt"
+        done
+        exit 1
+      ' _ >"$log_file" 2>&1; then
+    unset KV_BULK_BASE_URL KV_BULK_TOKEN KV_BULK_PHASE KV_BULK_RUN_ID
+    cat "$log_file" >&2 || true
+    return 1
+  fi
+  unset KV_BULK_BASE_URL KV_BULK_TOKEN KV_BULK_PHASE KV_BULK_RUN_ID
 }
 
 kv_present() {
@@ -2194,6 +2777,16 @@ force_ha_handoff_for_tuning_load() {
 }
 
 cmd_quiescent_reconnect_smoke() {
+  ensure_dr_harness
+  "$DR_HARNESS_BIN" quiescent-reconnect-smoke \
+    --root "$ROOT_DIR" \
+    --topology "$TOPOLOGY" \
+    --env-file "$ENV_FILE" \
+    --results-dir "$RESULTS_DIR" \
+    "$@"
+}
+
+cmd_quiescent_reconnect_smoke_legacy() {
   [[ "$TOPOLOGY" == "ha" ]] || die "quiescent-reconnect-smoke requires --topology ha"
   need_bin jq
 
@@ -2293,6 +2886,16 @@ cmd_quiescent_reconnect_smoke() {
 }
 
 cmd_accumulator_cold_restart_smoke() {
+  ensure_dr_harness
+  "$DR_HARNESS_BIN" accumulator-cold-restart-smoke \
+    --root "$ROOT_DIR" \
+    --topology "$TOPOLOGY" \
+    --env-file "$ENV_FILE" \
+    --results-dir "$RESULTS_DIR" \
+    "$@"
+}
+
+cmd_accumulator_cold_restart_smoke_legacy() {
   [[ "$TOPOLOGY" == "ha" ]] || die "accumulator-cold-restart-smoke requires --topology ha"
   need_bin jq
   need_bin rg
@@ -2475,6 +3078,18 @@ cmd_accumulator_cold_restart_smoke() {
 }
 
 cmd_secondary_outage_smoke() {
+  ensure_dr_harness
+  ensure_dr_stress
+  "$DR_HARNESS_BIN" secondary-outage-smoke \
+    --root "$ROOT_DIR" \
+    --topology "$TOPOLOGY" \
+    --env-file "$ENV_FILE" \
+    --results-dir "$RESULTS_DIR" \
+    --dr-stress-bin "$DR_STRESS_BIN" \
+    "$@"
+}
+
+cmd_secondary_outage_smoke_legacy() {
   [[ "$TOPOLOGY" == "ha" ]] || die "secondary-outage-smoke requires --topology ha"
   need_bin jq
   need_bin rg
@@ -2822,7 +3437,19 @@ cmd_secondary_outage_smoke() {
 }
 
 cmd_secondary_outage_reconcile_smoke() {
-  cmd_secondary_outage_smoke \
+  ensure_dr_harness
+  ensure_dr_stress
+  "$DR_HARNESS_BIN" secondary-outage-reconcile-smoke \
+    --root "$ROOT_DIR" \
+    --topology "$TOPOLOGY" \
+    --env-file "$ENV_FILE" \
+    --results-dir "$RESULTS_DIR" \
+    --dr-stress-bin "$DR_STRESS_BIN" \
+    "$@"
+}
+
+cmd_secondary_outage_reconcile_smoke_legacy() {
+  cmd_secondary_outage_smoke_legacy \
     --expect-reconcile \
     --tuning-profile out-of-horizon \
     --run-prefix secondary-outage-reconcile \
@@ -2835,7 +3462,19 @@ cmd_secondary_outage_reconcile_smoke() {
 }
 
 cmd_indexed_repair_smoke() {
-  cmd_secondary_outage_smoke \
+  ensure_dr_harness
+  ensure_dr_stress
+  "$DR_HARNESS_BIN" indexed-repair-smoke \
+    --root "$ROOT_DIR" \
+    --topology "$TOPOLOGY" \
+    --env-file "$ENV_FILE" \
+    --results-dir "$RESULTS_DIR" \
+    --dr-stress-bin "$DR_STRESS_BIN" \
+    "$@"
+}
+
+cmd_indexed_repair_smoke_legacy() {
+  cmd_secondary_outage_smoke_legacy \
     --expect-reconcile \
     --tuning-profile out-of-horizon \
     --run-prefix indexed-repair \
@@ -2848,6 +3487,30 @@ cmd_indexed_repair_smoke() {
 }
 
 cmd_tuning_load_smoke() {
+  ensure_dr_harness
+  ensure_dr_stress
+  "$DR_HARNESS_BIN" tuning-load-smoke \
+    --root "$ROOT_DIR" \
+    --topology "$TOPOLOGY" \
+    --env-file "$ENV_FILE" \
+    --results-dir "$RESULTS_DIR" \
+    --dr-stress-bin "$DR_STRESS_BIN" \
+    "$@"
+}
+
+cmd_composite_lifecycle_soak() {
+  ensure_dr_harness
+  ensure_dr_stress
+  "$DR_HARNESS_BIN" composite-lifecycle-soak \
+    --root "$ROOT_DIR" \
+    --topology "$TOPOLOGY" \
+    --env-file "$ENV_FILE" \
+    --results-dir "$RESULTS_DIR" \
+    --dr-stress-bin "$DR_STRESS_BIN" \
+    "$@"
+}
+
+cmd_tuning_load_smoke_legacy() {
   [[ "$TOPOLOGY" == "ha" ]] || die "tuning-load-smoke requires --topology ha"
   need_bin jq
 
@@ -3263,6 +3926,8 @@ main() {
     bootstrap) cmd_bootstrap "$@" ;;
     configure) cmd_configure "$@" ;;
     reset) cmd_reset "$@" ;;
+    dataset-fixture-create) cmd_dataset_fixture_create "$@" ;;
+    dataset-fixture-restore) cmd_dataset_fixture_restore "$@" ;;
     status) cmd_status "$@" ;;
     smoke) cmd_smoke "$@" ;;
     verify) cmd_verify "$@" ;;
@@ -3278,6 +3943,7 @@ main() {
     secondary-outage-reconcile-smoke) cmd_secondary_outage_reconcile_smoke "$@" ;;
     indexed-repair-smoke) cmd_indexed_repair_smoke "$@" ;;
     tuning-load-smoke) cmd_tuning_load_smoke "$@" ;;
+    composite-lifecycle-soak) cmd_composite_lifecycle_soak "$@" ;;
     failover-load-lifecycle) cmd_failover_load_lifecycle "$@" ;;
     down) cmd_down "$@" ;;
     logs) cmd_logs "$@" ;;
