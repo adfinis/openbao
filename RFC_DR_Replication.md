@@ -85,17 +85,16 @@ This RFC is asking for maintainer feedback on:
    data API should be part of the first version.
 8. Whether the large-cluster lifecycle should continue toward a fully
    first-class pre-seed and resnapshot API surface. The prototype now includes
-   checkpoint-bound manifest generation, inline bundle export/import, disabled
-   secondary acceptance, replicated-storage replacement with local-only
-   preservation, and baseline application on secondary enable. The remaining
-   design question is the production artifact lifecycle around the new
-   segmented metadata boundary: resumable transfer, durable import staging,
-   provenance, and optimizer seeding.
+   checkpoint-bound manifest generation, inline bundle export/import,
+   segmented export plans, per-segment export/import, disabled secondary
+   acceptance, durable import staging, replicated-storage replacement with
+   local-only preservation, and baseline application on secondary enable. The
+   remaining design question is the production artifact lifecycle around
+   external artifact storage, signed provenance, larger datasets, and optimizer
+   seeding.
 9. Whether the proposed resource model is acceptable: finite journal
    retention, bounded checkpoint build/digest/fetch work on the primary, and a
    checkpoint-scoped reconcile budget ledger on the secondary.
-10. What validation evidence maintainers would require before this moves from
-   RFC/design review toward production implementation.
 
 ## Problem statement
 
@@ -320,30 +319,37 @@ For large existing clusters, initial catch-up should not require every fresh
 secondary to fetch the entire dataset through ordinary reconciliation. The
 preferred lifecycle is a DR-aware pre-seed: create the relationship, cut a
 checkpoint-bound seed bundle for that relationship, restore it into a disabled
-secondary, validate the seed manifest and local-only scrub, then replay or
-reconcile only the post-seed delta. Resnapshot remains the online fallback when
-bounded reconciliation cannot converge or the operator wants a fresh base copy.
+secondary, validate the seed manifest and local-only scrub, then attempt stream
+journal catch-up for the post-seed delta before falling back to checkpoint
+reconciliation. Resnapshot remains the online fallback when bounded
+reconciliation cannot converge or the operator wants a fresh base copy.
 Neither path changes the authority boundary: promotion still requires
 relationship binding, stale-lineage fencing, local-only exclusion, and
 checkpoint proof.
 
-The current prototype has the control-plane and inline artifact lifecycle for
-this boundary: the primary can generate a checkpoint-bound pre-seed manifest
-for a specific relationship and bundle hash; the primary can export an inline
-JSON bundle from checkpoint artifacts; the disabled secondary can validate and
-import that bundle only with explicit confirmation that replacing replicated
-storage is intended; and secondary enable consumes the accepted baseline only
-with the same activation token before starting normal stream/reconcile
-catch-up. Config restore also consumes a still-pending accepted manifest before
-starting the secondary controller, closing the mid-enable crash window. The
-inline bundle is a PoC artifact format. The manifest now names the artifact
-format explicitly and can carry deterministic segment descriptors for a
-future `segmented-json-v1` artifact. Segment descriptors bind ordinal, entry
-count, canonical byte count, digest, and key bounds to the same sorted
-KID/VID/value-hash projection used by whole-bundle validation. Production
-still needs the transfer and recovery pieces around that metadata: segmented
-or streaming export/import, resumability, provenance, durable import staging,
-and optional optimizer seeding.
+The current prototype has the control-plane, inline artifact, and segmented
+artifact lifecycle for this boundary: the primary can generate a
+checkpoint-bound pre-seed manifest for a specific relationship and bundle hash;
+the primary can export an inline JSON bundle from checkpoint artifacts; the
+primary can also create a segmented export plan from checkpoint artifact
+metadata, optionally as an async/pollable job, and export individual
+checkpoint-bound segments directly from checkpoint artifact storage without
+rebuilding the full bundle for every segment; the disabled secondary can
+validate and import inline bundles only with explicit confirmation that
+replacing replicated storage is intended; and the disabled secondary can
+durably stage segmented imports until all segments are present before replacing
+replicated storage.
+Secondary enable consumes the accepted baseline only with the same activation
+token before starting normal stream catch-up. If the primary no longer retains
+journal/buffer coverage from the pre-seed cursor, the existing stream failure
+path falls back to checkpoint reconciliation. Config restore also
+consumes a still-pending accepted manifest before starting the secondary
+controller, closing the mid-enable crash window. The inline bundle is a PoC
+artifact format. The segmented path names the artifact format explicitly and
+binds ordinal, entry count, canonical byte count, digest, and key bounds to the
+same sorted KID/VID/value-hash projection used by whole-bundle validation.
+Production still needs external artifact storage, signed provenance, and
+datasets larger than the current 100k fixture-backed validation run.
 
 ### Runtime refresh
 
@@ -428,7 +434,7 @@ Operator pre-seeding is different from automatic snapshot-on-disconnect and
 should remain in scope as a lifecycle optimization for very large or old
 clusters. A pre-seeded secondary can start from an externally restored,
 primary-authorized base copy and then use normal DR relationship binding,
-checkpoint verification, and stream/reconcile catch-up for the remaining
+checkpoint verification, and stream-first catch-up for the remaining
 delta. The seed should be generated after relationship creation so the seed
 manifest can bind checkpoint identity, relationship ID, primary identity,
 range/checksum versions, local-only scrub version, and optional optimizer
@@ -528,10 +534,10 @@ profiles.
 4. How should DR transport CA rotation work without requiring full
    relationship replacement?
 5. What should the production bulk pre-seed artifact lifecycle be? The
-   prototype exposes inline JSON export/import and a versioned segmented
-   metadata model for lifecycle validation, but not resumable segment
-   transfer, signed artifact provenance, or durable interrupted-import
-   recovery.
+   prototype exposes inline JSON export/import, versioned segmented metadata,
+   per-segment transfer, and durable secondary import staging, but not external
+   artifact storage, signed artifact provenance, or validation beyond the
+   current 100k fixture-backed local smoke.
 6. What final UI/API wording should be used for planned authority transfer,
    disaster promotion, forced-promotion reasons, and data-loss estimate basis?
 
@@ -550,10 +556,10 @@ direction blockers for this RFC:
 - finish the operator pre-seed and resnapshot lifecycle for very large clusters
   where initial full reconciliation would be operationally expensive; the
   current prototype has inline export/import and secondary-enable baseline
-  application with local HA delta catch-up and post-accept handoff validation,
-  plus deterministic segmented artifact descriptors, but still needs resumable
-  segment transfer, interrupted import recovery, provenance, and optimizer
-  seeding
+  application with stream-first delta catch-up, local HA post-accept handoff
+  validation, deterministic segmented artifact descriptors, durable secondary
+  import staging, and a 100k fixture-backed smoke, but still needs external
+  artifact storage, provenance, and larger-dataset validation
 - define availability targets for HA active handoff under sustained DR backlog
   pressure
 - validate WAN latency, packet loss, proxy, and load-balancer behavior

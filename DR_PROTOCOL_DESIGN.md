@@ -453,9 +453,10 @@ dataset through normal reconciliation. The intended production shape is:
 2. capture a primary-authorized DR seed bundle at a known checkpoint boundary;
 3. restore that base copy into the new secondary cluster while DR is disabled;
 4. enable the secondary with the same fresh relationship material;
-5. seed or rebuild local optimizer metadata for the restored checkpoint; and
-6. catch up only the delta between the pre-seed checkpoint and the current
-   primary index through stream journal replay or checkpoint reconciliation.
+5. seed or rebuild local optimizer metadata for the restored checkpoint;
+6. attempt stream journal/buffer replay from the pre-seed checkpoint cursor; and
+7. use checkpoint reconciliation only if the primary can no longer prove replay
+   coverage for that cursor.
 
 Pre-seed is an operator lifecycle optimization, not a different correctness
 authority. The secondary still must bind to a fresh relationship, prove
@@ -469,6 +470,17 @@ The prototype exposes a first-class lifecycle boundary for this workflow:
 - `sys/replication/dr/primary/preseed/export` cuts a primary checkpoint and
   returns an inline JSON seed bundle containing checkpoint-artifact-backed
   replicated storage entries plus the same relationship-bound manifest.
+- `sys/replication/dr/primary/preseed/export-plan` cuts a primary checkpoint
+  and returns a segmented manifest with deterministic segment descriptors. The
+  segmented plan is built from checkpoint artifact metadata rather than by
+  materializing the full seed bundle in the request path, and can be requested
+  as an async job via `async=true`.
+- `sys/replication/dr/primary/preseed/export-plan-status` returns the state of
+  an async segmented export-plan job and includes the manifest once complete.
+- `sys/replication/dr/primary/preseed/export-segment` exports one
+  checkpoint-bound segment from that manifest by reading only that segment's
+  checkpoint artifact records; segments can be fetched and retried
+  independently.
 - `sys/replication/dr/secondary/preseed/accept` validates the manifest against
   the activation token while the secondary is still disabled and records the
   operator confirmations that storage was restored and local-only paths were
@@ -478,16 +490,29 @@ The prototype exposes a first-class lifecycle boundary for this workflow:
   local-only exclusion rules; replaces the disabled secondary's replicated
   storage plane while preserving cluster-local paths; and records the accepted
   checkpoint baseline.
+- `sys/replication/dr/secondary/preseed/import-begin` validates a segmented
+  manifest and records durable secondary-local staging without mutating the
+  replicated storage plane.
+- `sys/replication/dr/secondary/preseed/import-segment` validates and stores
+  one segment in local staging. Re-sending the same segment is idempotent, and
+  a process restart can continue from the staged segments.
+- `sys/replication/dr/secondary/preseed/import-complete` requires explicit
+  replacement confirmation, verifies that every segment is present, validates
+  the reassembled full bundle, then uses the same storage replacement and
+  accepted-baseline path as inline import.
 - `sys/replication/dr/secondary/enable` consumes the accepted manifest only
   when the same activation token is used, applies the checkpoint high-water mark
-  and durable stream cursor baseline, and then starts normal stream/reconcile
-  catch-up from that checkpoint.
+  and durable stream cursor/optimizer baseline, and then attempts stream
+  catch-up from that checkpoint before falling back to reconciliation.
 - If the process crashes after secondary config is persisted but before the
   accepted pre-seed record is consumed, config restore applies the same baseline
   before starting the secondary controller.
-- The local HA smoke validates the inline lifecycle across accept, post-export
-  delta catch-up, primary active handoff, secondary active handoff, and
-  checkpoint verification after the handoff.
+- The local HA smoke validates the segmented lifecycle across export-plan,
+  per-segment export/import, post-export delta catch-up, primary active
+  handoff, secondary active handoff, and checkpoint verification after the
+  handoff. The fixture-backed 100k smoke validates stream-first catch-up from
+  an accepted pre-seed baseline when the retained journal covers the post-seed
+  delta.
 
 The current inline bundle format is a prototype artifact format. It is useful
 for lifecycle validation because export, transfer, import, and baseline
@@ -496,15 +521,15 @@ segmented or streaming artifact with resumable transfer, stronger provenance,
 and external storage support rather than returning very large datasets inside a
 single API response.
 
-The manifest format now has an explicit artifact-format boundary. Existing
-exports use `inline-json-v1` for compatibility with the smoke lifecycle. The
-protocol model also defines `segmented-json-v1` metadata: each segment
-descriptor carries its ordinal, entry count, canonical payload byte count,
-SHA-256 digest, and key bounds. Bundle validation recomputes descriptors from
-the canonical sorted KID/VID/value-hash projection and rejects stale or
-tampered segment metadata. This is intentionally not a resumable transfer API
-yet; it is the validation foundation for chunked export/import without making
-the whole seed a single JSON response.
+The manifest format has an explicit artifact-format boundary. Existing inline
+exports use `inline-json-v1` for compatibility. The production-shape path uses
+`segmented-json-v1` metadata: each segment descriptor carries its ordinal,
+entry count, canonical payload byte count, SHA-256 digest, and key bounds.
+Bundle validation recomputes descriptors from the canonical sorted
+KID/VID/value-hash projection and rejects stale or tampered segment metadata.
+The current segmented API is resumable on the secondary import side through
+durable local staging; remaining production work is external artifact storage,
+signed provenance, and larger-scale validation.
 
 ```mermaid
 flowchart TD

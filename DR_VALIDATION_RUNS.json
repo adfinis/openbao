@@ -420,6 +420,531 @@
       "notes": "Confirms active handoff under quiescent conditions does not force scanned reconciliation."
     },
     {
+      "scenario_id": "S19",
+      "scenario": "100k fixture pre-seed with journal catch-up",
+      "run_id": "preseed-smoke-20260601T225805Z",
+      "path": "dr-stress-results/preseed-smoke-20260601T225805Z",
+      "topology": "single-primary-plus-two-secondaries",
+      "command_shape": "scripts/dr_local_test.sh --topology single preseed-smoke --dataset-fixture primary-100k --async-export-plan --segment-max-bytes 524288 --post-export-write-keys 20000 --post-export-write-concurrency 64 --timeout 1800 --build",
+      "result": "pass",
+      "duration_seconds": null,
+      "concurrency": 64,
+      "preseed": {
+        "fixture": "primary-100k",
+        "entry_count": 63346,
+        "segment_count": 54,
+        "checkpoint_index": 100047,
+        "post_export_write_keys": 20000,
+        "verified_checkpoint_index": 120070
+      },
+      "secondary2_status": {
+        "secondary_state": "streaming",
+        "last_applied_index": 120070,
+        "primary_index": 120070,
+        "lag_entries": 0,
+        "reconcile_count": 0,
+        "flat_accumulator_indexed_repair_total": 0,
+        "local_kid_index_fallback_scans_total": 0,
+        "scan_failures_total": 0,
+        "stream_txn_batches_total": 211,
+        "stream_txn_entries_total": 40002,
+        "stream_txn_commit_milliseconds_average": 125.30445736492892,
+        "stream_txn_commit_milliseconds_max": 343.66585,
+        "flat_accumulator_snapshot_persists_total": 6,
+        "flat_accumulator_snapshot_skipped_total": 205,
+        "flat_accumulator_cursor_writes_total": 211
+      },
+      "checkpoint_verification": {
+        "pass": true,
+        "reason": "ok",
+        "physical_scan_used": false,
+        "optimizer_reseeded": false,
+        "accumulator_index": 120070,
+        "matched_ranges": 1024,
+        "mismatched_ranges": 0,
+        "missing_ranges": 0
+      },
+      "notes": "Validates stream-first catch-up from an accepted pre-seed baseline when the primary journal covers the post-seed delta. The run avoided initial reconciliation, indexed repair, local KID fallback scans, and physical-scan verification fallback."
+    },
+    {
+      "scenario_id": "S19",
+      "scenario": "HA pre-seed with journal catch-up and post-accept handoff",
+      "run_id": "preseed-smoke-20260601T231801Z",
+      "path": "dr-stress-results/preseed-smoke-20260601T231801Z",
+      "topology": "ha-primary-plus-two-secondaries",
+      "command_shape": "scripts/dr_local_test.sh --topology ha preseed-smoke --post-export-write-keys 5000 --post-export-write-concurrency 64 --timeout 900",
+      "result": "pass",
+      "duration_seconds": null,
+      "concurrency": 64,
+      "preseed": {
+        "entry_count": 151,
+        "segment_count": 8,
+        "checkpoint_index": 113,
+        "post_export_write_keys": 5000,
+        "verified_checkpoint_index": 5127,
+        "post_handoff_verified_checkpoint_index": 5135
+      },
+      "secondary2_status": {
+        "secondary_state": "streaming",
+        "last_applied_index": 5127,
+        "primary_index": 5125,
+        "lag_entries": 0,
+        "reconcile_count": 0,
+        "flat_accumulator_indexed_repair_total": 0,
+        "local_kid_index_fallback_scans_total": 0,
+        "scan_failures_total": 0,
+        "stream_txn_batches_total": 190,
+        "stream_txn_entries_total": 10002,
+        "stream_txn_commit_milliseconds_average": 48.899497447368425,
+        "stream_txn_commit_milliseconds_max": 406.161658
+      },
+      "post_handoff_secondary2_status": {
+        "secondary_state": "streaming",
+        "last_applied_index": 5135,
+        "primary_index": 5135,
+        "lag_entries": 0,
+        "reconcile_count": 0,
+        "flat_accumulator_indexed_repair_total": 0,
+        "local_kid_index_fallback_scans_total": 0,
+        "scan_failures_total": 0
+      },
+      "checkpoint_verification": {
+        "pass": true,
+        "reason": "ok",
+        "physical_scan_used": false,
+        "optimizer_reseeded": false,
+        "accumulator_index": 5127,
+        "matched_ranges": 1024,
+        "mismatched_ranges": 0,
+        "missing_ranges": 0
+      },
+      "post_handoff_checkpoint_verification": {
+        "pass": true,
+        "reason": "ok",
+        "physical_scan_used": false,
+        "optimizer_reseeded": false,
+        "accumulator_index": 5135,
+        "matched_ranges": 1024,
+        "mismatched_ranges": 0,
+        "missing_ranges": 0
+      },
+      "notes": "Validates stream-first catch-up from an accepted pre-seed baseline in HA, then verifies the same accumulator path after primary and secondary active handoff. The run avoided initial reconciliation, indexed repair, local KID fallback scans, scan failures, and physical-scan verification fallback."
+    },
+    {
+      "scenario_id": "S19",
+      "scenario": "Go-harness HA pre-seed wrapper parity",
+      "run_id": "preseed-smoke-20260601T234900Z",
+      "path": "dr-stress-results/preseed-smoke-20260601T234900Z",
+      "topology": "ha-primary-plus-two-secondaries",
+      "command_shape": "scripts/dr_local_test.sh --topology ha preseed-smoke --post-export-write-keys 500 --post-export-write-concurrency 16 --timeout 600",
+      "result": "pass",
+      "duration_seconds": null,
+      "concurrency": 16,
+      "harness": "scripts/dr-harness",
+      "preseed": {
+        "entry_count": 151,
+        "segment_count": 8,
+        "checkpoint_index": 113,
+        "post_export_write_keys": 500,
+        "verified_checkpoint_index": 618,
+        "post_handoff_verified_checkpoint_index": 626
+      },
+      "secondary2_status": {
+        "secondary_state": "streaming",
+        "last_applied_index": 618,
+        "primary_index": 618,
+        "lag_entries": 0,
+        "reconcile_count": 0,
+        "flat_accumulator_indexed_repair_total": 0,
+        "local_kid_index_fallback_scans_total": 0,
+        "scan_failures_total": 0,
+        "stream_txn_batches_total": 9,
+        "stream_txn_entries_total": 1002,
+        "stream_txn_commit_milliseconds_average": 30.65477177777778,
+        "stream_txn_commit_milliseconds_max": 65.646175
+      },
+      "post_handoff_secondary2_status": {
+        "secondary_state": "streaming",
+        "last_applied_index": 626,
+        "primary_index": 626,
+        "lag_entries": 0,
+        "reconcile_count": 0,
+        "flat_accumulator_indexed_repair_total": 0,
+        "local_kid_index_fallback_scans_total": 0,
+        "scan_failures_total": 0
+      },
+      "checkpoint_verification": {
+        "pass": true,
+        "reason": "ok",
+        "physical_scan_used": false,
+        "optimizer_reseeded": false,
+        "accumulator_index": 618,
+        "matched_ranges": 1024,
+        "mismatched_ranges": 0,
+        "missing_ranges": 0
+      },
+      "post_handoff_checkpoint_verification": {
+        "pass": true,
+        "reason": "ok",
+        "physical_scan_used": false,
+        "optimizer_reseeded": false,
+        "accumulator_index": 626,
+        "matched_ranges": 1024,
+        "mismatched_ranges": 0,
+        "missing_ranges": 0
+      },
+      "notes": "Validates that the active preseed-smoke shell entrypoint now runs through the Go harness and preserves the same HA pre-seed, stream-first catch-up, handoff, and checkpoint-verification behavior. This is harness parity evidence, not a larger scalability benchmark."
+    },
+    {
+      "scenario_id": "S12",
+      "scenario": "Go-harness HA quiescent reconnect wrapper parity",
+      "run_id": "quiescent-reconnect-20260602T001152Z",
+      "path": "dr-stress-results/quiescent-reconnect-20260602T001152Z",
+      "topology": "ha-primary-plus-two-secondaries",
+      "command_shape": "scripts/dr_local_test.sh --topology ha quiescent-reconnect-smoke --no-reset --timeout 300",
+      "result": "pass",
+      "harness": "scripts/dr-harness",
+      "primary_active_before": "http://localhost:8800",
+      "primary_active_after": "http://localhost:8802",
+      "secondary1": {
+        "lag_entries_after": 0,
+        "reconcile_count_before": 1,
+        "reconcile_count_after": 1,
+        "flat_accumulator_fast_path_before": 0,
+        "flat_accumulator_fast_path_after": 0
+      },
+      "secondary2": {
+        "lag_entries_after": 0,
+        "reconcile_count_before": 1,
+        "reconcile_count_after": 1,
+        "flat_accumulator_fast_path_before": 0,
+        "flat_accumulator_fast_path_after": 0
+      },
+      "notes": "Validates that the active quiescent-reconnect-smoke shell entrypoint now runs through the Go harness and preserves the no-new-reconciliation HA active-handoff assertion. This is harness parity evidence."
+    },
+    {
+      "scenario_id": "S13",
+      "scenario": "Go-harness HA accumulator cold-restart wrapper parity",
+      "run_id": "accumulator-cold-restart-20260602T001327Z",
+      "path": "dr-stress-results/accumulator-cold-restart-20260602T001327Z",
+      "topology": "ha-primary-plus-two-secondaries",
+      "command_shape": "scripts/dr_local_test.sh --topology ha accumulator-cold-restart-smoke --no-reset --timeout 300 --stop-seconds 3",
+      "result": "pass",
+      "harness": "scripts/dr-harness",
+      "secondary1": {
+        "last_applied_before": 66,
+        "last_applied_after": 66,
+        "flat_accumulator_cursor_after": 66,
+        "flat_accumulator_snapshot_after": 66,
+        "reconcile_count_before": 0,
+        "reconcile_count_after": 0,
+        "scan_failures_before": 0,
+        "scan_failures_after": 0,
+        "local_kid_fallback_before": 0,
+        "local_kid_fallback_after": 0
+      },
+      "notes": "Validates that the active accumulator-cold-restart-smoke shell entrypoint now runs through the Go harness, restarts all secondary1 HA nodes, reloads the durable accumulator cursor, and avoids new scan/reconcile/fallback counters. This is harness parity evidence."
+    },
+    {
+      "scenario_id": "S16",
+      "scenario": "Go-harness HA secondary outage within journal horizon wrapper parity",
+      "run_id": "secondary-outage-20260602T001401Z",
+      "path": "dr-stress-results/secondary-outage-20260602T001401Z",
+      "topology": "ha-primary-plus-two-secondaries",
+      "command_shape": "scripts/dr_local_test.sh --topology ha secondary-outage-smoke --no-reset --duration 75 --concurrency 12 --outage-after 15 --outage-seconds 20 --max-wait-seconds 240 --progress-interval 10 --monitor-interval 2 --timeout 300",
+      "result": "pass",
+      "duration_seconds": 75,
+      "concurrency": 12,
+      "harness": "scripts/dr-harness",
+      "secondary1": {
+        "last_applied_before": 66,
+        "last_applied_after": 6786,
+        "reconcile_count_before": 0,
+        "reconcile_count_after": 0,
+        "indexed_repair_before": 0,
+        "indexed_repair_after": 0,
+        "local_kid_fallback_before": 0,
+        "local_kid_fallback_after": 0
+      },
+      "primary": {
+        "journal_range_too_old_before": 0,
+        "journal_range_too_old_after": 0
+      },
+      "notes": "Validates that the active secondary-outage-smoke shell entrypoint now runs through the Go harness, follows the new secondary1 active node after restart, catches up through journal replay, and passes terminal checkpoint verification. This is harness parity evidence, not a throughput benchmark."
+    },
+    {
+      "scenario_id": "S15/S17",
+      "scenario": "Go-harness HA indexed repair and out-of-horizon outage wrapper parity",
+      "run_id": "indexed-repair-20260602T001934Z",
+      "path": "dr-stress-results/indexed-repair-20260602T001934Z",
+      "topology": "ha-primary-plus-two-secondaries",
+      "command_shape": "scripts/dr_local_test.sh --topology ha indexed-repair-smoke --no-reset --duration 100 --concurrency 12 --outage-after 15 --outage-seconds 50 --max-wait-seconds 360 --progress-interval 10 --monitor-interval 2 --timeout 300",
+      "result": "pass",
+      "duration_seconds": 100,
+      "concurrency": 12,
+      "harness": "scripts/dr-harness",
+      "secondary1": {
+        "last_applied_before": 16165,
+        "last_applied_after": 25990,
+        "reconcile_count_before": 1,
+        "reconcile_count_after": 2,
+        "indexed_repair_before": 1,
+        "indexed_repair_after": 2,
+        "local_kid_fallback_before": 0,
+        "local_kid_fallback_after": 0
+      },
+      "primary": {
+        "journal_range_too_old_before": 1,
+        "journal_range_too_old_after": 3
+      },
+      "notes": "Validates that the active indexed-repair-smoke shell entrypoint now runs through the Go harness and exercises the same out-of-horizon reconciliation path used by secondary-outage-reconcile-smoke. The harness retries only transient accumulator/checkpoint index skew during terminal checkpoint verification; missing ranges, mismatches, proof failures, and API errors remain immediate failures."
+    },
+    {
+      "scenario_id": "S14/S18",
+      "scenario": "Go-harness HA mixed-load smoke wrapper parity",
+      "run_id": "drmixed-20260602T055824Z",
+      "path": "dr-stress-results/drmixed-20260602T055824Z",
+      "topology": "ha-primary-plus-two-secondaries",
+      "command_shape": "scripts/dr_local_test.sh --topology ha smoke --duration 45 --concurrency 8 --max-wait-seconds 180 --progress-interval 10 --monitor-interval 2 && verify --sample 0 --secondary-method checkpoint",
+      "result": "pass",
+      "duration_seconds": 45,
+      "concurrency": 8,
+      "operations_total": 5475,
+      "operations_per_second": 111.2330103004815,
+      "put_fail": 0,
+      "get_fail": 0,
+      "status_fail": 0,
+      "events_dropped": 0,
+      "sentinel": {
+        "secondary1_converge_seconds": 1.005763333,
+        "secondary2_converge_seconds": 1.015187375
+      },
+      "verification": {
+        "primary_api": { "pass": true, "sampled": 820, "missing": 0, "mismatches": 0, "errors": 0 },
+        "secondary1_checkpoint": {
+          "pass": true,
+          "checkpoint_index": 30661,
+          "accumulator_index": 30661,
+          "matched_ranges": 1024,
+          "mismatched_ranges": 0,
+          "missing_ranges": 0,
+          "physical_scan_used": false,
+          "optimizer_reseeded": false
+        },
+        "secondary2_checkpoint": {
+          "pass": true,
+          "checkpoint_index": 30661,
+          "accumulator_index": 30661,
+          "matched_ranges": 1024,
+          "mismatched_ranges": 0,
+          "missing_ranges": 0,
+          "physical_scan_used": false,
+          "optimizer_reseeded": false
+        }
+      },
+      "harness": "scripts/dr-harness",
+      "notes": "Validates that the active smoke shell entrypoint now runs through the Go harness, applies constrained HA primary tuning, delegates workload execution to dr-stress, and supports terminal active-secondary checkpoint verification. This is shortened harness parity evidence, not a throughput benchmark."
+    },
+    {
+      "scenario_id": "S14/S18",
+      "scenario": "Go-harness HA full mixed-load smoke",
+      "run_id": "drmixed-20260602T075024Z",
+      "path": "dr-stress-results/drmixed-20260602T075024Z",
+      "topology": "ha-primary-plus-two-secondaries",
+      "command_shape": "scripts/dr_local_test.sh --topology ha smoke --duration 900 --concurrency 48 --stepdown-interval 300 --max-wait-seconds 900 --progress-interval 30 --monitor-interval 5 && scripts/dr_local_test.sh --topology ha verify dr-stress-results/drmixed-20260602T075024Z --sample 0 --secondary-method checkpoint",
+      "result": "pass_with_expected_client_transients",
+      "duration_seconds": 900,
+      "concurrency": 48,
+      "operations_total": 79053,
+      "operations_per_second": 87.31587597529402,
+      "put_fail": 1057,
+      "get_fail": 73,
+      "status_fail": 0,
+      "events_dropped": 0,
+      "sentinel": {
+        "secondary1_converge_seconds": 1.011932917,
+        "secondary2_converge_seconds": 1.011247167
+      },
+      "verification": {
+        "primary_api": {
+          "pass": true,
+          "sampled": 7094,
+          "missing": 0,
+          "mismatches": 0,
+          "errors": 0
+        },
+        "secondary1_checkpoint": {
+          "pass": true,
+          "checkpoint_index": 42715,
+          "accumulator_index": 42715,
+          "matched_ranges": 1024,
+          "mismatched_ranges": 0,
+          "missing_ranges": 0,
+          "physical_scan_used": false,
+          "optimizer_reseeded": false
+        },
+        "secondary2_checkpoint": {
+          "pass": true,
+          "checkpoint_index": 42715,
+          "accumulator_index": 42715,
+          "matched_ranges": 1024,
+          "mismatched_ranges": 0,
+          "missing_ranges": 0,
+          "physical_scan_used": false,
+          "optimizer_reseeded": false
+        }
+      },
+      "status_after": {
+        "primary": {
+          "stream_buffer_entries": 20000,
+          "stream_buffer_max_entries": 20000,
+          "stream_buffer_horizon_seconds": 179,
+          "checkpoint_conflicts_storage_drift_total": 642,
+          "dr_backpressure_state": "healthy"
+        },
+        "secondary1": {
+          "secondary_state": "streaming",
+          "lag_entries": 0,
+          "last_applied_index": 42703,
+          "primary_index": 42703,
+          "reconcile_count": 2,
+          "reconcile_retries_total": 0,
+          "stream_batch_adaptive_level": 2,
+          "stream_batch_effective_max_wait_milliseconds": 100,
+          "stream_txn_batches_total": 4061,
+          "stream_txn_physical_entries_total": 115478,
+          "stream_txn_average_entries": 28.508741689239102,
+          "stream_txn_commit_milliseconds_average": 105.61046985791677,
+          "stream_txn_commit_milliseconds_max": 1438.991576,
+          "flat_accumulator_cursor_index": 42703,
+          "flat_accumulator_cursor_writes_total": 4068,
+          "flat_accumulator_snapshot_persists_total": 177,
+          "flat_accumulator_snapshot_skipped_total": 3891,
+          "flat_accumulator_indexed_repair_total": 1,
+          "flat_accumulator_indexed_repair_ranges_total": 490,
+          "flat_accumulator_indexed_repair_full_bucket_fallback_total": 0,
+          "flat_accumulator_indexed_repair_proof_mismatches_total": 0,
+          "local_kid_index_bucket_loads_total": 645,
+          "local_kid_index_entries_loaded_total": 606,
+          "local_kid_index_load_failures_total": 0,
+          "local_kid_index_fallback_scans_total": 0,
+          "scan_failures_total": 0
+        },
+        "secondary2": {
+          "secondary_state": "streaming",
+          "lag_entries": 0,
+          "last_applied_index": 42703,
+          "primary_index": 42703,
+          "reconcile_count": 2,
+          "reconcile_retries_total": 1,
+          "stream_batch_adaptive_level": 2,
+          "stream_batch_effective_max_wait_milliseconds": 100,
+          "stream_txn_batches_total": 4039,
+          "stream_txn_physical_entries_total": 114702,
+          "stream_txn_average_entries": 28.48130725427086,
+          "stream_txn_commit_milliseconds_average": 105.06044623817778,
+          "stream_txn_commit_milliseconds_max": 1439.487248,
+          "flat_accumulator_cursor_index": 42703,
+          "flat_accumulator_cursor_writes_total": 4046,
+          "flat_accumulator_snapshot_persists_total": 175,
+          "flat_accumulator_snapshot_skipped_total": 3871,
+          "flat_accumulator_indexed_repair_total": 1,
+          "flat_accumulator_indexed_repair_ranges_total": 749,
+          "flat_accumulator_indexed_repair_full_bucket_fallback_total": 0,
+          "flat_accumulator_indexed_repair_proof_mismatches_total": 0,
+          "local_kid_index_bucket_loads_total": 1279,
+          "local_kid_index_entries_loaded_total": 1061,
+          "local_kid_index_load_failures_total": 0,
+          "local_kid_index_fallback_scans_total": 0,
+          "scan_failures_total": 0
+        }
+      },
+      "harness": "scripts/dr-harness",
+      "notes": "Current representative full-duration Go-harness mixed-load smoke. The primary stream ring saturated under adversarial load, both secondaries briefly entered reconciliation and returned to streaming, indexed repair ran without local KID fallback scans, full-bucket fallback, proof mismatches, load failures, or scan failures, and terminal proof used primary API plus strict-secondary checkpoint verification."
+    },
+    {
+      "scenario_id": "S11",
+      "scenario": "Go-harness HA dynamic tuning load",
+      "run_id": "tuning-ha-load-20260602T071619Z",
+      "path": "dr-stress-results/tuning-ha-load-20260602T071619Z",
+      "topology": "ha-primary-plus-two-secondaries",
+      "command_shape": "scripts/dr_local_test.sh --topology ha tuning-load-smoke --no-reset --duration 900 --concurrency 36 --stepdown-interval 90 --first-tune-after 60 --second-tune-after 180 --max-wait-seconds 900 --progress-interval 30 --monitor-interval 2 --timeout 1500",
+      "result": "pass_with_expected_client_transients",
+      "duration_seconds": 900,
+      "concurrency": 36,
+      "operations_total": 86564,
+      "operations_per_second": 89.82016045688292,
+      "put_fail": 1885,
+      "get_fail": 352,
+      "status_fail": 0,
+      "events_dropped": 0,
+      "sentinel": {
+        "secondary1_converge_seconds": 1.012422166,
+        "secondary2_converge_seconds": 59.014738167
+      },
+      "dynamic_tuning": {
+        "first_profile": "constrained",
+        "first_tune_after_seconds": 60,
+        "second_profile": "relaxed",
+        "second_tune_after_seconds": 180,
+        "stepdown_interval_seconds": 90,
+        "relaxed_primary_tuning_retry_attempts": 3
+      },
+      "verification": {
+        "primary_api": {
+          "pass": true,
+          "sampled": 7663,
+          "missing": 0,
+          "mismatches": 0,
+          "errors": 0
+        },
+        "secondary1_checkpoint": {
+          "pass": true,
+          "checkpoint_index": 45871,
+          "accumulator_index": 45871,
+          "matched_ranges": 1024,
+          "mismatched_ranges": 0,
+          "missing_ranges": 0,
+          "physical_scan_used": false,
+          "optimizer_reseeded": false
+        },
+        "secondary2_checkpoint": {
+          "pass": true,
+          "checkpoint_index": 45872,
+          "accumulator_index": 45872,
+          "matched_ranges": 1024,
+          "mismatched_ranges": 0,
+          "missing_ranges": 0,
+          "physical_scan_used": false,
+          "optimizer_reseeded": false
+        }
+      },
+      "status_after": {
+        "secondary1": {
+          "secondary_state": "streaming",
+          "lag_entries": 0,
+          "last_applied_index": 45871,
+          "primary_index": 45866,
+          "reconcile_count": 2,
+          "fallback_count": 0,
+          "local_kid_index_fallback_scans_total": 0,
+          "flat_accumulator_cursor_index": 45871
+        },
+        "secondary2": {
+          "secondary_state": "streaming",
+          "lag_entries": 0,
+          "last_applied_index": 45866,
+          "primary_index": 45866,
+          "reconcile_count": 2,
+          "fallback_count": 0,
+          "local_kid_index_fallback_scans_total": 0,
+          "flat_accumulator_cursor_index": 45866
+        }
+      },
+      "harness": "scripts/dr-harness",
+      "notes": "Validates dynamic DR tuning writes under HA mixed load, periodic primary stepdown, and forced primary/secondary active handoff. The relaxed primary tuning write collided with active movement and succeeded after retry; PUT/GET failures are expected HA disruption noise. Strict-secondary checkpoint verification stayed on the O(1) accumulator path with no physical scan or optimizer reseed."
+    },
+    {
       "scenario_id": "E15",
       "scenario": "Engine/runtime lifecycle matrix",
       "run_id": "engine-matrix-20260530161139",
