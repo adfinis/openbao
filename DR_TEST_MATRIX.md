@@ -2,6 +2,11 @@
 
 This matrix defines manual and automated validation for DR replication in this repository.
 
+For curated validation evidence, see
+[DR_VALIDATION_RESULTS.md](DR_VALIDATION_RESULTS.md). For scale interpretation,
+see [DR_PERFORMANCE_NOTES.md](DR_PERFORMANCE_NOTES.md). For unresolved
+production work, see [DR_OPEN_WORK.md](DR_OPEN_WORK.md).
+
 ## Scope
 
 - Unit and integration tests under the repository root.

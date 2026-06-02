@@ -131,90 +131,13 @@ The curated set supports these current claims:
   warm-standby surface. Terminal secondary correctness should be cited through
   checkpoint verification, or through API verification after promotion.
 
-## Secondary Transaction-Pressure Baseline
+## Performance Evidence
 
-The current optimization baseline is `drmixed-20260531T214747Z`, the curated
-15-minute HA mixed-load run with primary handoff pressure. It passed exhaustive
-verification, but showed high secondary write amplification:
-
-| Node | Stream Txns | Avg Entries/Txn | Avg Commit ms | Max Commit ms | Cursor Writes | Snapshot Persists | Snapshot Skips | Local KID Updates |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| secondary1 | 6,764 | 19.64 | 100.55 | 5,687.65 | 6,768 | 175 | 6,593 | 132,799 |
-| secondary2 | 6,716 | 19.75 | 100.52 | 5,466.99 | 6,724 | 179 | 6,545 | 132,512 |
-
-The local KID-index update count was effectively one write per replicated
-physical entry. The implemented optimization target is therefore to make the
-local repair index store stable key identity only and recompute VIDs from local
-storage only when indexed repair loads a mismatched bucket. This keeps the
-flat accumulator as the authoritative value digest while reducing steady-state
-secondary-local write pressure for hot-key updates. Value-only batches also
-avoid advancing the local KID-index metadata; that metadata now tracks the
-key-set index and may lag the accumulator value index.
-
-The first validation run after that optimization is `drmixed-20260531T231905Z`.
-It preserves the correctness signal and shows the intended steady-state shape:
-
-| Node | Stream Txns | Physical Entries | Avg Entries/Txn | Avg Commit ms | Max Commit ms | Cursor Writes | Snapshot Persists | Snapshot Skips | Local KID Updates | Indexed Ranges | Indexed Entries Loaded | Fallback Scans |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| secondary1 | 9,713 | 201,556 | 20.77 | 61.70 | 1,376.58 | 9,719 | 180 | 9,539 | 139,416 | 558 | 12,760 | 0 |
-| secondary2 | 9,803 | 202,283 | 20.65 | 61.70 | 1,266.54 | 9,809 | 181 | 9,628 | 139,880 | 298 | 6,824 | 0 |
-
-The run had more replicated physical entries than the baseline, so the absolute
-local KID-index write count is still high. The important directional result is
-that the index no longer tracks every value mutation: local KID-index updates
-were about 69% of physical entries while indexed repair still completed without
-local full scans.
-
-The first adaptive stream batching validation run is `drmixed-20260531T235152Z`.
-Both secondaries adapted from the 25ms baseline to a 100ms effective wait
-window (`stream_batch_adaptive_level=2`, six adjustments observed live after
-the run). This roughly halved the number of secondary stream transactions and
-cursor writes:
-
-| Node | Stream Txns | Physical Entries | Avg Entries/Txn | Avg Commit ms | Max Commit ms | Cursor Writes | Snapshot Persists | Snapshot Skips | Local KID Updates | Indexed Ranges | Fallback Scans |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| secondary1 | 4,361 | 188,852 | 43.37 | 92.58 | 2,239.52 | 4,367 | 175 | 4,192 | 130,955 | 0 | 1 |
-| secondary2 | 4,401 | 190,505 | 43.36 | 92.29 | 2,238.07 | 4,407 | 177 | 4,230 | 132,102 | 372 | 0 |
-
-The transaction-pressure result was positive, but the single secondary #1
-`bucket_mismatch` fallback scan made reconciliation-after-handoff pressure the
-next follow-up target.
-
-The follow-up HA smoke is `drmixed-20260601T114049Z`. It keeps the adaptive
-batching shape and validates the standby key-transition fix at the same time:
-
-| Node | Stream Txns | Physical Entries | Avg Entries/Txn | Avg Commit ms | Max Commit ms | Cursor Writes | Snapshot Persists | Snapshot Skips | Local KID Updates | Indexed Ranges | Bucket Loads | Entries Loaded | Fallback Scans | Proof Mismatches |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| secondary1 | 4,425 | 164,252 | 37.24 | 87.18 | 1,944.17 | 4,432 | 174 | 4,258 | 164,231 | 1,024 | 10,405 | 12,703 | 0 | 0 |
-| secondary2 | 4,392 | 163,021 | 37.24 | 86.54 | 2,203.60 | 4,399 | 172 | 4,227 | 163,016 | 1,024 | 11,072 | 13,183 | 0 | 0 |
-
-This closes the previous `bucket_mismatch` follow-up for the current 15-minute
-HA smoke shape. The remaining transaction-pressure target is secondary commit
-latency and local metadata write amplification, especially while the primary
-stream ring is saturated under adversarial write load.
-
-The current full-duration Go-harness mixed-load baseline is
-`drmixed-20260602T075024Z`. It uses the same 900s / 48-worker / 300s-stepdown
-shape as the earlier 15-minute HA smokes, but terminal secondary proof now uses
-strict checkpoint verification instead of secondary API reads:
-
-| Node | Stream Txns | Physical Entries | Avg Entries/Txn | Avg Commit ms | Max Commit ms | Cursor Writes | Snapshot Persists | Snapshot Skips | Local KID Updates | Indexed Ranges | Bucket Loads | Entries Loaded | Fallback Scans | Proof Mismatches |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| secondary1 | 4,061 | 115,478 | 28.51 | 105.61 | 1,438.99 | 4,068 | 177 | 3,891 | 115,309 | 490 | 645 | 606 | 0 | 0 |
-| secondary2 | 4,039 | 114,702 | 28.48 | 105.06 | 1,439.49 | 4,046 | 175 | 3,871 | 114,441 | 749 | 1,279 | 1,061 | 0 | 0 |
-
-Compared with the older `drmixed-20260601T114049Z` evidence, this run has lower
-total operation count but cleaner terminal proof semantics: primary API
-verification passed across 7,094 truth-log keys and both secondaries passed
-checkpoint verification with 1,024/1,024 matched ranges, no scan fallback, and
-no optimizer reseed.
-
-The current dynamic-tuning HA evidence point is
-`tuning-ha-load-20260602T071619Z`. It does not replace the generic mixed-load
-transaction-pressure baseline because it uses 36 workers and a 90s primary
-stepdown cadence, but it validates runtime tuning writes under active HA
-movement. Both strict secondaries completed terminal checkpoint verification
-with no physical scan, no optimizer reseed, and zero range mismatches.
+Performance and scale interpretation now lives in
+[DR_PERFORMANCE_NOTES.md](DR_PERFORMANCE_NOTES.md). The validation claim here is
+narrower: selected runs show terminal correctness, scan-free accumulator/indexed
+repair in the tested paths, and promising secondary transaction-pressure
+improvements. They do not yet prove production scale or availability SLOs.
 
 The curated set does not prove:
 

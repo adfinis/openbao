@@ -43,6 +43,9 @@ Detailed design notes are split out of this RFC:
 
 - [DR_PROTOCOL_DESIGN.md](DR_PROTOCOL_DESIGN.md): streaming, checkpoints,
   reconciliation, flat accumulators, local KID index, and resource controls.
+- [DR_PRESEED_RESNAPSHOT_DESIGN.md](DR_PRESEED_RESNAPSHOT_DESIGN.md):
+  resnapshot, segmented pre-seed, artifact validation, secondary import, and
+  post-seed catch-up.
 - [DR_SECURITY_DESIGN.md](DR_SECURITY_DESIGN.md): bootstrap, mTLS,
   `SyncKeyring`, certificate lifecycle, revocation, and unauthenticated
   endpoint boundaries.
@@ -51,6 +54,8 @@ Detailed design notes are split out of this RFC:
 - [DR_RUNTIME_REFRESH_DESIGN.md](DR_RUNTIME_REFRESH_DESIGN.md): replication
   domain, local exclusions, namespaces, mount/auth/audit tables, identity, and
   route-backed cache refresh.
+- [DR_PERFORMANCE_NOTES.md](DR_PERFORMANCE_NOTES.md): current scale model,
+  transaction-pressure evidence, and optimization direction.
 
 Validation evidence and reproducibility live separately:
 
@@ -58,6 +63,7 @@ Validation evidence and reproducibility live separately:
 - [DR_VALIDATION_RUNS.json](DR_VALIDATION_RUNS.json)
 - [DR_TEST_MATRIX.md](DR_TEST_MATRIX.md)
 - [DR_BUG_TRACKER.md](DR_BUG_TRACKER.md)
+- [DR_OPEN_WORK.md](DR_OPEN_WORK.md)
 
 ## Review questions for maintainers
 
@@ -84,14 +90,10 @@ This RFC is asking for maintainer feedback on:
    checkpoint verification before promotion, or whether a supported read-only
    data API should be part of the first version.
 8. Whether the large-cluster lifecycle should continue toward a fully
-   first-class pre-seed and resnapshot API surface. The prototype now includes
-   checkpoint-bound manifest generation, inline bundle export/import,
-   segmented export plans, per-segment export/import, disabled secondary
-   acceptance, durable import staging, replicated-storage replacement with
-   local-only preservation, and baseline application on secondary enable. The
-   remaining design question is the production artifact lifecycle around
-   external artifact storage, signed provenance, larger datasets, and optimizer
-   seeding.
+   first-class pre-seed and resnapshot API surface. This RFC recommends yes:
+   old primaries need a relationship-bound base-copy path that can avoid
+   ordinary full reconciliation for the initial dataset. Details are in
+   [DR_PRESEED_RESNAPSHOT_DESIGN.md](DR_PRESEED_RESNAPSHOT_DESIGN.md).
 9. Whether the proposed resource model is acceptable: finite journal
    retention, bounded checkpoint build/digest/fetch work on the primary, and a
    checkpoint-scoped reconcile budget ledger on the secondary.
@@ -317,39 +319,14 @@ bucket proof validation, reconciliation falls back to a full local scan.
 
 For large existing clusters, initial catch-up should not require every fresh
 secondary to fetch the entire dataset through ordinary reconciliation. The
-preferred lifecycle is a DR-aware pre-seed: create the relationship, cut a
-checkpoint-bound seed bundle for that relationship, restore it into a disabled
-secondary, validate the seed manifest and local-only scrub, then attempt stream
-journal catch-up for the post-seed delta before falling back to checkpoint
-reconciliation. Resnapshot remains the online fallback when bounded
+preferred lifecycle is a DR-aware pre-seed: create the relationship, cut
+checkpoint-bound seed artifacts for that relationship, restore them into a
+disabled secondary, validate the seed manifest and local-only scrub, then
+attempt stream journal catch-up for the post-seed delta before falling back to
+checkpoint reconciliation. Resnapshot remains the online fallback when bounded
 reconciliation cannot converge or the operator wants a fresh base copy.
-Neither path changes the authority boundary: promotion still requires
-relationship binding, stale-lineage fencing, local-only exclusion, and
-checkpoint proof.
-
-The current prototype has the control-plane, inline artifact, and segmented
-artifact lifecycle for this boundary: the primary can generate a
-checkpoint-bound pre-seed manifest for a specific relationship and bundle hash;
-the primary can export an inline JSON bundle from checkpoint artifacts; the
-primary can also create a segmented export plan from checkpoint artifact
-metadata, optionally as an async/pollable job, and export individual
-checkpoint-bound segments directly from checkpoint artifact storage without
-rebuilding the full bundle for every segment; the disabled secondary can
-validate and import inline bundles only with explicit confirmation that
-replacing replicated storage is intended; and the disabled secondary can
-durably stage segmented imports until all segments are present before replacing
-replicated storage.
-Secondary enable consumes the accepted baseline only with the same activation
-token before starting normal stream catch-up. If the primary no longer retains
-journal/buffer coverage from the pre-seed cursor, the existing stream failure
-path falls back to checkpoint reconciliation. Config restore also
-consumes a still-pending accepted manifest before starting the secondary
-controller, closing the mid-enable crash window. The inline bundle is a PoC
-artifact format. The segmented path names the artifact format explicitly and
-binds ordinal, entry count, canonical byte count, digest, and key bounds to the
-same sorted KID/VID/value-hash projection used by whole-bundle validation.
-Production still needs external artifact storage, signed provenance, and
-datasets larger than the current 100k fixture-backed validation run.
+Neither path changes the authority boundary. The detailed lifecycle is in
+[DR_PRESEED_RESNAPSHOT_DESIGN.md](DR_PRESEED_RESNAPSHOT_DESIGN.md).
 
 ### Runtime refresh
 
@@ -432,13 +409,9 @@ for small stream gaps.
 
 Operator pre-seeding is different from automatic snapshot-on-disconnect and
 should remain in scope as a lifecycle optimization for very large or old
-clusters. A pre-seeded secondary can start from an externally restored,
-primary-authorized base copy and then use normal DR relationship binding,
-checkpoint verification, and stream-first catch-up for the remaining
-delta. The seed should be generated after relationship creation so the seed
-manifest can bind checkpoint identity, relationship ID, primary identity,
-range/checksum versions, local-only scrub version, and optional optimizer
-metadata to the activation material. Pre-seeding must not bypass
+clusters. A pre-seeded secondary can start from a primary-authorized base copy
+and then use normal DR relationship binding, checkpoint verification, and
+stream-first catch-up for the remaining delta. Pre-seeding must not bypass
 proof-before-delete, local-only path exclusion, stale-lineage fencing, or
 promotion checks.
 
@@ -520,7 +493,7 @@ of the current development workflow. The default matrix is self-contained;
 dependency-backed engines and topology-specific audit sinks belong in opt-in
 profiles.
 
-## Unresolved questions
+## Open decisions
 
 1. Should planned switchover be part of the first version, or should the first
    version only support disaster promotion?
@@ -541,38 +514,20 @@ profiles.
 6. What final UI/API wording should be used for planned authority transfer,
    disaster promotion, forced-promotion reasons, and data-loss estimate basis?
 
-## Productionization and validation follow-ups
+Additional open work is tracked in [DR_OPEN_WORK.md](DR_OPEN_WORK.md).
 
-These items are important before production use, but they are not design
-direction blockers for this RFC:
+## Production readiness
 
-- choose production defaults for checkpoint retention, journal retention,
-  backpressure, split depth, fetch batch sizing, adaptive stream batching, and
-  resource budgets
-- model worst-case primary checkpoint/digest/fetch CPU and I/O under highly
-  fragmented secondary reconnects
-- add an explicit secondary reconcile budget ledger for bytes, entries, RPCs,
-  retries, and wall time
-- finish the operator pre-seed and resnapshot lifecycle for very large clusters
-  where initial full reconciliation would be operationally expensive; the
-  current prototype has inline export/import and secondary-enable baseline
-  application with stream-first delta catch-up, local HA post-accept handoff
-  validation, deterministic segmented artifact descriptors, durable secondary
-  import staging, and a 100k fixture-backed smoke, but still needs external
-  artifact storage, provenance, and larger-dataset validation
-- define availability targets for HA active handoff under sustained DR backlog
-  pressure
-- validate WAN latency, packet loss, proxy, and load-balancer behavior
-- decide whether secondary pre-promotion read-serving belongs in the first
-  version; the strict warm-standby path verifies terminal correctness through
-  checkpoint proofs instead of data reads
-- add dependency-backed engine profiles for auth/secret engines that require
-  external services
-- add a deterministic audit-device topology profile for audit-table validation
-- keep HA standby key-transition deferral paired with active-node fail-closed
-  tests
-- run larger-scale keyspace validation, including billion-key-oriented
-  reconciliation and accumulator stress tests
+The prototype is past a narrow proof of concept for data correctness, but it
+is not a production-ready feature. Before production use, the design still
+needs resource-budget enforcement, primary checkpoint pressure controls,
+artifact provenance for pre-seed, rolling-upgrade compatibility, DR transport
+CA rotation, larger scale evidence, WAN/proxy validation, dependency-backed
+engine profiles, and operator runbooks.
+
+The current production recommendation remains strict warm standby: verify
+secondaries through DR status and checkpoint proofs before promotion, and treat
+pre-promotion data-serving as a separate future product decision.
 
 ## Related issues
 

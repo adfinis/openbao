@@ -433,158 +433,25 @@ falls back to the full scan path.
 
 ## Resnapshot and Pre-Seed
 
-Resnapshot is an explicit fallback for cases where bounded reconciliation
-cannot converge or the operator wants a fresh base copy. It still uses
-checkpoint-fenced fetches and proof validation. It is not a way to bypass
-delete proof or local-only path exclusion.
+Resnapshot and pre-seed are lifecycle choices for cases where bounded
+reconciliation is too expensive or cannot converge.
 
-Resnapshot is online and DR-protocol driven: the secondary discards its
-replicated data plane, fetches checkpoint-scoped entries from the primary, and
-proves the resulting checkpoint before returning to streaming. It is suitable
-when the dataset is small enough, the network budget is acceptable, or the
-operator wants a simple repair path.
+Resnapshot is online and protocol driven: the secondary replaces its replicated
+data plane with checkpoint-scoped entries fetched from the primary, validates
+the resulting checkpoint, preserves local-only paths, and returns to streaming.
 
-For old primaries or very large clusters, operators should be able to choose a
-pre-seed workflow instead of forcing the first secondary to pull the whole
-dataset through normal reconciliation. The intended production shape is:
+Pre-seed is operator assisted: the primary creates relationship-bound
+checkpoint artifacts, the operator restores them into a disabled secondary,
+the secondary validates the manifest and local-only scrub, and normal DR then
+catches up from the seed checkpoint through stream replay or checkpoint
+reconciliation.
 
-1. create the DR relationship and activation material so the primary has the
-   relationship ID and replication salt that define KID/VID projection;
-2. capture a primary-authorized DR seed bundle at a known checkpoint boundary;
-3. restore that base copy into the new secondary cluster while DR is disabled;
-4. enable the secondary with the same fresh relationship material;
-5. seed or rebuild local optimizer metadata for the restored checkpoint;
-6. attempt stream journal/buffer replay from the pre-seed checkpoint cursor; and
-7. use checkpoint reconciliation only if the primary can no longer prove replay
-   coverage for that cursor.
-
-Pre-seed is an operator lifecycle optimization, not a different correctness
-authority. The secondary still must bind to a fresh relationship, prove
-checkpoint convergence before promotion, and reject stale lineage or local-only
-path drift.
-
-The prototype exposes a first-class lifecycle boundary for this workflow:
-
-- `sys/replication/dr/primary/preseed/manifest` cuts a primary checkpoint and
-  returns a relationship-bound manifest for an out-of-band seed bundle hash.
-- `sys/replication/dr/primary/preseed/export` cuts a primary checkpoint and
-  returns an inline JSON seed bundle containing checkpoint-artifact-backed
-  replicated storage entries plus the same relationship-bound manifest.
-- `sys/replication/dr/primary/preseed/export-plan` cuts a primary checkpoint
-  and returns a segmented manifest with deterministic segment descriptors. The
-  segmented plan is built from checkpoint artifact metadata rather than by
-  materializing the full seed bundle in the request path, and can be requested
-  as an async job via `async=true`.
-- `sys/replication/dr/primary/preseed/export-plan-status` returns the state of
-  an async segmented export-plan job and includes the manifest once complete.
-- `sys/replication/dr/primary/preseed/export-segment` exports one
-  checkpoint-bound segment from that manifest by reading only that segment's
-  checkpoint artifact records; segments can be fetched and retried
-  independently.
-- `sys/replication/dr/secondary/preseed/accept` validates the manifest against
-  the activation token while the secondary is still disabled and records the
-  operator confirmations that storage was restored and local-only paths were
-  scrubbed or preserved with local values.
-- `sys/replication/dr/secondary/preseed/import` validates the bundle against
-  the activation token, bundle integrity hash, KID/VID projections, and
-  local-only exclusion rules; replaces the disabled secondary's replicated
-  storage plane while preserving cluster-local paths; and records the accepted
-  checkpoint baseline.
-- `sys/replication/dr/secondary/preseed/import-begin` validates a segmented
-  manifest and records durable secondary-local staging without mutating the
-  replicated storage plane.
-- `sys/replication/dr/secondary/preseed/import-segment` validates and stores
-  one segment in local staging. Re-sending the same segment is idempotent, and
-  a process restart can continue from the staged segments.
-- `sys/replication/dr/secondary/preseed/import-complete` requires explicit
-  replacement confirmation, verifies that every segment is present, validates
-  the reassembled full bundle, then uses the same storage replacement and
-  accepted-baseline path as inline import.
-- `sys/replication/dr/secondary/enable` consumes the accepted manifest only
-  when the same activation token is used, applies the checkpoint high-water mark
-  and durable stream cursor/optimizer baseline, and then attempts stream
-  catch-up from that checkpoint before falling back to reconciliation.
-- If the process crashes after secondary config is persisted but before the
-  accepted pre-seed record is consumed, config restore applies the same baseline
-  before starting the secondary controller.
-- The local HA smoke validates the segmented lifecycle across export-plan,
-  per-segment export/import, post-export delta catch-up, primary active
-  handoff, secondary active handoff, and checkpoint verification after the
-  handoff. The fixture-backed 100k smoke validates stream-first catch-up from
-  an accepted pre-seed baseline when the retained journal covers the post-seed
-  delta.
-
-The current inline bundle format is a prototype artifact format. It is useful
-for lifecycle validation because export, transfer, import, and baseline
-application are all explicit and testable. A production shape should use a
-segmented or streaming artifact with resumable transfer, stronger provenance,
-and external storage support rather than returning very large datasets inside a
-single API response.
-
-The manifest format has an explicit artifact-format boundary. Existing inline
-exports use `inline-json-v1` for compatibility. The production-shape path uses
-`segmented-json-v1` metadata: each segment descriptor carries its ordinal,
-entry count, canonical payload byte count, SHA-256 digest, and key bounds.
-Bundle validation recomputes descriptors from the canonical sorted
-KID/VID/value-hash projection and rejects stale or tampered segment metadata.
-The current segmented API is resumable on the secondary import side through
-durable local staging; remaining production work is external artifact storage,
-signed provenance, and larger-scale validation.
-
-```mermaid
-flowchart TD
-    A["Primary has existing dataset"] --> B["Create DR relationship<br/>and activation material"]
-    B --> C["Primary cuts seed checkpoint"]
-    C --> D["Build DR seed bundle<br/>replicated paths only"]
-    D --> E["Operator transfers bundle<br/>out of band"]
-    E --> F["Restore into disabled secondary"]
-    F --> G["Enable secondary with<br/>matching relationship material"]
-    G --> H["Validate seed manifest<br/>and local-only scrub"]
-    H --> I{"Seed checkpoint proven?"}
-    I -->|"No"| J["Reject seed<br/>require resnapshot or scan"]
-    I -->|"Yes"| K["Set baseline cursor<br/>rebuild optimizer metadata as needed"]
-    K --> L["Replay or reconcile<br/>post-seed delta"]
-    L --> M["Checkpoint verification passes"]
-    M --> N["Strict standby streaming"]
-```
-
-A production DR seed bundle should carry a manifest that is validated before
-the secondary trusts the restored base:
-
-- primary cluster ID and relationship ID
-- checkpoint ID, checkpoint commit index, and checkpoint creation time
-- projection parameters: replication salt identity, range version, range bits,
-  digest/checksum algorithm versions, and local-only exclusion version
-- top-level range counts and checksums for the checkpoint
-- optional flat accumulator snapshot and local KID index metadata version
-- replicated-path coverage metadata and explicit local-only scrub list version
-- bundle integrity hash and primary-authorized signature or equivalent
-  provenance for each segment or the complete artifact
-- expiration or operator acknowledgement policy for stale seed material
-
-The prototype manifest covers the relationship binding, checkpoint identity,
-projection versions, local-only scrub metadata, optimizer metadata versions,
-bundle SHA-256 integrity, and expiry. The prototype inline bundle contains
-replicated checkpoint artifact entries with key, value, seal-wrap flag, KID,
-and VID. Import recomputes the KID/VID projection and bundle hash before any
-storage mutation. It does not yet include a segmented transfer format, primary
-signature format, or checkpoint bucket checksums as importable optimizer state.
-
-The clean design is to generate the seed after relationship creation. A raw
-backup captured before relationship creation can still pre-populate storage,
-but it cannot safely seed KID/VID optimizer metadata because the replication
-salt and relationship binding are not known.
-
-Pre-seed validation must fail closed when the manifest does not match the
-activation token, primary cluster identity, checkpoint tuple, range algorithm,
-or local-only exclusion version. It must also reject seed material from a
-stale pre-promotion lineage. Restoring a generic physical snapshot without a
-DR-aware scrub step is unsafe because it can duplicate local cluster identity,
-HA coordination state, local audit assumptions, or DR relationship metadata.
-
-Before non-atomic reconciliation repair or resnapshot mutation, the secondary
-invalidates persisted accumulator/index state. If it crashes mid-repair,
-restart cannot trust stale optimizer metadata for partially repaired storage.
+Neither path changes the authority boundary. The secondary still must bind to
+fresh relationship material, reject stale lineage, preserve local-only state,
+prove checkpoint convergence, and keep optimizer metadata non-authoritative.
+The detailed lifecycle, artifact formats, endpoint surface, and current
+evidence are in
+[DR_PRESEED_RESNAPSHOT_DESIGN.md](DR_PRESEED_RESNAPSHOT_DESIGN.md).
 
 ## Resource Controls
 
