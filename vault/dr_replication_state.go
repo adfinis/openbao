@@ -167,6 +167,7 @@ type DRConfig struct {
 	ReconcileMaxRPCBytes                     uint64  `json:"reconcile_max_rpc_bytes,omitempty"`
 	ReconcileMaxWallTimeSeconds              int64   `json:"reconcile_max_wall_time_seconds,omitempty"`
 	ReconcileMaxInflightTasks                int     `json:"reconcile_max_inflight_tasks,omitempty"`
+	ReconcileMaxRangeDrillDownRPCs           int     `json:"reconcile_max_range_drilldown_rpcs,omitempty"`
 	StreamBatchMaxEntries                    int     `json:"stream_batch_max_entries,omitempty"`
 	StreamBatchMaxBytes                      int     `json:"stream_batch_max_bytes,omitempty"`
 	StreamBatchMaxWaitMillis                 int64   `json:"stream_batch_max_wait_milliseconds,omitempty"`
@@ -601,6 +602,9 @@ func applyDRConfigDefaults(cfg *DRConfig) {
 	if cfg.ReconcileApplyWorkers <= 0 {
 		cfg.ReconcileApplyWorkers = drDefaultReconcileApplyWorkers
 	}
+	if cfg.ReconcileMaxRangeDrillDownRPCs <= 0 {
+		cfg.ReconcileMaxRangeDrillDownRPCs = drDefaultReconcileMaxRangeDrillDownRPCs
+	}
 	if cfg.ReconcilePutBatchMaxEntries <= 0 {
 		cfg.ReconcilePutBatchMaxEntries = drDefaultReconcilePutBatchEntries
 	}
@@ -700,15 +704,16 @@ func validateDRTuningConfig(cfg *DRConfig) error {
 	}
 
 	for name, value := range map[string]int{
-		"stream_buffer_max_entries":       cfg.StreamBufferMaxEntries,
-		"reconcile_max_inflight_tasks":    cfg.ReconcileMaxInflightTasks,
-		"stream_batch_max_entries":        cfg.StreamBatchMaxEntries,
-		"stream_batch_max_bytes":          cfg.StreamBatchMaxBytes,
-		"reconcile_apply_workers":         cfg.ReconcileApplyWorkers,
-		"reconcile_put_batch_max_entries": cfg.ReconcilePutBatchMaxEntries,
-		"reconcile_put_batch_max_bytes":   cfg.ReconcilePutBatchMaxBytes,
-		"fallback_failure_threshold":      cfg.FallbackFailureThreshold,
-		"fallback_max_per_hour":           cfg.FallbackMaxPerHour,
+		"stream_buffer_max_entries":          cfg.StreamBufferMaxEntries,
+		"reconcile_max_inflight_tasks":       cfg.ReconcileMaxInflightTasks,
+		"reconcile_max_range_drilldown_rpcs": cfg.ReconcileMaxRangeDrillDownRPCs,
+		"stream_batch_max_entries":           cfg.StreamBatchMaxEntries,
+		"stream_batch_max_bytes":             cfg.StreamBatchMaxBytes,
+		"reconcile_apply_workers":            cfg.ReconcileApplyWorkers,
+		"reconcile_put_batch_max_entries":    cfg.ReconcilePutBatchMaxEntries,
+		"reconcile_put_batch_max_bytes":      cfg.ReconcilePutBatchMaxBytes,
+		"fallback_failure_threshold":         cfg.FallbackFailureThreshold,
+		"fallback_max_per_hour":              cfg.FallbackMaxPerHour,
 	} {
 		if err := positiveInt(name, value); err != nil {
 			return err
@@ -1132,6 +1137,7 @@ func (m *drRelationshipManager) EnablePrimary(ctx context.Context) error {
 		FallbackFailureThreshold:            drDefaultFallbackFailureThreshold,
 		FallbackCooldownSeconds:             int64(drDefaultFallbackCooldown / time.Second),
 		FallbackMaxPerHour:                  drDefaultFallbackMaxPerHour,
+		ReconcileMaxRangeDrillDownRPCs:      drDefaultReconcileMaxRangeDrillDownRPCs,
 		CheckpointArtifactEnabled:           true,
 		CheckpointArtifactGlobalBudgetBytes: drCheckpointArtifactDefaultGlobalBudget,
 		CheckpointArtifactPerRelBudgetBytes: drCheckpointArtifactDefaultPerRelBudget,
@@ -1311,11 +1317,12 @@ func (m *drRelationshipManager) EnableSecondary(ctx context.Context, token *DRAc
 		SecondaryClientKeyPEM: secondaryClientKeyPEM,
 		Promotion:             oldConfig.Promotion,
 
-		FallbackEnabled:          drDefaultFallbackEnabled,
-		FallbackStallSeconds:     int64(drDefaultFallbackStall / time.Second),
-		FallbackFailureThreshold: drDefaultFallbackFailureThreshold,
-		FallbackCooldownSeconds:  int64(drDefaultFallbackCooldown / time.Second),
-		FallbackMaxPerHour:       drDefaultFallbackMaxPerHour,
+		FallbackEnabled:                drDefaultFallbackEnabled,
+		FallbackStallSeconds:           int64(drDefaultFallbackStall / time.Second),
+		FallbackFailureThreshold:       drDefaultFallbackFailureThreshold,
+		FallbackCooldownSeconds:        int64(drDefaultFallbackCooldown / time.Second),
+		FallbackMaxPerHour:             drDefaultFallbackMaxPerHour,
+		ReconcileMaxRangeDrillDownRPCs: drDefaultReconcileMaxRangeDrillDownRPCs,
 	}
 	if localControlToken != "" {
 		m.config.SecondaryLocalControlTokenHash = hashDRSecondaryLocalControlToken(

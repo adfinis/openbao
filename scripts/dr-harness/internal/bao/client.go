@@ -394,6 +394,9 @@ type DRStatus struct {
 	LocalKIDIndexBucketLoads                  int64   `json:"local_kid_index_bucket_loads_total"`
 	LocalKIDIndexEntriesLoaded                int64   `json:"local_kid_index_entries_loaded_total"`
 	LocalKIDIndexLoadFailures                 int64   `json:"local_kid_index_load_failures_total"`
+	RangeDrillDownRPCsTotal                   int64   `json:"range_drilldown_rpc_total"`
+	RangeDrillDownCoarseFetchTotal            int64   `json:"range_drilldown_coarse_fetch_total"`
+	RangeDrillDownCoarseFetchRangesTotal      int64   `json:"range_drilldown_coarse_fetch_ranges_total"`
 	ReconcileBudgetRemainingBytes             uint64  `json:"reconcile_budget_remaining_bytes"`
 	ReconcileBudgetExhaustedTotal             int64   `json:"reconcile_budget_exhausted_total"`
 	ReconcileBudgetExhaustedPhaseLast         string  `json:"reconcile_budget_exhausted_phase_last"`

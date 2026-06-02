@@ -20,6 +20,8 @@ The target shape is:
 - use persisted flat accumulators and local KID indexes to avoid secondary
   full scans during common reconnects;
 - use checkpoint-fenced drill-down only for mismatched ranges;
+- cap per-range drill-down fanout and switch to coarser proof-backed fetch spans
+  under highly fragmented divergence;
 - use pre-seed or resnapshot when the retained journal cannot cover a large
   base-copy gap; and
 - bound primary and secondary work independently.
@@ -84,6 +86,14 @@ The secondary doing more coordination work does not by itself protect the
 primary. Primary-side admission control is required for checkpoint build
 concurrency, rebuild frequency, digest/fetch request rate, and response bytes.
 
+The prototype now bounds secondary-requested child digest fanout per mismatched
+top-level range. When the cap is reached, the secondary stops splitting and
+fetches the remaining child spans at their current granularity. This reduces
+primary digest RPC pressure in adversarial fragmentation, while preserving the
+same checkpoint correctness boundary because each coarser span still carries a
+primary digest proof and the fetch verifier recomputes it before applying
+remote entries or inferring local-only deletes.
+
 ## Large Existing Clusters
 
 For an old primary with a very large dataset, the intended initial-sync path is
@@ -110,6 +120,8 @@ The strongest next optimizations are:
 - external, signed pre-seed artifact storage with resumable segment transfer;
 - optimizer seeding from verified checkpoint artifacts after pre-seed and
   resnapshot;
+- clustered validation and default tuning for bounded drill-down fanout under
+  highly fragmented reconnects;
 - more aggressive coalescing of secondary local metadata writes;
 - measured defaults for stream journal retention and adaptive batching; and
 - larger fixture profiles that validate key-count scaling separately from

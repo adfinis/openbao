@@ -2845,6 +2845,9 @@ func TestDRSecondaryStatus(t *testing.T) {
 	sec.flatAccumulatorIndexedRepairProofMismatchChecksum.Store(true)
 	sec.localKIDIndexFallbackScans.Store(29)
 	sec.localKIDIndexInvalidations.Store(30)
+	sec.rangeDrillDownRPCs.Store(35)
+	sec.rangeDrillDownCoarseFetches.Store(36)
+	sec.rangeDrillDownCoarseFetchRanges.Store(37)
 	sec.sessionMu.Lock()
 	sec.lastReconcileBudgetExhausted = drReconcileBudgetExhaustedSnapshot{
 		Phase:         "range_checksums",
@@ -2942,6 +2945,15 @@ func TestDRSecondaryStatus(t *testing.T) {
 	}
 	if status.LocalKIDIndexLoadFailuresTotal != 22 {
 		t.Fatalf("expected local KID index load failures 22, got %d", status.LocalKIDIndexLoadFailuresTotal)
+	}
+	if status.RangeDrillDownRPCTotal != 35 {
+		t.Fatalf("expected range drill-down RPC total 35, got %d", status.RangeDrillDownRPCTotal)
+	}
+	if status.RangeDrillDownCoarseFetchTotal != 36 {
+		t.Fatalf("expected range drill-down coarse fetch total 36, got %d", status.RangeDrillDownCoarseFetchTotal)
+	}
+	if status.RangeDrillDownCoarseFetchRangesTotal != 37 {
+		t.Fatalf("expected range drill-down coarse fetch ranges total 37, got %d", status.RangeDrillDownCoarseFetchRangesTotal)
 	}
 	if status.LocalKIDIndexResetsTotal != 23 {
 		t.Fatalf("expected local KID index resets 23, got %d", status.LocalKIDIndexResetsTotal)
@@ -3279,6 +3291,7 @@ func TestDRRelationshipManager_UpdateTuningAppliesSecondaryRuntime(t *testing.T)
 	if err := mgr.UpdateTuning(ctx, func(cfg *DRConfig) error {
 		cfg.ReconcileMaxInflightTasks = 7
 		cfg.ReconcileMaxWallTimeSeconds = 120
+		cfg.ReconcileMaxRangeDrillDownRPCs = 5
 		cfg.StreamBatchMaxEntries = 1024
 		cfg.StreamBatchMaxBytes = 4 << 20
 		cfg.StreamBatchMaxWaitMillis = 20
@@ -3319,6 +3332,12 @@ func TestDRRelationshipManager_UpdateTuningAppliesSecondaryRuntime(t *testing.T)
 	}
 	if mgr.secondary.reconcileMaxInflightTasks != 7 {
 		t.Fatalf("expected runtime inflight=7, got %d", mgr.secondary.reconcileMaxInflightTasks)
+	}
+	if cfg.ReconcileMaxRangeDrillDownRPCs != 5 {
+		t.Fatalf("expected reconcile max range drill-down RPCs=5, got %d", cfg.ReconcileMaxRangeDrillDownRPCs)
+	}
+	if mgr.secondary.reconcileMaxRangeDrillDownRPCs != 5 {
+		t.Fatalf("expected runtime range drill-down RPCs=5, got %d", mgr.secondary.reconcileMaxRangeDrillDownRPCs)
 	}
 	if mgr.secondary.streamBatchMaxEntries != 1024 {
 		t.Fatalf("expected runtime stream batch max entries=1024, got %d", mgr.secondary.streamBatchMaxEntries)
@@ -5436,6 +5455,112 @@ func TestDRRangeReconciliationBudgetExhaustionDoesNotAdvanceCheckpoint(t *testin
 	}
 	if status.ReconcileBudgetExhaustedRetriesLast != 2 {
 		t.Fatalf("expected retry snapshot 2, got %d", status.ReconcileBudgetExhaustedRetriesLast)
+	}
+}
+
+func TestDRRangeDrillDownFanoutLimitFallsBackToCoarseFetch(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := bytes.Repeat([]byte{0x46}, 32)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-drilldown-fanout", core.logger)
+	secondary.reconcileMaxRangeDrillDownRPCs = 1
+
+	parent := reconciler.SpanFromRangeID(0)
+	left, right, ok := reconciler.SplitRange(parent)
+	if !ok {
+		t.Fatal("expected top-level range to split")
+	}
+	remoteKIDToVID := make(map[[32]byte][32]byte)
+	leftCount := 0
+	rightCount := 0
+	for i := 0; i < 200000 && (leftCount < 2 || rightCount < 2); i++ {
+		key := fmt.Sprintf("secret/drilldown-fanout-%d", i)
+		kid := secondary.scanner.ComputeKID(key)
+		if !parent.Contains(kid) {
+			continue
+		}
+		switch {
+		case left.Contains(kid) && leftCount < 2:
+			remoteKIDToVID[kid] = secondary.scanner.ComputeVIDWithSealWrap([]byte(key), false)
+			leftCount++
+		case right.Contains(kid) && rightCount < 2:
+			remoteKIDToVID[kid] = secondary.scanner.ComputeVIDWithSealWrap([]byte(key), false)
+			rightCount++
+		}
+	}
+	if leftCount < 2 || rightCount < 2 {
+		t.Fatalf("failed to seed both child spans: left=%d right=%d", leftCount, rightCount)
+	}
+
+	remoteIndex := reconciler.NewRangeMapIndex(remoteKIDToVID, nil)
+	localIndex := reconciler.NewRangeMapIndex(map[[32]byte][32]byte{}, nil)
+	checkpoint := &CheckpointResponse{CheckpointId: "cp-drilldown-fanout", CommitIndex: 123}
+	digestCalls := 0
+	secondary.client = &drTestClient{
+		exchangeRangeDigestsFn: func(_ context.Context, req *RangeDigestRequest, _ ...grpc.CallOption) (*RangeDigestResponse, error) {
+			if req.GetRelationshipId() != secondary.relationshipID {
+				return nil, fmt.Errorf("unexpected relationship id %q", req.GetRelationshipId())
+			}
+			if req.GetCheckpointId() != checkpoint.CheckpointId || req.GetCheckpointIndex() != checkpoint.CommitIndex {
+				return nil, fmt.Errorf("unexpected checkpoint tuple %q/%d", req.GetCheckpointId(), req.GetCheckpointIndex())
+			}
+			span, _, err := protoToRangeSpan(req.GetParentSpan())
+			if err != nil {
+				return nil, err
+			}
+			digestCalls++
+			leftSpan, rightSpan, ok := reconciler.SplitRange(span)
+			if !ok {
+				return &RangeDigestResponse{
+					Digests: []*RangeDigest{drRangeDigestForTest(span, remoteIndex)},
+				}, nil
+			}
+			return &RangeDigestResponse{
+				Digests: []*RangeDigest{
+					drRangeDigestForTest(leftSpan, remoteIndex),
+					drRangeDigestForTest(rightSpan, remoteIndex),
+				},
+			}, nil
+		},
+	}
+
+	drillDown, err := secondary.runRangeDrillDown(context.Background(), checkpoint, localIndex, parent)
+	if err != nil {
+		t.Fatalf("runRangeDrillDown failed: %v", err)
+	}
+	if digestCalls != 1 {
+		t.Fatalf("expected one digest RPC under fanout cap, got %d", digestCalls)
+	}
+	if drillDown.rpcCalls != 1 {
+		t.Fatalf("expected drill-down result to report one RPC, got %d", drillDown.rpcCalls)
+	}
+	if drillDown.splits != 2 {
+		t.Fatalf("expected two mismatched child splits, got %d", drillDown.splits)
+	}
+	if drillDown.coarseFetches != 1 || drillDown.coarseFetchRanges != 2 {
+		t.Fatalf("expected one coarse fetch fallback over two ranges, got fallbacks=%d ranges=%d",
+			drillDown.coarseFetches, drillDown.coarseFetchRanges)
+	}
+	if len(drillDown.fetchSpans) != 2 {
+		t.Fatalf("expected two coarse child fetch spans, got %d", len(drillDown.fetchSpans))
+	}
+	for _, fetchSpan := range drillDown.fetchSpans {
+		if fetchSpan.span.SplitDepth != parent.SplitDepth+1 {
+			t.Fatalf("expected child span depth %d, got %d", parent.SplitDepth+1, fetchSpan.span.SplitDepth)
+		}
+		if !fetchSpan.proof.hasDigest {
+			t.Fatal("expected coarse fetch span to carry digest proof")
+		}
+	}
+	status := secondary.Status()
+	if status.RangeDrillDownRPCTotal != 1 {
+		t.Fatalf("expected status drill-down RPC total 1, got %d", status.RangeDrillDownRPCTotal)
+	}
+	if status.RangeDrillDownCoarseFetchTotal != 1 || status.RangeDrillDownCoarseFetchRangesTotal != 2 {
+		t.Fatalf("expected status coarse fetch totals 1/2, got %d/%d",
+			status.RangeDrillDownCoarseFetchTotal, status.RangeDrillDownCoarseFetchRangesTotal)
+	}
+	if status.RangeSplitCount != 2 {
+		t.Fatalf("expected status range split count 2, got %d", status.RangeSplitCount)
 	}
 }
 

@@ -1064,6 +1064,10 @@ func (b *SystemBackend) drReplicationPaths() []*framework.Path {
 					Type:        framework.TypeInt,
 					Description: "Secondary max in-flight range tasks.",
 				},
+				"reconcile_max_range_drilldown_rpcs": {
+					Type:        framework.TypeInt,
+					Description: "Secondary max ExchangeRangeDigests RPCs per mismatched top-level range before falling back to coarser proof-backed fetch spans.",
+				},
 				"stream_batch_max_entries": {
 					Type:        framework.TypeInt,
 					Description: "Secondary stream apply batch max entries.",
@@ -1295,6 +1299,9 @@ func (b *SystemBackend) handleDRStatus(ctx context.Context, req *logical.Request
 		data["local_kid_index_fallback_scan_reason_last"] = status.LocalKIDIndexFallbackScanReasonLast
 		data["local_kid_index_invalidations_total"] = status.LocalKIDIndexInvalidationsTotal
 		data["local_kid_index_invalidation_reason_last"] = status.LocalKIDIndexInvalidationReasonLast
+		data["range_drilldown_rpc_total"] = status.RangeDrillDownRPCTotal
+		data["range_drilldown_coarse_fetch_total"] = status.RangeDrillDownCoarseFetchTotal
+		data["range_drilldown_coarse_fetch_ranges_total"] = status.RangeDrillDownCoarseFetchRangesTotal
 		data["stream_txn_coalesced_entries_total"] = status.StreamTxnCoalescedEntriesTotal
 		data["stream_txn_batches_total"] = status.StreamTxnBatchesTotal
 		data["stream_txn_entries_total"] = status.StreamTxnEntriesTotal
@@ -1351,6 +1358,7 @@ func (b *SystemBackend) handleDRStatus(ctx context.Context, req *logical.Request
 		data["reconcile_max_rpc_bytes"] = status.ReconcileMaxRPCBytes
 		data["reconcile_max_wall_time_seconds"] = status.ReconcileMaxWallTimeSeconds
 		data["reconcile_max_inflight_tasks"] = status.ReconcileMaxInflightTasks
+		data["reconcile_max_range_drilldown_rpcs"] = status.ReconcileMaxRangeDrillDownRPCs
 		data["stream_batch_max_entries"] = status.StreamBatchMaxEntries
 		data["stream_batch_max_bytes"] = status.StreamBatchMaxBytes
 		data["stream_batch_max_wait_milliseconds"] = status.StreamBatchMaxWaitMilliseconds
@@ -2509,6 +2517,7 @@ func (b *SystemBackend) handleDRTuningRead(ctx context.Context, req *logical.Req
 			"reconcile_max_rpc_bytes":                             cfg.ReconcileMaxRPCBytes,
 			"reconcile_max_wall_time_seconds":                     cfg.ReconcileMaxWallTimeSeconds,
 			"reconcile_max_inflight_tasks":                        cfg.ReconcileMaxInflightTasks,
+			"reconcile_max_range_drilldown_rpcs":                  cfg.ReconcileMaxRangeDrillDownRPCs,
 			"stream_batch_max_entries":                            cfg.StreamBatchMaxEntries,
 			"stream_batch_max_bytes":                              cfg.StreamBatchMaxBytes,
 			"stream_batch_max_wait_milliseconds":                  cfg.StreamBatchMaxWaitMillis,
@@ -2627,6 +2636,7 @@ func (b *SystemBackend) handleDRTuningWrite(ctx context.Context, req *logical.Re
 			func() error { return setUint64("reconcile_max_rpc_bytes", &cfg.ReconcileMaxRPCBytes) },
 			func() error { return setInt64("reconcile_max_wall_time_seconds", &cfg.ReconcileMaxWallTimeSeconds) },
 			func() error { return setInt("reconcile_max_inflight_tasks", &cfg.ReconcileMaxInflightTasks) },
+			func() error { return setInt("reconcile_max_range_drilldown_rpcs", &cfg.ReconcileMaxRangeDrillDownRPCs) },
 			func() error { return setInt("stream_batch_max_entries", &cfg.StreamBatchMaxEntries) },
 			func() error { return setInt("stream_batch_max_bytes", &cfg.StreamBatchMaxBytes) },
 			func() error { return setInt64("stream_batch_max_wait_milliseconds", &cfg.StreamBatchMaxWaitMillis) },

@@ -334,6 +334,7 @@ const (
 	drDefaultReconcileMaxRPCBytes               = 128 << 20
 	drDefaultReconcileMaxWallTime               = 30 * time.Minute
 	drDefaultReconcileMaxInflightTasks          = 16
+	drDefaultReconcileMaxRangeDrillDownRPCs     = 32
 	drDefaultReconcileStallAbort                = 90 * time.Second
 	drDefaultRPCDeadline                        = 30 * time.Second
 	drSecondaryApplyQueueMinEntries             = 1024
@@ -531,6 +532,9 @@ type drReplicationSecondary struct {
 	localKIDIndexUpdates                              atomic.Uint64
 	localKIDIndexFallbackScans                        atomic.Uint64
 	localKIDIndexInvalidations                        atomic.Uint64
+	rangeDrillDownRPCs                                atomic.Uint64
+	rangeDrillDownCoarseFetches                       atomic.Uint64
+	rangeDrillDownCoarseFetchRanges                   atomic.Uint64
 	streamTxnCoalescedEntries                         atomic.Uint64
 	streamTxnBatches                                  atomic.Uint64
 	streamTxnEntries                                  atomic.Uint64
@@ -605,6 +609,7 @@ type drReplicationSecondary struct {
 	reconcileMaxRPCBytes               uint64
 	reconcileMaxWallTime               time.Duration
 	reconcileMaxInflightTasks          int
+	reconcileMaxRangeDrillDownRPCs     int
 	reconcileStallAbort                time.Duration
 	rpcDeadline                        time.Duration
 	streamBatchMaxEntries              int
@@ -700,6 +705,7 @@ func newDRReplicationSecondary(core *Core, replSalt []byte, relationshipID strin
 		reconcileMaxRPCBytes:               drDefaultReconcileMaxRPCBytes,
 		reconcileMaxWallTime:               drDefaultReconcileMaxWallTime,
 		reconcileMaxInflightTasks:          drDefaultReconcileMaxInflightTasks,
+		reconcileMaxRangeDrillDownRPCs:     drDefaultReconcileMaxRangeDrillDownRPCs,
 		reconcileStallAbort:                drDefaultReconcileStallAbort,
 		rpcDeadline:                        drDefaultRPCDeadline,
 		streamBatchMaxEntries:              drDefaultStreamBatchMaxEntries,
@@ -2052,6 +2058,9 @@ func (s *drReplicationSecondary) Status() DRSecondaryStatus {
 		LocalKIDIndexFallbackScanReasonLast:               localKIDIndexFallbackReason,
 		LocalKIDIndexInvalidationsTotal:                   s.localKIDIndexInvalidations.Load(),
 		LocalKIDIndexInvalidationReasonLast:               localKIDIndexInvalidationReason,
+		RangeDrillDownRPCTotal:                            s.rangeDrillDownRPCs.Load(),
+		RangeDrillDownCoarseFetchTotal:                    s.rangeDrillDownCoarseFetches.Load(),
+		RangeDrillDownCoarseFetchRangesTotal:              s.rangeDrillDownCoarseFetchRanges.Load(),
 		StreamTxnCoalescedEntriesTotal:                    s.streamTxnCoalescedEntries.Load(),
 		StreamTxnBatchesTotal:                             streamTxnBatches,
 		StreamTxnEntriesTotal:                             streamTxnEntries,
@@ -2114,6 +2123,7 @@ func (s *drReplicationSecondary) Status() DRSecondaryStatus {
 		ReconcileMaxRPCBytes:                           s.reconcileMaxRPCBytes,
 		ReconcileMaxWallTimeSeconds:                    int64(s.reconcileMaxWallTime / time.Second),
 		ReconcileMaxInflightTasks:                      s.reconcileMaxInflightTasks,
+		ReconcileMaxRangeDrillDownRPCs:                 s.reconcileMaxRangeDrillDownRPCs,
 		StreamBatchMaxEntries:                          s.streamBatchMaxEntries,
 		StreamBatchMaxBytes:                            s.streamBatchMaxBytes,
 		StreamBatchMaxWaitMilliseconds:                 int64(s.streamBatchMaxWait / time.Millisecond),
@@ -2183,6 +2193,9 @@ type DRSecondaryStatus struct {
 	LocalKIDIndexFallbackScanReasonLast               string
 	LocalKIDIndexInvalidationsTotal                   uint64
 	LocalKIDIndexInvalidationReasonLast               string
+	RangeDrillDownRPCTotal                            uint64
+	RangeDrillDownCoarseFetchTotal                    uint64
+	RangeDrillDownCoarseFetchRangesTotal              uint64
 	StreamTxnCoalescedEntriesTotal                    uint64
 	StreamTxnBatchesTotal                             uint64
 	StreamTxnEntriesTotal                             uint64
@@ -2239,6 +2252,7 @@ type DRSecondaryStatus struct {
 	ReconcileMaxRPCBytes                              uint64
 	ReconcileMaxWallTimeSeconds                       int64
 	ReconcileMaxInflightTasks                         int
+	ReconcileMaxRangeDrillDownRPCs                    int
 	StreamBatchMaxEntries                             int
 	StreamBatchMaxBytes                               int
 	StreamBatchMaxWaitMilliseconds                    int64
@@ -2273,6 +2287,9 @@ func (s *drReplicationSecondary) applyRuntimeTuning(cfg *DRConfig) {
 	}
 	if cfg.ReconcileMaxInflightTasks > 0 {
 		s.reconcileMaxInflightTasks = cfg.ReconcileMaxInflightTasks
+	}
+	if cfg.ReconcileMaxRangeDrillDownRPCs > 0 {
+		s.reconcileMaxRangeDrillDownRPCs = cfg.ReconcileMaxRangeDrillDownRPCs
 	}
 	if cfg.StreamBatchMaxEntries > 0 {
 		s.streamBatchMaxEntries = cfg.StreamBatchMaxEntries
@@ -4904,6 +4921,10 @@ func (s *drReplicationSecondary) runFlatAccumulatorIndexedBucketRepair(
 				pendingDeletes[key] = struct{}{}
 			}
 		}
+		budget.addRangeSplits(result.drillDownSplits)
+		if err := s.addReconcileRPCBudgetBatch(budget, "indexed_repair_drilldown", result.drillDownBytes, result.drillDownRPCs, 0); err != nil {
+			return err
+		}
 		if err := s.addReconcileRPCBudget(budget, "indexed_repair_fetch", result.rpcBytes, uint64(len(result.fetchedEntries))); err != nil {
 			return err
 		}
@@ -5211,6 +5232,15 @@ type drFetchSpan struct {
 	proof drRangeFetchProof
 }
 
+type drRangeDrillDownResult struct {
+	fetchSpans        []drFetchSpan
+	rpcCalls          uint64
+	rpcBytes          uint64
+	splits            uint64
+	coarseFetches     uint64
+	coarseFetchRanges uint64
+}
+
 type drFetchedRangeAccumulator struct {
 	count        uint64
 	xorKeyHash   [32]byte
@@ -5224,14 +5254,17 @@ type drQueuedRangeTask struct {
 }
 
 type drRangeTaskResult struct {
-	id             int
-	task           drRangeTask
-	rpcBytes       uint64
-	fetchedEntries []*EntryChange
-	removedKeys    []string
-	localSet       *reconciler.ReconciliationSet
-	spanRepairs    []drSpanRepairContribution
-	err            error
+	id              int
+	task            drRangeTask
+	rpcBytes        uint64
+	drillDownRPCs   uint64
+	drillDownBytes  uint64
+	drillDownSplits uint64
+	fetchedEntries  []*EntryChange
+	removedKeys     []string
+	localSet        *reconciler.ReconciliationSet
+	spanRepairs     []drSpanRepairContribution
+	err             error
 }
 
 type drSpanRepairContribution struct {
@@ -5462,6 +5495,20 @@ func (b *drRangeBudget) addRangeHandled() {
 	b.rangesHandled++
 }
 
+func (b *drRangeBudget) addRangeSplits(n uint64) {
+	b.rangesSplit += n
+}
+
+func (b *drRangeBudget) addRPCBatch(phase string, bytes uint64, calls uint64, entries uint64) error {
+	if calls == 0 && bytes == 0 && entries == 0 {
+		return b.check(phase)
+	}
+	b.rpcBytes += bytes
+	b.rpcCalls += calls
+	b.entriesFetched += entries
+	return b.check(phase)
+}
+
 func (b *drRangeBudget) exhausted(phase string, reason string) error {
 	if phase == "" {
 		phase = "unknown"
@@ -5502,6 +5549,18 @@ func (s *drReplicationSecondary) addReconcileRPCBudget(budget *drRangeBudget, ph
 		return nil
 	}
 	err := budget.addRPC(phase, bytes, entries)
+	s.updateReconcileBudgetAccounting(budget)
+	if err != nil {
+		return s.reconcileBudgetFailure(err)
+	}
+	return nil
+}
+
+func (s *drReplicationSecondary) addReconcileRPCBudgetBatch(budget *drRangeBudget, phase string, bytes uint64, calls uint64, entries uint64) error {
+	if budget == nil {
+		return nil
+	}
+	err := budget.addRPCBatch(phase, bytes, calls, entries)
 	s.updateReconcileBudgetAccounting(budget)
 	if err != nil {
 		return s.reconcileBudgetFailure(err)
@@ -6292,6 +6351,11 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 			return res.err
 		}
 
+		budget.addRangeSplits(res.drillDownSplits)
+		if err := s.addReconcileRPCBudgetBatch(budget, "range_drilldown", res.drillDownBytes, res.drillDownRPCs, 0); err != nil {
+			workerCancel()
+			return err
+		}
 		if err := s.addReconcileRPCBudget(budget, "fetch_stream", res.rpcBytes, uint64(len(res.fetchedEntries))); err != nil {
 			workerCancel()
 			return err
@@ -6375,11 +6439,15 @@ func (s *drReplicationSecondary) processRangeTask(ctx context.Context, checkpoin
 	}
 
 	// Attempt fine-grained drill-down to narrow the diff.
-	fetchSpans, err := s.runRangeDrillDown(ctx, checkpoint, localIndex, task.span)
+	drillDown, err := s.runRangeDrillDown(ctx, checkpoint, localIndex, task.span)
 	if err != nil {
 		result.err = err
 		return result
 	}
+	result.drillDownRPCs = drillDown.rpcCalls
+	result.drillDownBytes = drillDown.rpcBytes
+	result.drillDownSplits = drillDown.splits
+	fetchSpans := drillDown.fetchSpans
 	if fetchSpans == nil {
 		result.err = fmt.Errorf("drill-down did not return a fetch plan")
 		return result
@@ -6387,7 +6455,11 @@ func (s *drReplicationSecondary) processRangeTask(ctx context.Context, checkpoin
 	if len(fetchSpans) == 0 {
 		return result
 	}
-	return s.processFetchSpans(ctx, checkpoint, localIndex, kidToKey, queued, fetchSpans)
+	fetchResult := s.processFetchSpans(ctx, checkpoint, localIndex, kidToKey, queued, fetchSpans)
+	fetchResult.drillDownRPCs = result.drillDownRPCs
+	fetchResult.drillDownBytes = result.drillDownBytes
+	fetchResult.drillDownSplits = result.drillDownSplits
+	return fetchResult
 }
 
 func (s *drReplicationSecondary) processIndexedRangeTask(ctx context.Context, checkpoint *CheckpointResponse, accumulatorIndex uint64, source *drLocalKIDIndexDigestSource, queued drQueuedRangeTask) drRangeTaskResult {
@@ -6401,11 +6473,15 @@ func (s *drReplicationSecondary) processIndexedRangeTask(ctx context.Context, ch
 		return s.processRangeTask(ctx, checkpoint, emptyIndex, nil, queued)
 	}
 
-	fetchSpans, err := s.runRangeDrillDownWithDigestFunc(ctx, checkpoint, task.span, source.RangeDigest)
+	drillDown, err := s.runRangeDrillDownWithDigestFunc(ctx, checkpoint, task.span, source.RangeDigest)
 	if err != nil {
 		result.err = err
 		return result
 	}
+	result.drillDownRPCs = drillDown.rpcCalls
+	result.drillDownBytes = drillDown.rpcBytes
+	result.drillDownSplits = drillDown.splits
+	fetchSpans := drillDown.fetchSpans
 	if fetchSpans == nil {
 		result.err = fmt.Errorf("drill-down did not return a fetch plan")
 		return result
@@ -6426,6 +6502,9 @@ func (s *drReplicationSecondary) processIndexedRangeTask(ctx context.Context, ch
 	}
 	localIndex := reconciler.NewRangeMapIndex(localSet.KIDToVID, nil)
 	result = s.processFetchSpans(ctx, checkpoint, localIndex, localSet.KIDToKey, queued, fetchSpans)
+	result.drillDownRPCs = drillDown.rpcCalls
+	result.drillDownBytes = drillDown.rpcBytes
+	result.drillDownSplits = drillDown.splits
 	if result.err != nil {
 		return result
 	}
@@ -6975,7 +7054,7 @@ func (s *drReplicationSecondary) runRangeDrillDown(
 	checkpoint *CheckpointResponse,
 	localIndex *reconciler.RangeMapIndex,
 	parentSpan reconciler.RangeSpan,
-) ([]drFetchSpan, error) {
+) (drRangeDrillDownResult, error) {
 	return s.runRangeDrillDownWithDigestFunc(ctx, checkpoint, parentSpan, func(_ context.Context, span reconciler.RangeSpan) (reconciler.RangeDescriptor, error) {
 		return reconciler.BuildRangeDigestFromIndex(localIndex, span), nil
 	})
@@ -6986,20 +7065,33 @@ func (s *drReplicationSecondary) runRangeDrillDownWithDigestFunc(
 	checkpoint *CheckpointResponse,
 	parentSpan reconciler.RangeSpan,
 	localDigest func(context.Context, reconciler.RangeSpan) (reconciler.RangeDescriptor, error),
-) ([]drFetchSpan, error) {
+) (drRangeDrillDownResult, error) {
+	var result drRangeDrillDownResult
+	maxRPCs := s.reconcileMaxRangeDrillDownRPCs
+	if maxRPCs <= 0 {
+		maxRPCs = drDefaultReconcileMaxRangeDrillDownRPCs
+	}
+
 	// Work queue of spans to drill into.
 	pending := []drFetchSpan{{span: parentSpan}}
-	var mismatched []drFetchSpan
-	splits := 0
 
-	for len(pending) > 0 && splits < drRangeMaxSessionSplits {
+	for len(pending) > 0 && int(result.splits) < drRangeMaxSessionSplits {
+		if int(result.rpcCalls) >= maxRPCs {
+			coarse := pending
+			result.fetchSpans = append(result.fetchSpans, coarse...)
+			result.coarseFetches++
+			result.coarseFetchRanges += uint64(len(coarse))
+			pending = nil
+			break
+		}
+
 		item := pending[0]
 		span := item.span
 		pending = pending[1:]
 
 		// Check depth limit.
 		if span.SplitDepth >= uint32(drRangeMaxSplitDepth) {
-			mismatched = append(mismatched, item)
+			result.fetchSpans = append(result.fetchSpans, item)
 			continue
 		}
 
@@ -7013,25 +7105,27 @@ func (s *drReplicationSecondary) runRangeDrillDownWithDigestFunc(
 		cancel()
 
 		if err != nil {
-			return nil, fmt.Errorf("drill-down RPC failed for span depth=%d: %w", span.SplitDepth, err)
+			return result, fmt.Errorf("drill-down RPC failed for span depth=%d: %w", span.SplitDepth, err)
 		}
 		if resp == nil {
-			return nil, fmt.Errorf("invalid drill-down response: nil response for span depth=%d", span.SplitDepth)
+			return result, fmt.Errorf("invalid drill-down response: nil response for span depth=%d", span.SplitDepth)
 		}
 		if len(resp.GetDigests()) == 0 {
-			return nil, fmt.Errorf("invalid drill-down response: no digests for span depth=%d", span.SplitDepth)
+			return result, fmt.Errorf("invalid drill-down response: no digests for span depth=%d", span.SplitDepth)
 		}
+		result.rpcCalls++
+		result.rpcBytes += rangeDigestApproxWireBytes(resp.GetDigests())
 
 		children, err := fetchSpansFromDigestResponse(span, resp.GetDigests())
 		if err != nil {
-			return nil, fmt.Errorf("invalid drill-down response: %w", err)
+			return result, fmt.Errorf("invalid drill-down response: %w", err)
 		}
 
 		for _, child := range children {
 			// Compute local RangeDescriptor for this sub-range.
 			localDesc, err := localDigest(ctx, child.span)
 			if err != nil {
-				return nil, fmt.Errorf("local drill-down digest failed for span depth=%d: %w", child.span.SplitDepth, err)
+				return result, fmt.Errorf("local drill-down digest failed for span depth=%d: %w", child.span.SplitDepth, err)
 			}
 
 			// Phase B authoritative equality: compare (count, XORKeyHash,
@@ -7044,28 +7138,58 @@ func (s *drReplicationSecondary) runRangeDrillDownWithDigestFunc(
 				continue
 			}
 
-			splits++
+			result.splits++
 			// Sub-range mismatched -- drill deeper or mark for fetch.
 			if child.span.SplitDepth < uint32(drRangeMaxSplitDepth) && (child.proof.count > 1 || localDesc.Count > 1) {
 				pending = append(pending, child)
 			} else {
-				mismatched = append(mismatched, child)
+				result.fetchSpans = append(result.fetchSpans, child)
 			}
 		}
 	}
 
 	// Drain any remaining pending spans as mismatched (hit split limit).
-	mismatched = append(mismatched, pending...)
+	if len(pending) > 0 {
+		result.fetchSpans = append(result.fetchSpans, pending...)
+		result.coarseFetches++
+		result.coarseFetchRanges += uint64(len(pending))
+	}
+	s.recordRangeDrillDownResult(result)
 
-	if len(mismatched) == 0 {
-		return mismatched, nil // Empty -- ranges converged during drill-down.
+	if len(result.fetchSpans) == 0 {
+		result.fetchSpans = []drFetchSpan{}
+		return result, nil // Empty -- ranges converged during drill-down.
 	}
 
 	s.logger.Info("drill-down complete",
 		"original_span_depth", parentSpan.SplitDepth,
-		"mismatched_sub_ranges", len(mismatched),
-		"total_splits", splits)
-	return mismatched, nil
+		"mismatched_sub_ranges", len(result.fetchSpans),
+		"total_splits", result.splits,
+		"rpc_calls", result.rpcCalls,
+		"coarse_fetches", result.coarseFetches,
+		"coarse_fetch_ranges", result.coarseFetchRanges)
+	return result, nil
+}
+
+func (s *drReplicationSecondary) recordRangeDrillDownResult(result drRangeDrillDownResult) {
+	if result.rpcCalls > 0 {
+		s.rangeDrillDownRPCs.Add(result.rpcCalls)
+	}
+	if result.splits > 0 {
+		s.rangeSplitCount.Add(result.splits)
+	}
+	if result.coarseFetches > 0 {
+		s.rangeDrillDownCoarseFetches.Add(result.coarseFetches)
+	}
+	if result.coarseFetchRanges > 0 {
+		s.rangeDrillDownCoarseFetchRanges.Add(result.coarseFetchRanges)
+	}
+}
+
+func rangeDigestApproxWireBytes(digests []*RangeDigest) uint64 {
+	const baseRequestBytes = 96
+	const baseDigestBytes = 176
+	return baseRequestBytes + uint64(len(digests))*baseDigestBytes
 }
 
 func fetchSpansFromDigestResponse(parent reconciler.RangeSpan, digests []*RangeDigest) ([]drFetchSpan, error) {

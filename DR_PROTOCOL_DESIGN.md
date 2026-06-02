@@ -30,6 +30,7 @@ validate.
 | Fixed KID range plane | Initial comparison cost | Divides sorted KID space into 1024 top-level ranges for coarse checksum comparison before drill-down. |
 | Top-level range checksums | Digest and fetch work for matching ranges | Lets reconciliation finalize at Phase A when every range count/checksum matches the checkpoint. |
 | Mandatory digest drill-down | Full-bucket fetches for localized divergence | Splits only mismatched ranges into child spans with stronger KID/VID digest descriptors. |
+| Bounded drill-down fanout | Unbounded digest RPCs under fragmented divergence | Caps child-digest RPCs per mismatched top-level range, then fetches coarser proof-bearing spans when further splitting would exceed the cap. |
 | Flat accumulator | O(N) secondary local scans on common reconnects | Maintains top-level range count/checksum incrementally during stream apply and persists snapshots/deltas for restart restore. |
 | Local KID index | Full local scans for mismatched buckets | Maps local KIDs back to physical keys so indexed repair can load and delete affected local entries without scanning unrelated storage. |
 | In-memory stream buffer | Reconciliation after short disconnects | Replays recent ordered mutations directly from primary memory when coverage from the secondary cursor is proven. |
@@ -265,13 +266,17 @@ The reconciliation flow is:
 4. Primary and secondary compare top-level range checksums.
 5. Mismatched ranges enter mandatory digest drill-down.
 6. Primary returns child digests that fully cover each parent span.
-7. Secondary fetches mismatched spans from checkpoint artifacts.
-8. Secondary cryptographically verifies fetched content against advertised
+7. Secondary continues splitting until ranges converge, reach terminal spans, or
+   hit the configured per-range fanout cap.
+8. Secondary fetches mismatched spans from checkpoint artifacts. If fanout is
+   capped, the fetch spans are coarser, but still carry the primary's digest
+   proofs.
+9. Secondary cryptographically verifies fetched content against advertised
    digest metadata.
-9. Secondary applies fetched primary entries.
-10. Secondary deletes local-only keys only after fetched remote spans are
+10. Secondary applies fetched primary entries.
+11. Secondary deletes local-only keys only after fetched remote spans are
     verified complete.
-11. Secondary advances `lastAppliedIndex` only after every phase succeeds.
+12. Secondary advances `lastAppliedIndex` only after every phase succeeds.
 
 ```mermaid
 sequenceDiagram
@@ -297,6 +302,7 @@ sequenceDiagram
         P->>CS: Read child digest descriptors
         P-->>S: Child span coverage + count + digest
         S->>S: Validate no gaps, overlap, or invalid split
+        S->>S: Stop splitting at fanout cap and keep proof-bearing spans
         S->>P: FetchEntries(mismatched spans)
         P->>CS: Fetch checkpoint-scoped entries
         P-->>S: Entry batch + digest metadata
@@ -553,6 +559,7 @@ minimum it should account for:
 
 - wall-clock reconcile time
 - range checksum and child digest RPC count
+- per-range drill-down fanout caps and coarse proof-backed fetch spans
 - fetched bytes and fetched entries
 - fetched delete candidates
 - local KID-index bucket loads and fallback scans
@@ -593,8 +600,9 @@ Protocol status should distinguish:
 
 The prototype exposes stream transaction shape, flush reasons, apply and commit
 timing, flat-accumulator cursor/snapshot/delta state, local KID index load and
-fallback counters, journal replay counters, range task counts, and lag/apply
-rates so stress runs can measure both correctness and optimization behavior.
+fallback counters, journal replay counters, range task counts, drill-down RPC
+and coarse-fetch counters, and lag/apply rates so stress runs can measure both
+correctness and optimization behavior.
 
 ## Protocol Invariants
 
