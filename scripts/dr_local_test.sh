@@ -46,6 +46,7 @@ Usage:
   scripts/dr_local_test.sh --topology ha secondary-outage-smoke [--duration N] [--concurrency N] [--outage-after N] [--outage-seconds N] [--no-reset] [--build]
   scripts/dr_local_test.sh --topology ha secondary-outage-reconcile-smoke [--duration N] [--concurrency N] [--outage-after N] [--outage-seconds N] [--no-reset] [--build]
   scripts/dr_local_test.sh --topology ha indexed-repair-smoke [--duration N] [--concurrency N] [--outage-after N] [--outage-seconds N] [--no-reset] [--build]
+  scripts/dr_local_test.sh --topology ha reconcile-budget-smoke [--duration N] [--concurrency N] [--outage-after N] [--outage-seconds N] [--no-reset] [--build]
   scripts/dr_local_test.sh --topology ha tuning-load-smoke [--duration N] [--concurrency N] [--no-reset]
   scripts/dr_local_test.sh --topology ha composite-lifecycle-soak [--duration N] [--concurrency N] [--seed-keys N] [--secondary2-outage-seconds N] [--no-reset]
   scripts/dr_local_test.sh --topology ha failover-load-lifecycle [--duration N] [--concurrency N] [--hard-stop-after N] [--no-reset]
@@ -75,6 +76,7 @@ HA topology:
   scripts/dr_local_test.sh --topology ha secondary-outage-smoke
   scripts/dr_local_test.sh --topology ha secondary-outage-reconcile-smoke
   scripts/dr_local_test.sh --topology ha indexed-repair-smoke
+  scripts/dr_local_test.sh --topology ha reconcile-budget-smoke
   scripts/dr_local_test.sh --topology ha tuning-load-smoke
   scripts/dr_local_test.sh --topology ha composite-lifecycle-soak
   scripts/dr_local_test.sh --topology ha failover-load-lifecycle
@@ -3473,6 +3475,18 @@ cmd_indexed_repair_smoke() {
     "$@"
 }
 
+cmd_reconcile_budget_smoke() {
+  ensure_dr_harness
+  ensure_dr_stress
+  "$DR_HARNESS_BIN" reconcile-budget-smoke \
+    --root "$ROOT_DIR" \
+    --topology "$TOPOLOGY" \
+    --env-file "$ENV_FILE" \
+    --results-dir "$RESULTS_DIR" \
+    --dr-stress-bin "$DR_STRESS_BIN" \
+    "$@"
+}
+
 cmd_indexed_repair_smoke_legacy() {
   cmd_secondary_outage_smoke_legacy \
     --expect-reconcile \
@@ -3942,6 +3956,7 @@ main() {
     secondary-outage-smoke) cmd_secondary_outage_smoke "$@" ;;
     secondary-outage-reconcile-smoke) cmd_secondary_outage_reconcile_smoke "$@" ;;
     indexed-repair-smoke) cmd_indexed_repair_smoke "$@" ;;
+    reconcile-budget-smoke) cmd_reconcile_budget_smoke "$@" ;;
     tuning-load-smoke) cmd_tuning_load_smoke "$@" ;;
     composite-lifecycle-soak) cmd_composite_lifecycle_soak "$@" ;;
     failover-load-lifecycle) cmd_failover_load_lifecycle "$@" ;;

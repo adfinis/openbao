@@ -17,6 +17,7 @@ scripts/dr_local_test.sh --topology ha accumulator-cold-restart-smoke
 scripts/dr_local_test.sh --topology ha secondary-outage-smoke
 scripts/dr_local_test.sh --topology ha secondary-outage-reconcile-smoke
 scripts/dr_local_test.sh --topology ha indexed-repair-smoke
+scripts/dr_local_test.sh --topology ha reconcile-budget-smoke
 scripts/dr_local_test.sh --topology ha tuning-load-smoke
 ```
 
@@ -30,6 +31,7 @@ bin/dr-harness accumulator-cold-restart-smoke
 bin/dr-harness secondary-outage-smoke
 bin/dr-harness secondary-outage-reconcile-smoke
 bin/dr-harness indexed-repair-smoke
+bin/dr-harness reconcile-budget-smoke
 bin/dr-harness tuning-load-smoke
 ```
 

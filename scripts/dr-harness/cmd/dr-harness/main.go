@@ -45,17 +45,22 @@ func main() {
 			os.Exit(1)
 		}
 	case "secondary-outage-smoke":
-		if err := runSecondaryOutage(ctx, os.Args[2:], false, "secondary-outage"); err != nil {
+		if err := runSecondaryOutage(ctx, os.Args[2:], false, false, "secondary-outage"); err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 			os.Exit(1)
 		}
 	case "secondary-outage-reconcile-smoke":
-		if err := runSecondaryOutage(ctx, os.Args[2:], true, "secondary-outage-reconcile"); err != nil {
+		if err := runSecondaryOutage(ctx, os.Args[2:], true, false, "secondary-outage-reconcile"); err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 			os.Exit(1)
 		}
 	case "indexed-repair-smoke":
-		if err := runSecondaryOutage(ctx, os.Args[2:], true, "indexed-repair"); err != nil {
+		if err := runSecondaryOutage(ctx, os.Args[2:], true, false, "indexed-repair"); err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+			os.Exit(1)
+		}
+	case "reconcile-budget-smoke":
+		if err := runSecondaryOutage(ctx, os.Args[2:], true, true, "reconcile-budget"); err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 			os.Exit(1)
 		}
@@ -87,6 +92,7 @@ func usage() {
   dr-harness secondary-outage-smoke [options]
   dr-harness secondary-outage-reconcile-smoke [options]
   dr-harness indexed-repair-smoke [options]
+  dr-harness reconcile-budget-smoke [options]
   dr-harness tuning-load-smoke [options]
   dr-harness composite-lifecycle-soak [options]
 
@@ -98,6 +104,7 @@ Commands:
   secondary-outage-smoke            Verify within-horizon replay after secondary outage
   secondary-outage-reconcile-smoke  Verify out-of-horizon checkpoint reconciliation
   indexed-repair-smoke              Verify indexed repair during out-of-horizon reconciliation
+  reconcile-budget-smoke            Verify clustered reconcile budget exhaustion fails closed
   tuning-load-smoke                 Verify dynamic tuning updates under HA mixed load
   composite-lifecycle-soak          Run 100k pre-seed, HA load, secondary outage lifecycle soak
 
@@ -307,7 +314,7 @@ func runAccumulatorColdRestart(ctx context.Context, args []string) error {
 	return scenario.RunAccumulatorColdRestart(ctx, cfg)
 }
 
-func runSecondaryOutage(ctx context.Context, args []string, expectReconcile bool, runPrefix string) error {
+func runSecondaryOutage(ctx context.Context, args []string, expectReconcile, expectBudget bool, runPrefix string) error {
 	cfg := scenario.OutageConfig{
 		RootDir:          defaultRootDir(),
 		Topology:         "ha",
@@ -322,6 +329,7 @@ func runSecondaryOutage(ctx context.Context, args []string, expectReconcile bool
 		MonitorInterval:  2 * time.Second,
 		MaxWait:          300 * time.Second,
 		ExpectReconcile:  expectReconcile,
+		ExpectBudget:     expectBudget,
 		RunPrefix:        runPrefix,
 	}
 	if expectReconcile {
@@ -331,6 +339,14 @@ func runSecondaryOutage(ctx context.Context, args []string, expectReconcile bool
 		cfg.OutageSeconds = 90 * time.Second
 		cfg.MaxWait = 900 * time.Second
 		cfg.TuningProfile = "out-of-horizon"
+	}
+	if expectBudget {
+		cfg.Duration = 120 * time.Second
+		cfg.Concurrency = 32
+		cfg.OutageAfter = 10 * time.Second
+		cfg.OutageSeconds = 60 * time.Second
+		cfg.MaxWait = 300 * time.Second
+		cfg.TuningProfile = "reconcile-budget-pressure"
 	}
 	cfg.EnvFile = filepath.Join(cfg.RootDir, ".dr-test.env")
 	cfg.ResultsDir = filepath.Join(cfg.RootDir, "dr-stress-results")
@@ -354,6 +370,7 @@ func runSecondaryOutage(ctx context.Context, args []string, expectReconcile bool
 	maxWait := fs.Int("max-wait-seconds", int(cfg.MaxWait.Seconds()), "Convergence timeout seconds")
 	timeout := fs.Int("timeout", int(cfg.Timeout.Seconds()), "Scenario timeout seconds")
 	fs.BoolVar(&cfg.ExpectReconcile, "expect-reconcile", cfg.ExpectReconcile, "Expect out-of-horizon reconciliation")
+	fs.BoolVar(&cfg.ExpectBudget, "expect-budget", cfg.ExpectBudget, "Expect reconcile budget exhaustion instead of convergence")
 	fs.StringVar(&cfg.TuningProfile, "tuning-profile", cfg.TuningProfile, "Tuning profile")
 	fs.StringVar(&cfg.RunPrefix, "run-prefix", cfg.RunPrefix, "Run ID prefix")
 	if err := fs.Parse(args); err != nil {

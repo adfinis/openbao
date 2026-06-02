@@ -46,6 +46,7 @@ type OutageConfig struct {
 	MonitorInterval  time.Duration
 	MaxWait          time.Duration
 	ExpectReconcile  bool
+	ExpectBudget     bool
 	TuningProfile    string
 	RunPrefix        string
 }
@@ -392,7 +393,11 @@ func RunSecondaryOutage(ctx context.Context, cfg OutageConfig) error {
 	if err != nil {
 		return err
 	}
-	if cfg.TuningProfile != "" {
+	if cfg.ExpectBudget {
+		if err := applyReconcileBudgetPressureTuning(ctx, rt); err != nil {
+			return err
+		}
+	} else if cfg.TuningProfile != "" {
 		if err := applyTuningProfile(ctx, rt, cfg.TuningProfile); err != nil {
 			return err
 		}
@@ -409,6 +414,7 @@ func RunSecondaryOutage(ctx context.Context, cfg OutageConfig) error {
 	run.Logf("outage_after_seconds=%d", int(cfg.OutageAfter.Seconds()))
 	run.Logf("outage_seconds=%d", int(cfg.OutageSeconds.Seconds()))
 	run.Logf("expect_reconcile=%t", cfg.ExpectReconcile)
+	run.Logf("expect_budget=%t", cfg.ExpectBudget)
 	run.Logf("tuning_profile=%s", cfg.TuningProfile)
 
 	primaryActive, err := topology.WaitActiveAddr(ctx, rt.primary, "primary pre-outage", 120*time.Second)
@@ -433,7 +439,13 @@ func RunSecondaryOutage(ctx context.Context, cfg OutageConfig) error {
 	if _, err := topology.WaitSecondaryReady(ctx, rt.secondary2DRRoot, "secondary2 pre-outage", cfg.Timeout); err != nil {
 		return err
 	}
-	beforeSecondary1, beforeSecondary1Raw, err := rt.secondary1DRRoot.DRStatus(ctx)
+	var beforeSecondary1 *bao.DRStatus
+	var beforeSecondary1Raw []byte
+	if cfg.ExpectBudget {
+		beforeSecondary1, beforeSecondary1Raw, err = rt.secondary1DRRoot.ActiveDRStatus(ctx)
+	} else {
+		beforeSecondary1, beforeSecondary1Raw, err = rt.secondary1DRRoot.DRStatus(ctx)
+	}
 	if err != nil {
 		return err
 	}
@@ -488,9 +500,21 @@ func RunSecondaryOutage(ctx context.Context, cfg OutageConfig) error {
 		return err
 	}
 	run.Logf("secondary1_active_after=%s", secondary1Active)
-	if _, err := topology.WaitSecondaryReady(ctx, rt.secondary1DRRoot, "secondary1 after outage", cfg.MaxWait); err != nil {
-		_ = stressCmd.Process.Kill()
-		return err
+	if cfg.ExpectBudget {
+		budgetStatus, budgetRaw, err := waitReconcileBudgetExhausted(ctx, rt.secondary1DRRoot, "secondary1 after outage", beforeSecondary1.ReconcileBudgetExhaustedTotal, cfg.MaxWait)
+		_ = run.WriteFile("budget-exhausted-secondary1-status.json", budgetRaw)
+		if err != nil {
+			_ = stressCmd.Process.Kill()
+			return err
+		}
+		run.Logf("secondary1_budget_exhausted_total=%d", budgetStatus.ReconcileBudgetExhaustedTotal)
+		run.Logf("secondary1_budget_exhausted_phase=%s", budgetStatus.ReconcileBudgetExhaustedPhaseLast)
+		run.Logf("secondary1_budget_exhausted_reason=%s", budgetStatus.ReconcileBudgetExhaustedReasonLast)
+	} else {
+		if _, err := topology.WaitSecondaryReady(ctx, rt.secondary1DRRoot, "secondary1 after outage", cfg.MaxWait); err != nil {
+			_ = stressCmd.Process.Kill()
+			return err
+		}
 	}
 
 	run.Logf("waiting_for_stress_pid=%d", stressCmd.Process.Pid)
@@ -501,13 +525,25 @@ func RunSecondaryOutage(ctx context.Context, cfg OutageConfig) error {
 	}
 	run.Logf("stress_rc=0")
 
-	if _, err := topology.WaitSecondaryReady(ctx, rt.secondary1DRRoot, "secondary1 final", cfg.MaxWait); err != nil {
-		return err
+	if cfg.ExpectBudget {
+		if _, _, err := waitReconcileBudgetExhausted(ctx, rt.secondary1DRRoot, "secondary1 final", beforeSecondary1.ReconcileBudgetExhaustedTotal, cfg.MaxWait); err != nil {
+			return err
+		}
+	} else {
+		if _, err := topology.WaitSecondaryReady(ctx, rt.secondary1DRRoot, "secondary1 final", cfg.MaxWait); err != nil {
+			return err
+		}
 	}
 	if _, err := topology.WaitSecondaryReady(ctx, rt.secondary2DRRoot, "secondary2 final", cfg.MaxWait); err != nil {
 		return err
 	}
-	afterSecondary1, afterSecondary1Raw, err := rt.secondary1DRRoot.DRStatus(ctx)
+	var afterSecondary1 *bao.DRStatus
+	var afterSecondary1Raw []byte
+	if cfg.ExpectBudget {
+		afterSecondary1, afterSecondary1Raw, err = rt.secondary1DRRoot.ActiveDRStatus(ctx)
+	} else {
+		afterSecondary1, afterSecondary1Raw, err = rt.secondary1DRRoot.DRStatus(ctx)
+	}
 	if err != nil {
 		return err
 	}
@@ -532,8 +568,12 @@ func RunSecondaryOutage(ctx context.Context, cfg OutageConfig) error {
 	if err := runDRStressVerify(ctx, cfg.DRStressBin, run.Dir, "primary", primaryActive, rt.layout.Primary.Token, "api"); err != nil {
 		return err
 	}
-	if err := runDRStressVerify(ctx, cfg.DRStressBin, run.Dir, "secondary1", secondary1Active, rt.layout.Secondary1.Token, "checkpoint"); err != nil {
-		return err
+	if cfg.ExpectBudget {
+		run.Logf("secondary1_verification_skipped=expected_budget_exhaustion")
+	} else {
+		if err := runDRStressVerify(ctx, cfg.DRStressBin, run.Dir, "secondary1", secondary1Active, rt.layout.Secondary1.Token, "checkpoint"); err != nil {
+			return err
+		}
 	}
 	if err := runDRStressVerify(ctx, cfg.DRStressBin, run.Dir, "secondary2", secondary2Active, rt.layout.Secondary2.Token, "checkpoint"); err != nil {
 		return err
@@ -542,25 +582,40 @@ func RunSecondaryOutage(ctx context.Context, cfg OutageConfig) error {
 	result := map[string]any{
 		"run_id":                           run.ID,
 		"expect_reconcile":                 cfg.ExpectReconcile,
+		"expect_budget":                    cfg.ExpectBudget,
 		"primary_active_final":             primaryActive,
 		"secondary1_active_final":          secondary1Active,
 		"last_applied_before_secondary1":   beforeSecondary1.LastAppliedIndex,
 		"last_applied_after_secondary1":    afterSecondary1.LastAppliedIndex,
 		"reconcile_before_secondary1":      beforeSecondary1.ReconcileCount,
 		"reconcile_after_secondary1":       afterSecondary1.ReconcileCount,
+		"budget_exhausted_before":          beforeSecondary1.ReconcileBudgetExhaustedTotal,
+		"budget_exhausted_after":           afterSecondary1.ReconcileBudgetExhaustedTotal,
+		"budget_exhausted_phase_last":      afterSecondary1.ReconcileBudgetExhaustedPhaseLast,
+		"budget_exhausted_reason_last":     afterSecondary1.ReconcileBudgetExhaustedReasonLast,
+		"budget_exhausted_rpc_bytes_last":  afterSecondary1.ReconcileBudgetExhaustedRPCBytesLast,
+		"budget_exhausted_max_rpc_bytes":   afterSecondary1.ReconcileBudgetExhaustedMaxRPCBytesLast,
 		"indexed_repair_before_secondary1": beforeSecondary1.FlatAccumulatorIndexedRepair,
 		"indexed_repair_after_secondary1":  afterSecondary1.FlatAccumulatorIndexedRepair,
 		"local_kid_fallback_before":        beforeSecondary1.LocalKIDIndexFallbackScans,
 		"local_kid_fallback_after":         afterSecondary1.LocalKIDIndexFallbackScans,
 		"journal_range_too_old_before":     beforePrimary.JournalRangeTooOldTotal,
 		"journal_range_too_old_after":      afterPrimary.JournalRangeTooOldTotal,
+		"range_checksum_requests_before":   beforePrimary.RangeChecksumRequestsTotal,
+		"range_checksum_requests_after":    afterPrimary.RangeChecksumRequestsTotal,
+		"range_digest_requests_before":     beforePrimary.RangeDigestRequestsTotal,
+		"range_digest_requests_after":      afterPrimary.RangeDigestRequestsTotal,
+		"fetch_requests_before":            beforePrimary.FetchRequestsTotal,
+		"fetch_requests_after":             afterPrimary.FetchRequestsTotal,
 		"completed_at":                     time.Now().UTC().Format(time.RFC3339),
 	}
 	if err := run.WriteJSON("result.json", result); err != nil {
 		return err
 	}
 	run.Logf("completed_at=%s", result["completed_at"])
-	if cfg.ExpectReconcile {
+	if cfg.ExpectBudget {
+		fmt.Println("Reconcile budget pressure smoke passed.")
+	} else if cfg.ExpectReconcile {
 		fmt.Println("Secondary outage reconcile smoke passed.")
 	} else {
 		fmt.Println("Secondary outage smoke passed.")
@@ -967,8 +1022,6 @@ func startDRStress(ctx context.Context, cfg OutageConfig, run *artifact.Run, pri
 		"-output-dir", cfg.ResultsDir,
 		"-primary-addr", primaryActive,
 		"-primary-token", layout.Primary.Token,
-		"-secondary1-addr", strings.Join(layout.Secondary1.Addrs, ","),
-		"-secondary1-token", layout.Primary.Token,
 		"-secondary2-addr", strings.Join(layout.Secondary2.Addrs, ","),
 		"-secondary2-token", layout.Primary.Token,
 		"-ensure-kv",
@@ -984,6 +1037,13 @@ func startDRStress(ctx context.Context, cfg OutageConfig, run *artifact.Run, pri
 		"-max-wait-seconds", fmt.Sprintf("%d", int(cfg.MaxWait.Seconds())),
 		"-progress-interval", fmt.Sprintf("%d", int(cfg.ProgressInterval.Seconds())),
 		"-monitor-interval", fmt.Sprintf("%d", int(cfg.MonitorInterval.Seconds())),
+	}
+	if !cfg.ExpectBudget {
+		args = append(
+			args,
+			"-secondary1-addr", strings.Join(layout.Secondary1.Addrs, ","),
+			"-secondary1-token", layout.Primary.Token,
+		)
 	}
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = cfg.RootDir
@@ -1013,6 +1073,35 @@ func closeFiles(files ...*os.File) {
 	}
 }
 
+func waitReconcileBudgetExhausted(ctx context.Context, client *bao.Client, label string, before int64, timeout time.Duration) (*bao.DRStatus, []byte, error) {
+	deadline := time.Now().Add(timeout)
+	var lastStatus *bao.DRStatus
+	var lastRaw []byte
+	var lastErr error
+	for {
+		status, raw, err := client.ActiveDRStatus(ctx)
+		if err == nil {
+			lastStatus = status
+			lastRaw = raw
+			if status.ReconcileBudgetExhaustedTotal > before {
+				return status, raw, nil
+			}
+		} else {
+			lastErr = err
+		}
+		if time.Now().After(deadline) {
+			if lastStatus != nil {
+				return lastStatus, lastRaw, fmt.Errorf("timed out waiting for %s reconcile budget exhaustion: before=%d current=%d state=%s phase=%s reconcile_phase=%s",
+					label, before, lastStatus.ReconcileBudgetExhaustedTotal, lastStatus.SecondaryState, lastStatus.ReconcileBudgetExhaustedPhaseLast, lastStatus.ReconcilePhase)
+			}
+			return nil, nil, fmt.Errorf("timed out waiting for %s reconcile budget exhaustion: %w", label, lastErr)
+		}
+		if err := sleepContext(ctx, 2*time.Second); err != nil {
+			return nil, nil, err
+		}
+	}
+}
+
 func validateOutageCounters(cfg OutageConfig, before, after, beforePrimary, afterPrimary *bao.DRStatus) error {
 	if after.LastAppliedIndex < before.LastAppliedIndex {
 		return fmt.Errorf("secondary1 last_applied_index moved backwards after outage: %d -> %d", before.LastAppliedIndex, after.LastAppliedIndex)
@@ -1022,6 +1111,39 @@ func validateOutageCounters(cfg OutageConfig, before, after, beforePrimary, afte
 	}
 	if after.ScanFailuresTotal > before.ScanFailuresTotal {
 		return fmt.Errorf("secondary1 reported new scan failures after outage: %d -> %d", before.ScanFailuresTotal, after.ScanFailuresTotal)
+	}
+	if cfg.ExpectBudget {
+		if after.ReconcileBudgetExhaustedTotal <= before.ReconcileBudgetExhaustedTotal {
+			return fmt.Errorf("secondary1 did not report reconcile budget exhaustion: %d -> %d", before.ReconcileBudgetExhaustedTotal, after.ReconcileBudgetExhaustedTotal)
+		}
+		if after.ReconcileBudgetExhaustedPhaseLast == "" || after.ReconcileBudgetExhaustedReasonLast == "" {
+			return fmt.Errorf("secondary1 budget exhaustion did not expose phase/reason: phase=%q reason=%q", after.ReconcileBudgetExhaustedPhaseLast, after.ReconcileBudgetExhaustedReasonLast)
+		}
+		if after.ReconcileBudgetExhaustedMaxRPCBytesLast == 0 {
+			return fmt.Errorf("secondary1 budget exhaustion did not expose max RPC byte budget")
+		}
+		if after.ReconcileBudgetExhaustedReasonLast == "rpc_bytes" && after.ReconcileBudgetExhaustedRPCBytesLast <= after.ReconcileBudgetExhaustedMaxRPCBytesLast {
+			return fmt.Errorf("secondary1 budget exhaustion rpc bytes did not exceed budget: used=%d max=%d",
+				after.ReconcileBudgetExhaustedRPCBytesLast, after.ReconcileBudgetExhaustedMaxRPCBytesLast)
+		}
+		if after.ReconcileCount > before.ReconcileCount {
+			return fmt.Errorf("secondary1 reconcile count advanced despite budget exhaustion: %d -> %d", before.ReconcileCount, after.ReconcileCount)
+		}
+		if afterPrimary.JournalRangeTooOldTotal <= beforePrimary.JournalRangeTooOldTotal {
+			return fmt.Errorf("primary did not report journal range too old during budget-pressure outage: %d -> %d", beforePrimary.JournalRangeTooOldTotal, afterPrimary.JournalRangeTooOldTotal)
+		}
+		if afterPrimary.RangeChecksumRequestsTotal <= beforePrimary.RangeChecksumRequestsTotal &&
+			afterPrimary.RangeDigestRequestsTotal <= beforePrimary.RangeDigestRequestsTotal &&
+			afterPrimary.FetchRequestsTotal <= beforePrimary.FetchRequestsTotal {
+			return fmt.Errorf("primary checkpoint pressure counters did not move during budget-pressure reconcile")
+		}
+		if afterPrimary.RangeChecksumRejectionsTotal > beforePrimary.RangeChecksumRejectionsTotal ||
+			afterPrimary.RangeDigestRejectionsTotal > beforePrimary.RangeDigestRejectionsTotal ||
+			afterPrimary.FetchRequestRejectionsTotal > beforePrimary.FetchRequestRejectionsTotal ||
+			afterPrimary.FetchResponseBudgetRejectionsTotal > beforePrimary.FetchResponseBudgetRejectionsTotal {
+			return fmt.Errorf("primary request rejection counters increased unexpectedly during secondary budget-pressure smoke")
+		}
+		return nil
 	}
 	if cfg.ExpectReconcile {
 		if after.ReconcileCount <= before.ReconcileCount &&
@@ -1172,6 +1294,24 @@ func applyTuningProfile(ctx context.Context, rt *harnessRuntime, profile string)
 	}
 	if _, err := rt.secondary2DRRoot.WriteTuning(ctx, values); err != nil {
 		return fmt.Errorf("write secondary2 tuning: %w", err)
+	}
+	return nil
+}
+
+func applyReconcileBudgetPressureTuning(ctx context.Context, rt *harnessRuntime) error {
+	controlValues := outOfHorizonTuning()
+	if _, err := rt.primary.WriteTuning(ctx, controlValues); err != nil {
+		return fmt.Errorf("write primary tuning: %w", err)
+	}
+	if _, err := rt.secondary2DRRoot.WriteTuning(ctx, controlValues); err != nil {
+		return fmt.Errorf("write secondary2 tuning: %w", err)
+	}
+
+	starvedValues := outOfHorizonTuning()
+	starvedValues["reconcile_max_rpc_bytes"] = 1
+	starvedValues["reconcile_max_inflight_tasks"] = 1
+	if _, err := rt.secondary1DRRoot.WriteTuning(ctx, starvedValues); err != nil {
+		return fmt.Errorf("write secondary1 budget-pressure tuning: %w", err)
 	}
 	return nil
 }

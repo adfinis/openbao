@@ -59,6 +59,7 @@ Orchestrated smokes add scenario-specific files such as
 | Go-harness HA secondary outage within horizon parity | `secondary-outage-20260602T001401Z` | Pass | The active shell entrypoint ran through `scripts/dr-harness`, stopped secondary #1 for 20s during a 75s workload, followed the new active secondary node after restart, recovered through journal replay without reconciliation or `journal_range_too_old`, and passed terminal checkpoint verification. This is harness parity evidence, not a throughput benchmark. |
 | Go-harness HA indexed repair/out-of-horizon parity | `indexed-repair-20260602T001934Z` | Pass | The active `indexed-repair-smoke` entrypoint ran through `scripts/dr-harness`, stopped secondary #1 beyond the shrunken journal horizon, incremented primary `journal_range_too_old_total`, ran indexed repair without local KID fallback scans, and passed terminal checkpoint verification. The harness retries only transient accumulator/checkpoint index skew during checkpoint verification. |
 | Clustered HA fragmented reconnect after S20/S21 observability | `indexed-repair-20260602T122921Z` | Pass | 180s, 48 workers, secondary #1 outage beyond journal horizon. Primary reported `journal_range_too_old_total=3`, `range_checksum_requests_total=55`, `range_digest_requests_total=21219`, `fetch_requests_total=2745`, and zero range/fetch rejections or scan failures. Secondary #1 returned to `streaming` with `lag_entries=0`, `reconcile_count=3`, `flat_accumulator_indexed_repair_total=3`, 2,715 indexed repair ranges, zero local KID fallback scans, zero full-bucket fallback, zero indexed proof mismatches, zero reconcile-budget exhaustion, and strict checkpoint verification passed on both secondaries with 1,024/1,024 matched ranges and `physical_scan_used=false`. |
+| Clustered HA reconcile budget pressure | `reconcile-budget-20260602T130034Z` | Pass | 120s, 32 workers, secondary #1 outage beyond journal horizon with `reconcile_max_rpc_bytes=1` only on secondary #1. The secondary hit `budget_exhausted` six times in `range_checksums` for `rpc_bytes`, reported `reconcile_fail_reason_last=budget_exceeded`, remained `reconciling` with lag instead of falsely completing repair, and had zero scan failures. The primary reported `journal_range_too_old_total=1`, range-checksum requests increased from 22 to 39, range-digest requests from 32 to 42, fetch requests from 32 to 33, and all primary rejection counters stayed zero. Primary API verification passed across 2,540 truth-log keys; secondary #2 checkpoint verification passed with 1,024/1,024 matched ranges and `physical_scan_used=false`. Secondary #1 verification was intentionally skipped because failure to converge is the expected fail-closed behavior. |
 | Go-harness HA mixed-load smoke parity | `drmixed-20260602T055824Z` | Pass | The active `smoke` entrypoint ran through `scripts/dr-harness`, applied the constrained HA primary tuning profile, delegated the workload body to `dr-stress`, and completed a shortened 45s, 8-worker mixed workload with 5,475 operations, zero PUT/GET/status failures, zero dropped events, and 1s/1s sentinel convergence. Terminal verification passed primary API checks across 820 truth-log keys and active-secondary checkpoint verification on both secondaries with 1,024/1,024 matched ranges, zero missing/mismatched ranges, `physical_scan_used=false`, and `optimizer_reseeded=false`. This is harness parity evidence, not a throughput benchmark. |
 | Go-harness HA full mixed-load smoke | `drmixed-20260602T075024Z` | Pass with expected client transients | 900s, 48 workers, primary stepdown every 300s, constrained HA tuning, 79,053 operations, zero status failures, zero dropped events, and 1.0s/1.0s sentinel convergence. Both secondaries briefly entered reconciliation under saturated-ring pressure, returned to `streaming`, and ended with `lag_entries=0`. Terminal primary API verification passed across 7,094 truth-log keys, and both strict secondaries passed checkpoint verification with 1,024/1,024 matched ranges, zero missing/mismatched ranges, `physical_scan_used=false`, and `optimizer_reseeded=false`. Indexed repair ran without local KID fallback scans, full-bucket fallback, proof mismatches, load failures, or scan failures. PUT/GET failures were client-facing HA disruption noise. |
 | Go-harness HA dynamic tuning load | `tuning-ha-load-20260602T071619Z` | Pass with expected client transients | 900s, 36 workers, primary stepdown every 90s, constrained tuning at 60s, relaxed tuning at 180s, forced primary and secondary active handoff, 86,564 operations, zero status failures, zero dropped events, and sentinel convergence in 1.0s/59.0s. Terminal primary API verification passed across 7,663 truth-log keys, and both strict secondaries passed checkpoint verification with 1,024/1,024 matched ranges, zero missing/mismatched ranges, `physical_scan_used=false`, and `optimizer_reseeded=false`. The relaxed primary tuning write collided with HA active movement and succeeded after harness retry. PUT/GET failures were client-facing HA disruption noise. |
@@ -81,6 +82,10 @@ The curated set supports these current claims:
   path after S20/S21 observability landed. It did not exhaust resource budgets,
   but it confirmed the pressure counters are visible during a real HA reconnect
   and that the successful repair path stayed scan-free.
+- The clustered reconcile-budget smoke now covers the negative path: a
+  deliberately starved secondary fails closed with explicit
+  `budget_exhausted` status while the primary and the healthy control secondary
+  continue to validate terminal correctness.
 - The key-only local KID index avoided fallback scans during HA mixed load while
   retaining exhaustive terminal data correctness.
 - The latest HA smoke cleared the earlier adaptive-run `bucket_mismatch`
@@ -147,7 +152,7 @@ The curated set supports these current claims:
 | Optimizers are not authority | Flat accumulator restore, local KID-index repair, dirty bitmap hinting, and pre-seed baseline runs all fall back or verify before advancing. | Local KID-index metadata write pressure and optimizer seeding after resnapshot remain optimization targets. |
 | Strict secondaries are warm standbys, not read replicas | Current HA smokes use checkpoint verification for secondary terminal correctness. | Supported pre-promotion read-serving is a separate future product decision. |
 | Relationship authorization guards every DR data-plane RPC | Security test slices cover gRPC authz, revocation, bootstrap, rotation, and `SyncKeyring` binding. | DR transport CA rotation and independent security review remain open. |
-| Primary and secondary resource usage must be bounded independently | Tuning validation, checkpoint artifact admission tests, S20 secondary budget exhaustion, and S21 primary checkpoint/digest/fetch pressure unit gates exist. | A clustered fragmented-reconnect stress run should still exercise these limits under HA load before production defaults are chosen. |
+| Primary and secondary resource usage must be bounded independently | Tuning validation, checkpoint artifact admission tests, S20 secondary budget exhaustion, S21 primary checkpoint/digest/fetch pressure unit gates, and clustered HA reconcile-budget pressure smoke exist. | Primary rejection/fetch-response budget paths remain unit-gated; production defaults still need measured sizing. |
 
 ## Performance Evidence
 
@@ -206,11 +211,10 @@ behavior without explaining their age and purpose.
   and HA validation of stream-first catch-up. The local HA smoke already covers
   segmented post-seed delta catch-up, checkpoint verification, and post-accept
   HA handoff.
-- Run the S20/S21 resource-bound behavior under a clustered fragmented-reconnect
-  smoke. The unit gates now cover budget exhaustion, checkpoint cursor safety,
-  and primary digest/fetch pressure counters, but the current stress results are
-  not yet a worst-case model for fragmented reconnects or maliciously expensive
-  checkpoint drill-down.
+- Extend S21 primary pressure evidence beyond unit gates if we add first-class
+  tuning knobs for clustered primary rejection/fetch-response budget paths. The
+  current clustered budget smoke proves primary pressure counters move during a
+  real reconnect, but rejection semantics remain unit-gated.
 - Add a current 1-hour no-stepdown stream-apply baseline with the latest code.
 - Add dependency-backed engine profiles when their services are available in the
   local compose topology.

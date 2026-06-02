@@ -369,36 +369,73 @@ func (c *Client) StepDown(ctx context.Context) error {
 }
 
 type DRStatus struct {
-	Mode                          string  `json:"mode"`
-	SecondaryState                string  `json:"secondary_state"`
-	PrimaryIndex                  uint64  `json:"primary_index"`
-	LastAppliedIndex              uint64  `json:"last_applied_index"`
-	LagEntries                    int64   `json:"lag_entries"`
-	ReconcileCount                int64   `json:"reconcile_count"`
-	ReconcilePhase                string  `json:"reconcile_phase"`
-	ScanFailuresTotal             int64   `json:"scan_failures_total"`
-	FlatAccumulatorIndexedRepair  int64   `json:"flat_accumulator_indexed_repair_total"`
-	LocalKIDIndexFallbackScans    int64   `json:"local_kid_index_fallback_scans_total"`
-	StreamTxnBatchesTotal         int64   `json:"stream_txn_batches_total"`
-	StreamTxnEntriesTotal         int64   `json:"stream_txn_entries_total"`
-	StreamTxnCommitAverageMS      float64 `json:"stream_txn_commit_milliseconds_average"`
-	StreamTxnCommitMaxMS          float64 `json:"stream_txn_commit_milliseconds_max"`
-	FlatAccumulatorCursorIndex    uint64  `json:"flat_accumulator_cursor_index"`
-	FlatAccumulatorSnapshotIndex  uint64  `json:"flat_accumulator_snapshot_index"`
-	FlatAccumulatorCursorWrites   int64   `json:"flat_accumulator_cursor_writes_total"`
-	FlatAccumulatorSnapshotWrites int64   `json:"flat_accumulator_snapshot_persists_total"`
-	JournalRangeTooOldTotal       int64   `json:"journal_range_too_old_total"`
-	FlatAccumulatorFastPathTotal  int64   `json:"flat_accumulator_fast_path_total"`
-	FlatAccumulatorFullBucket     int64   `json:"flat_accumulator_indexed_repair_full_bucket_fallback_total"`
-	FlatAccumulatorProofMismatch  int64   `json:"flat_accumulator_indexed_repair_proof_mismatches_total"`
-	LocalKIDIndexBucketLoads      int64   `json:"local_kid_index_bucket_loads_total"`
-	LocalKIDIndexEntriesLoaded    int64   `json:"local_kid_index_entries_loaded_total"`
-	LocalKIDIndexLoadFailures     int64   `json:"local_kid_index_load_failures_total"`
+	Mode                                      string  `json:"mode"`
+	SecondaryState                            string  `json:"secondary_state"`
+	PrimaryIndex                              uint64  `json:"primary_index"`
+	LastAppliedIndex                          uint64  `json:"last_applied_index"`
+	LagEntries                                int64   `json:"lag_entries"`
+	ReconcileCount                            int64   `json:"reconcile_count"`
+	ReconcilePhase                            string  `json:"reconcile_phase"`
+	ScanFailuresTotal                         int64   `json:"scan_failures_total"`
+	FlatAccumulatorIndexedRepair              int64   `json:"flat_accumulator_indexed_repair_total"`
+	LocalKIDIndexFallbackScans                int64   `json:"local_kid_index_fallback_scans_total"`
+	StreamTxnBatchesTotal                     int64   `json:"stream_txn_batches_total"`
+	StreamTxnEntriesTotal                     int64   `json:"stream_txn_entries_total"`
+	StreamTxnCommitAverageMS                  float64 `json:"stream_txn_commit_milliseconds_average"`
+	StreamTxnCommitMaxMS                      float64 `json:"stream_txn_commit_milliseconds_max"`
+	FlatAccumulatorCursorIndex                uint64  `json:"flat_accumulator_cursor_index"`
+	FlatAccumulatorSnapshotIndex              uint64  `json:"flat_accumulator_snapshot_index"`
+	FlatAccumulatorCursorWrites               int64   `json:"flat_accumulator_cursor_writes_total"`
+	FlatAccumulatorSnapshotWrites             int64   `json:"flat_accumulator_snapshot_persists_total"`
+	JournalRangeTooOldTotal                   int64   `json:"journal_range_too_old_total"`
+	FlatAccumulatorFastPathTotal              int64   `json:"flat_accumulator_fast_path_total"`
+	FlatAccumulatorFullBucket                 int64   `json:"flat_accumulator_indexed_repair_full_bucket_fallback_total"`
+	FlatAccumulatorProofMismatch              int64   `json:"flat_accumulator_indexed_repair_proof_mismatches_total"`
+	LocalKIDIndexBucketLoads                  int64   `json:"local_kid_index_bucket_loads_total"`
+	LocalKIDIndexEntriesLoaded                int64   `json:"local_kid_index_entries_loaded_total"`
+	LocalKIDIndexLoadFailures                 int64   `json:"local_kid_index_load_failures_total"`
+	ReconcileBudgetRemainingBytes             uint64  `json:"reconcile_budget_remaining_bytes"`
+	ReconcileBudgetExhaustedTotal             int64   `json:"reconcile_budget_exhausted_total"`
+	ReconcileBudgetExhaustedPhaseLast         string  `json:"reconcile_budget_exhausted_phase_last"`
+	ReconcileBudgetExhaustedReasonLast        string  `json:"reconcile_budget_exhausted_reason_last"`
+	ReconcileBudgetExhaustedRPCBytesLast      uint64  `json:"reconcile_budget_exhausted_rpc_bytes_last"`
+	ReconcileBudgetExhaustedMaxRPCBytesLast   uint64  `json:"reconcile_budget_exhausted_max_rpc_bytes_last"`
+	ReconcileBudgetExhaustedRPCCallsLast      int64   `json:"reconcile_budget_exhausted_rpc_calls_last"`
+	ReconcileBudgetExhaustedEntriesLast       int64   `json:"reconcile_budget_exhausted_entries_last"`
+	ReconcileBudgetExhaustedRangesHandledLast int64   `json:"reconcile_budget_exhausted_ranges_handled_last"`
+	ReconcileBudgetExhaustedRangesSplitLast   int64   `json:"reconcile_budget_exhausted_ranges_split_last"`
+	ReconcileBudgetExhaustedRetriesLast       int64   `json:"reconcile_budget_exhausted_retries_last"`
+	RangeChecksumRequestsTotal                int64   `json:"range_checksum_requests_total"`
+	RangeChecksumRejectionsTotal              int64   `json:"range_checksum_rejections_total"`
+	RangeDigestRequestsTotal                  int64   `json:"range_digest_requests_total"`
+	RangeDigestRejectionsTotal                int64   `json:"range_digest_rejections_total"`
+	FetchRequestsTotal                        int64   `json:"fetch_requests_total"`
+	FetchRequestRejectionsTotal               int64   `json:"fetch_request_rejections_total"`
+	FetchResponseBudgetRejectionsTotal        int64   `json:"fetch_response_budget_rejections_total"`
 }
 
 func (c *Client) DRStatus(ctx context.Context) (*DRStatus, []byte, error) {
 	raw, status, err := c.bestDRStatus(ctx)
 	return status, raw, err
+}
+
+func (c *Client) ActiveDRStatus(ctx context.Context) (*DRStatus, []byte, error) {
+	addr, err := c.ActiveAddr(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	code, body, err := c.doAt(ctx, addr, http.MethodGet, "/v1/sys/replication/dr/status", nil)
+	if err != nil {
+		return nil, body, err
+	}
+	if code != http.StatusOK {
+		return nil, body, fmt.Errorf("%s DR status returned %d: %s", addr, code, summarizeBody(body))
+	}
+	status, err := decodeDRStatus(body)
+	if err != nil {
+		return nil, body, fmt.Errorf("decode %s DR status: %w", addr, err)
+	}
+	return status, body, nil
 }
 
 func (c *Client) bestDRStatus(ctx context.Context) ([]byte, *DRStatus, error) {
@@ -416,16 +453,14 @@ func (c *Client) bestDRStatus(ctx context.Context) ([]byte, *DRStatus, error) {
 			lastErr = fmt.Errorf("%s DR status returned %d: %s", addr, code, summarizeBody(body))
 			continue
 		}
-		var envelope struct {
-			Data DRStatus `json:"data"`
-		}
-		if err := json.Unmarshal(body, &envelope); err != nil {
+		status, err := decodeDRStatus(body)
+		if err != nil {
 			lastErr = fmt.Errorf("decode %s DR status: %w", addr, err)
 			continue
 		}
-		score := drStatusScore(&envelope.Data)
+		score := drStatusScore(status)
 		if best == nil || score > bestScore {
-			copyStatus := envelope.Data
+			copyStatus := *status
 			best = &copyStatus
 			bestRaw = append([]byte(nil), body...)
 			bestScore = score
@@ -438,6 +473,16 @@ func (c *Client) bestDRStatus(ctx context.Context) ([]byte, *DRStatus, error) {
 		return nil, nil, lastErr
 	}
 	return nil, nil, fmt.Errorf("no DR status response")
+}
+
+func decodeDRStatus(body []byte) (*DRStatus, error) {
+	var envelope struct {
+		Data DRStatus `json:"data"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return nil, err
+	}
+	return &envelope.Data, nil
 }
 
 func drStatusScore(status *DRStatus) int {

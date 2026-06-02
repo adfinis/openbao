@@ -29,7 +29,7 @@ shape rather than local PoC.
 
 | Area | Status | Why it matters |
 |---|---|---|
-| Reconcile budget ledger | Unit-gated, HA validation open | A massive fragmented checkpoint repair must stop on explicit byte, entry, RPC, retry, and wall-time budgets instead of relying on implicit timeouts. |
+| Reconcile budget ledger | Unit-gated, clustered HA negative-path smoke passed | A massive fragmented checkpoint repair must stop on explicit byte, entry, RPC, retry, and wall-time budgets instead of relying on implicit timeouts. Primary rejection paths and production default sizing still need more evidence. |
 | Primary checkpoint pressure controls | Unit-gated, HA validation open | A secondary should not be able to force unbounded checkpoint construction, digest lookup, fetch serialization, or artifact retention on the primary. |
 | Pre-seed artifact provenance | Open | Large base-copy artifacts need signed provenance or equivalent primary authorization, external storage support, and resumable transfer semantics. |
 | DR transport CA rotation | Open | Leaf renewal is covered, but production CA rotation without relationship replacement is not finalized. |
@@ -92,7 +92,7 @@ The current performance direction is in
 
 The next scale work should focus on:
 
-- primary and secondary resource budgets;
+- primary rejection paths and production resource-budget defaults;
 - secondary transaction pressure and local metadata write amplification;
 - pre-seed external artifact lifecycle for large existing clusters;
 - optimizer seeding after pre-seed/resnapshot;
@@ -103,9 +103,8 @@ The next scale work should focus on:
 
 Recommended next validation targets:
 
-- clustered S20/S21 fragmented-reconnect validation now that the unit gates cover
-  secondary budget exhaustion and primary checkpoint/digest/fetch pressure
-  counters;
+- primary checkpoint/digest/fetch rejection evidence beyond unit tests, if
+  those limits become operator-tunable for clustered negative-path smokes;
 - default-duration Go-harness outage/reconcile smokes after the next
   implementation slice;
 - one-hour no-stepdown stream-apply baseline on current code;

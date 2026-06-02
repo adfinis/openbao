@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-06-01",
+  "generated_at": "2026-06-02",
   "purpose": "Curated DR replication validation evidence. This manifest intentionally references selected runs; it is not a latest-run index and is not a benchmark leaderboard.",
   "artifact_schema": {
     "dr_stress_run": [
@@ -943,6 +943,61 @@
       },
       "harness": "scripts/dr-harness",
       "notes": "Validates dynamic DR tuning writes under HA mixed load, periodic primary stepdown, and forced primary/secondary active handoff. The relaxed primary tuning write collided with active movement and succeeded after retry; PUT/GET failures are expected HA disruption noise. Strict-secondary checkpoint verification stayed on the O(1) accumulator path with no physical scan or optimizer reseed."
+    },
+    {
+      "scenario_id": "E17",
+      "scenario": "Clustered reconcile budget pressure",
+      "run_id": "reconcile-budget-20260602T130034Z",
+      "path": "dr-stress-results/reconcile-budget-20260602T130034Z",
+      "topology": "ha-primary-plus-two-secondaries",
+      "command_shape": "scripts/dr_local_test.sh --topology ha reconcile-budget-smoke",
+      "result": "pass",
+      "duration_seconds": 120,
+      "concurrency": 32,
+      "workload_keys_verified": 2540,
+      "budget_pressure": {
+        "secondary1": {
+          "reconcile_max_rpc_bytes": 1,
+          "reconcile_budget_exhausted_total": 6,
+          "reconcile_budget_exhausted_phase_last": "range_checksums",
+          "reconcile_budget_exhausted_reason_last": "rpc_bytes",
+          "reconcile_budget_exhausted_rpc_bytes_last": 2400,
+          "reconcile_budget_exhausted_max_rpc_bytes_last": 1,
+          "reconcile_fail_reason_last": "budget_exceeded",
+          "secondary_state": "reconciling",
+          "lag_entries": 11133,
+          "scan_failures_total": 0
+        },
+        "primary": {
+          "journal_range_too_old_total": 1,
+          "range_checksum_requests_before": 22,
+          "range_checksum_requests_after": 39,
+          "range_digest_requests_before": 32,
+          "range_digest_requests_after": 42,
+          "fetch_requests_before": 32,
+          "fetch_requests_after": 33,
+          "range_checksum_rejections_total": 0,
+          "range_digest_rejections_total": 0,
+          "fetch_request_rejections_total": 0,
+          "fetch_response_budget_rejections_total": 0
+        }
+      },
+      "verification": {
+        "primary": { "pass": true, "sampled": 2540, "missing": 0, "mismatches": 0, "errors": 0 },
+        "secondary1": { "pass": null, "skipped_reason": "expected_budget_exhaustion" },
+        "secondary2": {
+          "pass": true,
+          "method": "checkpoint",
+          "checkpoint_index": 12911,
+          "matched_ranges": 1024,
+          "mismatched_ranges": 0,
+          "missing_ranges": 0,
+          "physical_scan_used": false,
+          "optimizer_reseeded": false
+        }
+      },
+      "harness": "scripts/dr-harness",
+      "notes": "Negative-path clustered smoke. Secondary1 is intentionally configured with a one-byte reconcile RPC budget and is expected not to converge; primary and secondary2 remain the correctness control path."
     },
     {
       "scenario_id": "E15",
