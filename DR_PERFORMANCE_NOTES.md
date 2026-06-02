@@ -94,13 +94,15 @@ same checkpoint correctness boundary because each coarser span still carries a
 primary digest proof and the fetch verifier recomputes it before applying
 remote entries or inferring local-only deletes.
 
-The clustered low-cap smoke `fragmented-fanout-20260602T134143Z` exercised that
-path under HA outage load. With `reconcile_max_range_drilldown_rpcs=1` applied
+The paired clustered smokes `indexed-repair-20260602T142940Z` and
+`fragmented-fanout-20260602T142058Z` exercised that path under the same
+300-second, 64-worker HA outage shape on the same rebuilt binary. With the
+default cap of 32, primary range-digest request delta was 39,301 and fetch
+request delta was 3,974. With `reconcile_max_range_drilldown_rpcs=1` applied
 only to the disrupted secondary, primary range-digest request delta dropped to
-2,810 for the run, compared with the 17,740-request delta from the earlier
-default-cap indexed-repair smoke shape. The secondary used 2,730 coarse fetches,
-kept fallback/proof/load failure counters at zero, and checkpoint verification
-remained scan-free on both secondaries.
+3,877 and fetch request delta to 3,877. The low-cap secondary used 3,865 coarse
+fetches over 6,411 ranges, kept fallback/proof/load failure counters at zero,
+and checkpoint verification remained scan-free on both secondaries.
 
 ## Large Existing Clusters
 

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"hash/crc64"
 	"sort"
+	"time"
 
 	"github.com/openbao/openbao/physical/replication/reconciler"
 	"github.com/openbao/openbao/sdk/v2/physical"
@@ -25,6 +26,9 @@ const (
 	drLocalKIDIndexEntryVersion  = 2
 	drLocalKIDIndexDigestVersion = 1
 	drLocalKIDIndexLeafBits      = drFlatAccumulatorRangeBits + drRangeMaxSplitDepth
+
+	drLocalKIDIndexReadyRetryInterval = 100 * time.Millisecond
+	drLocalKIDIndexReadyRetryTimeout  = 5 * time.Second
 )
 
 type drLocalKIDIndexMeta struct {
@@ -883,7 +887,7 @@ func (s *drReplicationSecondary) prepareLocalKIDIndexDigestSource(
 	if s == nil || reader == nil || expectedIndex == 0 {
 		return nil, false, "unavailable", nil
 	}
-	if ok, reason, err := s.validateLocalKIDIndexReady(ctx, reader, expectedIndex); err != nil || !ok {
+	if ok, reason, err := s.waitLocalKIDIndexReady(ctx, reader, expectedIndex); err != nil || !ok {
 		return nil, ok, reason, err
 	}
 	source := &drLocalKIDIndexDigestSource{secondary: s, reader: reader}
@@ -906,6 +910,31 @@ func (s *drReplicationSecondary) prepareLocalKIDIndexDigestSource(
 		}
 	}
 	return source, true, "loaded", nil
+}
+
+func (s *drReplicationSecondary) waitLocalKIDIndexReady(ctx context.Context, reader physical.Backend, expectedIndex uint64) (bool, string, error) {
+	deadline := time.Now().Add(drLocalKIDIndexReadyRetryTimeout)
+	for {
+		ok, reason, err := s.validateLocalKIDIndexReady(ctx, reader, expectedIndex)
+		if err != nil || ok || !localKIDIndexReadyRetryable(reason) {
+			return ok, reason, err
+		}
+		if !time.Now().Before(deadline) {
+			return false, reason, nil
+		}
+
+		timer := time.NewTimer(drLocalKIDIndexReadyRetryInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false, reason, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func localKIDIndexReadyRetryable(reason string) bool {
+	return reason == "meta_missing"
 }
 
 func (s *drReplicationSecondary) validateLocalKIDIndexReady(ctx context.Context, reader physical.Backend, expectedIndex uint64) (bool, string, error) {

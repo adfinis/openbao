@@ -4899,6 +4899,61 @@ func TestDRLocalKIDIndexChangesRequireCompleteBaseline(t *testing.T) {
 	}
 }
 
+func TestDRLocalKIDIndexDigestSourceWaitsForTransientMetaMissing(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	replSalt := bytes.Repeat([]byte{0x49}, 32)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-local-index-transient-meta", core.logger)
+
+	key := "secret/local-index-transient-meta"
+	value := []byte("value")
+	kid := secondary.scanner.ComputeKID(key)
+	vid := secondary.scanner.ComputeVIDWithSealWrap(value, false)
+	localSet := &reconciler.ReconciliationSet{
+		KIDToVID: map[[32]byte][32]byte{kid: vid},
+		KIDToKey: map[[32]byte]string{kid: key},
+	}
+	buckets := drFlatAccumulatorBucketsFromSet(localSet)
+	rangeID := reconciler.RangeIDFromKID(kid)
+
+	resetErrCh := make(chan error, 1)
+	go func() {
+		time.Sleep(2 * drLocalKIDIndexReadyRetryInterval)
+		resetErrCh <- secondary.resetLocalKIDIndexFromSet(ctx, core.physical, 21, localSet)
+	}()
+
+	source, ok, reason, err := secondary.prepareLocalKIDIndexDigestSource(ctx, core.physical, 21, []uint64{rangeID}, buckets)
+	if err != nil {
+		t.Fatalf("unexpected digest source load error: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected digest source to wait for transient local KID index meta, reason=%q", reason)
+	}
+	if source == nil {
+		t.Fatal("expected loaded local KID index digest source")
+	}
+	if got := secondary.localKIDIndexFallbackScans.Load(); got != 0 {
+		t.Fatalf("expected no local KID index fallback scan, got %d", got)
+	}
+
+	select {
+	case err := <-resetErrCh:
+		if err != nil {
+			t.Fatalf("local KID index reset failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for local KID index reset")
+	}
+
+	desc, err := source.RangeDigest(ctx, reconciler.SpanFromRangeID(rangeID))
+	if err != nil {
+		t.Fatalf("failed to read digest source: %v", err)
+	}
+	if desc.Count != 1 {
+		t.Fatalf("expected one digest entry, got %d", desc.Count)
+	}
+}
+
 func TestDRReconcileExcludedRootKeySkipsOptimizerState(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	ctx := context.Background()
