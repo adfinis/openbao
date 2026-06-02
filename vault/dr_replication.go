@@ -215,6 +215,13 @@ type drReplicationPrimary struct {
 	checkpointAdmissionFailures      atomic.Uint64
 	checkpointThrottleTotal          atomic.Uint64
 	checkpointBuildAdmissionFailures atomic.Uint64
+	rangeChecksumRequests            atomic.Uint64
+	rangeChecksumRejections          atomic.Uint64
+	rangeDigestRequests              atomic.Uint64
+	rangeDigestRejections            atomic.Uint64
+	fetchRequests                    atomic.Uint64
+	fetchRequestRejections           atomic.Uint64
+	fetchResponseBudgetRejections    atomic.Uint64
 	checkpointGlobalBudget           uint64
 	checkpointPerRelationshipBudget  uint64
 	maxCheckpointsPerRelationship    int
@@ -1451,10 +1458,12 @@ func (s *drReplicationPrimary) ExchangeRangeChecksums(ctx context.Context, req *
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "range checksum request is required")
 	}
+	s.rangeChecksumRequests.Add(1)
 	if err := s.authorizeRelationship(ctx, req.RelationshipId, DRRelationshipStateActive); err != nil {
 		return nil, err
 	}
 	if err := validateRangeChecksumRequest(req); err != nil {
+		s.recordRangeChecksumRejection()
 		return nil, err
 	}
 	cp, err := s.getCheckpoint(req.CheckpointId)
@@ -1526,6 +1535,7 @@ func (s *drReplicationPrimary) ExchangeRangeDigests(ctx context.Context, req *Ra
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "range digest request is required")
 	}
+	s.rangeDigestRequests.Add(1)
 	if err := s.authorizeRelationship(ctx, req.RelationshipId, DRRelationshipStateActive); err != nil {
 		return nil, err
 	}
@@ -1542,9 +1552,11 @@ func (s *drReplicationPrimary) ExchangeRangeDigests(ctx context.Context, req *Ra
 
 	parentSpan := req.GetParentSpan()
 	if parentSpan == nil || len(parentSpan.StartKid) != 32 || len(parentSpan.EndKid) != 32 {
+		s.recordRangeDigestRejection()
 		return nil, status.Errorf(codes.InvalidArgument, "parent_span must have valid 32-byte KID boundaries")
 	}
 	if parentSpan.SplitDepth > uint32(drRangeMaxSplitDepth) {
+		s.recordRangeDigestRejection()
 		return nil, status.Errorf(codes.InvalidArgument, "parent_span split depth %d exceeds maximum %d", parentSpan.SplitDepth, drRangeMaxSplitDepth)
 	}
 
@@ -1557,6 +1569,7 @@ func (s *drReplicationPrimary) ExchangeRangeDigests(ctx context.Context, req *Ra
 		SplitDepth: parentSpan.SplitDepth,
 	}
 	if !parent.Valid() {
+		s.recordRangeDigestRejection()
 		return nil, status.Error(codes.InvalidArgument, "parent_span start must be <= end")
 	}
 
@@ -1616,10 +1629,12 @@ func (s *drReplicationPrimary) FetchEntries(req *FetchEntriesRequest, stream grp
 	if req == nil {
 		return status.Error(codes.InvalidArgument, "fetch request is required")
 	}
+	s.fetchRequests.Add(1)
 	if err := s.authorizeRelationship(stream.Context(), req.RelationshipId, DRRelationshipStateActive); err != nil {
 		return err
 	}
 	if err := validateFetchEntriesRequest(req); err != nil {
+		s.recordFetchRequestRejection()
 		return err
 	}
 
@@ -1714,6 +1729,7 @@ func (s *drReplicationPrimary) FetchEntries(req *FetchEntriesRequest, stream grp
 		changeBytes := entryChangeWireBytes(change)
 		singleEntryBatchBytes := entryBatchBaseWireBytes(&batch) + changeBytes
 		if singleEntryBatchBytes > drFetchSendBatchMaxBytes {
+			s.recordFetchResponseBudgetRejection()
 			return status.Errorf(codes.ResourceExhausted,
 				"fetch entry batch payload %d exceeds maximum batch bytes %d",
 				singleEntryBatchBytes, drFetchSendBatchMaxBytes)
@@ -1733,12 +1749,14 @@ func (s *drReplicationPrimary) FetchEntries(req *FetchEntriesRequest, stream grp
 	sent := make(map[[32]byte]bool)
 	rangeSpans, err := parseRangeSpans(req.GetRanges())
 	if err != nil {
+		s.recordFetchRequestRejection()
 		return status.Errorf(codes.InvalidArgument, "invalid ranges: %v", err)
 	}
 
 	expectedVIDByKID := make(map[[32]byte][32]byte, len(req.Items))
 	for _, item := range req.Items {
 		if len(item.Kid) != 32 || len(item.ExpectedVid) != 32 {
+			s.recordFetchRequestRejection()
 			return status.Error(codes.InvalidArgument, "fetch items must include 32-byte kid and expected_vid")
 		}
 		var kid [32]byte
@@ -2936,6 +2954,44 @@ func (s *drReplicationPrimary) checkpointBuildStats() (inFlight int, maxInFlight
 		maxInFlight = drCheckpointBuildMaxInFlight
 	}
 	return inFlight, maxInFlight, s.checkpointBuildAdmissionFailures.Load()
+}
+
+func (s *drReplicationPrimary) recordRangeChecksumRejection() {
+	s.rangeChecksumRejections.Add(1)
+	metrics.IncrCounter([]string{"replication", "dr", "checkpoint", "range_checksum_rejections_total"}, 1)
+}
+
+func (s *drReplicationPrimary) recordRangeDigestRejection() {
+	s.rangeDigestRejections.Add(1)
+	metrics.IncrCounter([]string{"replication", "dr", "checkpoint", "range_digest_rejections_total"}, 1)
+}
+
+func (s *drReplicationPrimary) recordFetchRequestRejection() {
+	s.fetchRequestRejections.Add(1)
+	metrics.IncrCounter([]string{"replication", "dr", "checkpoint", "fetch_request_rejections_total"}, 1)
+}
+
+func (s *drReplicationPrimary) recordFetchResponseBudgetRejection() {
+	s.fetchResponseBudgetRejections.Add(1)
+	metrics.IncrCounter([]string{"replication", "dr", "checkpoint", "fetch_response_budget_rejections_total"}, 1)
+}
+
+func (s *drReplicationPrimary) checkpointRPCPressureStats() (
+	rangeChecksumRequests uint64,
+	rangeChecksumRejections uint64,
+	rangeDigestRequests uint64,
+	rangeDigestRejections uint64,
+	fetchRequests uint64,
+	fetchRequestRejections uint64,
+	fetchResponseBudgetRejections uint64,
+) {
+	return s.rangeChecksumRequests.Load(),
+		s.rangeChecksumRejections.Load(),
+		s.rangeDigestRequests.Load(),
+		s.rangeDigestRejections.Load(),
+		s.fetchRequests.Load(),
+		s.fetchRequestRejections.Load(),
+		s.fetchResponseBudgetRejections.Load()
 }
 
 func (s *drReplicationPrimary) tuningSnapshot() (checkpointTTLSeconds int64, checkpointGlobalBudget uint64, checkpointPerRelationshipBudget uint64, streamBufferMaxEntries int, streamBufferMaxBytes uint64) {

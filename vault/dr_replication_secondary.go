@@ -569,6 +569,7 @@ type drReplicationSecondary struct {
 	flatAccumulatorDeltaReplayFailures                atomic.Uint64
 	rangeSplitCount                                   atomic.Uint64
 	reconcileRPCBytesUsed                             atomic.Uint64
+	reconcileBudgetExhaustedTotal                     atomic.Uint64
 	reconcileQueueDepth                               atomic.Int64
 	reconcileStalled                                  atomic.Uint64
 	lastReconcileActivityAt                           atomic.Int64 // unix timestamp
@@ -583,6 +584,7 @@ type drReplicationSecondary struct {
 	streamPausedAt                     uint64
 	lastReconcileFailReason            string
 	lastRangeManifestCount             int
+	lastReconcileBudgetExhausted       drReconcileBudgetExhaustedSnapshot
 	lastReconcileFailureByType         map[string]uint64
 	checkpointHighWaterMarkPersistHook func(uint64) error
 
@@ -1986,6 +1988,7 @@ func (s *drReplicationSecondary) Status() DRSecondaryStatus {
 	activeIndex := s.activeCheckpointIndex
 	failReason := s.lastReconcileFailReason
 	rangeManifestCount := s.lastRangeManifestCount
+	budgetExhaustedLast := s.lastReconcileBudgetExhausted
 	s.sessionMu.RUnlock()
 	fallbackLastAt := time.Unix(s.fallbackLastAt.Load(), 0)
 	taskRate := float64(s.reconcileTaskRateMillis.Load()) / 1000.0
@@ -2018,6 +2021,16 @@ func (s *drReplicationSecondary) Status() DRSecondaryStatus {
 		RangeManifestCount:                                rangeManifestCount,
 		RangeSplitCount:                                   s.rangeSplitCount.Load(),
 		ReconcileRPCBytesUsed:                             s.reconcileRPCBytesUsed.Load(),
+		ReconcileBudgetExhaustedTotal:                     s.reconcileBudgetExhaustedTotal.Load(),
+		ReconcileBudgetExhaustedPhaseLast:                 budgetExhaustedLast.Phase,
+		ReconcileBudgetExhaustedReasonLast:                budgetExhaustedLast.Reason,
+		ReconcileBudgetExhaustedRPCBytesLast:              budgetExhaustedLast.RPCBytesUsed,
+		ReconcileBudgetExhaustedMaxRPCBytesLast:           budgetExhaustedLast.MaxRPCBytes,
+		ReconcileBudgetExhaustedRPCCallsLast:              budgetExhaustedLast.RPCCalls,
+		ReconcileBudgetExhaustedEntriesLast:               budgetExhaustedLast.Entries,
+		ReconcileBudgetExhaustedRangesHandledLast:         budgetExhaustedLast.RangesHandled,
+		ReconcileBudgetExhaustedRangesSplitLast:           budgetExhaustedLast.RangesSplit,
+		ReconcileBudgetExhaustedRetriesLast:               budgetExhaustedLast.RetryCount,
 		FlatAccumulatorFastPathTotal:                      s.flatAccumulatorFastPathTotal.Load(),
 		FlatAccumulatorEmptyRepairTotal:                   s.flatAccumulatorEmptyRepairTotal.Load(),
 		FlatAccumulatorEmptyRepairRanges:                  s.flatAccumulatorEmptyRepairRanges.Load(),
@@ -2139,6 +2152,16 @@ type DRSecondaryStatus struct {
 	RangeManifestCount                                int
 	RangeSplitCount                                   uint64
 	ReconcileRPCBytesUsed                             uint64
+	ReconcileBudgetExhaustedTotal                     uint64
+	ReconcileBudgetExhaustedPhaseLast                 string
+	ReconcileBudgetExhaustedReasonLast                string
+	ReconcileBudgetExhaustedRPCBytesLast              uint64
+	ReconcileBudgetExhaustedMaxRPCBytesLast           uint64
+	ReconcileBudgetExhaustedRPCCallsLast              uint64
+	ReconcileBudgetExhaustedEntriesLast               uint64
+	ReconcileBudgetExhaustedRangesHandledLast         uint64
+	ReconcileBudgetExhaustedRangesSplitLast           uint64
+	ReconcileBudgetExhaustedRetriesLast               uint64
 	FlatAccumulatorFastPathTotal                      uint64
 	FlatAccumulatorEmptyRepairTotal                   uint64
 	FlatAccumulatorEmptyRepairRanges                  uint64
@@ -4860,8 +4883,8 @@ func (s *drReplicationSecondary) runFlatAccumulatorIndexedBucketRepair(
 	pendingDeletes := make(map[string]struct{})
 	repairedSpans := make([]reconciler.RangeSpan, 0)
 	for i, mismatch := range mismatches {
-		if err := budget.check(); err != nil {
-			return fmt.Errorf("reconcile failure [budget_exceeded]: %w", err)
+		if err := s.checkReconcileBudget(budget, "indexed_repair_range_tasks"); err != nil {
+			return err
 		}
 		task := drQueuedRangeTask{
 			id:       i + 1,
@@ -4881,10 +4904,10 @@ func (s *drReplicationSecondary) runFlatAccumulatorIndexedBucketRepair(
 				pendingDeletes[key] = struct{}{}
 			}
 		}
-		if err := budget.addRPC(result.rpcBytes); err != nil {
-			return fmt.Errorf("reconcile failure [budget_exceeded]: %w", err)
+		if err := s.addReconcileRPCBudget(budget, "indexed_repair_fetch", result.rpcBytes, uint64(len(result.fetchedEntries))); err != nil {
+			return err
 		}
-		budget.rangesHandled++
+		budget.addRangeHandled()
 		if len(result.fetchedEntries) > 0 {
 			if err := applyPipeline.submit(result.fetchedEntries); err != nil {
 				return wrapReconcileFailure(drReconcileFailureApplyFailed, "queue fetched entries for apply", err)
@@ -5074,8 +5097,8 @@ func (s *drReplicationSecondary) repairIndexedBucketProofMismatchesWithFullFetch
 	pendingDeletes := make(map[string]struct{})
 	for i, mismatch := range mismatches {
 		if budget != nil {
-			if err := budget.check(); err != nil {
-				return fmt.Errorf("reconcile failure [budget_exceeded]: %w", err)
+			if err := s.checkReconcileBudget(budget, "full_bucket_range_tasks"); err != nil {
+				return err
 			}
 		}
 		task := drQueuedRangeTask{
@@ -5088,13 +5111,16 @@ func (s *drReplicationSecondary) repairIndexedBucketProofMismatchesWithFullFetch
 		}
 		result := s.processFullRangeFetchTask(ctx, checkpoint, localIndex, localSet.KIDToKey, task)
 		if result.err != nil {
+			if s.recordReconcileBudgetExhaustion(result.err) {
+				return fmt.Errorf("reconcile failure [budget_exceeded]: %w", result.err)
+			}
 			return result.err
 		}
 		if budget != nil {
-			if err := budget.addRPC(result.rpcBytes); err != nil {
-				return fmt.Errorf("reconcile failure [budget_exceeded]: %w", err)
+			if err := s.addReconcileRPCBudget(budget, "full_bucket_fetch", result.rpcBytes, uint64(len(result.fetchedEntries))); err != nil {
+				return err
 			}
-			budget.rangesHandled++
+			budget.addRangeHandled()
 		}
 		if len(result.removedKeys) > 0 {
 			for _, key := range result.removedKeys {
@@ -5360,16 +5386,53 @@ func (q *drRangeTaskQueue) Pop() interface{} {
 	return item
 }
 
-type drRangeBudget struct {
-	start         time.Time
-	rpcBytes      uint64
-	rangesHandled int
-	rangesSplit   int
-	maxRPCBytes   uint64
-	maxWallTime   time.Duration
+type drReconcileBudgetExhaustedSnapshot struct {
+	Phase         string
+	Reason        string
+	RPCBytesUsed  uint64
+	MaxRPCBytes   uint64
+	RPCCalls      uint64
+	Entries       uint64
+	RangesHandled uint64
+	RangesSplit   uint64
+	RetryCount    uint64
+	Elapsed       time.Duration
+	MaxWallTime   time.Duration
 }
 
-func (b *drRangeBudget) check() error {
+type drReconcileBudgetExhaustedError struct {
+	drReconcileBudgetExhaustedSnapshot
+}
+
+func (e *drReconcileBudgetExhaustedError) Error() string {
+	if e == nil {
+		return "budget_exceeded"
+	}
+	switch e.Reason {
+	case "wall_time":
+		return fmt.Sprintf("budget_exceeded: reconciliation wall-time exceeded phase=%s elapsed=%s max=%s rpc_bytes=%d/%d rpc_calls=%d ranges=%d entries=%d",
+			e.Phase, e.Elapsed.Round(time.Millisecond), e.MaxWallTime.Round(time.Millisecond), e.RPCBytesUsed, e.MaxRPCBytes, e.RPCCalls, e.RangesHandled, e.Entries)
+	case "rpc_bytes":
+		return fmt.Sprintf("budget_exceeded: reconcile RPC bytes exceeded phase=%s rpc_bytes=%d/%d rpc_calls=%d ranges=%d entries=%d",
+			e.Phase, e.RPCBytesUsed, e.MaxRPCBytes, e.RPCCalls, e.RangesHandled, e.Entries)
+	default:
+		return fmt.Sprintf("budget_exceeded: reconcile budget exhausted phase=%s reason=%s rpc_bytes=%d/%d rpc_calls=%d ranges=%d entries=%d",
+			e.Phase, e.Reason, e.RPCBytesUsed, e.MaxRPCBytes, e.RPCCalls, e.RangesHandled, e.Entries)
+	}
+}
+
+type drRangeBudget struct {
+	start          time.Time
+	rpcBytes       uint64
+	rpcCalls       uint64
+	entriesFetched uint64
+	rangesHandled  uint64
+	rangesSplit    uint64
+	maxRPCBytes    uint64
+	maxWallTime    time.Duration
+}
+
+func (b *drRangeBudget) check(phase string) error {
 	if b.start.IsZero() {
 		b.start = time.Now()
 	}
@@ -5380,17 +5443,107 @@ func (b *drRangeBudget) check() error {
 		b.maxRPCBytes = drDefaultReconcileMaxRPCBytes
 	}
 	if time.Since(b.start) > b.maxWallTime {
-		return fmt.Errorf("budget_exceeded: reconciliation wall-time exceeded")
+		return b.exhausted(phase, "wall_time")
 	}
 	if b.rpcBytes > b.maxRPCBytes {
-		return fmt.Errorf("budget_exceeded: reconcile RPC bytes exceeded (%d > %d)", b.rpcBytes, b.maxRPCBytes)
+		return b.exhausted(phase, "rpc_bytes")
 	}
 	return nil
 }
 
-func (b *drRangeBudget) addRPC(n uint64) error {
+func (b *drRangeBudget) addRPC(phase string, n uint64, entries uint64) error {
 	b.rpcBytes += n
-	return b.check()
+	b.rpcCalls++
+	b.entriesFetched += entries
+	return b.check(phase)
+}
+
+func (b *drRangeBudget) addRangeHandled() {
+	b.rangesHandled++
+}
+
+func (b *drRangeBudget) exhausted(phase string, reason string) error {
+	if phase == "" {
+		phase = "unknown"
+	}
+	if reason == "" {
+		reason = "unknown"
+	}
+	return &drReconcileBudgetExhaustedError{
+		drReconcileBudgetExhaustedSnapshot: drReconcileBudgetExhaustedSnapshot{
+			Phase:         phase,
+			Reason:        reason,
+			RPCBytesUsed:  b.rpcBytes,
+			MaxRPCBytes:   b.maxRPCBytes,
+			RPCCalls:      b.rpcCalls,
+			Entries:       b.entriesFetched,
+			RangesHandled: b.rangesHandled,
+			RangesSplit:   b.rangesSplit,
+			Elapsed:       time.Since(b.start),
+			MaxWallTime:   b.maxWallTime,
+		},
+	}
+}
+
+func (s *drReplicationSecondary) checkReconcileBudget(budget *drRangeBudget, phase string) error {
+	if budget == nil {
+		return nil
+	}
+	err := budget.check(phase)
+	s.updateReconcileBudgetAccounting(budget)
+	if err != nil {
+		return s.reconcileBudgetFailure(err)
+	}
+	return nil
+}
+
+func (s *drReplicationSecondary) addReconcileRPCBudget(budget *drRangeBudget, phase string, bytes uint64, entries uint64) error {
+	if budget == nil {
+		return nil
+	}
+	err := budget.addRPC(phase, bytes, entries)
+	s.updateReconcileBudgetAccounting(budget)
+	if err != nil {
+		return s.reconcileBudgetFailure(err)
+	}
+	return nil
+}
+
+func (s *drReplicationSecondary) updateReconcileBudgetAccounting(budget *drRangeBudget) {
+	if budget == nil {
+		return
+	}
+	s.reconcileRPCBytesUsed.Store(budget.rpcBytes)
+	if budget.maxRPCBytes > budget.rpcBytes {
+		s.reconcileBudgetRemainingByte.Store(int64(budget.maxRPCBytes - budget.rpcBytes))
+	} else {
+		s.reconcileBudgetRemainingByte.Store(0)
+	}
+}
+
+func (s *drReplicationSecondary) recordReconcileBudgetExhaustion(err error) bool {
+	var exhausted *drReconcileBudgetExhaustedError
+	if !errors.As(err, &exhausted) || exhausted == nil {
+		return false
+	}
+	s.reconcileBudgetExhaustedTotal.Add(1)
+	snapshot := exhausted.drReconcileBudgetExhaustedSnapshot
+	snapshot.RetryCount = s.reconcileRetries.Load()
+	s.sessionMu.Lock()
+	s.lastReconcileBudgetExhausted = snapshot
+	s.sessionMu.Unlock()
+	metrics.IncrCounter([]string{"replication", "dr", "secondary", "reconcile_budget_exhausted_total"}, 1)
+	return true
+}
+
+func (s *drReplicationSecondary) reconcileBudgetFailure(err error) error {
+	if err == nil {
+		return nil
+	}
+	if s.recordReconcileBudgetExhaustion(err) && !strings.Contains(strings.ToLower(err.Error()), "reconcile failure [budget_exceeded]") {
+		return fmt.Errorf("reconcile failure [budget_exceeded]: %w", err)
+	}
+	return err
 }
 
 type drPutApplyPipeline struct {
@@ -5975,7 +6128,7 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 		if csumResp == nil {
 			return fmt.Errorf("reconcile failure [rpc_failed]: exchange range checksums returned nil response")
 		}
-		if err := budget.addRPC(uint64(len(batchIDs) * 24)); err != nil { // Approximate size
+		if err := s.addReconcileRPCBudget(budget, "range_checksums", uint64(len(batchIDs)*24), 0); err != nil { // Approximate size
 			return err
 		}
 
@@ -6107,9 +6260,9 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 		}
 
 		for inflight < maxWorkers && queue.Len() > 0 {
-			if err := budget.check(); err != nil {
+			if err := s.checkReconcileBudget(budget, "range_tasks"); err != nil {
 				workerCancel()
-				return fmt.Errorf("reconcile failure [budget_exceeded]: %w", err)
+				return err
 			}
 			task := heap.Pop(&queue).(drQueuedRangeTask)
 			select {
@@ -6133,15 +6286,18 @@ func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, che
 
 		if res.err != nil {
 			workerCancel()
+			if s.recordReconcileBudgetExhaustion(res.err) {
+				return fmt.Errorf("reconcile failure [budget_exceeded]: %w", res.err)
+			}
 			return res.err
 		}
 
-		if err := budget.addRPC(res.rpcBytes); err != nil {
+		if err := s.addReconcileRPCBudget(budget, "fetch_stream", res.rpcBytes, uint64(len(res.fetchedEntries))); err != nil {
 			workerCancel()
-			return fmt.Errorf("reconcile failure [budget_exceeded]: %w", err)
+			return err
 		}
 
-		budget.rangesHandled++
+		budget.addRangeHandled()
 
 		if len(res.fetchedEntries) > 0 {
 			if err := applyPipeline.submit(res.fetchedEntries); err != nil {
@@ -6359,7 +6515,17 @@ func (s *drReplicationSecondary) processFetchSpans(
 		}
 		rpcBytes += entryBatchWireBytes(batch)
 		if rpcBytes > maxRPCBytes {
-			result.err = fmt.Errorf("budget_exceeded: fetch stream bytes exceeded (%d > %d)", rpcBytes, maxRPCBytes)
+			result.rpcBytes = rpcBytes
+			result.err = &drReconcileBudgetExhaustedError{
+				drReconcileBudgetExhaustedSnapshot: drReconcileBudgetExhaustedSnapshot{
+					Phase:        "fetch_stream",
+					Reason:       "rpc_bytes",
+					RPCBytesUsed: rpcBytes,
+					MaxRPCBytes:  maxRPCBytes,
+					RPCCalls:     1,
+					Entries:      uint64(len(result.fetchedEntries)),
+				},
+			}
 			return result
 		}
 		for _, e := range batch.Entries {

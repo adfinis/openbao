@@ -34,7 +34,8 @@ The core safety properties are:
 - Bootstrap never transfers the root key in plaintext activation material.
 - Streaming advances `lastAppliedIndex` only after durable secondary apply.
 - Reconciliation is bound to immutable checkpoint tuples.
-- Fetched range contents must prove completeness before deletes are inferred.
+- Fetched range contents must be cryptographically verified complete before
+  deletes are inferred.
 - Runtime metadata is refreshed from replicated storage before a secondary or
   promoted cluster relies on it.
 - Promotion is a one-way authority transition with explicit lineage fencing.
@@ -132,8 +133,8 @@ If the stream disconnects and the primary can prove replay coverage from the
 secondary's last applied index, the secondary resumes streaming. If replay
 coverage cannot be proven, the secondary reconciles against a checkpoint:
 compare range metadata, drill down mismatched ranges, fetch checkpoint-scoped
-entries, validate fetched completeness, apply primary entries, infer deletes
-only from proven absence, then advance the checkpoint.
+entries, cryptographically verify fetched completeness, apply primary entries,
+infer deletes only from verified absence, then advance the checkpoint.
 
 If the primary is permanently unavailable, an operator can promote a secondary.
 Promotion makes the secondary a standalone write authority, terminates the old
@@ -306,8 +307,9 @@ Reconciliation uses KID/VID metadata:
   or a tombstone marker for explicit point-delete fetches.
 
 Top-level range checksums are only filters. Mismatched ranges require digest
-drill-down, and fetched spans must prove completeness before the secondary can
-infer that a local key absent from the primary should be deleted.
+drill-down, and fetched spans must be cryptographically verified complete
+before the secondary can infer that a local key absent from the primary should
+be deleted.
 
 The secondary maintains a flat accumulator over top-level KID ranges and a
 local-only KID-to-key point index. The index stores stable key identity only;
@@ -377,8 +379,8 @@ decision share one authority tuple.
 ### Why proof-before-delete
 
 Deletes are inferred from absence. Absence is only meaningful if the primary
-response is complete for the relevant checkpoint span. Digest proof validation
-turns "the primary did not send this key" into a defensible delete decision.
+response is complete for the relevant checkpoint span. Digest validation turns
+"the primary did not send this key" into a defensible delete decision.
 
 ### Why flat accumulators instead of a persistent Merkle tree
 
@@ -520,10 +522,10 @@ Additional open work is tracked in [DR_OPEN_WORK.md](DR_OPEN_WORK.md).
 
 The prototype is past a narrow proof of concept for data correctness, but it
 is not a production-ready feature. Before production use, the design still
-needs resource-budget enforcement, primary checkpoint pressure controls,
-artifact provenance for pre-seed, rolling-upgrade compatibility, DR transport
-CA rotation, larger scale evidence, WAN/proxy validation, dependency-backed
-engine profiles, and operator runbooks.
+needs clustered validation of resource-budget enforcement and primary
+checkpoint pressure controls, artifact provenance for pre-seed,
+rolling-upgrade compatibility, DR transport CA rotation, larger scale evidence,
+WAN/proxy validation, dependency-backed engine profiles, and operator runbooks.
 
 The current production recommendation remains strict warm standby: verify
 secondaries through DR status and checkpoint proofs before promotion, and treat

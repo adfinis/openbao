@@ -17,6 +17,37 @@ The design assumes:
 Other storage backends are future work unless they can provide equivalent
 ordering, replay, and transaction boundaries.
 
+## Optimization Summary
+
+The protocol uses several optimizations, but none of them replace the
+checkpoint correctness boundary. Accelerators can reduce scan, fetch, or commit
+pressure only when their relationship, checkpoint, range, and proof metadata
+validate.
+
+| Optimization | Reduces | Protocol role |
+|---|---|---|
+| KID/VID projection | Path-specific comparison and raw key exposure | Converts physical storage into deterministic key/value identifiers for range math, digests, accumulators, local indexes, and seed manifests. |
+| Fixed KID range plane | Initial comparison cost | Divides sorted KID space into 1024 top-level ranges for coarse checksum comparison before drill-down. |
+| Top-level range checksums | Digest and fetch work for matching ranges | Lets reconciliation finalize at Phase A when every range count/checksum matches the checkpoint. |
+| Mandatory digest drill-down | Full-bucket fetches for localized divergence | Splits only mismatched ranges into child spans with stronger KID/VID digest descriptors. |
+| Flat accumulator | O(N) secondary local scans on common reconnects | Maintains top-level range count/checksum incrementally during stream apply and persists snapshots/deltas for restart restore. |
+| Local KID index | Full local scans for mismatched buckets | Maps local KIDs back to physical keys so indexed repair can load and delete affected local entries without scanning unrelated storage. |
+| In-memory stream buffer | Reconciliation after short disconnects | Replays recent ordered mutations directly from primary memory when coverage from the secondary cursor is proven. |
+| Disk-backed stream journal | Reconciliation after longer reconnects or HA handoff | Replays retained ordered mutations from primary journal segments when the in-memory buffer no longer covers the cursor. |
+| Credit-based streaming | Unbounded primary buffering | Lets the secondary pace ingress by granting credits after durable apply. |
+| Stream transaction batching | Secondary commit and metadata write pressure | Commits multiple ordered stream entries per secondary transaction within configured entry, byte, and wait bounds. |
+| Duplicate mutation coalescing | Redundant physical writes inside a batch | Materializes only the final mutation for a physical key inside an atomic secondary transaction. |
+| Adaptive stream batch wait | Commit pressure under backlog | Temporarily stretches the secondary wait window under pressure, then decays it when quiet. |
+| Dirty bitmap | Time to reach likely divergent ranges | Prioritizes dirty top-level ranges, but range selection remains complete; bitmap false negatives cannot skip verification. |
+| Checkpoint artifact store | Live-storage races and repeated fetch scans | Serves `FetchEntries` and pre-seed segments from immutable checkpoint artifacts instead of live storage. |
+| Fetch batching and parallel artifact reads | Fetch RPC and artifact-read overhead | Sends bounded response batches and parallelizes range artifact reads. |
+| Reconcile apply batching/workers | Repair apply wall time | Applies fetched puts/deletes in bounded batches with limited worker concurrency. |
+| Segmented pre-seed | Initial full reconciliation for old or large primaries | Lets operators import a relationship-bound base copy into a disabled secondary, then catch up through journal replay or reconciliation. |
+| Pre-seed optimizer baseline | Post-import local scan | Persists flat accumulator and local KID-index baseline from the verified seed set. |
+
+Performance evidence and remaining scale work live in
+[DR_PERFORMANCE_NOTES.md](DR_PERFORMANCE_NOTES.md).
+
 ## Steady Streaming
 
 The normal path is ordered physical mutation streaming:
@@ -119,8 +150,8 @@ flowchart TD
 
 ## Checkpoints
 
-A checkpoint is an immutable primary-side view of replicated storage at a
-specific commit index.
+A checkpoint is an immutable primary-side reconciliation target with a
+relationship-bound commit-index high-water mark.
 
 Checkpoint identity is:
 
@@ -133,10 +164,35 @@ checksum, digest, fetch, or delete work that does not match its active
 checkpoint tuple.
 
 The primary serves `FetchEntries` from checkpoint artifacts rather than live
-storage. This prevents live write races from corrupting reconciliation. If a
-key disappears while a checkpoint artifact is being built, it is omitted from
-the checkpoint live range set and can later be deleted as a proven local-only
-key.
+storage. This prevents live write races from changing the target while the
+secondary is repairing against it.
+
+## Checkpoint Construction Under Live Writes
+
+The current design does not require the primary to expose a historical MVCC
+view for every physical value at exactly `commit_index`. Instead, checkpoint
+construction is commit-index fenced and artifact based:
+
+1. The primary chooses a checkpoint commit index.
+2. The primary waits until its applied-index observer has reached that index.
+3. The primary builds or reuses KID/VID metadata for replicated physical
+   storage.
+4. The primary materializes an immutable checkpoint artifact.
+5. Range checksums, child digests, `FetchEntries`, and pre-seed segment export
+   are served from that same checkpoint artifact and cache entry.
+
+Live writes can occur while the artifact is being materialized. The artifact is
+therefore the reconciliation target, not live storage. If a key disappears
+during materialization, it is omitted from the checkpoint live set and the
+storage-drift counter records the event. If a value changes during
+materialization, the artifact records the materialized value/VID and the
+storage-drift counter records the drift. Later stream replay or checkpoint
+reconciliation covers subsequent movement beyond the checkpoint high-water
+mark.
+
+Completeness checks are scoped to the immutable checkpoint artifact. Delete
+inference is allowed only after the secondary has cryptographically verified
+that the fetched span is complete for that artifact and checkpoint tuple.
 
 ## KID and VID
 
@@ -203,17 +259,18 @@ flowchart LR
 The reconciliation flow is:
 
 1. Secondary requests a checkpoint.
-2. Secondary obtains local KID/VID state from a trusted accumulator/index fast
-   path or a full local scan.
+2. Secondary obtains local KID/VID state from a validated optimizer fast path
+   or a full local scan.
 3. Secondary selects ranges requiring verification.
 4. Primary and secondary compare top-level range checksums.
 5. Mismatched ranges enter mandatory digest drill-down.
 6. Primary returns child digests that fully cover each parent span.
 7. Secondary fetches mismatched spans from checkpoint artifacts.
-8. Secondary validates fetched content against advertised digest proofs.
+8. Secondary cryptographically verifies fetched content against advertised
+   digest metadata.
 9. Secondary applies fetched primary entries.
 10. Secondary deletes local-only keys only after fetched remote spans are
-    proven complete.
+    verified complete.
 11. Secondary advances `lastAppliedIndex` only after every phase succeeds.
 
 ```mermaid
@@ -243,9 +300,9 @@ sequenceDiagram
         S->>P: FetchEntries(mismatched spans)
         P->>CS: Fetch checkpoint-scoped entries
         P-->>S: Entry batch + digest metadata
-        S->>S: Recompute digest and prove completeness
+        S->>S: Recompute digest and verify completeness
         S->>LS: Apply fetched primary puts
-        S->>LS: Delete local-only keys after proof
+        S->>LS: Delete local-only keys after verification
     end
 
     S->>S: Verify all required ranges complete
@@ -282,12 +339,11 @@ through the DR control plane:
 The `sys/replication/dr/secondary/verify-checkpoint` endpoint returns only
 proof metadata: pass/fail, checkpoint identity, accumulator index, range
 counts, and mismatch summaries. It does not expose replicated keys or values.
-The endpoint is listed as unauthenticated in the framework only so strict
-secondaries can reach it without relying on the replicated token backend; the
-handler authenticates the caller with relationship-local control material that
-was captured when the secondary was enabled. This keeps verification aligned
-with warm-standby semantics while still giving the test harness a terminal
-data-correctness proof for secondaries.
+It is a relationship-local DR control endpoint that does not depend on the
+replicated token backend. The handler authenticates the caller with
+relationship-local control material captured when the secondary was enabled.
+This keeps verification aligned with warm-standby semantics while still giving
+the test harness a terminal data-correctness proof for secondaries.
 
 ## Mandatory Digest Drill-Down
 
@@ -323,20 +379,20 @@ The secondary rejects fetched output that:
 - includes entries that make the recomputed digest differ
 
 Only after digest validation succeeds can the secondary treat the fetched set
-as the complete primary set for those spans.
+as cryptographically verified complete for those spans.
 
 ## Delete Inference
 
 Range fetches list primary-present entries. They do not naturally list
 secondary-local keys that no longer exist on the primary.
 
-After fetch completeness is proven, the secondary compares local KIDs in the
-fetched spans with the proven remote KID set. Local KIDs absent from the remote
-set become candidate deletes. Deletes are applied after fetched puts complete
-and before checkpoint finalization.
+After fetch completeness is cryptographically verified, the secondary compares
+local KIDs in the fetched spans with the verified remote KID set. Local KIDs
+absent from the remote set become candidate deletes. Deletes are applied after
+fetched puts complete and before checkpoint finalization.
 
-Absence is authority only after proof. This is the key safety boundary for
-delete inference.
+Absence is authority only after completeness verification. This is the key
+safety boundary for delete inference.
 
 ## Apply and Commit Rule
 
@@ -485,11 +541,12 @@ lookups, fetch serialization, and TLS/gRPC overhead. Production defaults should
 therefore include per-relationship admission limits and status counters for
 primary checkpoint pressure, not only secondary lag.
 
-On the secondary, reconcile should use a first-class budget ledger rather than
+On the secondary, reconcile uses a first-class budget ledger rather than only
 implicit goroutine or timeout limits. When the ledger is exhausted, the
-secondary should stop with an observable `budget_exhausted` reason and wait for
-operator tuning, resnapshot, or pre-seed instead of continuing until it harms
-the local cluster.
+secondary stops with an observable `budget_exhausted` reason, reports the last
+phase and consumed RPC budget in DR status, and waits for retry, operator
+tuning, resnapshot, or pre-seed instead of continuing until it harms the local
+cluster.
 
 The budget ledger should be checkpoint-scoped and relationship-scoped. At
 minimum it should account for:
@@ -502,6 +559,11 @@ minimum it should account for:
 - apply batches, physical mutations, and delete batches
 - retry count by phase
 - primary checkpoint artifact build attempts caused by the relationship
+
+The primary status surface exposes checkpoint build/admission, range-checksum,
+range-digest, fetch-request, and fetch-response budget counters so expensive
+reconnect behavior can be diagnosed from the primary side as well as from the
+secondary.
 
 Primary-side pressure must be enforced independently from secondary-side
 cooperation. A secondary cannot be allowed to request unbounded child digests
@@ -542,7 +604,8 @@ rates so stress runs can measure both correctness and optimization behavior.
 - Checkpoint work is bound to checkpoint ID, commit index, and relationship ID.
 - Range selection must be complete before checkpoint advancement.
 - A checksum mismatch requires digest drill-down.
-- Fetched spans must prove completeness before delete inference.
+- Fetched spans must be cryptographically verified complete before delete
+  inference.
 - Optimizer state can avoid scans only when relationship, cluster, range
   version, algorithm, snapshot, delta, and bucket proofs validate.
 - Optimizer failure degrades to scan/reconcile; it must not produce committed

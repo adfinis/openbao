@@ -29,8 +29,8 @@ shape rather than local PoC.
 
 | Area | Status | Why it matters |
 |---|---|---|
-| Reconcile budget ledger | Open | A massive fragmented checkpoint repair must stop on explicit byte, entry, RPC, retry, and wall-time budgets instead of relying on implicit timeouts. |
-| Primary checkpoint pressure controls | Open | A secondary should not be able to force unbounded checkpoint construction, digest lookup, fetch serialization, or artifact retention on the primary. |
+| Reconcile budget ledger | Unit-gated, HA validation open | A massive fragmented checkpoint repair must stop on explicit byte, entry, RPC, retry, and wall-time budgets instead of relying on implicit timeouts. |
+| Primary checkpoint pressure controls | Unit-gated, HA validation open | A secondary should not be able to force unbounded checkpoint construction, digest lookup, fetch serialization, or artifact retention on the primary. |
 | Pre-seed artifact provenance | Open | Large base-copy artifacts need signed provenance or equivalent primary authorization, external storage support, and resumable transfer semantics. |
 | DR transport CA rotation | Open | Leaf renewal is covered, but production CA rotation without relationship replacement is not finalized. |
 | Rolling upgrade/protocol compatibility | Open | Protocol versions, artifact formats, accumulator metadata versions, and range versions need explicit compatibility rules. |
@@ -103,11 +103,13 @@ The next scale work should focus on:
 
 Recommended next validation targets:
 
+- clustered S20/S21 fragmented-reconnect validation now that the unit gates cover
+  secondary budget exhaustion and primary checkpoint/digest/fetch pressure
+  counters;
 - default-duration Go-harness outage/reconcile smokes after the next
   implementation slice;
 - one-hour no-stepdown stream-apply baseline on current code;
 - larger fixture-backed pre-seed with active post-export writes;
-- fragmented reconnect budget-exhaustion test;
 - WAN latency and packet-loss profile;
 - proxy/load-balancer profile;
 - dependency-backed engine matrix; and

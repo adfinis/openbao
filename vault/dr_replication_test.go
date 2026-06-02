@@ -2828,6 +2828,7 @@ func TestDRSecondaryStatus(t *testing.T) {
 	sec.flatAccumulatorDeltaReplayFailures.Store(15)
 	sec.flatAccumulatorEmptyRepairTotal.Store(16)
 	sec.flatAccumulatorEmptyRepairRanges.Store(17)
+	sec.reconcileBudgetExhaustedTotal.Store(34)
 	sec.flatAccumulatorIndexedRepairTotal.Store(18)
 	sec.flatAccumulatorIndexedRepairRanges.Store(19)
 	sec.flatAccumulatorIndexedRepairFullBucketFallbacks.Store(31)
@@ -2844,6 +2845,19 @@ func TestDRSecondaryStatus(t *testing.T) {
 	sec.flatAccumulatorIndexedRepairProofMismatchChecksum.Store(true)
 	sec.localKIDIndexFallbackScans.Store(29)
 	sec.localKIDIndexInvalidations.Store(30)
+	sec.sessionMu.Lock()
+	sec.lastReconcileBudgetExhausted = drReconcileBudgetExhaustedSnapshot{
+		Phase:         "range_checksums",
+		Reason:        "rpc_bytes",
+		RPCBytesUsed:  2400,
+		MaxRPCBytes:   1,
+		RPCCalls:      1,
+		Entries:       0,
+		RangesHandled: 0,
+		RangesSplit:   0,
+		RetryCount:    3,
+	}
+	sec.sessionMu.Unlock()
 	sec.optimizerStatusMu.Lock()
 	sec.lastLocalKIDIndexFallbackScanReason = "bucket_mismatch"
 	sec.lastLocalKIDIndexInvalidationReason = "indexed_repair_proof_mismatch"
@@ -2898,6 +2912,27 @@ func TestDRSecondaryStatus(t *testing.T) {
 	}
 	if !status.FlatAccumulatorIndexedRepairProofMismatchChecksum {
 		t.Fatal("expected flat accumulator indexed repair proof mismatch checksum flag")
+	}
+	if status.ReconcileBudgetExhaustedTotal != 34 {
+		t.Fatalf("expected reconcile budget exhaustion total 34, got %d", status.ReconcileBudgetExhaustedTotal)
+	}
+	if status.ReconcileBudgetExhaustedPhaseLast != "range_checksums" {
+		t.Fatalf("expected reconcile budget exhaustion phase range_checksums, got %q", status.ReconcileBudgetExhaustedPhaseLast)
+	}
+	if status.ReconcileBudgetExhaustedReasonLast != "rpc_bytes" {
+		t.Fatalf("expected reconcile budget exhaustion reason rpc_bytes, got %q", status.ReconcileBudgetExhaustedReasonLast)
+	}
+	if status.ReconcileBudgetExhaustedRPCBytesLast != 2400 {
+		t.Fatalf("expected reconcile budget exhaustion rpc bytes 2400, got %d", status.ReconcileBudgetExhaustedRPCBytesLast)
+	}
+	if status.ReconcileBudgetExhaustedMaxRPCBytesLast != 1 {
+		t.Fatalf("expected reconcile budget exhaustion max rpc bytes 1, got %d", status.ReconcileBudgetExhaustedMaxRPCBytesLast)
+	}
+	if status.ReconcileBudgetExhaustedRPCCallsLast != 1 {
+		t.Fatalf("expected reconcile budget exhaustion rpc calls 1, got %d", status.ReconcileBudgetExhaustedRPCCallsLast)
+	}
+	if status.ReconcileBudgetExhaustedRetriesLast != 3 {
+		t.Fatalf("expected reconcile budget exhaustion retries 3, got %d", status.ReconcileBudgetExhaustedRetriesLast)
 	}
 	if status.LocalKIDIndexBucketLoadsTotal != 20 {
 		t.Fatalf("expected local KID index bucket loads 20, got %d", status.LocalKIDIndexBucketLoadsTotal)
@@ -5325,6 +5360,85 @@ func TestDRRangeReconciliationSeedsFlatAccumulatorOnPhaseAMatch(t *testing.T) {
 	assertDRFlatAccumulatorMatchesSet(t, secondary.rangeAccumulator, checkpoint.CommitIndex, localSet)
 }
 
+func TestDRRangeReconciliationBudgetExhaustionDoesNotAdvanceCheckpoint(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := bytes.Repeat([]byte{0x45}, 32)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-budget-exhaustion", core.logger)
+	secondary.reconcileMaxRPCBytes = 1
+	secondary.checkpointHighWaterMarkPersistHook = func(index uint64) error {
+		t.Fatalf("checkpoint high-water mark must not advance on incomplete repair, got %d", index)
+		return nil
+	}
+	secondary.setLastAppliedIndex(10)
+	secondary.reconcileRetries.Store(2)
+
+	checkpoint := &CheckpointResponse{CheckpointId: "cp-budget-exhaustion", CommitIndex: 99}
+	localSet := &reconciler.ReconciliationSet{
+		Checkpoint: reconciler.Checkpoint{ID: checkpoint.CheckpointId, CommitIndex: checkpoint.CommitIndex},
+		KIDToVID:   map[[32]byte][32]byte{},
+		KIDToKey:   map[[32]byte]string{},
+	}
+
+	secondary.client = &drTestClient{
+		exchangeDirtyBitmapFn: func(_ context.Context, req *DirtyBitmapMessage, _ ...grpc.CallOption) (*DirtyBitmapMessage, error) {
+			if req.GetRelationshipId() != secondary.relationshipID {
+				t.Fatalf("unexpected relationship id %q", req.GetRelationshipId())
+			}
+			return &DirtyBitmapMessage{
+				RelationshipId:  secondary.relationshipID,
+				CheckpointId:    checkpoint.CheckpointId,
+				CheckpointIndex: checkpoint.CommitIndex,
+				StartIndex:      10,
+				Bitmap:          make([]byte, drDirtyBitmapBytes),
+			}, nil
+		},
+		exchangeRangeChecksumsFn: func(_ context.Context, req *RangeChecksumRequest, _ ...grpc.CallOption) (*RangeChecksumResponse, error) {
+			if req.GetRelationshipId() != secondary.relationshipID {
+				t.Fatalf("unexpected relationship id %q", req.GetRelationshipId())
+			}
+			if req.GetCheckpointId() != checkpoint.CheckpointId || req.GetCheckpointIndex() != checkpoint.CommitIndex {
+				t.Fatalf("unexpected checkpoint tuple %q/%d", req.GetCheckpointId(), req.GetCheckpointIndex())
+			}
+			return &RangeChecksumResponse{Checksums: []*RangeChecksum{}}, nil
+		},
+	}
+
+	err := secondary.runRangeReconciliation(context.Background(), checkpoint, localSet, time.Now())
+	if err == nil {
+		t.Fatal("expected budget exhaustion")
+	}
+	if !strings.Contains(err.Error(), "reconcile failure [budget_exceeded]") {
+		t.Fatalf("expected budget_exceeded failure, got %v", err)
+	}
+	if got := secondary.lastAppliedIndex.Load(); got != 10 {
+		t.Fatalf("expected last_applied_index to remain 10, got %d", got)
+	}
+	status := secondary.Status()
+	if status.ReconcileCount != 0 {
+		t.Fatalf("expected reconcile count to remain 0, got %d", status.ReconcileCount)
+	}
+	if status.ReconcileBudgetExhaustedTotal != 1 {
+		t.Fatalf("expected one budget exhaustion, got %d", status.ReconcileBudgetExhaustedTotal)
+	}
+	if status.ReconcileBudgetExhaustedPhaseLast != "range_checksums" {
+		t.Fatalf("expected range_checksums phase, got %q", status.ReconcileBudgetExhaustedPhaseLast)
+	}
+	if status.ReconcileBudgetExhaustedReasonLast != "rpc_bytes" {
+		t.Fatalf("expected rpc_bytes reason, got %q", status.ReconcileBudgetExhaustedReasonLast)
+	}
+	if status.ReconcileBudgetExhaustedRPCBytesLast <= status.ReconcileBudgetExhaustedMaxRPCBytesLast {
+		t.Fatalf("expected consumed bytes to exceed max, got used=%d max=%d",
+			status.ReconcileBudgetExhaustedRPCBytesLast,
+			status.ReconcileBudgetExhaustedMaxRPCBytesLast)
+	}
+	if status.ReconcileBudgetExhaustedRPCCallsLast != 1 {
+		t.Fatalf("expected one budgeted RPC call, got %d", status.ReconcileBudgetExhaustedRPCCallsLast)
+	}
+	if status.ReconcileBudgetExhaustedRetriesLast != 2 {
+		t.Fatalf("expected retry snapshot 2, got %d", status.ReconcileBudgetExhaustedRetriesLast)
+	}
+}
+
 func TestDRSecondaryQuiescentReconnectUsesFlatAccumulatorFastPath(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	replSalt := bytes.Repeat([]byte{0x24}, 32)
@@ -6823,6 +6937,10 @@ func TestDRPrimary_ExchangeRangeChecksumsRejectsOversizedRequests(t *testing.T) 
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("expected InvalidArgument for out-of-range range_id, got %v: %v", status.Code(err), err)
 	}
+	rangeChecksumRequests, rangeChecksumRejections, _, _, _, _, _ := primary.checkpointRPCPressureStats()
+	if rangeChecksumRequests != 2 || rangeChecksumRejections != 2 {
+		t.Fatalf("unexpected range checksum pressure stats: requests=%d rejections=%d", rangeChecksumRequests, rangeChecksumRejections)
+	}
 }
 
 func TestDRPrimary_ExchangeRangeDigestsRejectsMalformedParentSpan(t *testing.T) {
@@ -6847,6 +6965,10 @@ func TestDRPrimary_ExchangeRangeDigestsRejectsMalformedParentSpan(t *testing.T) 
 	})
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("expected InvalidArgument for inverted span, got %v: %v", status.Code(err), err)
+	}
+	_, _, rangeDigestRequests, rangeDigestRejections, _, _, _ := primary.checkpointRPCPressureStats()
+	if rangeDigestRequests != 2 || rangeDigestRejections != 2 {
+		t.Fatalf("unexpected range digest pressure stats: requests=%d rejections=%d", rangeDigestRequests, rangeDigestRejections)
 	}
 }
 
@@ -6894,6 +7016,11 @@ func TestFetchEntriesRejectsOversizedAndMalformedRequests(t *testing.T) {
 				t.Fatalf("expected InvalidArgument, got %v: %v", status.Code(err), err)
 			}
 		})
+	}
+	_, _, _, _, fetchRequests, fetchRequestRejections, fetchResponseBudgetRejections := primary.checkpointRPCPressureStats()
+	if fetchRequests != 5 || fetchRequestRejections != 5 || fetchResponseBudgetRejections != 0 {
+		t.Fatalf("unexpected fetch pressure stats: requests=%d request_rejections=%d response_budget_rejections=%d",
+			fetchRequests, fetchRequestRejections, fetchResponseBudgetRejections)
 	}
 }
 
@@ -6997,6 +7124,11 @@ func TestFetchEntriesRejectsSingleEntryOverResponseByteBudget(t *testing.T) {
 	}
 	if got := stream.sendCount.Load(); got != 0 {
 		t.Fatalf("expected no batches to be sent for oversized entry, got %d", got)
+	}
+	_, _, _, _, fetchRequests, fetchRequestRejections, fetchResponseBudgetRejections := primary.checkpointRPCPressureStats()
+	if fetchRequests != 1 || fetchRequestRejections != 0 || fetchResponseBudgetRejections != 1 {
+		t.Fatalf("unexpected fetch pressure stats: requests=%d request_rejections=%d response_budget_rejections=%d",
+			fetchRequests, fetchRequestRejections, fetchResponseBudgetRejections)
 	}
 }
 
