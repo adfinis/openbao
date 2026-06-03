@@ -14,6 +14,9 @@ scripts/dr_local_test.sh --topology ha smoke
 scripts/dr_local_test.sh --topology ha preseed-smoke
 scripts/dr_local_test.sh --topology ha quiescent-reconnect-smoke
 scripts/dr_local_test.sh --topology ha accumulator-cold-restart-smoke
+scripts/dr_local_test.sh --topology ha transport-ca-rotation-smoke
+scripts/dr_local_test.sh --topology ha transport-ca-rotation-load-smoke
+scripts/dr_local_test.sh --topology ha transport-ca-rotation-chain-smoke
 scripts/dr_local_test.sh --topology ha secondary-outage-smoke
 scripts/dr_local_test.sh --topology ha secondary-outage-reconcile-smoke
 scripts/dr_local_test.sh --topology ha indexed-repair-smoke
@@ -29,6 +32,9 @@ bin/dr-harness smoke
 bin/dr-harness preseed-smoke
 bin/dr-harness quiescent-reconnect-smoke
 bin/dr-harness accumulator-cold-restart-smoke
+bin/dr-harness transport-ca-rotation-smoke
+bin/dr-harness transport-ca-rotation-load-smoke
+bin/dr-harness transport-ca-rotation-chain-smoke
 bin/dr-harness secondary-outage-smoke
 bin/dr-harness secondary-outage-reconcile-smoke
 bin/dr-harness indexed-repair-smoke
@@ -41,7 +47,7 @@ The topology lifecycle is still subprocess-backed through
 `scripts/dr_local_test.sh reset` or `dataset-fixture-restore`. The scenario
 bodies are Go: active-node discovery, OpenBao API calls, pre-seed
 export/import, bounded KV write pressure, checkpoint verification, HA handoff,
-secondary outage/restart orchestration, tuning profile setup, `dr-stress`
+transport CA rotation, secondary outage/restart orchestration, tuning profile setup, `dr-stress`
 foreground process control, passthrough workload flags, and artifact writing.
 Docker compose lifecycle is still invoked as a subprocess from typed scenario
 code.
@@ -78,6 +84,20 @@ Every scenario writes a run directory under `dr-stress-results/` with:
 The outage scenarios additionally write `harness.out`, `harness.err`,
 secondary restart logs, before/after optimizer counters, and
 `verify-{primary,secondary1,secondary2}.json`.
+
+`transport-ca-rotation-smoke` writes each trust-bundle operation response,
+secondary accept response, stale-bundle rejection errors, before/after DR
+status snapshots, and terminal checkpoint verification files.
+
+`transport-ca-rotation-load-smoke` runs the same staged, activated, and retired
+trust-bundle lifecycle while a mixed `dr-stress` workload and HA primary
+stepdowns are active. It preserves workload artifacts in `result.json` and
+writes lifecycle assertions to `scenario-result.json`.
+
+`transport-ca-rotation-chain-smoke` performs repeated transport CA rotations on
+one live relationship without resetting between rotations. It writes every
+bundle response, rejects stale bundles from current and prior generations, and
+finishes with strict-secondary checkpoint verification.
 
 `smoke` delegates the workload body to `dr-stress run`; it writes an
 `orchestrator.log`, applies HA primary tuning when requested, and preserves

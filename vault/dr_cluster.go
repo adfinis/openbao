@@ -155,6 +155,12 @@ func (h *drReplicationClusterHandler) ensureDRLeafCert() error {
 	return h.SetTransportCA(ca)
 }
 
+func (h *drReplicationClusterHandler) currentTransportCA() *drTransportCA {
+	h.drLeafCertMu.RLock()
+	defer h.drLeafCertMu.RUnlock()
+	return h.drTransportCA
+}
+
 // ActiveDRLeafCertDER returns a copy of the currently minted DR transport
 // leaf certificate DER bytes. Returns nil when no DR leaf is available.
 func (h *drReplicationClusterHandler) ActiveDRLeafCertDER() []byte {
@@ -226,11 +232,19 @@ func (h *drReplicationClusterHandler) startLeafRenewal(ca *drTransportCA) {
 				if h.hasDRLeafCert() {
 					continue
 				}
-				if err := h.SetTransportCA(ca); err != nil {
+				currentCA := h.currentTransportCA()
+				if currentCA == nil {
+					currentCA = ca
+				}
+				if err := h.SetTransportCA(currentCA); err != nil {
 					h.logger.Debug("DR transport leaf cert not available yet", "error", err)
 				}
 			case <-renewTicker.C:
-				if err := h.SetTransportCA(ca); err != nil {
+				currentCA := h.currentTransportCA()
+				if currentCA == nil {
+					currentCA = ca
+				}
+				if err := h.SetTransportCA(currentCA); err != nil {
 					h.logger.Error("failed to renew DR transport leaf cert", "error", err)
 				} else {
 					h.logger.Info("renewed DR transport leaf certificate")
@@ -369,8 +383,9 @@ func (h *drReplicationClusterHandler) Stop() error {
 // with a timestamp of when it was last seen in a heartbeat response.
 // Certificates whose lastSeen exceeds trustedCertTTL are pruned.
 type trustedPrimaryCert struct {
-	derBytes []byte
-	lastSeen time.Time
+	derBytes   []byte
+	lastSeen   time.Time
+	caIdentity string
 }
 
 const trustedCertTTL = 10 * time.Minute
@@ -386,11 +401,17 @@ func drCertFingerprint(der []byte) string {
 // connecting to the primary's DR replication gRPC service over mTLS.
 type drReplicationClusterClient struct {
 	core *Core
-	// primaryCACert is the primary's DR transport CA certificate from
-	// the activation token. This is the sole trust anchor used to
-	// verify primary identity.
+	caMu sync.RWMutex
+	// primaryCACert is the active primary DR transport CA certificate from
+	// the activation token. It is retained for the cluster.Client interface
+	// and as a fallback before the TLS verifier records the matched CA.
 	primaryCACert *x509.Certificate
-	logger        log.Logger
+
+	// primaryCACerts is the ordered primary DR transport CA trust set. The
+	// active CA is first; later entries are staged/previous CAs accepted
+	// during transport CA rotation.
+	primaryCACerts []*x509.Certificate
+	logger         log.Logger
 
 	// trustedCertsMu and trustedCerts are owned by the
 	// drReplicationSecondary and shared via pointer so the pool
@@ -402,6 +423,9 @@ type drReplicationClusterClient struct {
 
 	clientCertMu sync.RWMutex
 	clientCertFP string
+
+	serverIdentityMu sync.RWMutex
+	serverCAIdentity string
 }
 
 // ClientLookup returns the client TLS certificate for outgoing connections.
@@ -438,6 +462,25 @@ func (c *drReplicationClusterClient) LastClientCertFingerprint() string {
 	return fp
 }
 
+func (c *drReplicationClusterClient) setLastPrimaryCAIdentity(identity string) {
+	if c == nil || identity == "" {
+		return
+	}
+	c.serverIdentityMu.Lock()
+	c.serverCAIdentity = identity
+	c.serverIdentityMu.Unlock()
+}
+
+func (c *drReplicationClusterClient) LastPrimaryCAIdentity() string {
+	if c == nil {
+		return ""
+	}
+	c.serverIdentityMu.RLock()
+	identity := c.serverCAIdentity
+	c.serverIdentityMu.RUnlock()
+	return identity
+}
+
 // ServerName returns empty because after a leadership change the
 // secondary may reach any primary node, each with a unique CN.
 func (c *drReplicationClusterClient) ServerName() string {
@@ -448,7 +491,15 @@ func (c *drReplicationClusterClient) ServerName() string {
 // token. Retained for the initial CA pool (first connection to the
 // original leader).
 func (c *drReplicationClusterClient) CACert(ctx context.Context) *x509.Certificate {
-	return c.primaryCACert
+	c.caMu.RLock()
+	defer c.caMu.RUnlock()
+	if c.primaryCACert != nil {
+		return c.primaryCACert
+	}
+	if len(c.primaryCACerts) == 0 {
+		return nil
+	}
+	return c.primaryCACerts[0]
 }
 
 // VerifyPeerCertificate returns a callback that checks the primary's
@@ -468,22 +519,39 @@ func (c *drReplicationClusterClient) VerifyPeerCertificate() func([][]byte, [][]
 
 		c.trustedCertsMu.RLock()
 		entry, known := c.trustedCerts[fp]
+		entryCAIdentity := ""
+		if known {
+			entryCAIdentity = entry.caIdentity
+		}
 		c.trustedCertsMu.RUnlock()
 
 		if known {
-			// Refresh lastSeen for the known cert.
+			caIdentity := entryCAIdentity
+			if caIdentity == "" || !c.primaryTrustAnchorAllowsIdentity(caIdentity) {
+				matchedCA, err := c.verifyPrimaryCertCA(rawCerts[0])
+				if err != nil {
+					c.trustedCertsMu.Lock()
+					delete(c.trustedCerts, fp)
+					c.trustedCertsMu.Unlock()
+					return fmt.Errorf("dr: cached server certificate no longer chains to a trusted DR transport CA: %w", err)
+				}
+				caIdentity = drTransportCAKeyID(matchedCA)
+			}
+
+			// Refresh lastSeen and the matched CA identity for the known cert.
 			c.trustedCertsMu.Lock()
 			entry.lastSeen = time.Now()
+			entry.caIdentity = caIdentity
 			c.trustedCertsMu.Unlock()
+			c.setLastPrimaryCAIdentity(caIdentity)
 			return nil
 		}
 
-		// Unknown cert: verify it chains to the DR transport CA.
-		if c.primaryCACert == nil {
-			return errors.New("dr: no DR transport CA configured; cannot verify server certificate")
-		}
-
-		if err := verifyCertChainToCA(rawCerts[0], c.primaryCACert); err != nil {
+		// Unknown cert: verify it chains to one of the configured DR
+		// transport CAs. During CA rotation both the current and staged
+		// anchors can be trusted, but an unknown CA still fails closed.
+		matchedCA, err := c.verifyPrimaryCertCA(rawCerts[0])
+		if err != nil {
 			cn := "(unknown)"
 			if cert, parseErr := x509.ParseCertificate(rawCerts[0]); parseErr == nil {
 				cn = cert.Subject.CommonName
@@ -496,12 +564,15 @@ func (c *drReplicationClusterClient) VerifyPeerCertificate() func([][]byte, [][]
 		}
 
 		// Certificate chains to the CA -- accept and add to pool.
+		caIdentity := drTransportCAKeyID(matchedCA)
 		c.trustedCertsMu.Lock()
 		c.trustedCerts[fp] = &trustedPrimaryCert{
-			derBytes: append([]byte(nil), rawCerts[0]...),
-			lastSeen: time.Now(),
+			derBytes:   append([]byte(nil), rawCerts[0]...),
+			lastSeen:   time.Now(),
+			caIdentity: caIdentity,
 		}
 		c.trustedCertsMu.Unlock()
+		c.setLastPrimaryCAIdentity(caIdentity)
 
 		cn := "(unknown)"
 		if cert, err := x509.ParseCertificate(rawCerts[0]); err == nil {
@@ -509,45 +580,151 @@ func (c *drReplicationClusterClient) VerifyPeerCertificate() func([][]byte, [][]
 		}
 		c.logger.Info("accepted primary certificate verified against DR transport CA",
 			"fingerprint", fp,
+			"ca_key_id", caIdentity,
 			"cn", cn)
 		return nil
 	}
 }
 
-// addTrustedCert adds or refreshes a DER-encoded certificate in the
-// trust pool. Called from the heartbeat loop. The certificate must
-// chain to the DR transport CA or it is rejected.
+// addTrustedCert adds or refreshes a DER-encoded certificate in the trust
+// pool. Called from the heartbeat loop. The certificate must chain to a
+// configured DR transport CA or it is rejected.
 func (c *drReplicationClusterClient) addTrustedCert(der []byte) error {
 	fp := drCertFingerprint(der)
 
 	c.trustedCertsMu.RLock()
 	entry, known := c.trustedCerts[fp]
+	entryCAIdentity := ""
+	if known {
+		entryCAIdentity = entry.caIdentity
+	}
 	c.trustedCertsMu.RUnlock()
 
 	if known {
+		caIdentity := entryCAIdentity
+		if caIdentity == "" || !c.primaryTrustAnchorAllowsIdentity(caIdentity) {
+			matchedCA, err := c.verifyPrimaryCertCA(der)
+			if err != nil {
+				c.trustedCertsMu.Lock()
+				delete(c.trustedCerts, fp)
+				c.trustedCertsMu.Unlock()
+				return fmt.Errorf("cached heartbeat certificate no longer chains to a trusted DR transport CA: %w", err)
+			}
+			caIdentity = drTransportCAKeyID(matchedCA)
+		}
+
 		c.trustedCertsMu.Lock()
 		entry.lastSeen = time.Now()
+		entry.caIdentity = caIdentity
 		c.trustedCertsMu.Unlock()
+		c.setLastPrimaryCAIdentity(caIdentity)
 		return nil
 	}
 
-	// Verify chain to DR transport CA before adding.
-	if c.primaryCACert != nil {
-		if err := verifyCertChainToCA(der, c.primaryCACert); err != nil {
-			c.logger.Warn("rejected heartbeat certificate: does not chain to DR transport CA",
-				"fingerprint", fp,
-				"error", err)
-			return fmt.Errorf("heartbeat certificate does not chain to DR transport CA: %w", err)
-		}
+	// Verify chain to a configured DR transport CA before adding.
+	matchedCA, err := c.verifyPrimaryCertCA(der)
+	if err != nil {
+		c.logger.Warn("rejected heartbeat certificate: does not chain to DR transport CA",
+			"fingerprint", fp,
+			"error", err)
+		return fmt.Errorf("heartbeat certificate does not chain to DR transport CA: %w", err)
 	}
 
+	caIdentity := drTransportCAKeyID(matchedCA)
 	c.trustedCertsMu.Lock()
 	c.trustedCerts[fp] = &trustedPrimaryCert{
-		derBytes: append([]byte(nil), der...),
-		lastSeen: time.Now(),
+		derBytes:   append([]byte(nil), der...),
+		lastSeen:   time.Now(),
+		caIdentity: caIdentity,
 	}
 	c.trustedCertsMu.Unlock()
+	c.setLastPrimaryCAIdentity(caIdentity)
 	return nil
+}
+
+func (c *drReplicationClusterClient) verifyPrimaryCertCA(der []byte) (*x509.Certificate, error) {
+	cas := c.primaryTrustAnchors()
+	if len(cas) == 0 {
+		return nil, errors.New("no DR transport CA configured")
+	}
+	return verifyCertChainToAnyCA(der, cas)
+}
+
+func (c *drReplicationClusterClient) primaryTrustAnchorAllowsIdentity(identity string) bool {
+	if c == nil || identity == "" {
+		return false
+	}
+	for _, ca := range c.primaryTrustAnchors() {
+		if drTransportCAKeyID(ca) == identity {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *drReplicationClusterClient) primaryTrustAnchors() []*x509.Certificate {
+	if c == nil {
+		return nil
+	}
+	c.caMu.RLock()
+	defer c.caMu.RUnlock()
+	out := make([]*x509.Certificate, 0, len(c.primaryCACerts)+1)
+	seen := make(map[string]struct{}, len(c.primaryCACerts)+1)
+	add := func(cert *x509.Certificate) {
+		if cert == nil {
+			return
+		}
+		fp := certFingerprintSHA256(cert)
+		if _, ok := seen[fp]; ok {
+			return
+		}
+		seen[fp] = struct{}{}
+		out = append(out, cert)
+	}
+	add(c.primaryCACert)
+	for _, ca := range c.primaryCACerts {
+		add(ca)
+	}
+	return out
+}
+
+func (c *drReplicationClusterClient) updatePrimaryTrustAnchors(active *x509.Certificate, trusted []*x509.Certificate) {
+	if c == nil {
+		return
+	}
+	c.caMu.Lock()
+	c.primaryCACert = active
+	c.primaryCACerts = append([]*x509.Certificate(nil), trusted...)
+	c.caMu.Unlock()
+}
+
+func parseDRPrimaryCACerts(active []byte, trusted [][]byte) (*x509.Certificate, []*x509.Certificate, error) {
+	trusted = normalizeDRPrimaryCACerts(active, trusted)
+	if len(trusted) == 0 {
+		return nil, nil, errors.New("no DR transport CA configured")
+	}
+
+	activeDER := active
+	if len(activeDER) == 0 {
+		activeDER = trusted[0]
+	}
+
+	var activeCert *x509.Certificate
+	certs := make([]*x509.Certificate, 0, len(trusted))
+	for i, der := range trusted {
+		cert, err := x509.ParseCertificate(der)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to parse primary CA cert %d: %w", i, err)
+		}
+		if activeCert == nil && bytes.Equal(der, activeDER) {
+			activeCert = cert
+		}
+		certs = append(certs, cert)
+	}
+	if activeCert == nil {
+		activeCert = certs[0]
+	}
+	return activeCert, certs, nil
 }
 
 // pruneTrustedCerts removes entries whose lastSeen exceeds the TTL.
@@ -573,9 +750,16 @@ func initTrustedPool(pool map[string]*trustedPrimaryCert, caCert *x509.Certifica
 	fp := drCertFingerprint(caCert.Raw)
 	if _, ok := pool[fp]; !ok {
 		pool[fp] = &trustedPrimaryCert{
-			derBytes: append([]byte(nil), caCert.Raw...),
-			lastSeen: time.Now(),
+			derBytes:   append([]byte(nil), caCert.Raw...),
+			lastSeen:   time.Now(),
+			caIdentity: drTransportCAKeyID(caCert),
 		}
+	}
+}
+
+func initTrustedPoolFromCAs(pool map[string]*trustedPrimaryCert, caCerts []*x509.Certificate) {
+	for _, caCert := range caCerts {
+		initTrustedPool(pool, caCert)
 	}
 }
 

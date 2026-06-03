@@ -168,6 +168,39 @@ The primary serves `FetchEntries` from checkpoint artifacts rather than live
 storage. This prevents live write races from changing the target while the
 secondary is repairing against it.
 
+## Compatibility Gates
+
+The current prototype is a greenfield protocol, so compatibility is strict:
+missing or unknown protocol metadata fails closed instead of being interpreted
+as a legacy-compatible default.
+
+The main versioned boundaries are:
+
+| Boundary | Version metadata | Current rule |
+|---|---|---|
+| Live checkpoint reconciliation | `CheckpointResponse.range_plan_version` | Secondary accepts only the current deterministic range-plan version before verification, resnapshot, or reconciliation work starts. A missing zero value is unsupported. |
+| Pre-seed manifest | manifest version, range-plan version, range bits/count, checksum algorithm, value domain, accumulator snapshot version, local KID-index version, bundle format, integrity algorithm | Import accepts only matching metadata for the active relationship and activation token. |
+| Persisted flat accumulator | snapshot, cursor, delta, stream-applied-index versions plus relationship, cluster, range bits, and checksum algorithm | Restore or fast-path use is allowed only when metadata matches the current relationship and local cluster context. |
+| Local KID index | meta, entry, and leaf-digest versions plus relationship, cluster, range bits/count, and leaf bits | Indexed repair is allowed only after the local index proves it is checkpoint-aligned and version-compatible. Otherwise reconciliation falls back to a full local scan. |
+| `SyncKeyring` crypto envelope | AEAD AAD version | The secondary rejects unknown AAD versions and mismatched relationship/identity binding. |
+| DR transport CA trust | active CA plus ordered trusted CA set | Secondary transport verification accepts primary leaves chained to any configured trust anchor during rotation overlap. `SyncKeyring` primary identity is bound to the CA that verified the primary leaf for the current mTLS connection, with active CA fallback only before a verified connection exists. |
+
+DR transport CA rotation uses signed public trust bundles rather than silent
+trust replacement. The primary stages a pending CA, signs a trust bundle with a
+currently active CA, and operators apply that bundle to secondaries before
+activation. After activation, the primary signs a new bundle from the new
+active CA so secondaries that already trusted the staged CA can promote it to
+their active `primary_ca_cert`. The previous public CA remains observable until
+operators retire it from future bundles. After retirement, secondaries reject
+stale bundles that would reintroduce the retired previous CA.
+
+This is not yet a mixed-version rolling-upgrade contract. A production design
+still needs an explicit compatibility matrix that states which primary and
+secondary versions may stream, reconcile, verify, pre-seed, and promote
+together. Until that exists, new protocol, artifact, optimizer, or crypto
+formats should add explicit version checks and negative tests before being used
+by a checkpoint or relationship.
+
 ## Checkpoint Construction Under Live Writes
 
 The current design does not require the primary to expose a historical MVCC
@@ -507,6 +540,12 @@ checkpoint artifacts, the operator restores them into a disabled secondary,
 the secondary validates the manifest and local-only scrub, and normal DR then
 catches up from the seed checkpoint through stream replay or checkpoint
 reconciliation.
+
+Pre-seed manifests carry primary-issued provenance. The manifest is signed by
+the primary DR transport CA after the final bundle integrity hash and segment
+metadata are known. The secondary verifies the signature with the DR transport
+CA certificate pinned in the activation token before accepting, staging, or
+completing an import.
 
 Neither path changes the authority boundary. The secondary still must bind to
 fresh relationship material, reject stale lineage, preserve local-only state,

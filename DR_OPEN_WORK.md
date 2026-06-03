@@ -31,9 +31,9 @@ shape rather than local PoC.
 |---|---|---|
 | Reconcile budget ledger | Unit-gated, clustered HA negative-path smoke passed | A massive fragmented checkpoint repair must stop on explicit byte, entry, RPC, retry, and wall-time budgets instead of relying on implicit timeouts. Primary rejection paths and production default sizing still need more evidence. |
 | Primary checkpoint pressure controls | Unit-gated, HA validation open | A secondary should not be able to force unbounded checkpoint construction, digest lookup, fetch serialization, or artifact retention on the primary. |
-| Pre-seed artifact provenance | Open | Large base-copy artifacts need signed provenance or equivalent primary authorization, external storage support, and resumable transfer semantics. |
-| DR transport CA rotation | Open | Leaf renewal is covered, but production CA rotation without relationship replacement is not finalized. |
-| Rolling upgrade/protocol compatibility | Open | Protocol versions, artifact formats, accumulator metadata versions, and range versions need explicit compatibility rules. |
+| Pre-seed artifact provenance | Primary-signed manifest provenance added; external custody open | Manifests are signed by the DR transport CA and verified with the activation-token CA before import. Production still needs external artifact storage support, resumable transfer semantics, and custody/audit policy. |
+| DR transport CA rotation | Unit-gated first-class lifecycle added; clustered HA, HA-load, and repeated-chain smokes passed | Primary stage/read/activate/retire and secondary accept-bundle endpoints exist. The HA smokes cover staged, activated, and retired trust bundles across primary and secondary active handoff, mixed load, repeated rotation chains, stale bundle replay rejection, and checkpoint verification. Production still needs longer soak coverage, overlap timing policy, audit review, and operator runbook detail. |
+| Rolling upgrade/protocol compatibility | Initial strict gates added; mixed-version policy open | Live checkpoints, pre-seed manifests, accumulator metadata, local KID indexes, and keyring AAD now have fail-closed version checks. A production rolling-upgrade matrix still needs explicit supported-version rules. |
 | Production defaults | Open | Journal retention, checkpoint retention, fetch sizes, split depth, adaptive batching, and resource budgets need measured defaults. |
 
 ## Security Follow-Up
@@ -45,12 +45,13 @@ bootstrap/rotation paths, and revocation fail-closed behavior.
 
 Remaining security work:
 
-- finalize DR transport CA rotation;
-- add production artifact signing/provenance for pre-seed;
+- document DR transport CA rotation operator overlap policy and runbook;
+- finish external artifact custody, resumable transfer, and audit policy for
+  pre-seed;
 - extend resource-abuse tests to primary checkpoint and digest/fetch pressure;
 - verify audit redaction for any new artifact/provenance endpoints;
-- review rolling upgrade behavior for stale credential and stale artifact
-  acceptance; and
+- review rolling upgrade behavior for stale credential, stale artifact, and
+  mixed-version acceptance; and
 - run an independent security review before any upstream-quality rewrite.
 
 ## Availability and HA
@@ -112,7 +113,7 @@ Recommended next validation targets:
 - WAN latency and packet-loss profile;
 - proxy/load-balancer profile;
 - dependency-backed engine matrix; and
-- production artifact provenance negative tests once that design exists.
+- external artifact custody/provenance negative tests once that design exists.
 
 ## Review Questions Still Worth Asking
 
@@ -122,6 +123,7 @@ The RFC should keep only the review questions that change design direction:
 2. Should planned switchover ship with the first version or follow disaster
    promotion?
 3. What rolling-upgrade compatibility guarantee is required?
-4. What is the acceptable DR transport CA rotation lifecycle?
-5. What production artifact/provenance model is required for pre-seed?
+4. What is the acceptable DR transport CA rotation lifecycle and overlap
+   policy?
+5. What external artifact custody and audit model is required for pre-seed?
 6. What default resource budgets are acceptable for very large clusters?

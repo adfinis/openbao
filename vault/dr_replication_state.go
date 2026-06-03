@@ -123,10 +123,14 @@ type DRConfig struct {
 	// the one-time SyncKeyring bootstrap for an already-active relationship.
 	SecondaryKeyringBootstrapped bool `json:"secondary_keyring_bootstrapped,omitempty"`
 
-	// PrimaryCACert is the primary's DR transport CA certificate (DER-encoded).
-	// Persisted so the secondary can re-establish mTLS after a restart.
-	// This is the sole trust anchor for verifying primary identity.
+	// PrimaryCACert is the active primary DR transport CA certificate
+	// (DER-encoded). It remains the primary identity bound into SyncKeyring AAD.
 	PrimaryCACert []byte `json:"primary_ca_cert,omitempty"`
+
+	// PrimaryCACerts is the ordered trusted primary DR transport CA set. The
+	// first entry is the active CA; later entries are staged/previous anchors
+	// used during transport CA rotation.
+	PrimaryCACerts [][]byte `json:"primary_ca_certs,omitempty"`
 
 	// PrimaryAPIAddr, PrimaryAPICACert, and PrimaryAPIServerName describe the
 	// primary HTTP API endpoint used for bootstrap registration and later
@@ -226,10 +230,13 @@ type DRActivationToken struct {
 	// ReplSalt is the shared HMAC key for KID derivation.
 	ReplSalt []byte `json:"repl_salt"`
 
-	// DRTransportCACert is the primary's DR transport CA certificate (DER).
-	// This is the sole trust anchor for verifying primary identity over
-	// the DR gRPC transport.
+	// DRTransportCACert is the active primary DR transport CA certificate
+	// (DER). It is the primary identity bound into SyncKeyring AAD.
 	DRTransportCACert []byte `json:"dr_transport_ca_cert,omitempty"`
+
+	// DRTransportCACerts is the ordered trusted primary DR transport CA set
+	// used for transport CA rotation. The active CA is always first.
+	DRTransportCACerts [][]byte `json:"dr_transport_ca_certs,omitempty"`
 
 	// PrimaryAPICACert is the CA certificate used to validate the
 	// primary API endpoint during secondary registration. If empty,
@@ -560,6 +567,10 @@ func applyDRConfigDefaults(cfg *DRConfig) {
 	if cfg == nil {
 		return
 	}
+	cfg.PrimaryCACerts = normalizeDRPrimaryCACerts(cfg.PrimaryCACert, cfg.PrimaryCACerts)
+	if len(cfg.PrimaryCACert) == 0 && len(cfg.PrimaryCACerts) > 0 {
+		cfg.PrimaryCACert = append([]byte(nil), cfg.PrimaryCACerts[0]...)
+	}
 	if cfg.FallbackStallSeconds <= 0 {
 		cfg.FallbackStallSeconds = int64(drDefaultFallbackStall / time.Second)
 	}
@@ -656,6 +667,28 @@ func applyDRConfigDefaults(cfg *DRConfig) {
 	if cfg.DRBackpressureCriticalMinQPS <= 0 {
 		cfg.DRBackpressureCriticalMinQPS = drBackpressureDefaultCriticalMinQPS
 	}
+}
+
+func normalizeDRPrimaryCACerts(active []byte, trusted [][]byte) [][]byte {
+	out := make([][]byte, 0, len(trusted)+1)
+	seen := make(map[string]struct{}, len(trusted)+1)
+	add := func(der []byte) {
+		if len(der) == 0 {
+			return
+		}
+		key := string(der)
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, append([]byte(nil), der...))
+	}
+
+	add(active)
+	for _, der := range trusted {
+		add(der)
+	}
+	return out
 }
 
 func validateDRTuningConfig(cfg *DRConfig) error {
@@ -921,9 +954,9 @@ func (m *drRelationshipManager) LoadConfig(ctx context.Context) error {
 		}
 		m.applySecondaryTunablesLocked()
 
-		// Restore the primary's CA cert so mTLS works after restart.
-		if len(config.PrimaryCACert) > 0 {
-			m.secondary.primaryCACert = config.PrimaryCACert
+		// Restore the primary's CA trust set so mTLS works after restart.
+		if err := m.secondary.setPrimaryCATrustDER(config.PrimaryCACert, config.PrimaryCACerts); err != nil {
+			return fmt.Errorf("invalid DR secondary primary CA trust set: %w", err)
 		}
 		if len(config.SecondaryClientCert) > 0 || len(config.SecondaryClientKeyPEM) > 0 {
 			if err := m.secondary.setClientCertificate(config.SecondaryClientCert, config.SecondaryClientKeyPEM); err != nil {
@@ -934,11 +967,13 @@ func (m *drRelationshipManager) LoadConfig(ctx context.Context) error {
 			return err
 		} else if ok {
 			token := &DRActivationToken{
-				ClusterID:      config.ClusterID,
-				RelationshipID: config.RelationshipID,
-				PrimaryAddr:    config.PrimaryAddr,
-				PrimaryAddrs:   config.PrimaryAddrs,
-				ReplSalt:       config.ReplSalt,
+				ClusterID:          config.ClusterID,
+				RelationshipID:     config.RelationshipID,
+				PrimaryAddr:        config.PrimaryAddr,
+				PrimaryAddrs:       config.PrimaryAddrs,
+				ReplSalt:           config.ReplSalt,
+				DRTransportCACert:  config.PrimaryCACert,
+				DRTransportCACerts: config.PrimaryCACerts,
 			}
 			if err := m.applyAcceptedPreSeedLocked(ctx, acceptedPreSeed, token); err != nil {
 				return fmt.Errorf("failed to apply accepted DR pre-seed baseline during config restore: %w", err)
@@ -1300,6 +1335,11 @@ func (m *drRelationshipManager) EnableSecondary(ctx context.Context, token *DRAc
 			return fmt.Errorf("accepted DR pre-seed record is incompatible with activation token: %w", err)
 		}
 	}
+	primaryCACerts := normalizeDRPrimaryCACerts(token.DRTransportCACert, token.DRTransportCACerts)
+	primaryCACert := append([]byte(nil), token.DRTransportCACert...)
+	if len(primaryCACert) == 0 && len(primaryCACerts) > 0 {
+		primaryCACert = append([]byte(nil), primaryCACerts[0]...)
+	}
 
 	oldConfig := m.config
 	m.config = &DRConfig{
@@ -1309,7 +1349,8 @@ func (m *drRelationshipManager) EnableSecondary(ctx context.Context, token *DRAc
 		ReplSalt:              token.ReplSalt,
 		PrimaryAddr:           primaryAddr,
 		PrimaryAddrs:          normalizedPrimaryAddrs,
-		PrimaryCACert:         token.DRTransportCACert,
+		PrimaryCACert:         primaryCACert,
+		PrimaryCACerts:        primaryCACerts,
 		PrimaryAPIAddr:        normalizePrimaryAPIAddr(token.PrimaryAPIAddr),
 		PrimaryAPICACert:      token.PrimaryAPICACert,
 		PrimaryAPIServerName:  token.PrimaryAPIServerName,
@@ -1332,7 +1373,7 @@ func (m *drRelationshipManager) EnableSecondary(ctx context.Context, token *DRAc
 		)
 	}
 	if len(m.config.PrimaryAPICACert) == 0 {
-		m.config.PrimaryAPICACert = token.DRTransportCACert
+		m.config.PrimaryAPICACert = m.config.PrimaryCACert
 	}
 	if m.config.PrimaryAPIServerName == "" {
 		m.config.PrimaryAPIServerName = deriveServerName(m.config.PrimaryAPIAddr)
@@ -1361,7 +1402,11 @@ func (m *drRelationshipManager) EnableSecondary(ctx context.Context, token *DRAc
 	)
 	m.secondary.clusterID = token.ClusterID
 	m.applySecondaryTunablesLocked()
-	m.secondary.primaryCACert = token.DRTransportCACert
+	if err := m.secondary.setPrimaryCATrustDER(m.config.PrimaryCACert, m.config.PrimaryCACerts); err != nil {
+		m.config = oldConfig
+		m.stopSecondaryRuntimeLocked()
+		return fmt.Errorf("failed to configure primary CA trust set: %w", err)
+	}
 	if err := m.secondary.setClientCertificate(secondaryClientCert, secondaryClientKeyPEM); err != nil {
 		m.config = oldConfig
 		m.stopSecondaryRuntimeLocked()
@@ -1642,6 +1687,7 @@ var drSecondaryAllowedPaths = []string{
 	"sys/replication/dr/secondary/promote",
 	"sys/replication/dr/secondary/disable",
 	"sys/replication/dr/secondary/rotate-certificate",
+	"sys/replication/dr/secondary/transport-ca/accept",
 	"sys/replication/dr/secondary/resnapshot",
 	"sys/replication/dr/tuning",
 	"sys/replication/dr/status",

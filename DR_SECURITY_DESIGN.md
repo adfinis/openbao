@@ -159,9 +159,10 @@ secondary's local seal.
 ## Transport Trust
 
 DR traffic uses mTLS. The primary owns a dedicated DR transport CA stored in
-barrier storage. Primary nodes present leaf certificates signed by this CA. The
-secondary pins the CA from the activation token and rejects primary
-certificates that do not chain to it.
+barrier storage. Primary nodes present leaf certificates signed by this CA.
+The secondary pins an ordered primary DR transport CA trust set from the
+activation token or persisted secondary config and rejects primary
+certificates that do not chain to one of those anchors.
 
 The secondary persists its DR client certificate and private key in local DR
 configuration. The primary accepts that certificate only after bootstrap
@@ -169,14 +170,47 @@ registration and binds subsequent RPC authorization to the registered
 fingerprint.
 
 Heartbeat responses may advertise active primary leaf certificates, but the
-secondary accepts them only if they chain to the pinned DR transport CA. There
-is no trust-on-first-use path and no insecure fallback.
+secondary accepts them only if they chain to a configured DR transport CA.
+There is no trust-on-first-use path and no insecure fallback.
 
 ## Certificate Lifecycle
 
-Primary DR transport leaf certificates are renewed from the long-lived DR
-transport CA. DR transport CA rotation is not finalized in this design and
-remains an unresolved production question.
+Primary DR transport leaf certificates are renewed from the active DR transport
+CA.
+
+The secondary config now carries both:
+
+- `primary_ca_cert`: the active primary CA, used as the primary identity for
+  `SyncKeyring` AAD fallback before a verified transport connection exists; and
+- `primary_ca_certs`: the ordered transport trust set used during CA rotation.
+
+This supports a fail-closed overlap window where the secondary can accept
+primary leaves signed by either the current CA or a staged replacement CA.
+For `SyncKeyring`, the secondary binds unwrap AAD to the CA that actually
+verified the primary leaf on the current mTLS connection, so overlap windows do
+not depend on the secondary having already promoted `primary_ca_cert` locally.
+Leaves signed by unknown CAs remain rejected, and cached leaves stop validating
+when their CA is removed from the accepted trust set.
+
+DR transport CA rotation is operator driven:
+
+1. The primary stages a replacement CA and persists it as pending.
+2. The primary returns a signed public trust bundle containing active, staged,
+   and optional previous CA certificates.
+3. Operators apply that trust bundle on each secondary before activation.
+4. The primary activates the staged CA and renews its transport leaf from the
+   new active CA.
+5. Operators apply the post-activation trust bundle so secondaries update
+   `primary_ca_cert` to the new active CA.
+6. After the overlap window, the primary retires the previous public CA from
+   future bundles.
+
+Trust bundles are signed by a currently trusted DR transport CA. A secondary
+accepts a bundle only if the signature chains to an already trusted CA, the
+cluster ID matches, and the bundle's certificate set validates. After the
+previous CA is retired, stale bundles that would reintroduce that retired CA are
+rejected. This prevents stale or attacker-supplied CA sets from replacing or
+reviving primary trust roots.
 
 Secondary DR client certificates are relationship credentials. The design does
 not silently renew them. Healthy relationships rotate through a two-phase
@@ -272,6 +306,29 @@ Specific field-shape failures can remain specific. Once relationship state,
 token validation, signature validation, duplicate fingerprint checks, lockout,
 stale lineage, or pending rotation state is involved, public errors must be
 generic. Detailed reasons belong in logs and root-protected status.
+
+## Pre-Seed Artifact Provenance
+
+Pre-seed manifests are primary-authorized artifacts. The primary signs the
+canonical manifest payload with the DR transport CA private key after the
+checkpoint tuple, relationship identity, primary cluster identity, bundle
+integrity hash, segment descriptors, projection metadata, local-only scrub
+metadata, and expiry are finalized.
+
+The secondary verifies the manifest signature with the DR transport CA
+certificate pinned in the activation token. Unsigned manifests, manifests
+signed by another CA, or manifests whose signed metadata has been changed are
+rejected before import or accept can trust the seed.
+
+This does not make external artifact storage trusted. The external channel may
+transport bytes, but validation still requires:
+
+- CA-backed manifest provenance;
+- relationship and activation-token binding;
+- bundle integrity or segment descriptor integrity;
+- KID/VID recomputation with the relationship replication salt;
+- local-only path exclusion; and
+- stale-lineage rejection.
 
 ## Revocation
 

@@ -482,6 +482,10 @@ func waitVerifyCheckpoint(ctx context.Context, client *bao.Client, label string,
 		}
 		if err != nil {
 			lastErr = err
+			msg := strings.ToLower(err.Error())
+			if strings.Contains(msg, "returned 403") || strings.Contains(msg, "permission denied") {
+				return nil, lastRaw, fmt.Errorf("%s checkpoint verification unauthorized: %w", label, err)
+			}
 		} else {
 			lastErr = fmt.Errorf("checkpoint verification did not pass: reason=%s state=%s mismatched=%d missing=%d", verify.Reason, verify.State, verify.MismatchedRanges, verify.MissingRanges)
 		}

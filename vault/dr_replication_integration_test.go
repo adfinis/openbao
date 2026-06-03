@@ -387,6 +387,18 @@ func TestDRIntegration_ReadOnlyEnforcement(t *testing.T) {
 		t.Fatal("promote path should not be blocked by read-only enforcement")
 	}
 
+	// Verify that the secondary-local transport CA trust update path is
+	// allowed. It may fail validation later, but it must reach its handler
+	// instead of being treated as a client write to replicated storage.
+	transportCAAcceptReq := &logical.Request{
+		Operation: logical.UpdateOperation,
+		Path:      "sys/replication/dr/secondary/transport-ca/accept",
+	}
+	_, err = core.switchedLockHandleRequest(ctx, transportCAAcceptReq, false)
+	if err == logical.ErrReadOnly {
+		t.Fatal("transport CA accept path should not be blocked by read-only enforcement")
+	}
+
 	// Verify that namespace-routed promote path is evaluated using the
 	// canonical routed path and not rejected as read-only.
 	namespacedPromoteReq := &logical.Request{
@@ -975,6 +987,9 @@ func TestDRIntegration_NamespacePathMatching(t *testing.T) {
 	if !isDRSecondaryAllowedPath("sys/replication/dr/secondary/promote") {
 		t.Error("root promote should be allowed")
 	}
+	if !isDRSecondaryAllowedPath("sys/replication/dr/secondary/transport-ca/accept") {
+		t.Error("transport CA accept should be allowed")
+	}
 	if !isDRSecondaryAllowedPath("sys/seal") {
 		t.Error("root seal should be allowed")
 	}
@@ -1344,6 +1359,10 @@ func TestDRIntegration_LoadConfigRestoresSecondaryClientCert(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to generate secondary client cert: %v", err)
 	}
+	primaryCAMaterial, err := generateDRTransportCAMaterial()
+	if err != nil {
+		t.Fatalf("failed to generate primary CA material: %v", err)
+	}
 
 	config := &DRConfig{
 		Mode:                  DRModeSecondary,
@@ -1352,7 +1371,7 @@ func TestDRIntegration_LoadConfigRestoresSecondaryClientCert(t *testing.T) {
 		ReplSalt:              replSalt,
 		PrimaryAddr:           "127.0.0.1:8201",
 		PrimaryAddrs:          []string{"127.0.0.1:8201"},
-		PrimaryCACert:         []byte("not-a-real-ca"),
+		PrimaryCACert:         primaryCAMaterial.ca.certDER,
 		SecondaryClientCert:   clientCertDER,
 		SecondaryClientKeyPEM: clientKeyPEM,
 	}
@@ -2722,7 +2741,7 @@ func TestDRIntegration_RangeReconciliationRemovesLocalOnlyKeys(t *testing.T) {
 	}
 
 	kid, vid := sec.scanner.ComputeItemFromEntry(localEntry)
-	checkpoint := &CheckpointResponse{CheckpointId: "cp-range-local-only", CommitIndex: 88}
+	checkpoint := drTestCheckpointResponse("cp-range-local-only", 88)
 
 	sec.client = &drRangeTestClient{
 		exchangeDirtyBitmapFn: func(_ context.Context, req *DirtyBitmapMessage, _ ...grpc.CallOption) (*DirtyBitmapMessage, error) {
@@ -2790,7 +2809,7 @@ func TestDRIntegration_RangeReconciliationDirtyBitmapFalseNegativeStillChecked(t
 	}
 
 	kid, vid := sec.scanner.ComputeItemFromEntry(localEntry)
-	checkpoint := &CheckpointResponse{CheckpointId: "cp-range-bitmap-false-negative", CommitIndex: 88}
+	checkpoint := drTestCheckpointResponse("cp-range-bitmap-false-negative", 88)
 	seenChecksumRanges := make(map[uint64]struct{}, drRangeMaxTotalRanges)
 
 	sec.client = &drRangeTestClient{
@@ -2869,7 +2888,7 @@ func TestDRIntegration_RangeReconciliationFinalizeFailureIsRetryable(t *testing.
 	}
 
 	kid, vid := sec.scanner.ComputeItemFromEntry(localEntry)
-	checkpoint := &CheckpointResponse{CheckpointId: "cp-range-finalize-retry", CommitIndex: 88}
+	checkpoint := drTestCheckpointResponse("cp-range-finalize-retry", 88)
 
 	sec.client = &drRangeTestClient{
 		exchangeDirtyBitmapFn: func(_ context.Context, req *DirtyBitmapMessage, _ ...grpc.CallOption) (*DirtyBitmapMessage, error) {
@@ -2971,7 +2990,7 @@ func TestDRIntegration_ResnapshotRejectsSilentFetchOmission(t *testing.T) {
 	leftDesc := reconciler.BuildRangeDigestFromIndex(remoteIndex, left)
 	rightDesc := reconciler.BuildRangeDigestFromIndex(remoteIndex, right)
 
-	checkpoint := &CheckpointResponse{CheckpointId: "cp-resnapshot-omission", CommitIndex: 88}
+	checkpoint := drTestCheckpointResponse("cp-resnapshot-omission", 88)
 	sec.client = &drRangeTestClient{
 		requestCheckpointFn: func(context.Context, *CheckpointRequest, ...grpc.CallOption) (*CheckpointResponse, error) {
 			return checkpoint, nil
@@ -3071,7 +3090,7 @@ func TestDRIntegration_RangeReconciliationRejectsIncompleteFetchBatch(t *testing
 			}
 
 			kid, vid := sec.scanner.ComputeItemFromEntry(localEntry)
-			checkpoint := &CheckpointResponse{CheckpointId: "cp-range-incomplete-" + tc.name, CommitIndex: 88}
+			checkpoint := drTestCheckpointResponse("cp-range-incomplete-"+tc.name, 88)
 
 			sec.client = &drRangeTestClient{
 				exchangeDirtyBitmapFn: func(_ context.Context, req *DirtyBitmapMessage, _ ...grpc.CallOption) (*DirtyBitmapMessage, error) {
@@ -3142,7 +3161,7 @@ func TestDRIntegration_RangeTaskEnforcesFetchedValueByteBudget(t *testing.T) {
 
 	rangeID := reconciler.RangeIDFromKID(kid)
 	parent := reconciler.SpanFromRangeID(rangeID)
-	checkpoint := &CheckpointResponse{CheckpointId: "cp-range-budget", CommitIndex: 88}
+	checkpoint := drTestCheckpointResponse("cp-range-budget", 88)
 	if err := sec.beginReconcileSession(checkpoint.CheckpointId, checkpoint.CommitIndex); err != nil {
 		t.Fatalf("failed to begin reconcile session: %v", err)
 	}
@@ -3236,7 +3255,7 @@ func TestDRIntegration_RangeReconciliationRejectsSilentFetchOmission(t *testing.
 	rangeID := reconciler.RangeIDFromKID(kid)
 	localChecksum, localCount := reconciler.ComputeRangeChecksum(localIndex, rangeID)
 
-	checkpoint := &CheckpointResponse{CheckpointId: "cp-range-silent-omission", CommitIndex: 88}
+	checkpoint := drTestCheckpointResponse("cp-range-silent-omission", 88)
 	sec.client = &drRangeTestClient{
 		exchangeDirtyBitmapFn: func(_ context.Context, req *DirtyBitmapMessage, _ ...grpc.CallOption) (*DirtyBitmapMessage, error) {
 			return &DirtyBitmapMessage{
@@ -3341,7 +3360,7 @@ func TestDRIntegration_RangeReconciliationRejectsIncompleteDigestCoverage(t *tes
 	rangeID := reconciler.RangeIDFromKID(kid)
 	localChecksum, localCount := reconciler.ComputeRangeChecksum(localIndex, rangeID)
 
-	checkpoint := &CheckpointResponse{CheckpointId: "cp-range-digest-gap", CommitIndex: 88}
+	checkpoint := drTestCheckpointResponse("cp-range-digest-gap", 88)
 	sec.client = &drRangeTestClient{
 		exchangeDirtyBitmapFn: func(_ context.Context, req *DirtyBitmapMessage, _ ...grpc.CallOption) (*DirtyBitmapMessage, error) {
 			return &DirtyBitmapMessage{
@@ -3531,7 +3550,7 @@ func TestDRIntegration_NoIndexAdvanceOnPartialFetchFailure(t *testing.T) {
 		KIDToKey: make(map[[32]byte]string),
 		Entries:  make(map[[32]byte]*physical.Entry),
 	}
-	checkpoint := &CheckpointResponse{CheckpointId: "cp-range-partial", CommitIndex: 88}
+	checkpoint := drTestCheckpointResponse("cp-range-partial", 88)
 
 	err := sec.runRangeReconciliation(context.Background(), checkpoint, localSet, time.Now())
 	if err == nil {

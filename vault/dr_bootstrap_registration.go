@@ -51,6 +51,9 @@ func drPrimaryAPIClientConfigFromActivationToken(token *DRActivationToken) drPri
 	if len(caBytes) == 0 {
 		caBytes = token.DRTransportCACert
 	}
+	if len(caBytes) == 0 && len(token.DRTransportCACerts) > 0 {
+		caBytes = token.DRTransportCACerts[0]
+	}
 	serverName := token.PrimaryAPIServerName
 	if serverName == "" {
 		serverName = deriveServerName(token.PrimaryAPIAddr)
@@ -261,11 +264,15 @@ func (m *drRelationshipManager) GenerateActivationToken(ctx context.Context) (*D
 		BootstrapToken: bootstrapToken,
 	}
 
-	// Include the DR transport CA cert so the secondary can verify
-	// the primary's TLS identity. The transport CA is the sole trust
-	// anchor for cross-cluster mTLS.
+	// Include the active DR transport CA and any staged/previous public CAs so
+	// the secondary can verify primary TLS identity during rotation overlap.
 	if m.transportCA != nil {
 		token.DRTransportCACert = m.transportCA.certDER
+		if bundle, err := loadDRTransportCABundle(m.core); err == nil && bundle != nil {
+			token.DRTransportCACerts = trustedDERFromTransportCABundle(bundle)
+		} else {
+			token.DRTransportCACerts = normalizeDRPrimaryCACerts(m.transportCA.certDER, nil)
+		}
 	}
 	// For API registration HTTPS verification, use the API listener chain CA
 	// where available; fall back to cluster CA if we cannot determine it.

@@ -18,7 +18,7 @@ import (
 )
 
 func TestDRPreSeedManifestValidationAcceptsMatchingFreshRelationship(t *testing.T) {
-	token, manifest, now := testDRPreSeedManifestFixture()
+	token, manifest, now := testDRPreSeedManifestFixture(t)
 
 	if err := validateDRPreSeedManifest(manifest, token, nil, now); err != nil {
 		t.Fatalf("expected valid pre-seed manifest, got: %v", err)
@@ -26,7 +26,7 @@ func TestDRPreSeedManifestValidationAcceptsMatchingFreshRelationship(t *testing.
 }
 
 func TestDRPreSeedManifestValidationRejectsRelationshipMismatch(t *testing.T) {
-	token, manifest, now := testDRPreSeedManifestFixture()
+	token, manifest, now := testDRPreSeedManifestFixture(t)
 	manifest.RelationshipID = "rel-other"
 
 	err := validateDRPreSeedManifest(manifest, token, nil, now)
@@ -36,7 +36,7 @@ func TestDRPreSeedManifestValidationRejectsRelationshipMismatch(t *testing.T) {
 }
 
 func TestDRPreSeedManifestValidationRejectsAlgorithmMismatch(t *testing.T) {
-	token, manifest, now := testDRPreSeedManifestFixture()
+	token, manifest, now := testDRPreSeedManifestFixture(t)
 	manifest.ChecksumAlgorithm = "crc64-old"
 
 	err := validateDRPreSeedManifest(manifest, token, nil, now)
@@ -46,7 +46,7 @@ func TestDRPreSeedManifestValidationRejectsAlgorithmMismatch(t *testing.T) {
 }
 
 func TestDRPreSeedManifestValidationRejectsMissingLocalOnlyScrubMetadata(t *testing.T) {
-	token, manifest, now := testDRPreSeedManifestFixture()
+	token, manifest, now := testDRPreSeedManifestFixture(t)
 	manifest.LocalOnlyScrubVersion = 0
 	manifest.LocalOnlyExactPaths = nil
 	manifest.LocalOnlyPrefixes = nil
@@ -58,7 +58,7 @@ func TestDRPreSeedManifestValidationRejectsMissingLocalOnlyScrubMetadata(t *test
 }
 
 func TestDRPreSeedManifestValidationRejectsStalePromotionLineage(t *testing.T) {
-	token, manifest, now := testDRPreSeedManifestFixture()
+	token, manifest, now := testDRPreSeedManifestFixture(t)
 	promotion := &DRPromotionRecord{
 		PromotionID:         "promotion-preseed-stale",
 		OldPrimaryClusterID: token.ClusterID,
@@ -73,7 +73,7 @@ func TestDRPreSeedManifestValidationRejectsStalePromotionLineage(t *testing.T) {
 }
 
 func TestDRPreSeedManifestValidationRejectsExpiredManifest(t *testing.T) {
-	token, manifest, now := testDRPreSeedManifestFixture()
+	token, manifest, now := testDRPreSeedManifestFixture(t)
 
 	err := validateDRPreSeedManifest(manifest, token, nil, now.Add(2*time.Hour))
 	if err == nil || !strings.Contains(err.Error(), "expired") {
@@ -81,8 +81,39 @@ func TestDRPreSeedManifestValidationRejectsExpiredManifest(t *testing.T) {
 	}
 }
 
+func TestDRPreSeedManifestValidationRejectsMissingProvenance(t *testing.T) {
+	token, manifest, now := testDRPreSeedManifestFixture(t)
+	manifest.ProvenanceSignature = nil
+
+	err := validateDRPreSeedManifest(manifest, token, nil, now)
+	if err == nil || !strings.Contains(err.Error(), "provenance signature") {
+		t.Fatalf("expected missing provenance rejection, got: %v", err)
+	}
+}
+
+func TestDRPreSeedManifestValidationRejectsTamperedProvenance(t *testing.T) {
+	token, manifest, now := testDRPreSeedManifestFixture(t)
+	manifest.BundleIntegritySHA256[0] ^= 0xff
+
+	err := validateDRPreSeedManifest(manifest, token, nil, now)
+	if err == nil || !strings.Contains(err.Error(), "provenance signature mismatch") {
+		t.Fatalf("expected provenance signature mismatch, got: %v", err)
+	}
+}
+
+func TestDRPreSeedManifestValidationRejectsWrongProvenanceCA(t *testing.T) {
+	token, manifest, now := testDRPreSeedManifestFixture(t)
+	otherCACert, _ := newTestDRTransportCACert(t)
+	token.DRTransportCACert = otherCACert.Raw
+
+	err := validateDRPreSeedManifest(manifest, token, nil, now)
+	if err == nil || !strings.Contains(err.Error(), "provenance key_id mismatch") {
+		t.Fatalf("expected provenance key_id mismatch, got: %v", err)
+	}
+}
+
 func TestDRPreSeedManifestValidationRejectsInvalidSegmentMetadata(t *testing.T) {
-	token, manifest, now := testDRPreSeedManifestFixture()
+	token, manifest, now := testDRPreSeedManifestFixture(t)
 	manifest.BundleFormat = drPreSeedBundleFormatSegmentedV1
 	manifest.BundleSegments = []DRPreSeedSegmentDescriptor{{
 		Index:      1,
@@ -101,7 +132,7 @@ func TestDRPreSeedManifestValidationRejectsInvalidSegmentMetadata(t *testing.T) 
 
 func TestDRRelationshipManagerValidatePreSeedManifestUsesPreservedPromotionLineage(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
-	token, manifest, now := testDRPreSeedManifestFixture()
+	token, manifest, now := testDRPreSeedManifestFixture(t)
 	mgr := newDRRelationshipManager(core, core.logger)
 	mgr.config = &DRConfig{
 		Mode: DRModeDisabled,
@@ -142,6 +173,7 @@ func TestDRPreSeedBundleValidationAcceptsSegmentedMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	bundle.Manifest.BundleIntegritySHA256 = sum
+	testSignDRPreSeedManifest(t, &bundle.Manifest, token)
 
 	if err := validateDRPreSeedBundle(bundle, token, nil, now); err != nil {
 		t.Fatalf("expected segmented pre-seed bundle to validate, got: %v", err)
@@ -162,6 +194,7 @@ func TestDRPreSeedBundleValidationRejectsSegmentMetadataMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	bundle.Manifest.BundleIntegritySHA256 = sum
+	testSignDRPreSeedManifest(t, &bundle.Manifest, token)
 
 	err = validateDRPreSeedBundle(bundle, token, nil, now)
 	if err == nil || !strings.Contains(err.Error(), "segment 0 metadata mismatch") {
@@ -344,6 +377,7 @@ func TestDRPreSeedBundleValidationRejectsLocalOnlyPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	bundle.Manifest.BundleIntegritySHA256 = sum
+	testSignDRPreSeedManifest(t, &bundle.Manifest, token)
 
 	err = validateDRPreSeedBundle(bundle, token, nil, now)
 	if err == nil || !strings.Contains(err.Error(), "local-only") {
@@ -370,6 +404,7 @@ func TestDRPreSeedBundleValidationRejectsBootstrapOwnedRootKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	bundle.Manifest.BundleIntegritySHA256 = sum
+	testSignDRPreSeedManifest(t, &bundle.Manifest, token)
 
 	err = validateDRPreSeedBundle(bundle, token, nil, now)
 	if err == nil || !strings.Contains(err.Error(), "local-only or excluded") {
@@ -562,7 +597,7 @@ func TestDRRelationshipManagerGenerateSegmentedPreSeedManifestAndSegment(t *test
 func TestDRPrimaryBuildPreSeedBundleRejectsMissingCheckpointArtifactRecord(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	ctx := context.Background()
-	token, _, _ := testDRPreSeedManifestFixture()
+	token, _, _ := testDRPreSeedManifestFixture(t)
 
 	primary := NewDRReplicationPrimary(core, token.ReplSalt, core.logger, nil)
 	primary.checkpointArtifacts = newDRCheckpointArtifactStore(core.logger, t.TempDir())
@@ -674,7 +709,7 @@ func TestDRRelationshipManagerImportPreSeedBundleReplacesReplicatedStorageAndAcc
 func TestDRRelationshipManagerAcceptPreSeedManifestRequiresConfirmations(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	ctx := context.Background()
-	token, manifest, now := testDRPreSeedManifestFixture()
+	token, manifest, now := testDRPreSeedManifestFixture(t)
 	mgr := newDRRelationshipManager(core, core.logger)
 
 	err := mgr.AcceptPreSeedManifest(ctx, manifest, token, now, false, true)
@@ -717,7 +752,7 @@ func TestDRPreSeedReconciliationSetFromBundle(t *testing.T) {
 func TestDRRelationshipManagerEnableSecondaryAppliesAcceptedPreSeedBaseline(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	ctx := context.Background()
-	token, manifest, now := testDRPreSeedManifestFixture()
+	token, manifest, now := testDRPreSeedManifestFixture(t)
 	mgr := newDRRelationshipManager(core, core.logger)
 
 	if err := mgr.AcceptPreSeedManifest(ctx, manifest, token, now, true, true); err != nil {
@@ -766,7 +801,7 @@ func TestDRRelationshipManagerEnableSecondaryAppliesAcceptedPreSeedBaseline(t *t
 func TestDRRelationshipManagerLoadConfigAppliesAcceptedPreSeedBaseline(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	ctx := context.Background()
-	token, manifest, now := testDRPreSeedManifestFixture()
+	token, manifest, now := testDRPreSeedManifestFixture(t)
 	mgr := newDRRelationshipManager(core, core.logger)
 
 	if err := mgr.AcceptPreSeedManifest(ctx, manifest, token, now, true, true); err != nil {
@@ -779,6 +814,7 @@ func TestDRRelationshipManagerLoadConfigAppliesAcceptedPreSeedBaseline(t *testin
 		ReplSalt:       token.ReplSalt,
 		PrimaryAddr:    token.PrimaryAddr,
 		PrimaryAddrs:   token.PrimaryAddrs,
+		PrimaryCACert:  token.DRTransportCACert,
 	}
 	if err := mgr.saveConfig(ctx); err != nil {
 		t.Fatalf("save secondary config failed: %v", err)
@@ -818,7 +854,7 @@ func TestDRRelationshipManagerLoadConfigAppliesAcceptedPreSeedBaseline(t *testin
 func TestDRRelationshipManagerEnableSecondaryRejectsMismatchedAcceptedPreSeed(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	ctx := context.Background()
-	token, manifest, now := testDRPreSeedManifestFixture()
+	token, manifest, now := testDRPreSeedManifestFixture(t)
 	mgr := newDRRelationshipManager(core, core.logger)
 
 	if err := mgr.AcceptPreSeedManifest(ctx, manifest, token, now, true, true); err != nil {
@@ -838,7 +874,7 @@ func TestDRRelationshipManagerEnableSecondaryRejectsMismatchedAcceptedPreSeed(t 
 func TestDRPreSeedBootstrapPurgeKeepsImportedReplicatedPlane(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	ctx := context.Background()
-	token, _, _ := testDRPreSeedManifestFixture()
+	token, _, _ := testDRPreSeedManifestFixture(t)
 	secondary := newDRReplicationSecondary(core, token.ReplSalt, token.RelationshipID, core.logger)
 	secondary.preSeedBaselineIndex.Store(42)
 
@@ -999,7 +1035,9 @@ func assertDRPreSeedOptimizerBaseline(t *testing.T, ctx context.Context, core *C
 	}
 }
 
-func testDRPreSeedManifestFixture() (*DRActivationToken, *DRPreSeedManifest, time.Time) {
+func testDRPreSeedManifestFixture(t *testing.T) (*DRActivationToken, *DRPreSeedManifest, time.Time) {
+	t.Helper()
+
 	now := time.Now().UTC()
 	replSalt := sha256.Sum256([]byte("preseed-test-repl-salt"))
 	token := &DRActivationToken{
@@ -1034,13 +1072,28 @@ func testDRPreSeedManifestFixture() (*DRActivationToken, *DRPreSeedManifest, tim
 		BundleIntegrityAlgorithm: drPreSeedBundleIntegrityAlgorithm,
 		BundleIntegritySHA256:    bundleHash[:],
 	}
+	testSignDRPreSeedManifest(t, manifest, token)
 	return token, manifest, now
+}
+
+func testSignDRPreSeedManifest(t *testing.T, manifest *DRPreSeedManifest, token *DRActivationToken) {
+	t.Helper()
+
+	caCert, caKey := newTestDRTransportCACert(t)
+	token.DRTransportCACert = caCert.Raw
+	if err := signDRPreSeedManifestProvenance(manifest, &drTransportCA{
+		cert:    caCert,
+		certDER: caCert.Raw,
+		key:     caKey,
+	}); err != nil {
+		t.Fatalf("failed to sign test pre-seed manifest: %v", err)
+	}
 }
 
 func testDRPreSeedBundleFixture(t *testing.T) (*DRActivationToken, *DRPreSeedBundle, time.Time) {
 	t.Helper()
 
-	token, manifest, now := testDRPreSeedManifestFixture()
+	token, manifest, now := testDRPreSeedManifestFixture(t)
 	scanner := drPreSeedScanner(token.ReplSalt, nil)
 	rawEntries := []struct {
 		key      string
@@ -1073,6 +1126,7 @@ func testDRPreSeedBundleFixture(t *testing.T) (*DRActivationToken, *DRPreSeedBun
 		t.Fatal(err)
 	}
 	bundle.Manifest.BundleIntegritySHA256 = sum
+	testSignDRPreSeedManifest(t, &bundle.Manifest, token)
 	return token, bundle, now
 }
 
@@ -1092,6 +1146,7 @@ func testDRPreSeedSegmentedBundleFixture(t *testing.T) (*DRActivationToken, *DRP
 		t.Fatal(err)
 	}
 	bundle.Manifest.BundleIntegritySHA256 = sum
+	testSignDRPreSeedManifest(t, &bundle.Manifest, token)
 
 	out := make([]*DRPreSeedSegment, 0, len(segments))
 	for i := range segments {

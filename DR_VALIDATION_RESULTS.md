@@ -64,6 +64,9 @@ Orchestrated smokes add scenario-specific files such as
 | Go-harness HA mixed-load smoke parity | `drmixed-20260602T055824Z` | Pass | The active `smoke` entrypoint ran through `scripts/dr-harness`, applied the constrained HA primary tuning profile, delegated the workload body to `dr-stress`, and completed a shortened 45s, 8-worker mixed workload with 5,475 operations, zero PUT/GET/status failures, zero dropped events, and 1s/1s sentinel convergence. Terminal verification passed primary API checks across 820 truth-log keys and active-secondary checkpoint verification on both secondaries with 1,024/1,024 matched ranges, zero missing/mismatched ranges, `physical_scan_used=false`, and `optimizer_reseeded=false`. This is harness parity evidence, not a throughput benchmark. |
 | Go-harness HA full mixed-load smoke | `drmixed-20260602T075024Z` | Pass with expected client transients | 900s, 48 workers, primary stepdown every 300s, constrained HA tuning, 79,053 operations, zero status failures, zero dropped events, and 1.0s/1.0s sentinel convergence. Both secondaries briefly entered reconciliation under saturated-ring pressure, returned to `streaming`, and ended with `lag_entries=0`. Terminal primary API verification passed across 7,094 truth-log keys, and both strict secondaries passed checkpoint verification with 1,024/1,024 matched ranges, zero missing/mismatched ranges, `physical_scan_used=false`, and `optimizer_reseeded=false`. Indexed repair ran without local KID fallback scans, full-bucket fallback, proof mismatches, load failures, or scan failures. PUT/GET failures were client-facing HA disruption noise. |
 | Go-harness HA dynamic tuning load | `tuning-ha-load-20260602T071619Z` | Pass with expected client transients | 900s, 36 workers, primary stepdown every 90s, constrained tuning at 60s, relaxed tuning at 180s, forced primary and secondary active handoff, 86,564 operations, zero status failures, zero dropped events, and sentinel convergence in 1.0s/59.0s. Terminal primary API verification passed across 7,663 truth-log keys, and both strict secondaries passed checkpoint verification with 1,024/1,024 matched ranges, zero missing/mismatched ranges, `physical_scan_used=false`, and `optimizer_reseeded=false`. The relaxed primary tuning write collided with HA active movement and succeeded after harness retry. PUT/GET failures were client-facing HA disruption noise. |
+| Go-harness HA DR transport CA rotation | `transport-ca-rotation-20260602T194455Z` | Pass | HA topology started from streaming secondaries, staged a replacement primary DR transport CA, accepted the staged trust bundle on both secondaries, activated the new CA, forced primary active handoff, accepted the activated bundle, retired the previous CA, rejected stale activated and stale staged bundles, forced another primary handoff plus secondary #2 active handoff, and passed checkpoint verification on both secondaries. This validates the local clustered lifecycle and HA transport restore path; longer soak coverage and operator overlap policy remain product work. |
+| Go-harness HA DR transport CA rotation under load | `transport-ca-rotation-load-20260602T201743Z` | Pass with expected client transients | Clean-reset 180s mixed read/write/status workload, 24 workers, primary stepdown requests every 60s, stage/activate/retire at 30/70/110s, 25,493 operations, 24 PUT failures, 31 GET failures, zero status failures, zero dropped events, and 1.0s/1.0s sentinel convergence. Both secondaries accepted staged, activated, and retired signed trust bundles; stale activated and staged bundles were rejected after retirement. Terminal primary API verification passed across 2,819 truth-log keys, and both strict secondaries passed checkpoint verification with 1,024/1,024 matched ranges, zero missing/mismatched ranges, `physical_scan_used=false`, and `optimizer_reseeded=false`. PUT/GET failures were client-facing HA disruption noise during stepdown windows. |
+| Go-harness HA DR transport CA repeated chain | `transport-ca-rotation-chain-20260602T211227Z` | Pass | Clean-reset clustered chain smoke ran three back-to-back stage/activate/retire cycles on the same DR relationships. Each cycle forced primary handoff after activation and secondary #2 active handoff after retirement. Current-generation stale stage and activated bundles were rejected; prior-generation stale bundles were replayed and rejected with cumulative checks 0, 3, and 6. Both strict secondaries passed final checkpoint verification at index 77 with 1,024/1,024 matched ranges, zero missing/mismatched ranges, `physical_scan_used=false`, and `optimizer_reseeded=false`. |
 | Quiescent reconnect | `quiescent-reconnect-20260531T204826Z` | Pass | Forced primary active handoff from `http://localhost:8800` to `http://localhost:8802`; both secondaries remained streaming with lag 0 and no reconciliation count increase. |
 | Fixture-backed async pre-seed smoke | `preseed-smoke-20260601T195421Z` | Pass | Single-node topology restored a reusable primary dataset fixture, configured fresh secondaries, created a fresh relationship, completed async segmented export planning, exported and staged 281 checkpoint-bound entries across 16 segments, wrote 64 post-export keys, enabled secondary #2 from checkpoint 178, and passed checkpoint verification at index 248 with streaming lag 0. |
 | Segmented pre-seed smoke | `preseed-smoke-20260601T184840Z` | Pass | Single-node topology wrote 64 seed keys, created a segmented pre-seed export plan for a fresh relationship, exported and staged 151 checkpoint-bound entries across 7 segments, completed import on disabled secondary #2, enabled from checkpoint 110, replayed the post-export delta, and passed checkpoint verification at index 113 with zero missing or mismatched ranges. Secondary #2 ended `streaming` with `lag_entries=0`, `last_applied_index=113`, zero scan failures, and zero local KID-index fallback scans. |
@@ -101,9 +104,9 @@ The curated set supports these current claims:
   active handoff, and checkpoint verification after the handoff.
 - The pre-seed artifact model now validates an explicit artifact format,
   deterministic segment descriptors, checkpoint-bound segment payloads, and
-  durable secondary-side segment staging across manager restart. Larger
-  datasets, external artifact storage, and signed provenance remain future
-  validation targets.
+  durable secondary-side segment staging across manager restart. Manifest
+  provenance is unit-gated with primary DR transport CA signatures. Larger
+  datasets and external artifact storage remain future validation targets.
 - Fixture-backed pre-seed can now take the stream-first catch-up path when the
   primary still retains journal coverage from the accepted checkpoint baseline.
   The current 100k fixture smoke caught up a 20k-key post-export delta with
@@ -139,6 +142,22 @@ The curated set supports these current claims:
   primary and promoted-primary lineages fenced.
 - The broad engine/runtime matrix has passed across failover and reseed for the
   current local feature set.
+- DR transport CA rotation now has unit evidence for primary stage/read,
+  activate, retire-previous, secondary signed-bundle accept, active CA update,
+  tamper rejection, active/staged primary leaf verification, matched CA identity
+  binding for `SyncKeyring`, stale cached-leaf rejection after CA retirement,
+  and rejection of heartbeat-advertised leaves without a configured CA.
+- Clustered DR transport CA rotation now has HA smoke evidence for staged,
+  activated, and retired trust bundles across primary and secondary active
+  handoff, including stale bundle rejection and strict-secondary checkpoint
+  verification after the final handoff.
+- Clustered DR transport CA rotation also has clean-reset mixed-load evidence
+  across stage, activate, retire, stale-bundle rejection, workload stepdown
+  pressure, primary API verification, and strict-secondary checkpoint
+  verification.
+- Clustered DR transport CA rotation has repeated-chain evidence for three
+  back-to-back rotations on the same relationships, including prior-generation
+  stale bundle replay rejection and strict-secondary checkpoint verification.
 - Secondary API read-serving semantics are intentionally outside the strict
   warm-standby surface. Terminal secondary correctness should be cited through
   checkpoint verification, or through API verification after promotion.
@@ -149,11 +168,11 @@ The curated set supports these current claims:
 |---|---|---|
 | `lastAppliedIndex` advances only after durable apply | HA steady-state soak, HA mixed-load smoke, outage/reconnect smokes, and terminal verification passed in the curated runs. | Production availability under active handoff is not an SLO yet. |
 | Stream replay is used only when journal or buffer coverage is proven | Within-horizon secondary outage recovered through journal replay without reconciliation; beyond-horizon outage forced reconcile. | Retention defaults for offline secondaries over long periods need production sizing. |
-| Checkpoint repair is bound to checkpoint tuple and immutable artifact state | Indexed repair, strict-secondary checkpoint verification, pre-seed smokes, and the low-cap fragmented-fanout smoke passed without physical-scan fallback in current evidence. | Larger keyspaces, WAN/proxy profiles, and production fanout defaults remain unmeasured. |
+| Checkpoint repair is bound to checkpoint tuple and immutable artifact state | Indexed repair, strict-secondary checkpoint verification, pre-seed smokes, pre-seed provenance unit tests, and the low-cap fragmented-fanout smoke passed without physical-scan fallback in current evidence. | Larger keyspaces, WAN/proxy profiles, external artifact custody, and production fanout defaults remain unmeasured. |
 | Delete inference happens only after completeness verification | Range reconciliation and fetch proof tests cover duplicate, missing, failed, out-of-span, and digest-mismatch cases. | Larger keyspace and WAN/proxy profiles remain untested. |
 | Optimizers are not authority | Flat accumulator restore, local KID-index repair, dirty bitmap hinting, and pre-seed baseline runs all fall back or verify before advancing. | Local KID-index metadata write pressure and optimizer seeding after resnapshot remain optimization targets. |
 | Strict secondaries are warm standbys, not read replicas | Current HA smokes use checkpoint verification for secondary terminal correctness. | Supported pre-promotion read-serving is a separate future product decision. |
-| Relationship authorization guards every DR data-plane RPC | Security test slices cover gRPC authz, revocation, bootstrap, rotation, and `SyncKeyring` binding. | DR transport CA rotation and independent security review remain open. |
+| Relationship authorization guards every DR data-plane RPC | Security test slices cover gRPC authz, revocation, bootstrap, secondary credential rotation, DR transport CA rotation lifecycle, clustered CA-rotation HA smoke, clustered CA-rotation under load, and `SyncKeyring` binding. | Independent security review remains open. |
 | Primary and secondary resource usage must be bounded independently | Tuning validation, checkpoint artifact admission tests, S20 secondary budget exhaustion, S21 primary checkpoint/digest/fetch pressure unit gates, and clustered HA reconcile-budget pressure smoke exist. | Primary rejection/fetch-response budget paths remain unit-gated; production defaults still need measured sizing. |
 
 ## Performance Evidence
@@ -213,6 +232,9 @@ behavior without explaining their age and purpose.
   and HA validation of stream-first catch-up. The local HA smoke already covers
   segmented post-seed delta catch-up, checkpoint verification, and post-accept
   HA handoff.
+- Extend DR transport CA rotation from local clustered lifecycle/load/chain
+  coverage to explicit overlap timing policy, longer soak coverage, and
+  operator/audit runbook validation.
 - Extend S21 primary pressure evidence beyond unit gates if we add first-class
   tuning knobs for clustered primary rejection/fetch-response budget paths. The
   current clustered budget smoke proves primary pressure counters move during a

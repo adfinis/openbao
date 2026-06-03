@@ -89,13 +89,35 @@ The seed manifest must bind:
 - replicated-path coverage metadata and local-only scrub version
 - optional optimizer metadata version and seed cursor
 - expiration or stale-seed acknowledgement policy
-- signed provenance or equivalent primary-authorized proof in the production
-  shape
+- primary-authorized provenance
 
 Pre-seed validation fails closed if the manifest does not match the activation
 token, primary identity, checkpoint tuple, artifact format, projection
 versions, local-only exclusion version, or current lineage. Seed material from
 stale pre-promotion lineage must be rejected.
+
+## Manifest Provenance
+
+The manifest carries primary-issued provenance. The primary signs a canonical
+manifest payload with the DR transport CA private key after the final
+`bundle_integrity_sha256`, segment descriptors, range metadata, local-only
+scrub metadata, relationship ID, primary cluster ID, checkpoint ID, checkpoint
+index, and expiry are known.
+
+The secondary verifies that signature with the DR transport CA certificate
+pinned in the activation token. This means external artifact storage is not
+trusted for integrity or authority: it may store or transport bytes, but it
+cannot mint a manifest for another relationship, checkpoint, primary, range
+layout, bundle hash, or local-only policy without the primary DR transport CA
+private key.
+
+Bundle and segment validation remain separate:
+
+- provenance proves the primary authorized the manifest metadata;
+- bundle integrity proves the inline bundle entries match that manifest;
+- segment descriptors prove each staged segment matches the manifest; and
+- KID/VID recomputation proves entries match the activation token's
+  replication salt and ciphertext value domain.
 
 ## Artifact Formats
 
@@ -136,7 +158,9 @@ The prototype exposes this lifecycle:
 
 The production direction is to keep this first-class API surface, but move
 large transfer bytes to external artifact storage or streaming segment
-retrieval with signed provenance.
+retrieval. External storage remains untrusted; imports still require manifest
+provenance, segment integrity, relationship/activation-token binding, and
+local-only scrub validation.
 
 ## Secondary Import and Enable
 

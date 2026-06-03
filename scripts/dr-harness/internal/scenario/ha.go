@@ -84,6 +84,41 @@ type TuningLoadConfig struct {
 	MaxWait          time.Duration
 }
 
+type TransportCALoadConfig struct {
+	RootDir          string
+	Topology         string
+	EnvFile          string
+	ResultsDir       string
+	DRStressBin      string
+	Timeout          time.Duration
+	HTTPTimeout      time.Duration
+	Reset            bool
+	Build            bool
+	Duration         time.Duration
+	Concurrency      int
+	StepdownInterval time.Duration
+	StageAfter       time.Duration
+	ActivateAfter    time.Duration
+	RetireAfter      time.Duration
+	ProgressInterval time.Duration
+	MonitorInterval  time.Duration
+	MaxWait          time.Duration
+	TuningProfile    string
+}
+
+type TransportCAChainConfig struct {
+	RootDir     string
+	Topology    string
+	EnvFile     string
+	ResultsDir  string
+	Timeout     time.Duration
+	HTTPTimeout time.Duration
+	Reset       bool
+	Build       bool
+	Rotations   int
+	MaxWait     time.Duration
+}
+
 type harnessRuntime struct {
 	layout           topology.Layout
 	primary          *bao.Client

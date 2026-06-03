@@ -12,7 +12,6 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash/crc64"
@@ -54,6 +53,8 @@ func (e *errDRRedirect) Error() string {
 var (
 	errDRSecondaryApplyStopped            = errors.New("DR secondary stream apply stopped")
 	errDRIndexedBucketRepairProofMismatch = errors.New("flat accumulator indexed-bucket repair proof mismatch")
+	errDRInvalidCheckpointResponse        = errors.New("invalid DR checkpoint response")
+	errDRUnsupportedCheckpointRangePlan   = errors.New("unsupported DR checkpoint range_plan_version")
 )
 
 type drIndexedBucketRepairProofMismatchError struct {
@@ -466,8 +467,16 @@ type drReplicationSecondary struct {
 	// replSalt is the shared HMAC key for KID derivation.
 	replSalt []byte
 
-	// primaryCACert is the primary's TLS CA certificate for mTLS.
+	// primaryCAMu protects primaryCACert and primaryCACerts.
+	primaryCAMu sync.RWMutex
+
+	// primaryCACert is the active primary TLS CA certificate for mTLS and
+	// SyncKeyring primary identity binding.
 	primaryCACert []byte
+
+	// primaryCACerts is the ordered trusted primary TLS CA set. The active CA
+	// is first, followed by staged/previous CAs accepted during rotation.
+	primaryCACerts [][]byte
 
 	// trustedPrimaryCerts holds primary cluster TLS certificates
 	// keyed by SHA-256 fingerprint. Seeded from the activation
@@ -787,7 +796,8 @@ func (s *drReplicationSecondary) Connect(ctx context.Context, primaryAddr string
 	primaryAddr = strings.TrimPrefix(primaryAddr, "https://")
 	primaryAddr = strings.TrimPrefix(primaryAddr, "http://")
 
-	if len(s.primaryCACert) == 0 {
+	activeCA, trustedCAs := s.primaryCATrustDER()
+	if len(activeCA) == 0 && len(trustedCAs) == 0 {
 		return fmt.Errorf("dr-secondary: missing primary CA certificate; mTLS is required")
 	}
 
@@ -796,7 +806,7 @@ func (s *drReplicationSecondary) Connect(ctx context.Context, primaryAddr string
 		return fmt.Errorf("dr-secondary: cluster listener not available; mTLS transport cannot be established")
 	}
 
-	parsedCert, err := x509.ParseCertificate(s.primaryCACert)
+	parsedCert, parsedCerts, err := parseDRPrimaryCACerts(activeCA, trustedCAs)
 	if err != nil {
 		return fmt.Errorf("dr-secondary: failed to parse primary CA cert: %w", err)
 	}
@@ -806,12 +816,13 @@ func (s *drReplicationSecondary) Connect(ctx context.Context, primaryAddr string
 	if s.trustedPrimaryCerts == nil {
 		s.trustedPrimaryCerts = make(map[string]*trustedPrimaryCert)
 	}
-	initTrustedPool(s.trustedPrimaryCerts, parsedCert)
+	initTrustedPoolFromCAs(s.trustedPrimaryCerts, parsedCerts)
 	s.trustedPrimaryCertsMu.Unlock()
 
 	client := &drReplicationClusterClient{
 		core:           s.core,
 		primaryCACert:  parsedCert,
+		primaryCACerts: parsedCerts,
 		logger:         s.logger,
 		trustedCertsMu: &s.trustedPrimaryCertsMu,
 		trustedCerts:   s.trustedPrimaryCerts,
@@ -1278,6 +1289,33 @@ func (s *drReplicationSecondary) localKIDIndexOptimizerStatus() (fallbackReason,
 	return s.lastLocalKIDIndexFallbackScanReason, s.lastLocalKIDIndexInvalidationReason
 }
 
+func validateDRCheckpointResponse(checkpoint *CheckpointResponse) error {
+	if checkpoint == nil {
+		return fmt.Errorf("%w: response is nil", errDRInvalidCheckpointResponse)
+	}
+	if checkpoint.GetCheckpointId() == "" {
+		return fmt.Errorf("%w: checkpoint_id is required", errDRInvalidCheckpointResponse)
+	}
+	if checkpoint.GetCommitIndex() == 0 {
+		return fmt.Errorf("%w: commit_index is required", errDRInvalidCheckpointResponse)
+	}
+	if got := checkpoint.GetRangePlanVersion(); got != reconciler.RangePlanVersion {
+		return fmt.Errorf("%w: got %d want %d", errDRUnsupportedCheckpointRangePlan, got, reconciler.RangePlanVersion)
+	}
+	return nil
+}
+
+func drCheckpointValidationReason(err error) string {
+	switch {
+	case errors.Is(err, errDRUnsupportedCheckpointRangePlan):
+		return "unsupported_range_plan_version"
+	case err != nil:
+		return "invalid_checkpoint"
+	default:
+		return ""
+	}
+}
+
 func (s *drReplicationSecondary) VerifyCheckpoint(ctx context.Context) (*DRSecondaryCheckpointVerificationResult, error) {
 	result := &DRSecondaryCheckpointVerificationResult{
 		State:          s.State().String(),
@@ -1312,12 +1350,14 @@ func (s *drReplicationSecondary) VerifyCheckpoint(ctx context.Context) (*DRSecon
 	if err != nil {
 		return result, fmt.Errorf("checkpoint verification request checkpoint: %w", err)
 	}
-	if checkpoint == nil || checkpoint.CheckpointId == "" || checkpoint.CommitIndex == 0 {
-		result.Reason = "invalid_checkpoint"
+	if checkpoint != nil {
+		result.CheckpointID = checkpoint.CheckpointId
+		result.CheckpointIndex = checkpoint.CommitIndex
+	}
+	if err := validateDRCheckpointResponse(checkpoint); err != nil {
+		result.Reason = drCheckpointValidationReason(err)
 		return result, nil
 	}
-	result.CheckpointID = checkpoint.CheckpointId
-	result.CheckpointIndex = checkpoint.CommitIndex
 
 	if accumulatorIndex != checkpoint.CommitIndex {
 		result.Reason = "accumulator_checkpoint_index_mismatch"
@@ -2352,6 +2392,49 @@ func (s *drReplicationSecondary) applyRuntimeTuning(cfg *DRConfig) {
 	}
 }
 
+func (s *drReplicationSecondary) primaryCATrustDER() ([]byte, [][]byte) {
+	if s == nil {
+		return nil, nil
+	}
+	s.primaryCAMu.RLock()
+	defer s.primaryCAMu.RUnlock()
+	active := append([]byte(nil), s.primaryCACert...)
+	trusted := normalizeDRPrimaryCACerts(active, s.primaryCACerts)
+	return active, trusted
+}
+
+func (s *drReplicationSecondary) setPrimaryCATrustDER(active []byte, trusted [][]byte) error {
+	if s == nil {
+		return nil
+	}
+	trusted = normalizeDRPrimaryCACerts(active, trusted)
+	if len(active) == 0 && len(trusted) > 0 {
+		active = trusted[0]
+	}
+
+	var (
+		activeCert *x509.Certificate
+		trustCerts []*x509.Certificate
+		err        error
+	)
+	if len(active) > 0 || len(trusted) > 0 {
+		activeCert, trustCerts, err = parseDRPrimaryCACerts(active, trusted)
+		if err != nil {
+			return err
+		}
+	}
+
+	s.primaryCAMu.Lock()
+	s.primaryCACert = append([]byte(nil), active...)
+	s.primaryCACerts = normalizeDRPrimaryCACerts(active, trusted)
+	s.primaryCAMu.Unlock()
+
+	if cl := s.drClusterClient; cl != nil {
+		cl.updatePrimaryTrustAnchors(activeCert, trustCerts)
+	}
+	return nil
+}
+
 func (s *drReplicationSecondary) rpcContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	deadline := s.rpcDeadline
 	if deadline <= 0 {
@@ -2732,6 +2815,9 @@ func (s *drReplicationSecondary) performResnapshot(ctx context.Context, reason s
 	if err != nil {
 		return fmt.Errorf("failed to request checkpoint for resnapshot: %w", err)
 	}
+	if err := validateDRCheckpointResponse(checkpoint); err != nil {
+		return fmt.Errorf("failed to validate checkpoint for resnapshot: %w", err)
+	}
 
 	if err := s.beginReconcileSession(checkpoint.CheckpointId, checkpoint.CommitIndex); err != nil {
 		return fmt.Errorf("failed to begin reconcile session: %w", err)
@@ -3029,13 +3115,13 @@ func (s *drReplicationSecondary) syncKeyringFromPrimary(ctx context.Context, boo
 		cfg := mgr.Config()
 		unwrapClusterID = cfg.ClusterID
 	}
-	if len(s.primaryCACert) > 0 {
-		if caCert, parseErr := x509.ParseCertificate(s.primaryCACert); parseErr == nil {
-			// Compute SPKI hash to match what the primary used.
-			if spki, spkiErr := x509.MarshalPKIXPublicKey(caCert.PublicKey); spkiErr == nil {
-				h := sha256.Sum256(spki)
-				unwrapPrimaryIdentity = hex.EncodeToString(h[:])
-			}
+	if s.drClusterClient != nil {
+		unwrapPrimaryIdentity = s.drClusterClient.LastPrimaryCAIdentity()
+	}
+	activeCA, _ := s.primaryCATrustDER()
+	if unwrapPrimaryIdentity == "" && len(activeCA) > 0 {
+		if caCert, parseErr := x509.ParseCertificate(activeCA); parseErr == nil {
+			unwrapPrimaryIdentity = drTransportCAKeyID(caCert)
 		}
 	}
 	unwrapSecondaryFP := ""
@@ -4646,6 +4732,9 @@ func (s *drReplicationSecondary) runReconciliation(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to request checkpoint: %w", err)
 	}
+	if err := validateDRCheckpointResponse(checkpoint); err != nil {
+		return fmt.Errorf("failed to validate checkpoint: %w", err)
+	}
 	s.logger.Info("checkpoint established",
 		"checkpoint_id", checkpoint.CheckpointId,
 		"primary_commit_index", checkpoint.CommitIndex)
@@ -6084,6 +6173,9 @@ func drFetchedChangeAppliesToStorage(change *EntryChange, kidToKey map[[32]byte]
 }
 
 func (s *drReplicationSecondary) runRangeReconciliation(ctx context.Context, checkpoint *CheckpointResponse, localSet *reconciler.ReconciliationSet, startTime time.Time) error {
+	if err := validateDRCheckpointResponse(checkpoint); err != nil {
+		return err
+	}
 	ownedSession := false
 	if err := s.assertActiveCheckpoint(checkpoint.CheckpointId, checkpoint.CommitIndex); err != nil {
 		if beginErr := s.beginReconcileSession(checkpoint.CheckpointId, checkpoint.CommitIndex); beginErr != nil {

@@ -44,6 +44,21 @@ func main() {
 			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 			os.Exit(1)
 		}
+	case "transport-ca-rotation-smoke":
+		if err := runTransportCARotationSmoke(ctx, os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+			os.Exit(1)
+		}
+	case "transport-ca-rotation-load-smoke":
+		if err := runTransportCARotationLoadSmoke(ctx, os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+			os.Exit(1)
+		}
+	case "transport-ca-rotation-chain-smoke":
+		if err := runTransportCARotationChainSmoke(ctx, os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+			os.Exit(1)
+		}
 	case "secondary-outage-smoke":
 		if err := runSecondaryOutage(ctx, os.Args[2:], false, false, false, "secondary-outage"); err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
@@ -94,6 +109,9 @@ func usage() {
   dr-harness preseed-smoke [options]
   dr-harness quiescent-reconnect-smoke [options]
   dr-harness accumulator-cold-restart-smoke [options]
+  dr-harness transport-ca-rotation-smoke [options]
+  dr-harness transport-ca-rotation-load-smoke [options]
+  dr-harness transport-ca-rotation-chain-smoke [options]
   dr-harness secondary-outage-smoke [options]
   dr-harness secondary-outage-reconcile-smoke [options]
   dr-harness indexed-repair-smoke [options]
@@ -107,6 +125,9 @@ Commands:
   preseed-smoke                     Run the segmented DR pre-seed smoke scenario
   quiescent-reconnect-smoke         Verify HA active handoff avoids scanned reconciliation
   accumulator-cold-restart-smoke    Verify persisted accumulator restore after secondary restart
+  transport-ca-rotation-smoke       Verify staged DR transport CA rotation across HA reconnects
+  transport-ca-rotation-load-smoke  Verify DR transport CA rotation under HA mixed load
+  transport-ca-rotation-chain-smoke Verify repeated DR transport CA rotations on one relationship
   secondary-outage-smoke            Verify within-horizon replay after secondary outage
   secondary-outage-reconcile-smoke  Verify out-of-horizon checkpoint reconciliation
   indexed-repair-smoke              Verify indexed repair during out-of-horizon reconciliation
@@ -319,6 +340,132 @@ func runAccumulatorColdRestart(ctx context.Context, args []string) error {
 	finalize()
 	cfg.StopSeconds = time.Duration(*stopSeconds) * time.Second
 	return scenario.RunAccumulatorColdRestart(ctx, cfg)
+}
+
+func runTransportCARotationSmoke(ctx context.Context, args []string) error {
+	cfg := defaultHAConfig()
+	cfg.Timeout = 360 * time.Second
+	fs := flag.NewFlagSet("transport-ca-rotation-smoke", flag.ExitOnError)
+	finalize := bindHAFlags(fs, &cfg)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	finalize()
+	return scenario.RunTransportCARotationSmoke(ctx, cfg)
+}
+
+func runTransportCARotationLoadSmoke(ctx context.Context, args []string) error {
+	cfg := scenario.TransportCALoadConfig{
+		RootDir:          defaultRootDir(),
+		Topology:         "ha",
+		Timeout:          600 * time.Second,
+		HTTPTimeout:      600 * time.Second,
+		Reset:            true,
+		Duration:         240 * time.Second,
+		Concurrency:      36,
+		StepdownInterval: 60 * time.Second,
+		StageAfter:       45 * time.Second,
+		ActivateAfter:    90 * time.Second,
+		RetireAfter:      135 * time.Second,
+		ProgressInterval: 10 * time.Second,
+		MonitorInterval:  2 * time.Second,
+		MaxWait:          600 * time.Second,
+		TuningProfile:    "constrained",
+	}
+	cfg.EnvFile = filepath.Join(cfg.RootDir, ".dr-test.env")
+	cfg.ResultsDir = filepath.Join(cfg.RootDir, "dr-stress-results")
+	cfg.DRStressBin = filepath.Join(cfg.RootDir, "bin", "dr-stress")
+
+	fs := flag.NewFlagSet("transport-ca-rotation-load-smoke", flag.ExitOnError)
+	fs.StringVar(&cfg.RootDir, "root", cfg.RootDir, "OpenBao repository root")
+	fs.StringVar(&cfg.EnvFile, "env-file", cfg.EnvFile, "DR local env file")
+	fs.StringVar(&cfg.ResultsDir, "results-dir", cfg.ResultsDir, "Result artifact directory")
+	fs.StringVar(&cfg.DRStressBin, "dr-stress-bin", cfg.DRStressBin, "dr-stress binary path")
+	fs.StringVar(&cfg.Topology, "topology", cfg.Topology, "Topology: ha")
+	fs.BoolVar(&cfg.Reset, "reset", cfg.Reset, "Reset topology before running")
+	noReset := fs.Bool("no-reset", false, "Do not reset topology before running")
+	fs.BoolVar(&cfg.Build, "build", false, "Build docker image before reset")
+	duration := fs.Int("duration", int(cfg.Duration.Seconds()), "Workload duration in seconds")
+	concurrency := fs.Int("concurrency", cfg.Concurrency, "Workload concurrency")
+	stepdown := fs.Int("stepdown-interval", int(cfg.StepdownInterval.Seconds()), "Primary stepdown interval seconds for dr-stress")
+	stageAfter := fs.Int("stage-after", int(cfg.StageAfter.Seconds()), "Seconds after workload start before staging replacement transport CA")
+	activateAfter := fs.Int("activate-after", int(cfg.ActivateAfter.Seconds()), "Seconds after workload start before activating replacement transport CA")
+	retireAfter := fs.Int("retire-after", int(cfg.RetireAfter.Seconds()), "Seconds after workload start before retiring previous transport CA")
+	progress := fs.Int("progress-interval", int(cfg.ProgressInterval.Seconds()), "dr-stress progress interval seconds")
+	monitor := fs.Int("monitor-interval", int(cfg.MonitorInterval.Seconds()), "dr-stress monitor interval seconds")
+	maxWait := fs.Int("max-wait-seconds", int(cfg.MaxWait.Seconds()), "Convergence timeout seconds")
+	timeout := fs.Int("timeout", int(cfg.Timeout.Seconds()), "Scenario timeout seconds")
+	fs.StringVar(&cfg.TuningProfile, "tuning-profile", cfg.TuningProfile, "Initial DR tuning profile: constrained|relaxed|out-of-horizon|none")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *noReset {
+		cfg.Reset = false
+	}
+	cfg.RootDir = filepath.Clean(cfg.RootDir)
+	if !filepath.IsAbs(cfg.EnvFile) {
+		cfg.EnvFile = filepath.Join(cfg.RootDir, cfg.EnvFile)
+	}
+	if !filepath.IsAbs(cfg.ResultsDir) {
+		cfg.ResultsDir = filepath.Join(cfg.RootDir, cfg.ResultsDir)
+	}
+	if !filepath.IsAbs(cfg.DRStressBin) {
+		cfg.DRStressBin = filepath.Join(cfg.RootDir, cfg.DRStressBin)
+	}
+	cfg.Duration = time.Duration(*duration) * time.Second
+	cfg.Concurrency = *concurrency
+	cfg.StepdownInterval = time.Duration(*stepdown) * time.Second
+	cfg.StageAfter = time.Duration(*stageAfter) * time.Second
+	cfg.ActivateAfter = time.Duration(*activateAfter) * time.Second
+	cfg.RetireAfter = time.Duration(*retireAfter) * time.Second
+	cfg.ProgressInterval = time.Duration(*progress) * time.Second
+	cfg.MonitorInterval = time.Duration(*monitor) * time.Second
+	cfg.MaxWait = time.Duration(*maxWait) * time.Second
+	cfg.Timeout = time.Duration(*timeout) * time.Second
+	return scenario.RunTransportCARotationLoadSmoke(ctx, cfg)
+}
+
+func runTransportCARotationChainSmoke(ctx context.Context, args []string) error {
+	cfg := scenario.TransportCAChainConfig{
+		RootDir:     defaultRootDir(),
+		Topology:    "ha",
+		Timeout:     600 * time.Second,
+		HTTPTimeout: 600 * time.Second,
+		Reset:       true,
+		Rotations:   3,
+		MaxWait:     600 * time.Second,
+	}
+	cfg.EnvFile = filepath.Join(cfg.RootDir, ".dr-test.env")
+	cfg.ResultsDir = filepath.Join(cfg.RootDir, "dr-stress-results")
+
+	fs := flag.NewFlagSet("transport-ca-rotation-chain-smoke", flag.ExitOnError)
+	fs.StringVar(&cfg.RootDir, "root", cfg.RootDir, "OpenBao repository root")
+	fs.StringVar(&cfg.EnvFile, "env-file", cfg.EnvFile, "DR local env file")
+	fs.StringVar(&cfg.ResultsDir, "results-dir", cfg.ResultsDir, "Result artifact directory")
+	fs.StringVar(&cfg.Topology, "topology", cfg.Topology, "Topology: ha")
+	fs.BoolVar(&cfg.Reset, "reset", cfg.Reset, "Reset topology before running")
+	noReset := fs.Bool("no-reset", false, "Do not reset topology before running")
+	fs.BoolVar(&cfg.Build, "build", false, "Build docker image before reset")
+	rotations := fs.Int("rotations", cfg.Rotations, "Number of transport CA rotations to perform on the same relationship")
+	maxWait := fs.Int("max-wait-seconds", int(cfg.MaxWait.Seconds()), "Convergence timeout seconds")
+	timeout := fs.Int("timeout", int(cfg.Timeout.Seconds()), "Scenario timeout seconds")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *noReset {
+		cfg.Reset = false
+	}
+	cfg.RootDir = filepath.Clean(cfg.RootDir)
+	if !filepath.IsAbs(cfg.EnvFile) {
+		cfg.EnvFile = filepath.Join(cfg.RootDir, cfg.EnvFile)
+	}
+	if !filepath.IsAbs(cfg.ResultsDir) {
+		cfg.ResultsDir = filepath.Join(cfg.RootDir, cfg.ResultsDir)
+	}
+	cfg.Rotations = *rotations
+	cfg.MaxWait = time.Duration(*maxWait) * time.Second
+	cfg.Timeout = time.Duration(*timeout) * time.Second
+	return scenario.RunTransportCARotationChainSmoke(ctx, cfg)
 }
 
 func runSecondaryOutage(ctx context.Context, args []string, expectReconcile, expectBudget, lowFanout bool, runPrefix string) error {

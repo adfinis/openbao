@@ -6,7 +6,11 @@ package vault
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -26,6 +30,7 @@ const (
 	drPreSeedAcceptedRecordVersion         = 1
 	drPreSeedLocalOnlyScrubVersion         = 1
 	drPreSeedBundleIntegrityAlgorithm      = "sha256"
+	drPreSeedProvenanceAlgorithm           = "ecdsa-sha256-dr-transport-ca-v1"
 	drPreSeedBundleFormatInlineJSONV1      = "inline-json-v1"
 	drPreSeedBundleFormatSegmentedV1       = "segmented-json-v1"
 	drPreSeedAcceptedStoragePath           = "core/cluster/local/dr/preseed/accepted"
@@ -82,6 +87,9 @@ type DRPreSeedManifest struct {
 	BundleSegments           []DRPreSeedSegmentDescriptor `json:"bundle_segments,omitempty"`
 	BundleIntegrityAlgorithm string                       `json:"bundle_integrity_algorithm"`
 	BundleIntegritySHA256    []byte                       `json:"bundle_integrity_sha256"`
+	ProvenanceAlgorithm      string                       `json:"provenance_algorithm"`
+	ProvenanceKeyID          string                       `json:"provenance_key_id"`
+	ProvenanceSignature      []byte                       `json:"provenance_signature"`
 }
 
 // DRPreSeedBundle is a checkpoint-bound, relationship-bound physical seed
@@ -187,6 +195,33 @@ type drPreSeedBundleIntegrityPayloadEntry struct {
 	ValueSHA256 []byte `json:"value_sha256"`
 }
 
+type drPreSeedManifestProvenancePayload struct {
+	Version                  int                          `json:"version"`
+	PrimaryClusterID         string                       `json:"primary_cluster_id"`
+	RelationshipID           string                       `json:"relationship_id"`
+	CheckpointID             string                       `json:"checkpoint_id"`
+	CheckpointIndex          uint64                       `json:"checkpoint_index"`
+	CreatedAtUnix            int64                        `json:"created_at_unix"`
+	ExpiresAtUnix            int64                        `json:"expires_at_unix,omitempty"`
+	ReplSaltSHA256           []byte                       `json:"repl_salt_sha256"`
+	RangePlanVersion         uint32                       `json:"range_plan_version"`
+	RangeBits                int                          `json:"range_bits"`
+	RangeCount               int                          `json:"range_count"`
+	ChecksumAlgorithm        string                       `json:"checksum_algorithm"`
+	ValueDomain              string                       `json:"value_domain"`
+	LocalOnlyScrubVersion    int                          `json:"local_only_scrub_version"`
+	LocalOnlyExactPaths      []string                     `json:"local_only_exact_paths"`
+	LocalOnlyPrefixes        []string                     `json:"local_only_prefixes"`
+	AccumulatorSnapshotVer   int                          `json:"accumulator_snapshot_version,omitempty"`
+	LocalKIDIndexVersion     int                          `json:"local_kid_index_version,omitempty"`
+	BundleFormat             string                       `json:"bundle_format,omitempty"`
+	BundleSegments           []DRPreSeedSegmentDescriptor `json:"bundle_segments,omitempty"`
+	BundleIntegrityAlgorithm string                       `json:"bundle_integrity_algorithm"`
+	BundleIntegritySHA256    []byte                       `json:"bundle_integrity_sha256"`
+	ProvenanceAlgorithm      string                       `json:"provenance_algorithm"`
+	ProvenanceKeyID          string                       `json:"provenance_key_id"`
+}
+
 func (m *drRelationshipManager) GeneratePreSeedManifest(ctx context.Context, relationshipID string, bundleIntegritySHA256 []byte, ttl time.Duration) (*DRPreSeedManifest, error) {
 	if m == nil {
 		return nil, fmt.Errorf("DR relationship manager is nil")
@@ -207,6 +242,7 @@ func (m *drRelationshipManager) GeneratePreSeedManifest(ctx context.Context, rel
 	replSalt := append([]byte(nil), m.config.ReplSalt...)
 	promotion := m.config.Promotion
 	primary := m.primary
+	transportCA := m.transportCA
 	m.mu.Unlock()
 
 	if primary == nil {
@@ -241,7 +277,11 @@ func (m *drRelationshipManager) GeneratePreSeedManifest(ctx context.Context, rel
 		return nil, err
 	}
 
-	return newDRPreSeedManifest(clusterID, relationshipID, replSalt, checkpoint, bundleIntegritySHA256, ttl, now), nil
+	manifest := newDRPreSeedManifest(clusterID, relationshipID, replSalt, checkpoint, bundleIntegritySHA256, ttl, now)
+	if err := signDRPreSeedManifestProvenance(manifest, transportCA); err != nil {
+		return nil, err
+	}
+	return manifest, nil
 }
 
 func (m *drRelationshipManager) GeneratePreSeedBundle(ctx context.Context, relationshipID string, ttl time.Duration) (*DRPreSeedBundle, error) {
@@ -261,6 +301,7 @@ func (m *drRelationshipManager) GeneratePreSeedBundle(ctx context.Context, relat
 	replSalt := append([]byte(nil), m.config.ReplSalt...)
 	promotion := m.config.Promotion
 	primary := m.primary
+	transportCA := m.transportCA
 	m.mu.Unlock()
 
 	if primary == nil {
@@ -307,6 +348,9 @@ func (m *drRelationshipManager) GeneratePreSeedBundle(ctx context.Context, relat
 		return nil, err
 	}
 	bundle.Manifest.BundleIntegritySHA256 = sum
+	if err := signDRPreSeedManifestProvenance(&bundle.Manifest, transportCA); err != nil {
+		return nil, err
+	}
 	return bundle, nil
 }
 
@@ -330,6 +374,7 @@ func (m *drRelationshipManager) GenerateSegmentedPreSeedManifest(ctx context.Con
 	replSalt := append([]byte(nil), m.config.ReplSalt...)
 	promotion := m.config.Promotion
 	primary := m.primary
+	transportCA := m.transportCA
 	m.mu.Unlock()
 
 	if primary == nil {
@@ -384,6 +429,9 @@ func (m *drRelationshipManager) GenerateSegmentedPreSeedManifest(ctx context.Con
 		return nil, 0, err
 	}
 	manifest.BundleIntegritySHA256 = sum
+	if err := signDRPreSeedManifestProvenance(manifest, transportCA); err != nil {
+		return nil, 0, err
+	}
 	return manifest, len(metadata), nil
 }
 
@@ -462,6 +510,7 @@ func (j *drPreSeedExportPlanJob) status() *DRPreSeedExportPlanStatus {
 		copyManifest.LocalOnlyPrefixes = append([]string(nil), j.manifest.LocalOnlyPrefixes...)
 		copyManifest.BundleSegments = append([]DRPreSeedSegmentDescriptor(nil), j.manifest.BundleSegments...)
 		copyManifest.BundleIntegritySHA256 = append([]byte(nil), j.manifest.BundleIntegritySHA256...)
+		copyManifest.ProvenanceSignature = append([]byte(nil), j.manifest.ProvenanceSignature...)
 		manifest = &copyManifest
 	}
 	return &DRPreSeedExportPlanStatus{
@@ -996,6 +1045,9 @@ func validateDRPreSeedManifest(manifest *DRPreSeedManifest, token *DRActivationT
 	if err := validateDRPreSeedLocalOnlyScrub(manifest); err != nil {
 		return err
 	}
+	if err := validateDRPreSeedManifestProvenance(manifest, token); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -1304,13 +1356,16 @@ func preSeedSegmentManifestMatches(expected *DRPreSeedManifest, got *DRPreSeedMa
 	if expected == nil || got == nil {
 		return false
 	}
-	return expected.Version == got.Version &&
-		expected.PrimaryClusterID == got.PrimaryClusterID &&
-		expected.RelationshipID == got.RelationshipID &&
-		expected.CheckpointID == got.CheckpointID &&
-		expected.CheckpointIndex == got.CheckpointIndex &&
-		expected.BundleFormat == got.BundleFormat &&
-		bytes.Equal(expected.BundleIntegritySHA256, got.BundleIntegritySHA256)
+	expectedDigest, err := drPreSeedManifestProvenanceDigest(expected)
+	if err != nil {
+		return false
+	}
+	gotDigest, err := drPreSeedManifestProvenanceDigest(got)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(expectedDigest, gotDigest) &&
+		bytes.Equal(expected.ProvenanceSignature, got.ProvenanceSignature)
 }
 
 func (m *drRelationshipManager) validatePrimaryPreSeedManifest(ctx context.Context, manifest *DRPreSeedManifest, now time.Time) (*drReplicationPrimary, error) {
@@ -1326,6 +1381,7 @@ func (m *drRelationshipManager) validatePrimaryPreSeedManifest(ctx context.Conte
 	replSalt := append([]byte(nil), m.config.ReplSalt...)
 	promotion := m.config.Promotion
 	primary := m.primary
+	transportCA := m.transportCA
 	m.mu.Unlock()
 	if primary == nil {
 		return nil, fmt.Errorf("DR primary runtime not initialized")
@@ -1334,6 +1390,9 @@ func (m *drRelationshipManager) validatePrimaryPreSeedManifest(ctx context.Conte
 		ClusterID:      clusterID,
 		RelationshipID: manifest.RelationshipID,
 		ReplSalt:       replSalt,
+	}
+	if transportCA != nil {
+		token.DRTransportCACert = transportCA.certDER
 	}
 	if err := validateDRPreSeedManifest(manifest, token, promotion, now); err != nil {
 		return nil, err
@@ -1919,6 +1978,127 @@ func computeDRPreSeedBundleIntegrityFromPayloadEntries(version int, manifest DRP
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("marshal pre-seed bundle integrity payload: %w", err)
+	}
+	sum := sha256.Sum256(data)
+	return sum[:], nil
+}
+
+func signDRPreSeedManifestProvenance(manifest *DRPreSeedManifest, ca *drTransportCA) error {
+	if manifest == nil {
+		return fmt.Errorf("pre-seed manifest is nil")
+	}
+	if ca == nil || ca.cert == nil || ca.key == nil {
+		return fmt.Errorf("DR transport CA is required to sign pre-seed manifest provenance")
+	}
+	keyID, err := drPreSeedProvenanceKeyID(ca.cert)
+	if err != nil {
+		return err
+	}
+	manifest.ProvenanceAlgorithm = drPreSeedProvenanceAlgorithm
+	manifest.ProvenanceKeyID = keyID
+	manifest.ProvenanceSignature = nil
+
+	digest, err := drPreSeedManifestProvenanceDigest(manifest)
+	if err != nil {
+		return err
+	}
+	signature, err := ecdsa.SignASN1(rand.Reader, ca.key, digest)
+	if err != nil {
+		return fmt.Errorf("sign pre-seed manifest provenance: %w", err)
+	}
+	manifest.ProvenanceSignature = signature
+	return nil
+}
+
+func validateDRPreSeedManifestProvenance(manifest *DRPreSeedManifest, token *DRActivationToken) error {
+	if manifest == nil {
+		return fmt.Errorf("pre-seed manifest is nil")
+	}
+	if token == nil {
+		return fmt.Errorf("activation token is required")
+	}
+	if manifest.ProvenanceAlgorithm != drPreSeedProvenanceAlgorithm {
+		return fmt.Errorf("unsupported pre-seed provenance algorithm %q", manifest.ProvenanceAlgorithm)
+	}
+	if manifest.ProvenanceKeyID == "" {
+		return fmt.Errorf("pre-seed provenance key_id is required")
+	}
+	if len(manifest.ProvenanceSignature) == 0 {
+		return fmt.Errorf("pre-seed provenance signature is required")
+	}
+	if len(token.DRTransportCACert) == 0 {
+		return fmt.Errorf("activation token missing DR transport CA certificate for pre-seed provenance")
+	}
+	cert, err := x509.ParseCertificate(token.DRTransportCACert)
+	if err != nil {
+		return fmt.Errorf("invalid DR transport CA certificate for pre-seed provenance: %w", err)
+	}
+	if !cert.BasicConstraintsValid || !cert.IsCA {
+		return fmt.Errorf("pre-seed provenance DR transport certificate is not a CA")
+	}
+	keyID, err := drPreSeedProvenanceKeyID(cert)
+	if err != nil {
+		return err
+	}
+	if manifest.ProvenanceKeyID != keyID {
+		return fmt.Errorf("pre-seed provenance key_id mismatch")
+	}
+	pub, ok := cert.PublicKey.(*ecdsa.PublicKey)
+	if !ok {
+		return fmt.Errorf("pre-seed provenance DR transport CA key is not ECDSA")
+	}
+	digest, err := drPreSeedManifestProvenanceDigest(manifest)
+	if err != nil {
+		return err
+	}
+	if !ecdsa.VerifyASN1(pub, digest, manifest.ProvenanceSignature) {
+		return fmt.Errorf("pre-seed provenance signature mismatch")
+	}
+	return nil
+}
+
+func drPreSeedProvenanceKeyID(cert *x509.Certificate) (string, error) {
+	if cert == nil {
+		return "", fmt.Errorf("DR transport CA certificate is required for pre-seed provenance")
+	}
+	spki, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
+	if err != nil {
+		return "", fmt.Errorf("marshal pre-seed provenance public key: %w", err)
+	}
+	sum := sha256.Sum256(spki)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func drPreSeedManifestProvenanceDigest(manifest *DRPreSeedManifest) ([]byte, error) {
+	payload := drPreSeedManifestProvenancePayload{
+		Version:                  manifest.Version,
+		PrimaryClusterID:         manifest.PrimaryClusterID,
+		RelationshipID:           manifest.RelationshipID,
+		CheckpointID:             manifest.CheckpointID,
+		CheckpointIndex:          manifest.CheckpointIndex,
+		CreatedAtUnix:            manifest.CreatedAtUnix,
+		ExpiresAtUnix:            manifest.ExpiresAtUnix,
+		ReplSaltSHA256:           append([]byte(nil), manifest.ReplSaltSHA256...),
+		RangePlanVersion:         manifest.RangePlanVersion,
+		RangeBits:                manifest.RangeBits,
+		RangeCount:               manifest.RangeCount,
+		ChecksumAlgorithm:        manifest.ChecksumAlgorithm,
+		ValueDomain:              manifest.ValueDomain,
+		LocalOnlyScrubVersion:    manifest.LocalOnlyScrubVersion,
+		LocalOnlyExactPaths:      append([]string(nil), manifest.LocalOnlyExactPaths...),
+		LocalOnlyPrefixes:        append([]string(nil), manifest.LocalOnlyPrefixes...),
+		AccumulatorSnapshotVer:   manifest.AccumulatorSnapshotVer,
+		LocalKIDIndexVersion:     manifest.LocalKIDIndexVersion,
+		BundleFormat:             normalizedDRPreSeedBundleFormat(manifest.BundleFormat),
+		BundleSegments:           append([]DRPreSeedSegmentDescriptor(nil), manifest.BundleSegments...),
+		BundleIntegrityAlgorithm: manifest.BundleIntegrityAlgorithm,
+		BundleIntegritySHA256:    append([]byte(nil), manifest.BundleIntegritySHA256...),
+		ProvenanceAlgorithm:      manifest.ProvenanceAlgorithm,
+		ProvenanceKeyID:          manifest.ProvenanceKeyID,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal pre-seed provenance payload: %w", err)
 	}
 	sum := sha256.Sum256(data)
 	return sum[:], nil

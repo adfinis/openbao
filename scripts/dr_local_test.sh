@@ -43,6 +43,9 @@ Usage:
   scripts/dr_local_test.sh --topology ha reseed-secondary-smoke
   scripts/dr_local_test.sh --topology ha quiescent-reconnect-smoke [--no-reset] [--build]
   scripts/dr_local_test.sh --topology ha accumulator-cold-restart-smoke [--no-reset] [--build] [--stop-seconds N]
+  scripts/dr_local_test.sh --topology ha transport-ca-rotation-smoke [--no-reset] [--build]
+  scripts/dr_local_test.sh --topology ha transport-ca-rotation-load-smoke [--duration N] [--concurrency N] [--stage-after N] [--activate-after N] [--retire-after N] [--no-reset] [--build]
+  scripts/dr_local_test.sh --topology ha transport-ca-rotation-chain-smoke [--rotations N] [--no-reset] [--build]
   scripts/dr_local_test.sh --topology ha secondary-outage-smoke [--duration N] [--concurrency N] [--outage-after N] [--outage-seconds N] [--no-reset] [--build]
   scripts/dr_local_test.sh --topology ha secondary-outage-reconcile-smoke [--duration N] [--concurrency N] [--outage-after N] [--outage-seconds N] [--no-reset] [--build]
   scripts/dr_local_test.sh --topology ha indexed-repair-smoke [--duration N] [--concurrency N] [--outage-after N] [--outage-seconds N] [--no-reset] [--build]
@@ -73,6 +76,9 @@ HA topology:
   scripts/dr_local_test.sh --topology ha smoke --duration 900 --concurrency 48 --stepdown-interval 300
   scripts/dr_local_test.sh --topology ha quiescent-reconnect-smoke
   scripts/dr_local_test.sh --topology ha accumulator-cold-restart-smoke
+  scripts/dr_local_test.sh --topology ha transport-ca-rotation-smoke
+  scripts/dr_local_test.sh --topology ha transport-ca-rotation-load-smoke
+  scripts/dr_local_test.sh --topology ha transport-ca-rotation-chain-smoke
   scripts/dr_local_test.sh preseed-smoke
   scripts/dr_local_test.sh --topology ha secondary-outage-smoke
   scripts/dr_local_test.sh --topology ha secondary-outage-reconcile-smoke
@@ -3093,6 +3099,38 @@ cmd_secondary_outage_smoke() {
     "$@"
 }
 
+cmd_transport_ca_rotation_smoke() {
+  ensure_dr_harness
+  "$DR_HARNESS_BIN" transport-ca-rotation-smoke \
+    --root "$ROOT_DIR" \
+    --topology "$TOPOLOGY" \
+    --env-file "$ENV_FILE" \
+    --results-dir "$RESULTS_DIR" \
+    "$@"
+}
+
+cmd_transport_ca_rotation_load_smoke() {
+  ensure_dr_harness
+  ensure_dr_stress
+  "$DR_HARNESS_BIN" transport-ca-rotation-load-smoke \
+    --root "$ROOT_DIR" \
+    --topology "$TOPOLOGY" \
+    --env-file "$ENV_FILE" \
+    --results-dir "$RESULTS_DIR" \
+    --dr-stress-bin "$DR_STRESS_BIN" \
+    "$@"
+}
+
+cmd_transport_ca_rotation_chain_smoke() {
+  ensure_dr_harness
+  "$DR_HARNESS_BIN" transport-ca-rotation-chain-smoke \
+    --root "$ROOT_DIR" \
+    --topology "$TOPOLOGY" \
+    --env-file "$ENV_FILE" \
+    --results-dir "$RESULTS_DIR" \
+    "$@"
+}
+
 cmd_secondary_outage_smoke_legacy() {
   [[ "$TOPOLOGY" == "ha" ]] || die "secondary-outage-smoke requires --topology ha"
   need_bin jq
@@ -3967,6 +4005,9 @@ main() {
     reseed-secondary-smoke) cmd_reseed_secondary_smoke "$@" ;;
     quiescent-reconnect-smoke) cmd_quiescent_reconnect_smoke "$@" ;;
     accumulator-cold-restart-smoke) cmd_accumulator_cold_restart_smoke "$@" ;;
+    transport-ca-rotation-smoke) cmd_transport_ca_rotation_smoke "$@" ;;
+    transport-ca-rotation-load-smoke) cmd_transport_ca_rotation_load_smoke "$@" ;;
+    transport-ca-rotation-chain-smoke) cmd_transport_ca_rotation_chain_smoke "$@" ;;
     secondary-outage-smoke) cmd_secondary_outage_smoke "$@" ;;
     secondary-outage-reconcile-smoke) cmd_secondary_outage_reconcile_smoke "$@" ;;
     indexed-repair-smoke) cmd_indexed_repair_smoke "$@" ;;

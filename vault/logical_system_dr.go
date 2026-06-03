@@ -210,6 +210,118 @@ func (b *SystemBackend) drReplicationPaths() []*framework.Path {
 			HelpDescription: "Generates a token that a secondary cluster uses to establish a DR replication relationship with this primary.",
 		},
 
+		// --- DR Transport CA Trust Bundle ---
+		{
+			Pattern: "replication/dr/primary/transport-ca/trust-bundle$",
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: "replication-dr-primary-transport-ca",
+				OperationVerb:   "trust-bundle",
+			},
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.ReadOperation: &framework.PathOperation{
+					Callback:                  b.handleDRPrimaryTransportCATrustBundle,
+					Summary:                   "Return a signed DR transport CA trust bundle.",
+					ForwardPerformanceStandby: true,
+					Responses: map[int][]framework.Response{
+						http.StatusOK: {{
+							Description: "OK",
+						}},
+					},
+				},
+			},
+
+			HelpSynopsis:    "Read DR transport CA trust bundle",
+			HelpDescription: "Returns a signed public CA trust bundle for operator transfer to DR secondaries during transport CA rotation.",
+		},
+
+		// --- Stage DR Transport CA Rotation ---
+		{
+			Pattern: "replication/dr/primary/transport-ca/stage$",
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: "replication-dr-primary-transport-ca",
+				OperationVerb:   "stage",
+			},
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback:                  b.handleDRPrimaryTransportCAStage,
+					Summary:                   "Stage a replacement DR transport CA.",
+					ForwardPerformanceStandby: true,
+					Responses: map[int][]framework.Response{
+						http.StatusOK: {{
+							Description: "OK",
+						}},
+					},
+				},
+			},
+
+			HelpSynopsis:    "Stage DR transport CA rotation",
+			HelpDescription: "Generates and persists a staged DR transport CA, returning a signed trust bundle for secondaries to accept before activation.",
+		},
+
+		// --- Activate DR Transport CA Rotation ---
+		{
+			Pattern: "replication/dr/primary/transport-ca/activate$",
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: "replication-dr-primary-transport-ca",
+				OperationVerb:   "activate",
+			},
+
+			Fields: map[string]*framework.FieldSchema{
+				"operation_id": {
+					Type:        framework.TypeString,
+					Description: "The staged transport CA rotation operation ID.",
+					Required:    true,
+				},
+			},
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback:                  b.handleDRPrimaryTransportCAActivate,
+					Summary:                   "Activate the staged DR transport CA.",
+					ForwardPerformanceStandby: true,
+					Responses: map[int][]framework.Response{
+						http.StatusOK: {{
+							Description: "OK",
+						}},
+					},
+				},
+			},
+
+			HelpSynopsis:    "Activate DR transport CA rotation",
+			HelpDescription: "Promotes the staged DR transport CA to active and renews this primary node's DR transport leaf.",
+		},
+
+		// --- Retire Previous DR Transport CA ---
+		{
+			Pattern: "replication/dr/primary/transport-ca/retire-previous$",
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: "replication-dr-primary-transport-ca",
+				OperationVerb:   "retire-previous",
+			},
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback:                  b.handleDRPrimaryTransportCARetirePrevious,
+					Summary:                   "Retire the previous DR transport CA from the primary trust bundle.",
+					ForwardPerformanceStandby: true,
+					Responses: map[int][]framework.Response{
+						http.StatusOK: {{
+							Description: "OK",
+						}},
+					},
+				},
+			},
+
+			HelpSynopsis:    "Retire previous DR transport CA",
+			HelpDescription: "Removes the previous public DR transport CA from the primary trust-bundle overlap set after secondaries have adopted the active CA.",
+		},
+
 		// --- Primary Pre-Seed Manifest ---
 		{
 			Pattern: "replication/dr/primary/preseed/manifest$",
@@ -747,6 +859,39 @@ func (b *SystemBackend) drReplicationPaths() []*framework.Path {
 
 			HelpSynopsis:    "Rotate DR secondary credential",
 			HelpDescription: "Generates a new local DR secondary client certificate, stages and confirms it with the primary, persists it locally, and reconnects using the new credential.",
+		},
+
+		// --- Accept Primary Transport CA Bundle ---
+		{
+			Pattern: "replication/dr/secondary/transport-ca/accept$",
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: "replication-dr-secondary-transport-ca",
+				OperationVerb:   "accept",
+			},
+
+			Fields: map[string]*framework.FieldSchema{
+				"bundle": {
+					Type:        framework.TypeString,
+					Description: "Signed DR transport CA trust bundle JSON from the primary.",
+					Required:    true,
+				},
+			},
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback: b.handleDRSecondaryTransportCAAccept,
+					Summary:  "Accept a signed primary DR transport CA trust bundle.",
+					Responses: map[int][]framework.Response{
+						http.StatusOK: {{
+							Description: "OK",
+						}},
+					},
+				},
+			},
+
+			HelpSynopsis:    "Accept primary DR transport CA trust bundle",
+			HelpDescription: "Verifies a signed primary DR transport CA trust bundle against existing trusted CA material and updates the secondary trust set.",
 		},
 
 		// --- Register Secondary (unauthenticated, bootstrap token is the auth) ---
@@ -2122,6 +2267,155 @@ func (b *SystemBackend) handleDRSecondaryRotateCertificate(ctx context.Context, 
 		"rotation_started_at":   result.RotationStartedAt,
 		"rotation_completed_at": result.RotationCompletedAt,
 	}}, nil
+}
+
+func drTransportCATrustBundleJSON(bundle *DRTransportCATrustBundle) (string, error) {
+	encoded, err := json.Marshal(bundle)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
+}
+
+func drTransportCARotationResponse(result *DRTransportCARotationResult) (*logical.Response, error) {
+	if result == nil {
+		return nil, fmt.Errorf("DR transport CA rotation result is required")
+	}
+	data := map[string]interface{}{
+		"operation_id":    result.OperationID,
+		"active_key_id":   result.ActiveKeyID,
+		"staged_key_id":   result.StagedKeyID,
+		"previous_key_id": result.PreviousKeyID,
+		"started_at":      result.StartedAt,
+		"activated_at":    result.ActivatedAt,
+		"retired_at":      result.RetiredAt,
+	}
+	if result.TrustBundle != nil {
+		bundleJSON, err := drTransportCATrustBundleJSON(result.TrustBundle)
+		if err != nil {
+			return nil, err
+		}
+		data["trust_bundle"] = bundleJSON
+	}
+	return &logical.Response{Data: data}, nil
+}
+
+func (b *SystemBackend) handleDRPrimaryTransportCATrustBundle(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	mgr := b.Core.drManager
+	if mgr == nil {
+		return logical.ErrorResponse("DR replication not initialized"), nil
+	}
+	bundle, err := mgr.PrimaryTransportCATrustBundle(ctx)
+	if err != nil {
+		return logical.ErrorResponse("transport CA trust bundle failed: %s", err.Error()), nil
+	}
+	active, trusted, err := validateDRTransportCATrustBundleCerts(bundle)
+	if err != nil {
+		return nil, err
+	}
+	bundleJSON, err := drTransportCATrustBundleJSON(bundle)
+	if err != nil {
+		return nil, err
+	}
+	return &logical.Response{Data: map[string]interface{}{
+		"trust_bundle":         bundleJSON,
+		"active_key_id":        drTransportCAKeyID(active),
+		"trusted_key_count":    len(trusted),
+		"operation_id":         bundle.OperationID,
+		"staged_key_present":   len(bundle.StagedCACert) > 0,
+		"previous_key_present": len(bundle.PreviousCACert) > 0,
+	}}, nil
+}
+
+func (b *SystemBackend) handleDRPrimaryTransportCAStage(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	mgr := b.Core.drManager
+	if mgr == nil {
+		return logical.ErrorResponse("DR replication not initialized"), nil
+	}
+	result, err := mgr.StagePrimaryTransportCARotation(ctx)
+	if err != nil {
+		return logical.ErrorResponse("transport CA stage failed: %s", err.Error()), nil
+	}
+	b.Core.logger.Info("DR transport CA rotation staged",
+		"operation_id", result.OperationID,
+		"active_key_id", result.ActiveKeyID,
+		"staged_key_id", result.StagedKeyID,
+		"source_ip", sourceIPFromRequest(req))
+	return drTransportCARotationResponse(result)
+}
+
+func (b *SystemBackend) handleDRPrimaryTransportCAActivate(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	mgr := b.Core.drManager
+	if mgr == nil {
+		return logical.ErrorResponse("DR replication not initialized"), nil
+	}
+	operationIDRaw, ok := d.GetOk("operation_id")
+	if !ok {
+		return logical.ErrorResponse("operation_id is required"), nil
+	}
+	operationID, ok := operationIDRaw.(string)
+	if !ok || operationID == "" {
+		return logical.ErrorResponse("operation_id must be a non-empty string"), nil
+	}
+	result, err := mgr.ActivatePrimaryTransportCARotation(ctx, operationID)
+	if err != nil {
+		return logical.ErrorResponse("transport CA activate failed: %s", err.Error()), nil
+	}
+	b.Core.logger.Info("DR transport CA rotation activated",
+		"operation_id", result.OperationID,
+		"active_key_id", result.ActiveKeyID,
+		"previous_key_id", result.PreviousKeyID,
+		"source_ip", sourceIPFromRequest(req))
+	return drTransportCARotationResponse(result)
+}
+
+func (b *SystemBackend) handleDRPrimaryTransportCARetirePrevious(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	mgr := b.Core.drManager
+	if mgr == nil {
+		return logical.ErrorResponse("DR replication not initialized"), nil
+	}
+	result, err := mgr.RetirePreviousPrimaryTransportCA(ctx)
+	if err != nil {
+		return logical.ErrorResponse("transport CA retire failed: %s", err.Error()), nil
+	}
+	b.Core.logger.Info("DR previous transport CA retired",
+		"active_key_id", result.ActiveKeyID,
+		"previous_key_id", result.PreviousKeyID,
+		"source_ip", sourceIPFromRequest(req))
+	return drTransportCARotationResponse(result)
+}
+
+func (b *SystemBackend) handleDRSecondaryTransportCAAccept(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	mgr := b.Core.drManager
+	if mgr == nil {
+		return logical.ErrorResponse("DR replication not initialized"), nil
+	}
+	bundleRaw, ok := d.GetOk("bundle")
+	if !ok {
+		return logical.ErrorResponse("bundle is required"), nil
+	}
+	bundleStr, ok := bundleRaw.(string)
+	if !ok || bundleStr == "" {
+		return logical.ErrorResponse("bundle must be a non-empty string"), nil
+	}
+	if len(bundleStr) > drActivationTokenMaxBytes {
+		return logical.ErrorResponse("bundle exceeds maximum size %d", drActivationTokenMaxBytes), nil
+	}
+	var bundle DRTransportCATrustBundle
+	if err := json.Unmarshal([]byte(bundleStr), &bundle); err != nil {
+		return logical.ErrorResponse("invalid transport CA trust bundle: %s", err.Error()), nil
+	}
+	result, err := mgr.AcceptPrimaryTransportCATrustBundle(ctx, &bundle)
+	if err != nil {
+		return logical.ErrorResponse("transport CA trust bundle rejected: %s", err.Error()), nil
+	}
+	b.Core.logger.Info("DR primary transport CA trust bundle accepted",
+		"operation_id", result.OperationID,
+		"active_key_id", result.ActiveKeyID,
+		"staged_key_id", result.StagedKeyID,
+		"previous_key_id", result.PreviousKeyID,
+		"source_ip", sourceIPFromRequest(req))
+	return drTransportCARotationResponse(result)
 }
 
 func (b *SystemBackend) handleDRPrimaryRegisterSecondary(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {

@@ -59,6 +59,9 @@ func NewClient(node Node) (*Client, error) {
 		httpClient: &http.Client{
 			Transport: transport,
 			Timeout:   node.HTTPTimeout + 5*time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
 		addrs: normalizeAddrs(node.Addrs),
 		token: node.Token,
@@ -219,7 +222,7 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader) (i
 	}
 
 	code, resp, err := c.doAt(ctx, addr, method, path, bodyReader())
-	if err == nil {
+	if err == nil && !isRedirectStatus(code) {
 		return code, resp, nil
 	}
 	c.ClearActiveAddr()
@@ -228,6 +231,15 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader) (i
 		return c.doAt(ctx, resolved, method, path, bodyReader())
 	}
 	return code, resp, err
+}
+
+func isRedirectStatus(code int) bool {
+	switch code {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *Client) doAt(ctx context.Context, addr, method, path string, body io.Reader) (int, []byte, error) {
@@ -714,4 +726,82 @@ func (c *Client) WriteTuning(ctx context.Context, values map[string]any) ([]byte
 
 func (c *Client) ReadRaw(ctx context.Context, path string) ([]byte, error) {
 	return c.Read(ctx, path, nil)
+}
+
+type TransportCARotation struct {
+	OperationID        string `json:"operation_id"`
+	ActiveKeyID        string `json:"active_key_id"`
+	StagedKeyID        string `json:"staged_key_id"`
+	PreviousKeyID      string `json:"previous_key_id"`
+	StartedAt          int64  `json:"started_at"`
+	ActivatedAt        int64  `json:"activated_at"`
+	RetiredAt          int64  `json:"retired_at"`
+	TrustBundle        string `json:"trust_bundle"`
+	TrustedKeyCount    int    `json:"trusted_key_count"`
+	StagedKeyPresent   bool   `json:"staged_key_present"`
+	PreviousKeyPresent bool   `json:"previous_key_present"`
+}
+
+func (c *Client) DRPrimaryTransportCATrustBundle(ctx context.Context) (*TransportCARotation, []byte, error) {
+	var data TransportCARotation
+	raw, err := c.Read(ctx, "sys/replication/dr/primary/transport-ca/trust-bundle", &data)
+	if err != nil {
+		return nil, raw, err
+	}
+	if data.TrustBundle == "" {
+		return nil, raw, fmt.Errorf("transport CA trust-bundle response did not include trust_bundle")
+	}
+	return &data, raw, nil
+}
+
+func (c *Client) StageDRPrimaryTransportCA(ctx context.Context) (*TransportCARotation, []byte, error) {
+	var data TransportCARotation
+	raw, err := c.Write(ctx, "sys/replication/dr/primary/transport-ca/stage", nil, &data)
+	if err != nil {
+		return nil, raw, err
+	}
+	if data.OperationID == "" || data.TrustBundle == "" || data.StagedKeyID == "" {
+		return nil, raw, fmt.Errorf("transport CA stage response missing operation_id, trust_bundle, or staged_key_id")
+	}
+	return &data, raw, nil
+}
+
+func (c *Client) ActivateDRPrimaryTransportCA(ctx context.Context, operationID string) (*TransportCARotation, []byte, error) {
+	var data TransportCARotation
+	raw, err := c.Write(ctx, "sys/replication/dr/primary/transport-ca/activate", map[string]any{
+		"operation_id": operationID,
+	}, &data)
+	if err != nil {
+		return nil, raw, err
+	}
+	if data.TrustBundle == "" || data.ActiveKeyID == "" || data.PreviousKeyID == "" {
+		return nil, raw, fmt.Errorf("transport CA activate response missing trust_bundle, active_key_id, or previous_key_id")
+	}
+	return &data, raw, nil
+}
+
+func (c *Client) RetirePreviousDRPrimaryTransportCA(ctx context.Context) (*TransportCARotation, []byte, error) {
+	var data TransportCARotation
+	raw, err := c.Write(ctx, "sys/replication/dr/primary/transport-ca/retire-previous", nil, &data)
+	if err != nil {
+		return nil, raw, err
+	}
+	if data.TrustBundle == "" || data.ActiveKeyID == "" {
+		return nil, raw, fmt.Errorf("transport CA retire response missing trust_bundle or active_key_id")
+	}
+	return &data, raw, nil
+}
+
+func (c *Client) AcceptDRSecondaryTransportCA(ctx context.Context, bundle string) (*TransportCARotation, []byte, error) {
+	var data TransportCARotation
+	raw, err := c.Write(ctx, "sys/replication/dr/secondary/transport-ca/accept", map[string]any{
+		"bundle": bundle,
+	}, &data)
+	if err != nil {
+		return nil, raw, err
+	}
+	if data.ActiveKeyID == "" {
+		return nil, raw, fmt.Errorf("transport CA accept response missing active_key_id")
+	}
+	return &data, raw, nil
 }

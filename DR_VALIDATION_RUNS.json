@@ -1106,6 +1106,183 @@
       "notes": "Clustered low-cap counterpart to the S23 unit test, paired with a same-binary default-cap out-of-horizon run. Secondary1 is the intentionally disrupted low-fanout target; primary and secondary2 keep the normal out-of-horizon profile. The low cap reduced primary range-digest request delta from 39,301 to 3,877 for the same workload shape while preserving scan-free checkpoint verification. GET failures are client-facing HA disruption noise; terminal primary API and strict-secondary checkpoint verification passed."
     },
     {
+      "scenario_id": "E18",
+      "scenario": "DR transport CA rotation under HA",
+      "run_id": "transport-ca-rotation-20260602T194455Z",
+      "path": "dr-stress-results/transport-ca-rotation-20260602T194455Z",
+      "topology": "ha-primary-plus-two-secondaries",
+      "command_shape": "scripts/dr_local_test.sh --topology ha transport-ca-rotation-smoke",
+      "result": "pass",
+      "lifecycle": {
+        "stage_bundle_accepted_on_secondaries": true,
+        "activate_bundle_accepted_on_secondaries": true,
+        "retire_bundle_accepted_on_secondaries": true,
+        "stale_activated_bundle_rejected": true,
+        "stale_stage_bundle_rejected": true,
+        "primary_active_handoff_after_activation": {
+          "from": "http://localhost:8800",
+          "to": "http://localhost:8802"
+        },
+        "primary_active_handoff_after_retire": {
+          "from": "http://localhost:8802",
+          "to": "http://localhost:8800"
+        },
+        "secondary2_active_handoff_after_retire": {
+          "from": "http://localhost:9002",
+          "to": "http://localhost:9000"
+        }
+      },
+      "verification": {
+        "secondary1": {
+          "pass": true,
+          "method": "checkpoint",
+          "checkpoint_index": 120,
+          "accumulator_index": 120,
+          "matched_ranges": 1024,
+          "mismatched_ranges": 0,
+          "missing_ranges": 0,
+          "physical_scan_used": false,
+          "optimizer_reseeded": false
+        },
+        "secondary2": {
+          "pass": true,
+          "method": "checkpoint",
+          "checkpoint_index": 120,
+          "accumulator_index": 120,
+          "matched_ranges": 1024,
+          "mismatched_ranges": 0,
+          "missing_ranges": 0,
+          "physical_scan_used": false,
+          "optimizer_reseeded": false
+        }
+      },
+      "harness": "scripts/dr-harness",
+      "notes": "Clustered lifecycle smoke for operator-driven DR transport CA rotation. It validates staged, activated, and retired signed trust bundles across primary and secondary active handoff, rejects stale bundle replay after retirement, restores DR transport connectivity, and verifies both strict secondaries against a checkpoint."
+    },
+    {
+      "scenario_id": "E19",
+      "scenario": "DR transport CA rotation under HA load",
+      "run_id": "transport-ca-rotation-load-20260602T201743Z",
+      "path": "dr-stress-results/transport-ca-rotation-load-20260602T201743Z",
+      "topology": "ha-primary-plus-two-secondaries",
+      "command_shape": "scripts/dr_local_test.sh --topology ha transport-ca-rotation-load-smoke --duration 180 --concurrency 24 --stepdown-interval 60 --stage-after 30 --activate-after 70 --retire-after 110 --progress-interval 10 --monitor-interval 2 --max-wait-seconds 600",
+      "result": "pass_with_expected_client_transients",
+      "duration_seconds": 180,
+      "concurrency": 24,
+      "operations_total": 25493,
+      "operations_per_second": 138.3909668313338,
+      "put_fail": 24,
+      "get_fail": 31,
+      "status_fail": 0,
+      "events_dropped": 0,
+      "sentinel_converged": {
+        "secondary1_seconds": 1.004466833,
+        "secondary2_seconds": 1.004088375
+      },
+      "lifecycle": {
+        "stage_bundle_accepted_on_secondaries": true,
+        "activate_bundle_accepted_on_secondaries": true,
+        "retire_bundle_accepted_on_secondaries": true,
+        "stale_activated_bundle_rejected": true,
+        "stale_stage_bundle_rejected": true,
+        "primary_stepdown_requested_after_activation": {
+          "before": "http://localhost:8800",
+          "after": "http://localhost:8800",
+          "active_changed": false
+        },
+        "primary_stepdown_requested_after_retire": {
+          "before": "http://localhost:8800",
+          "after": "http://localhost:8800",
+          "active_changed": false
+        },
+        "secondary2_active_handoff_after_retire": {
+          "from": "http://localhost:9000",
+          "to": "http://localhost:9002"
+        },
+        "primary_active_after_workload": "http://localhost:8802"
+      },
+      "verification": {
+        "primary": { "pass": true, "sampled": 2819, "missing": 0, "mismatches": 0, "errors": 0, "ambiguous_sampled": 21 },
+        "secondary1": {
+          "pass": true,
+          "method": "checkpoint",
+          "checkpoint_index": 13999,
+          "accumulator_index": 13999,
+          "matched_ranges": 1024,
+          "mismatched_ranges": 0,
+          "missing_ranges": 0,
+          "physical_scan_used": false,
+          "optimizer_reseeded": false
+        },
+        "secondary2": {
+          "pass": true,
+          "method": "checkpoint",
+          "checkpoint_index": 13999,
+          "accumulator_index": 13999,
+          "matched_ranges": 1024,
+          "mismatched_ranges": 0,
+          "missing_ranges": 0,
+          "physical_scan_used": false,
+          "optimizer_reseeded": false
+        }
+      },
+      "harness": "scripts/dr-harness",
+      "notes": "Clean-reset clustered load smoke. It validates the signed transport CA stage/activate/retire lifecycle while mixed read/write/status load and primary stepdown requests are active. Primary stepdown requests re-elected the same node during lifecycle phases, while workload-driven HA movement still changed the final primary active and the explicit secondary2 handoff changed active nodes. PUT/GET failures were client-facing HA disruption noise; terminal primary API verification and strict-secondary checkpoint verification passed."
+    },
+    {
+      "scenario_id": "E20",
+      "scenario": "DR transport CA repeated rotation chain",
+      "run_id": "transport-ca-rotation-chain-20260602T211227Z",
+      "path": "dr-stress-results/transport-ca-rotation-chain-20260602T211227Z",
+      "topology": "ha-primary-plus-two-secondaries",
+      "command_shape": "scripts/dr_local_test.sh --topology ha transport-ca-rotation-chain-smoke --build --rotations 3 --max-wait-seconds 600",
+      "result": "pass",
+      "rotations": 3,
+      "lifecycle": {
+        "stage_activate_retire_cycles": 3,
+        "primary_active_handoffs": [
+          { "rotation": 1, "active_after_handoff": "http://localhost:8802" },
+          { "rotation": 2, "active_after_handoff": "http://localhost:8800" },
+          { "rotation": 3, "active_after_handoff": "http://localhost:8802" }
+        ],
+        "secondary2_active_handoffs": [
+          { "rotation": 1, "active_after_handoff": "http://localhost:9002" },
+          { "rotation": 2, "active_after_handoff": "http://localhost:9000" },
+          { "rotation": 3, "active_after_handoff": "http://localhost:9002" }
+        ],
+        "current_stale_stage_bundles_rejected": true,
+        "current_stale_activated_bundles_rejected": true,
+        "prior_stale_bundles_checked": 9,
+        "prior_stale_bundles_rejected": 9
+      },
+      "verification": {
+        "secondary1": {
+          "pass": true,
+          "method": "checkpoint",
+          "checkpoint_index": 77,
+          "accumulator_index": 77,
+          "matched_ranges": 1024,
+          "mismatched_ranges": 0,
+          "missing_ranges": 0,
+          "physical_scan_used": false,
+          "optimizer_reseeded": false
+        },
+        "secondary2": {
+          "pass": true,
+          "method": "checkpoint",
+          "checkpoint_index": 77,
+          "accumulator_index": 77,
+          "matched_ranges": 1024,
+          "mismatched_ranges": 0,
+          "missing_ranges": 0,
+          "physical_scan_used": false,
+          "optimizer_reseeded": false
+        }
+      },
+      "harness": "scripts/dr-harness",
+      "notes": "Clean-reset clustered chain smoke with three back-to-back transport CA stage/activate/retire cycles on the same DR relationships. It validates CA overlap across primary handoff, secondary active handoff, stale bundle rejection for current and prior generations, and final strict-secondary checkpoint verification."
+    },
+    {
       "scenario_id": "E15",
       "scenario": "Engine/runtime lifecycle matrix",
       "run_id": "engine-matrix-20260530161139",
@@ -1167,6 +1344,21 @@
       "run_id": "drmixed-20260531T145022Z",
       "path": "dr-stress-results/drmixed-20260531T145022Z",
       "reason": "Historical proof-mismatch fallback run from before the current indexed-repair hardening. Keep as regression context, not as the current expected indexed-repair behavior."
+    },
+    {
+      "run_id": "transport-ca-rotation-load-20260602T195956Z",
+      "path": "dr-stress-results/transport-ca-rotation-load-20260602T195956Z",
+      "reason": "Interrupted no-reset under-load transport CA run. The workload completed, but the harness was killed while blocked on a strict active-change assertion after sys/step-down re-elected the same primary node. Keep only as harness-debug context."
+    },
+    {
+      "run_id": "transport-ca-rotation-load-20260602T200637Z",
+      "path": "dr-stress-results/transport-ca-rotation-load-20260602T200637Z",
+      "reason": "No-reset rerun after the interrupted transport CA load run. It inherited dirty state and failed checkpoint verification with 46 range mismatches. A clean-reset rerun, transport-ca-rotation-load-20260602T201743Z, is the current representative evidence."
+    },
+    {
+      "run_id": "transport-ca-rotation-chain-20260602T210015Z",
+      "path": "dr-stress-results/transport-ca-rotation-chain-20260602T210015Z",
+      "reason": "Pre-fix repeated transport CA rotation chain attempt. It exposed a SyncKeyring AAD mismatch during CA overlap: the primary wrapped with the newly active transport CA identity while the secondary still unwrapped with its locally active old CA identity. The fix records the CA that actually verified the TLS primary leaf and uses that identity for keyring unwrap."
     }
   ]
 }

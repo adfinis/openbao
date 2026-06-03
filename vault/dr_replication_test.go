@@ -255,6 +255,232 @@ func TestDRRelationshipManager_EnableSecondaryStoresLocalControlTokenHash(t *tes
 	}
 }
 
+func TestDRRelationshipManager_EnableSecondaryPersistsPrimaryCATrustSet(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	mgr := newDRRelationshipManager(core, core.logger)
+
+	activeCA, _ := newTestDRTransportCACert(t)
+	stagedCA, _ := newTestDRTransportCACert(t)
+	token := &DRActivationToken{
+		ClusterID:          "cluster-ca-rotation",
+		RelationshipID:     "rel-ca-rotation",
+		PrimaryAddr:        "127.0.0.1:8201",
+		PrimaryAddrs:       []string{"127.0.0.1:8201"},
+		ReplSalt:           make([]byte, drReplSaltLen),
+		DRTransportCACert:  activeCA.Raw,
+		DRTransportCACerts: [][]byte{stagedCA.Raw, activeCA.Raw, stagedCA.Raw},
+	}
+	if _, err := rand.Read(token.ReplSalt); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mgr.EnableSecondary(ctx, token); err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.DisableSecondary(ctx)
+
+	cfg := mgr.Config()
+	if !bytes.Equal(cfg.PrimaryCACert, activeCA.Raw) {
+		t.Fatal("expected active primary CA to be persisted")
+	}
+	if len(cfg.PrimaryCACerts) != 2 {
+		t.Fatalf("expected active+staged CA trust set, got %d entries", len(cfg.PrimaryCACerts))
+	}
+	if !bytes.Equal(cfg.PrimaryCACerts[0], activeCA.Raw) || !bytes.Equal(cfg.PrimaryCACerts[1], stagedCA.Raw) {
+		t.Fatal("expected primary CA trust set to be normalized with active CA first")
+	}
+
+	secondary := mgr.Secondary()
+	if secondary == nil {
+		t.Fatal("expected secondary runtime")
+	}
+	if !bytes.Equal(secondary.primaryCACert, activeCA.Raw) {
+		t.Fatal("expected secondary active CA to be installed")
+	}
+	if len(secondary.primaryCACerts) != 2 {
+		t.Fatalf("expected secondary CA trust set, got %d entries", len(secondary.primaryCACerts))
+	}
+	if !bytes.Equal(secondary.primaryCACerts[0], activeCA.Raw) || !bytes.Equal(secondary.primaryCACerts[1], stagedCA.Raw) {
+		t.Fatal("expected secondary CA trust set to be normalized with active CA first")
+	}
+}
+
+func TestDRRelationshipManager_PrimaryTransportCARotationLifecycle(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	mgr := newDRRelationshipManager(core, core.logger)
+	if err := mgr.EnablePrimary(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	oldActiveDER := append([]byte(nil), mgr.transportCA.certDER...)
+	oldActiveKeyID := mgr.transportCA.spkiHash()
+
+	staged, err := mgr.StagePrimaryTransportCARotation(ctx)
+	if err != nil {
+		t.Fatalf("stage transport CA rotation failed: %v", err)
+	}
+	if staged.OperationID == "" || staged.StagedKeyID == "" {
+		t.Fatalf("expected staged operation and key id, got %#v", staged)
+	}
+	if staged.ActiveKeyID != oldActiveKeyID {
+		t.Fatalf("expected old active key id %q, got %q", oldActiveKeyID, staged.ActiveKeyID)
+	}
+	if staged.TrustBundle == nil || len(staged.TrustBundle.StagedCACert) == 0 {
+		t.Fatal("expected staged trust bundle with staged CA")
+	}
+	_, stagedTrusted, err := validateDRTransportCATrustBundleCerts(staged.TrustBundle)
+	if err != nil {
+		t.Fatalf("invalid staged trust bundle: %v", err)
+	}
+	if len(stagedTrusted) != 2 {
+		t.Fatalf("expected active+staged trust anchors, got %d", len(stagedTrusted))
+	}
+	if err := verifyDRTransportCATrustBundleSignature(staged.TrustBundle, []*x509.Certificate{mgr.transportCA.cert}); err != nil {
+		t.Fatalf("expected staged trust bundle to verify against active CA: %v", err)
+	}
+
+	stagedAgain, err := mgr.StagePrimaryTransportCARotation(ctx)
+	if err != nil {
+		t.Fatalf("idempotent stage failed: %v", err)
+	}
+	if stagedAgain.OperationID != staged.OperationID || stagedAgain.StagedKeyID != staged.StagedKeyID {
+		t.Fatalf("expected idempotent stage to preserve pending operation, got %#v then %#v", staged, stagedAgain)
+	}
+
+	token, err := mgr.GenerateActivationToken(ctx)
+	if err != nil {
+		t.Fatalf("failed to generate activation token: %v", err)
+	}
+	if !bytes.Equal(token.DRTransportCACert, oldActiveDER) {
+		t.Fatal("expected activation token active CA to remain old active before activation")
+	}
+	if len(token.DRTransportCACerts) != 2 {
+		t.Fatalf("expected activation token to include active+staged CAs, got %d", len(token.DRTransportCACerts))
+	}
+
+	if _, err := mgr.ActivatePrimaryTransportCARotation(ctx, "wrong-operation"); err == nil {
+		t.Fatal("expected activation with wrong operation to fail")
+	}
+
+	activated, err := mgr.ActivatePrimaryTransportCARotation(ctx, staged.OperationID)
+	if err != nil {
+		t.Fatalf("activate transport CA rotation failed: %v", err)
+	}
+	if activated.ActiveKeyID == oldActiveKeyID {
+		t.Fatal("expected active key id to change after activation")
+	}
+	if activated.PreviousKeyID != oldActiveKeyID {
+		t.Fatalf("expected previous key id %q, got %q", oldActiveKeyID, activated.PreviousKeyID)
+	}
+	if !bytes.Equal(activated.TrustBundle.PreviousCACert, oldActiveDER) {
+		t.Fatal("expected activated trust bundle to include previous CA")
+	}
+
+	bundle, err := mgr.PrimaryTransportCATrustBundle(ctx)
+	if err != nil {
+		t.Fatalf("failed to read trust bundle: %v", err)
+	}
+	if len(bundle.PreviousCACert) == 0 {
+		t.Fatal("expected previous CA to remain observable before retire")
+	}
+
+	retired, err := mgr.RetirePreviousPrimaryTransportCA(ctx)
+	if err != nil {
+		t.Fatalf("retire previous CA failed: %v", err)
+	}
+	if retired.PreviousKeyID != oldActiveKeyID {
+		t.Fatalf("expected retired previous key id %q, got %q", oldActiveKeyID, retired.PreviousKeyID)
+	}
+	if len(retired.TrustBundle.PreviousCACert) != 0 {
+		t.Fatal("expected retired trust bundle to omit previous CA")
+	}
+}
+
+func TestDRRelationshipManager_SecondaryAcceptsPrimaryTransportCATrustBundleLifecycle(t *testing.T) {
+	primaryCore, _, _ := TestCoreUnsealed(t)
+	ctx := context.Background()
+	primaryMgr := newDRRelationshipManager(primaryCore, primaryCore.logger)
+	if err := primaryMgr.EnablePrimary(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	oldActiveDER := append([]byte(nil), primaryMgr.transportCA.certDER...)
+	stage, err := primaryMgr.StagePrimaryTransportCARotation(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	secondaryCore, _, _ := TestCoreUnsealed(t)
+	secondaryMgr := newDRRelationshipManager(secondaryCore, secondaryCore.logger)
+	token := &DRActivationToken{
+		ClusterID:         primaryMgr.config.ClusterID,
+		RelationshipID:    "rel-transport-ca-accept",
+		PrimaryAddr:       "127.0.0.1:1",
+		PrimaryAddrs:      []string{"127.0.0.1:1"},
+		ReplSalt:          append([]byte(nil), primaryMgr.config.ReplSalt...),
+		DRTransportCACert: oldActiveDER,
+	}
+	if err := secondaryMgr.EnableSecondary(ctx, token); err != nil {
+		t.Fatal(err)
+	}
+	defer secondaryMgr.DisableSecondary(ctx)
+	stopDRSecondaryControllerForTest(t, secondaryMgr)
+
+	acceptedStage, err := secondaryMgr.AcceptPrimaryTransportCATrustBundle(ctx, stage.TrustBundle)
+	if err != nil {
+		t.Fatalf("secondary failed to accept staged trust bundle: %v", err)
+	}
+	if acceptedStage.StagedKeyID != stage.StagedKeyID {
+		t.Fatalf("expected staged key id %q, got %q", stage.StagedKeyID, acceptedStage.StagedKeyID)
+	}
+	cfg := secondaryMgr.Config()
+	if !bytes.Equal(cfg.PrimaryCACert, oldActiveDER) {
+		t.Fatal("expected active CA to remain old before primary activation")
+	}
+	if len(cfg.PrimaryCACerts) != 2 {
+		t.Fatalf("expected active+staged CA trust set, got %d entries", len(cfg.PrimaryCACerts))
+	}
+
+	tampered := *stage.TrustBundle
+	tampered.StagedCACert = append([]byte(nil), tampered.StagedCACert...)
+	tampered.StagedCACert[0] ^= 0xff
+	if _, err := secondaryMgr.AcceptPrimaryTransportCATrustBundle(ctx, &tampered); err == nil {
+		t.Fatal("expected tampered trust bundle to be rejected")
+	}
+
+	activated, err := primaryMgr.ActivatePrimaryTransportCARotation(ctx, stage.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := secondaryMgr.AcceptPrimaryTransportCATrustBundle(ctx, activated.TrustBundle); err != nil {
+		t.Fatalf("secondary failed to accept activated trust bundle: %v", err)
+	}
+	cfg = secondaryMgr.Config()
+	if !bytes.Equal(cfg.PrimaryCACert, activated.TrustBundle.ActiveCACert) {
+		t.Fatal("expected secondary active CA to advance after activated bundle")
+	}
+	if len(cfg.PrimaryCACerts) != 2 {
+		t.Fatalf("expected active+previous CA trust set after activation, got %d entries", len(cfg.PrimaryCACerts))
+	}
+
+	retired, err := primaryMgr.RetirePreviousPrimaryTransportCA(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := secondaryMgr.AcceptPrimaryTransportCATrustBundle(ctx, retired.TrustBundle); err != nil {
+		t.Fatalf("secondary failed to accept retired trust bundle: %v", err)
+	}
+	cfg = secondaryMgr.Config()
+	if len(cfg.PrimaryCACerts) != 1 {
+		t.Fatalf("expected only active CA after retire, got %d entries", len(cfg.PrimaryCACerts))
+	}
+	if _, err := secondaryMgr.AcceptPrimaryTransportCATrustBundle(ctx, activated.TrustBundle); err == nil {
+		t.Fatal("expected stale activated trust bundle to be rejected after previous CA retirement")
+	}
+}
+
 func TestDRRelationshipManager_EnableSecondaryClearsStaleCheckpointCursor(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	ctx := context.Background()
@@ -1649,6 +1875,100 @@ func TestDRSystemBackend_SecondaryCredentialRotationEndpoints(t *testing.T) {
 	}
 	if resp.Data["credential_generation"] != uint64(2) {
 		t.Fatalf("expected credential generation 2, got %#v", resp.Data["credential_generation"])
+	}
+}
+
+func TestDRSystemBackend_TransportCARotationEndpoints(t *testing.T) {
+	primaryCore, _, _ := TestCoreUnsealed(t)
+	ctx := namespace.RootContext(t.Context())
+	primaryMgr := newDRRelationshipManager(primaryCore, primaryCore.logger)
+	primaryCore.drManager = primaryMgr
+	if err := primaryMgr.EnablePrimary(ctx); err != nil {
+		t.Fatal(err)
+	}
+	oldActiveDER := append([]byte(nil), primaryMgr.transportCA.certDER...)
+
+	stageReq := logical.TestRequest(t, logical.UpdateOperation, "replication/dr/primary/transport-ca/stage")
+	stageResp, err := primaryCore.systemBackend.HandleRequest(ctx, stageReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stageResp == nil || stageResp.IsError() {
+		t.Fatalf("expected transport CA stage response, got %#v", stageResp)
+	}
+	operationID, ok := stageResp.Data["operation_id"].(string)
+	if !ok || operationID == "" {
+		t.Fatalf("expected operation_id in stage response, got %#v", stageResp.Data["operation_id"])
+	}
+	trustBundle, ok := stageResp.Data["trust_bundle"].(string)
+	if !ok || trustBundle == "" {
+		t.Fatalf("expected trust_bundle in stage response, got %#v", stageResp.Data["trust_bundle"])
+	}
+
+	secondaryCore, _, _ := TestCoreUnsealed(t)
+	secondaryMgr := newDRRelationshipManager(secondaryCore, secondaryCore.logger)
+	secondaryCore.drManager = secondaryMgr
+	token := &DRActivationToken{
+		ClusterID:         primaryMgr.config.ClusterID,
+		RelationshipID:    "rel-transport-ca-api",
+		PrimaryAddr:       "127.0.0.1:1",
+		PrimaryAddrs:      []string{"127.0.0.1:1"},
+		ReplSalt:          append([]byte(nil), primaryMgr.config.ReplSalt...),
+		DRTransportCACert: oldActiveDER,
+	}
+	if err := secondaryMgr.EnableSecondary(ctx, token); err != nil {
+		t.Fatal(err)
+	}
+	defer secondaryMgr.DisableSecondary(ctx)
+	stopDRSecondaryControllerForTest(t, secondaryMgr)
+
+	acceptReq := logical.TestRequest(t, logical.UpdateOperation, "replication/dr/secondary/transport-ca/accept")
+	acceptReq.Data = map[string]interface{}{"bundle": trustBundle}
+	acceptResp, err := secondaryCore.systemBackend.HandleRequest(ctx, acceptReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acceptResp == nil || acceptResp.IsError() {
+		t.Fatalf("expected transport CA accept response, got %#v", acceptResp)
+	}
+	if len(secondaryMgr.Config().PrimaryCACerts) != 2 {
+		t.Fatalf("expected secondary to trust active+staged CAs after accept, got %d", len(secondaryMgr.Config().PrimaryCACerts))
+	}
+
+	activateReq := logical.TestRequest(t, logical.UpdateOperation, "replication/dr/primary/transport-ca/activate")
+	activateReq.Data = map[string]interface{}{"operation_id": operationID}
+	activateResp, err := primaryCore.systemBackend.HandleRequest(ctx, activateReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activateResp == nil || activateResp.IsError() {
+		t.Fatalf("expected transport CA activate response, got %#v", activateResp)
+	}
+	activatedBundle, ok := activateResp.Data["trust_bundle"].(string)
+	if !ok || activatedBundle == "" {
+		t.Fatalf("expected activated trust_bundle, got %#v", activateResp.Data["trust_bundle"])
+	}
+
+	acceptReq = logical.TestRequest(t, logical.UpdateOperation, "replication/dr/secondary/transport-ca/accept")
+	acceptReq.Data = map[string]interface{}{"bundle": activatedBundle}
+	acceptResp, err = secondaryCore.systemBackend.HandleRequest(ctx, acceptReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acceptResp == nil || acceptResp.IsError() {
+		t.Fatalf("expected activated transport CA accept response, got %#v", acceptResp)
+	}
+	if bytes.Equal(secondaryMgr.Config().PrimaryCACert, oldActiveDER) {
+		t.Fatal("expected secondary active CA to change after accepting activated bundle")
+	}
+
+	retireReq := logical.TestRequest(t, logical.UpdateOperation, "replication/dr/primary/transport-ca/retire-previous")
+	retireResp, err := primaryCore.systemBackend.HandleRequest(ctx, retireReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retireResp == nil || retireResp.IsError() {
+		t.Fatalf("expected transport CA retire response, got %#v", retireResp)
 	}
 }
 
@@ -4018,7 +4338,7 @@ func TestDRFailover_FromSecondary(t *testing.T) {
 	if cfg.ClusterID != "" || cfg.RelationshipID != "" || cfg.PrimaryAddr != "" || len(cfg.PrimaryAddrs) != 0 {
 		t.Fatalf("expected stale upstream relationship fields to be cleared, got %#v", cfg)
 	}
-	if len(cfg.ReplSalt) != 0 || len(cfg.PrimaryCACert) != 0 || len(cfg.SecondaryClientCert) != 0 || len(cfg.SecondaryClientKeyPEM) != 0 {
+	if len(cfg.ReplSalt) != 0 || len(cfg.PrimaryCACert) != 0 || len(cfg.PrimaryCACerts) != 0 || len(cfg.SecondaryClientCert) != 0 || len(cfg.SecondaryClientKeyPEM) != 0 {
 		t.Fatal("expected stale replication secrets to be cleared after promotion")
 	}
 }
@@ -5411,7 +5731,7 @@ func TestDRRangeReconciliationSeedsFlatAccumulatorOnPhaseAMatch(t *testing.T) {
 		},
 	}
 	rangeIndex := reconciler.NewRangeMapIndex(localSet.KIDToVID, nil)
-	checkpoint := &CheckpointResponse{CheckpointId: "cp-flat-seed", CommitIndex: 73}
+	checkpoint := drTestCheckpointResponse("cp-flat-seed", 73)
 
 	secondary.client = &drTestClient{
 		exchangeRangeChecksumsFn: func(_ context.Context, req *RangeChecksumRequest, _ ...grpc.CallOption) (*RangeChecksumResponse, error) {
@@ -5446,7 +5766,7 @@ func TestDRRangeReconciliationBudgetExhaustionDoesNotAdvanceCheckpoint(t *testin
 	secondary.setLastAppliedIndex(10)
 	secondary.reconcileRetries.Store(2)
 
-	checkpoint := &CheckpointResponse{CheckpointId: "cp-budget-exhaustion", CommitIndex: 99}
+	checkpoint := drTestCheckpointResponse("cp-budget-exhaustion", 99)
 	localSet := &reconciler.ReconciliationSet{
 		Checkpoint: reconciler.Checkpoint{ID: checkpoint.CheckpointId, CommitIndex: checkpoint.CommitIndex},
 		KIDToVID:   map[[32]byte][32]byte{},
@@ -5548,7 +5868,7 @@ func TestDRRangeDrillDownFanoutLimitFallsBackToCoarseFetch(t *testing.T) {
 
 	remoteIndex := reconciler.NewRangeMapIndex(remoteKIDToVID, nil)
 	localIndex := reconciler.NewRangeMapIndex(map[[32]byte][32]byte{}, nil)
-	checkpoint := &CheckpointResponse{CheckpointId: "cp-drilldown-fanout", CommitIndex: 123}
+	checkpoint := drTestCheckpointResponse("cp-drilldown-fanout", 123)
 	digestCalls := 0
 	secondary.client = &drTestClient{
 		exchangeRangeDigestsFn: func(_ context.Context, req *RangeDigestRequest, _ ...grpc.CallOption) (*RangeDigestResponse, error) {
@@ -5652,7 +5972,7 @@ func TestDRSecondaryQuiescentReconnectUsesFlatAccumulatorFastPath(t *testing.T) 
 			if req.GetRelationshipId() != secondary.relationshipID {
 				t.Fatalf("unexpected relationship id %q", req.GetRelationshipId())
 			}
-			return &CheckpointResponse{CheckpointId: "cp-flat-fast-path", CommitIndex: 42}, nil
+			return drTestCheckpointResponse("cp-flat-fast-path", 42), nil
 		},
 		exchangeRangeChecksumsFn: func(_ context.Context, req *RangeChecksumRequest, _ ...grpc.CallOption) (*RangeChecksumResponse, error) {
 			if req.GetRelationshipId() != secondary.relationshipID {
@@ -5698,6 +6018,38 @@ func TestDRSecondaryQuiescentReconnectUsesFlatAccumulatorFastPath(t *testing.T) 
 	}
 }
 
+func TestDRSecondaryReconciliationRejectsUnsupportedCheckpointRangePlan(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := bytes.Repeat([]byte{0x5a}, 32)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-unsupported-range-plan", core.logger)
+
+	var checksumCalled bool
+	secondary.client = &drTestClient{
+		requestCheckpointFn: func(_ context.Context, req *CheckpointRequest, _ ...grpc.CallOption) (*CheckpointResponse, error) {
+			if req.GetRelationshipId() != secondary.relationshipID {
+				t.Fatalf("unexpected relationship id %q", req.GetRelationshipId())
+			}
+			return &CheckpointResponse{
+				CheckpointId:     "cp-unsupported-range-plan",
+				CommitIndex:      42,
+				RangePlanVersion: reconciler.RangePlanVersion + 1,
+			}, nil
+		},
+		exchangeRangeChecksumsFn: func(context.Context, *RangeChecksumRequest, ...grpc.CallOption) (*RangeChecksumResponse, error) {
+			checksumCalled = true
+			return nil, errors.New("must not be called")
+		},
+	}
+
+	err := secondary.runReconciliation(context.Background())
+	if !errors.Is(err, errDRUnsupportedCheckpointRangePlan) {
+		t.Fatalf("expected unsupported range-plan error, got %v", err)
+	}
+	if checksumCalled {
+		t.Fatal("range checksum RPC must not run after incompatible checkpoint")
+	}
+}
+
 func TestDRSecondaryVerifyCheckpointMatchesAccumulator(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	replSalt := bytes.Repeat([]byte{0x25}, 32)
@@ -5725,7 +6077,7 @@ func TestDRSecondaryVerifyCheckpointMatchesAccumulator(t *testing.T) {
 			if req.GetRelationshipId() != secondary.relationshipID {
 				t.Fatalf("unexpected relationship id %q", req.GetRelationshipId())
 			}
-			return &CheckpointResponse{CheckpointId: "cp-verify-checkpoint", CommitIndex: 42}, nil
+			return drTestCheckpointResponse("cp-verify-checkpoint", 42), nil
 		},
 		exchangeRangeChecksumsFn: func(_ context.Context, req *RangeChecksumRequest, _ ...grpc.CallOption) (*RangeChecksumResponse, error) {
 			if req.GetRelationshipId() != secondary.relationshipID {
@@ -5762,6 +6114,45 @@ func TestDRSecondaryVerifyCheckpointMatchesAccumulator(t *testing.T) {
 	}
 }
 
+func TestDRSecondaryVerifyCheckpointRejectsUnsupportedCheckpointRangePlan(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	replSalt := bytes.Repeat([]byte{0x5b}, 32)
+	secondary := newDRReplicationSecondary(core, replSalt, "rel-verify-unsupported-range-plan", core.logger)
+	secondary.setState(DRSecondaryStreaming)
+
+	localSet := &reconciler.ReconciliationSet{KIDToVID: map[[32]byte][32]byte{}}
+	secondary.rangeAccumulator.resetFromSet(localSet, 42)
+
+	var checksumCalled bool
+	secondary.client = &drTestClient{
+		requestCheckpointFn: func(_ context.Context, req *CheckpointRequest, _ ...grpc.CallOption) (*CheckpointResponse, error) {
+			if req.GetRelationshipId() != secondary.relationshipID {
+				t.Fatalf("unexpected relationship id %q", req.GetRelationshipId())
+			}
+			return &CheckpointResponse{
+				CheckpointId:     "cp-verify-unsupported-range-plan",
+				CommitIndex:      42,
+				RangePlanVersion: reconciler.RangePlanVersion + 1,
+			}, nil
+		},
+		exchangeRangeChecksumsFn: func(context.Context, *RangeChecksumRequest, ...grpc.CallOption) (*RangeChecksumResponse, error) {
+			checksumCalled = true
+			return nil, errors.New("must not be called")
+		},
+	}
+
+	result, err := secondary.VerifyCheckpoint(context.Background())
+	if err != nil {
+		t.Fatalf("VerifyCheckpoint returned error: %v", err)
+	}
+	if result.Pass || result.Reason != "unsupported_range_plan_version" {
+		t.Fatalf("expected unsupported range-plan verification result, got %#v", result)
+	}
+	if checksumCalled {
+		t.Fatal("range checksum RPC must not run after incompatible checkpoint")
+	}
+}
+
 func TestDRSecondaryVerifyCheckpointDetectsMismatch(t *testing.T) {
 	core, _, _ := TestCoreUnsealed(t)
 	replSalt := bytes.Repeat([]byte{0x26}, 32)
@@ -5782,7 +6173,7 @@ func TestDRSecondaryVerifyCheckpointDetectsMismatch(t *testing.T) {
 
 	secondary.client = &drTestClient{
 		requestCheckpointFn: func(_ context.Context, req *CheckpointRequest, _ ...grpc.CallOption) (*CheckpointResponse, error) {
-			return &CheckpointResponse{CheckpointId: "cp-verify-checkpoint-mismatch", CommitIndex: 43}, nil
+			return drTestCheckpointResponse("cp-verify-checkpoint-mismatch", 43), nil
 		},
 		exchangeRangeChecksumsFn: func(_ context.Context, req *RangeChecksumRequest, _ ...grpc.CallOption) (*RangeChecksumResponse, error) {
 			resp := &RangeChecksumResponse{Checksums: make([]*RangeChecksum, 0, len(req.GetRangeIds()))}
@@ -5835,7 +6226,7 @@ func TestDRSecondaryVerifyCheckpointReseedsOptimizerFromLocalScan(t *testing.T) 
 		t.Fatalf("failed to write local entry b: %v", err)
 	}
 
-	checkpoint := &CheckpointResponse{CheckpointId: "cp-verify-checkpoint-reseed", CommitIndex: 44}
+	checkpoint := drTestCheckpointResponse("cp-verify-checkpoint-reseed", 44)
 	remoteSet, err := secondary.scanner.ScanPhysical(ctx, core.physical, reconciler.Checkpoint{
 		ID:          checkpoint.CheckpointId,
 		CommitIndex: checkpoint.CommitIndex,
@@ -5918,7 +6309,7 @@ func TestDRFlatAccumulatorEmptyBucketRepairAvoidsLocalScan(t *testing.T) {
 	value := []byte("remote")
 	kid := secondary.scanner.ComputeKID(key)
 	vid := secondary.scanner.ComputeVIDWithSealWrap(value, false)
-	checkpoint := &CheckpointResponse{CheckpointId: "cp-flat-empty-repair", CommitIndex: 11}
+	checkpoint := drTestCheckpointResponse("cp-flat-empty-repair", 11)
 	remoteSet := &reconciler.ReconciliationSet{
 		Checkpoint: reconciler.Checkpoint{ID: checkpoint.CheckpointId, CommitIndex: checkpoint.CommitIndex},
 		KeyCount:   1,
@@ -6154,7 +6545,7 @@ func TestDRFlatAccumulatorIndexedBucketRepairAvoidsLocalScan(t *testing.T) {
 	secondary.setLastAppliedIndex(10)
 	secondary.setState(DRSecondaryReconciling)
 
-	checkpoint := &CheckpointResponse{CheckpointId: "cp-flat-indexed-repair", CommitIndex: 11}
+	checkpoint := drTestCheckpointResponse("cp-flat-indexed-repair", 11)
 	remoteSet := &reconciler.ReconciliationSet{
 		Checkpoint: reconciler.Checkpoint{ID: checkpoint.CheckpointId, CommitIndex: checkpoint.CommitIndex},
 		KeyCount:   3,
@@ -6376,7 +6767,7 @@ func TestDRFlatAccumulatorIndexedBucketRepairFullBucketFallbackAvoidsLocalScan(t
 	secondary.setLastAppliedIndex(10)
 	secondary.setState(DRSecondaryReconciling)
 
-	checkpoint := &CheckpointResponse{CheckpointId: "cp-flat-indexed-full-bucket", CommitIndex: 11}
+	checkpoint := drTestCheckpointResponse("cp-flat-indexed-full-bucket", 11)
 	remoteSet := &reconciler.ReconciliationSet{
 		Checkpoint: reconciler.Checkpoint{ID: checkpoint.CheckpointId, CommitIndex: checkpoint.CommitIndex},
 		KeyCount:   2,
@@ -6572,7 +6963,7 @@ func TestDRRangeReconciliationSeedsFlatAccumulatorAfterRepair(t *testing.T) {
 	kid := secondary.scanner.ComputeKID(key)
 	oldVID := secondary.scanner.ComputeVIDWithSealWrap(oldValue, false)
 	newVID := secondary.scanner.ComputeVIDWithSealWrap(newValue, false)
-	checkpoint := &CheckpointResponse{CheckpointId: "cp-flat-repair", CommitIndex: 88}
+	checkpoint := drTestCheckpointResponse("cp-flat-repair", 88)
 	localSet := &reconciler.ReconciliationSet{
 		Checkpoint: reconciler.Checkpoint{ID: checkpoint.CheckpointId, CommitIndex: checkpoint.CommitIndex},
 		KeyCount:   1,
@@ -9781,6 +10172,14 @@ type drTestClient struct {
 	syncKeyringFn            func(context.Context, *SyncKeyringRequest, ...grpc.CallOption) (*SyncKeyringResponse, error)
 }
 
+func drTestCheckpointResponse(id string, index uint64) *CheckpointResponse {
+	return &CheckpointResponse{
+		CheckpointId:     id,
+		CommitIndex:      index,
+		RangePlanVersion: reconciler.RangePlanVersion,
+	}
+}
+
 func (c *drTestClient) StreamChanges(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[StreamChangesUpstream, EntryBatch], error) {
 	if c.streamChangesFn == nil {
 		return nil, errors.New("not implemented")
@@ -9879,7 +10278,9 @@ func (s *blockingEntryBatchBidiClient) Recv() (*EntryBatch, error) {
 }
 
 func TestDRClusterClient_VerifyKnownCert(t *testing.T) {
-	der, _ := generateTestCert(t, "fw-known")
+	caCert, caKey := newTestDRTransportCACert(t)
+	now := time.Now().UTC()
+	der := newLeafSignedByTestCA(t, caCert, caKey, now.Add(-time.Minute), now.Add(time.Hour))
 	fp := drCertFingerprint(der)
 
 	var mu sync.RWMutex
@@ -9891,6 +10292,7 @@ func TestDRClusterClient_VerifyKnownCert(t *testing.T) {
 		logger:         log.NewNullLogger(),
 		trustedCertsMu: &mu,
 		trustedCerts:   pool,
+		primaryCACert:  caCert,
 	}
 
 	verifier := client.VerifyPeerCertificate()
@@ -9909,6 +10311,9 @@ func TestDRClusterClient_VerifyKnownCert(t *testing.T) {
 	mu.RUnlock()
 	if time.Since(entry.lastSeen) > time.Second {
 		t.Fatalf("lastSeen not refreshed: %v ago", time.Since(entry.lastSeen))
+	}
+	if got, want := entry.caIdentity, drTransportCAKeyID(caCert); got != want {
+		t.Fatalf("expected cached cert CA identity %q, got %q", want, got)
 	}
 }
 
@@ -10057,6 +10462,70 @@ func TestDRClusterClient_VerifyCASignedCert(t *testing.T) {
 	}
 }
 
+func TestDRClusterClient_VerifyCASignedCertFromStagedTrustAnchor(t *testing.T) {
+	activeCA, activeKey := newTestDRTransportCACert(t)
+	stagedCA, stagedKey := newTestDRTransportCACert(t)
+	unknownCA, unknownKey := newTestDRTransportCACert(t)
+
+	now := time.Now().UTC()
+	activeLeaf := newLeafSignedByTestCA(t, activeCA, activeKey, now.Add(-time.Minute), now.Add(time.Hour))
+	stagedLeaf := newLeafSignedByTestCA(t, stagedCA, stagedKey, now.Add(-time.Minute), now.Add(time.Hour))
+	unknownLeaf := newLeafSignedByTestCA(t, unknownCA, unknownKey, now.Add(-time.Minute), now.Add(time.Hour))
+
+	var mu sync.RWMutex
+	pool := make(map[string]*trustedPrimaryCert)
+	client := &drReplicationClusterClient{
+		logger:         log.NewNullLogger(),
+		trustedCertsMu: &mu,
+		trustedCerts:   pool,
+		primaryCACert:  activeCA,
+		primaryCACerts: []*x509.Certificate{activeCA, stagedCA},
+	}
+	verifier := client.VerifyPeerCertificate()
+
+	if err := verifier([][]byte{activeLeaf}, nil); err != nil {
+		t.Fatalf("expected active CA leaf to verify: %v", err)
+	}
+	if got, want := client.LastPrimaryCAIdentity(), drTransportCAKeyID(activeCA); got != want {
+		t.Fatalf("expected active CA identity %q after active leaf verify, got %q", want, got)
+	}
+	if err := verifier([][]byte{stagedLeaf}, nil); err != nil {
+		t.Fatalf("expected staged CA leaf to verify during rotation overlap: %v", err)
+	}
+	if got, want := client.LastPrimaryCAIdentity(), drTransportCAKeyID(stagedCA); got != want {
+		t.Fatalf("expected staged CA identity %q after staged leaf verify, got %q", want, got)
+	}
+	if err := verifier([][]byte{unknownLeaf}, nil); err == nil {
+		t.Fatal("expected unknown CA leaf to be rejected")
+	}
+
+	mu.RLock()
+	activeEntry, activeKnown := pool[drCertFingerprint(activeLeaf)]
+	stagedEntry, stagedKnown := pool[drCertFingerprint(stagedLeaf)]
+	_, unknownKnown := pool[drCertFingerprint(unknownLeaf)]
+	mu.RUnlock()
+	if !activeKnown || !stagedKnown {
+		t.Fatal("expected active and staged CA leaves to be cached")
+	}
+	if got, want := activeEntry.caIdentity, drTransportCAKeyID(activeCA); got != want {
+		t.Fatalf("expected cached active CA identity %q, got %q", want, got)
+	}
+	if got, want := stagedEntry.caIdentity, drTransportCAKeyID(stagedCA); got != want {
+		t.Fatalf("expected cached staged CA identity %q, got %q", want, got)
+	}
+	if unknownKnown {
+		t.Fatal("unexpectedly cached unknown CA leaf")
+	}
+
+	client.updatePrimaryTrustAnchors(stagedCA, []*x509.Certificate{stagedCA})
+	if err := verifier([][]byte{activeLeaf}, nil); err == nil {
+		t.Fatal("expected cached active CA leaf to be rejected after active CA retirement")
+	}
+	if err := verifier([][]byte{stagedLeaf}, nil); err != nil {
+		t.Fatalf("expected staged CA leaf to remain valid after active CA retirement: %v", err)
+	}
+}
+
 func TestDRClusterClient_VerifyEmptyCerts(t *testing.T) {
 	var mu sync.RWMutex
 	pool := make(map[string]*trustedPrimaryCert)
@@ -10109,7 +10578,13 @@ func TestDRTrustPool_TTLEviction(t *testing.T) {
 }
 
 func TestHeartbeatResponse_ActiveClusterCert(t *testing.T) {
-	der, parsed := generateTestCert(t, "fw-primary-leader")
+	caCert, caKey := newTestDRTransportCACert(t)
+	now := time.Now().UTC()
+	der := newLeafSignedByTestCA(t, caCert, caKey, now.Add(-time.Minute), now.Add(time.Hour))
+	parsed, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	var mu sync.RWMutex
 	pool := make(map[string]*trustedPrimaryCert)
@@ -10118,6 +10593,7 @@ func TestHeartbeatResponse_ActiveClusterCert(t *testing.T) {
 		logger:         log.NewNullLogger(),
 		trustedCertsMu: &mu,
 		trustedCerts:   pool,
+		primaryCACert:  caCert,
 	}
 
 	// Simulate heartbeat delivering the active cluster cert.
@@ -10150,6 +10626,21 @@ func TestHeartbeatResponse_ActiveClusterCert(t *testing.T) {
 	mu.RUnlock()
 	if !secondSeen.After(firstSeen) {
 		t.Fatalf("lastSeen was not refreshed on duplicate add: first=%v, second=%v", firstSeen, secondSeen)
+	}
+}
+
+func TestHeartbeatResponse_ActiveClusterCertRequiresConfiguredCA(t *testing.T) {
+	der, _ := generateTestCert(t, "fw-untrusted-primary-leader")
+
+	var mu sync.RWMutex
+	client := &drReplicationClusterClient{
+		logger:         log.NewNullLogger(),
+		trustedCertsMu: &mu,
+		trustedCerts:   make(map[string]*trustedPrimaryCert),
+	}
+
+	if err := client.addTrustedCert(der); err == nil {
+		t.Fatal("expected heartbeat certificate to require a configured DR transport CA")
 	}
 }
 
