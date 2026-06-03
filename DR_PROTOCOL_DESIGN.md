@@ -186,13 +186,17 @@ The main versioned boundaries are:
 | DR transport CA trust | active CA plus ordered trusted CA set | Secondary transport verification accepts primary leaves chained to any configured trust anchor during rotation overlap. `SyncKeyring` primary identity is bound to the CA that verified the primary leaf for the current mTLS connection, with active CA fallback only before a verified connection exists. |
 
 DR transport CA rotation uses signed public trust bundles rather than silent
-trust replacement. The primary stages a pending CA, signs a trust bundle with a
-currently active CA, and operators apply that bundle to secondaries before
-activation. After activation, the primary signs a new bundle from the new
-active CA so secondaries that already trusted the staged CA can promote it to
-their active `primary_ca_cert`. The previous public CA remains observable until
-operators retire it from future bundles. After retirement, secondaries reject
-stale bundles that would reintroduce the retired previous CA.
+trust replacement. The primary stages a pending CA and returns a staged bundle
+signed by the current active CA; operators apply that bundle to secondaries
+before activation so the staged CA is trusted for the overlap window. After
+activation, the primary promotes the staged CA to active, retains the old public
+CA as previous, renews its transport leaf from the new active CA, and returns a
+post-activation bundle signed by the new active CA. Secondaries that already
+trusted the staged CA can then promote it to their active `primary_ca_cert`.
+After the overlap window, the primary retires the previous public CA from
+future bundles and secondaries applying the retired bundle remove it from their
+trust set. After retirement, secondaries reject stale bundles that would
+reintroduce the retired previous CA.
 
 This is not yet a mixed-version rolling-upgrade contract. A production design
 still needs an explicit compatibility matrix that states which primary and

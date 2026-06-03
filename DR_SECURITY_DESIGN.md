@@ -159,10 +159,10 @@ secondary's local seal.
 ## Transport Trust
 
 DR traffic uses mTLS. The primary owns a dedicated DR transport CA stored in
-barrier storage. Primary nodes present leaf certificates signed by this CA.
-The secondary pins an ordered primary DR transport CA trust set from the
-activation token or persisted secondary config and rejects primary
-certificates that do not chain to one of those anchors.
+barrier storage. Primary nodes present leaf certificates signed by the current
+active DR transport CA. The secondary pins an ordered primary DR transport CA
+trust set from the activation token or persisted secondary config and rejects
+primary certificates that do not chain to one of those anchors.
 
 The secondary persists its DR client certificate and private key in local DR
 configuration. The primary accepts that certificate only after bootstrap
@@ -175,17 +175,20 @@ There is no trust-on-first-use path and no insecure fallback.
 
 ## Certificate Lifecycle
 
-Primary DR transport leaf certificates are renewed from the active DR transport
-CA.
+Primary DR transport CA state contains one active CA and may temporarily contain
+one pending CA and one previous public CA during rotation. Primary DR transport
+leaf certificates are minted and renewed from the current active CA.
 
 The secondary config now carries both:
 
-- `primary_ca_cert`: the active primary CA, used as the primary identity for
-  `SyncKeyring` AAD fallback before a verified transport connection exists; and
+- `primary_ca_cert`: the active primary CA and fallback source for
+  `SyncKeyring` AAD only before a verified transport connection records the
+  matched CA identity; and
 - `primary_ca_certs`: the ordered transport trust set used during CA rotation.
 
 This supports a fail-closed overlap window where the secondary can accept
-primary leaves signed by either the current CA or a staged replacement CA.
+primary leaves signed by the active, staged, or previous CA only while those CAs
+remain in the accepted trust set.
 For `SyncKeyring`, the secondary binds unwrap AAD to the CA that actually
 verified the primary leaf on the current mTLS connection, so overlap windows do
 not depend on the secondary having already promoted `primary_ca_cert` locally.
@@ -195,22 +198,29 @@ when their CA is removed from the accepted trust set.
 DR transport CA rotation is operator driven:
 
 1. The primary stages a replacement CA and persists it as pending.
-2. The primary returns a signed public trust bundle containing active, staged,
-   and optional previous CA certificates.
-3. Operators apply that trust bundle on each secondary before activation.
-4. The primary activates the staged CA and renews its transport leaf from the
-   new active CA.
-5. Operators apply the post-activation trust bundle so secondaries update
-   `primary_ca_cert` to the new active CA.
+2. The primary returns a signed public trust bundle containing the current
+   active CA, the staged CA, and any previous public CA still in the overlap
+   set. This staged bundle is signed by the current active CA.
+3. Operators apply the staged bundle on each secondary before activation. This
+   adds the staged CA to the secondary trust set but keeps the old active CA as
+   `primary_ca_cert`.
+4. The primary activates the staged CA, promotes it to active CA, retains the
+   old public CA as previous, and renews its transport leaf from the new active
+   CA.
+5. The primary returns a post-activation bundle signed by the new active CA.
+   Operators apply that bundle so secondaries promote `primary_ca_cert` to the
+   new active CA while retaining the old public CA for the remaining overlap
+   window.
 6. After the overlap window, the primary retires the previous public CA from
-   future bundles.
+   future bundles. Operators apply the retired bundle so secondaries remove the
+   previous CA from their trust set.
 
-Trust bundles are signed by a currently trusted DR transport CA. A secondary
-accepts a bundle only if the signature chains to an already trusted CA, the
-cluster ID matches, and the bundle's certificate set validates. After the
-previous CA is retired, stale bundles that would reintroduce that retired CA are
-rejected. This prevents stale or attacker-supplied CA sets from replacing or
-reviving primary trust roots.
+Trust bundles are signed by a DR transport CA that must already be present in
+the secondary's local trust set. A secondary accepts a bundle only if the
+signature verifies against that local trust set, the cluster ID matches, and the
+bundle's certificate set validates. After the previous CA is retired, stale
+bundles that would reintroduce that retired CA are rejected. This prevents stale
+or attacker-supplied CA sets from replacing or reviving primary trust roots.
 
 Secondary DR client certificates are relationship credentials. The design does
 not silently renew them. Healthy relationships rotate through a two-phase
