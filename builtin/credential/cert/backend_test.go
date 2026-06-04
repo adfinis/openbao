@@ -1240,6 +1240,83 @@ func TestBackend_uri_singleCert(t *testing.T) {
 	})
 }
 
+func TestBackend_uriSANAliasNameSource(t *testing.T) {
+	ca := &certyaml.Certificate{
+		Subject: "cn=ca",
+	}
+
+	const spiffeID = "spiffe://example.com/ns/default/sa/openbao-kms"
+	cert := &certyaml.Certificate{
+		SubjectAltNames: []string{"IP:127.0.0.1", "URI:" + spiffeID},
+		Issuer:          ca,
+	}
+
+	connState, err := testConnState(cert, ca)
+	if err != nil {
+		t.Fatalf("error testing connection state: %v", err)
+	}
+
+	checkAlias := func(resp *logical.Response) error {
+		if resp.Auth == nil || resp.Auth.Alias == nil {
+			return errors.New("missing auth alias")
+		}
+		if resp.Auth.Alias.Name != spiffeID {
+			return fmt.Errorf("expected alias %q, got %q", spiffeID, resp.Auth.Alias.Name)
+		}
+		return nil
+	}
+
+	loginStep := func() logicaltest.TestStep {
+		return logicaltest.TestStep{
+			Operation:       logical.UpdateOperation,
+			Path:            "login",
+			Unauthenticated: true,
+			ConnState:       &connState,
+			Check: func(resp *logical.Response) error {
+				if resp.Auth.TTL != 1000*time.Second {
+					t.Fatalf("bad lease length: %#v", resp.Auth)
+				}
+				if resp.Auth.DisplayName != "mnt-web" {
+					t.Fatalf("matched the wrong cert: %#v", resp.Auth.DisplayName)
+				}
+				if err := logicaltest.TestCheckAuth([]string{"default", "foo"})(resp); err != nil {
+					return err
+				}
+				return checkAlias(resp)
+			},
+			Data: map[string]interface{}{
+				"name": "web",
+			},
+		}
+	}
+
+	logicaltest.Test(t, logicaltest.TestCase{
+		CredentialBackend: testFactory(t),
+		Steps: []logicaltest.TestStep{
+			testAccStepCertWithExtraParams(t, "web", ca.CertPEM(), "foo", allowed{}, true, map[string]interface{}{
+				"alias_name_source": aliasNameSourceURISAN,
+			}),
+			testAccStepCertWithExtraParams(t, "web", ca.CertPEM(), "foo", allowed{uris: "spiffe://example.com/*"}, false, map[string]interface{}{
+				"alias_name_source": aliasNameSourceURISAN,
+			}),
+			testAccStepReadCertPolicy(t, "web", false, map[string]interface{}{
+				"alias_name_source": aliasNameSourceURISAN,
+			}),
+			{
+				Operation:       logical.AliasLookaheadOperation,
+				Path:            "login",
+				Unauthenticated: true,
+				ConnState:       &connState,
+				Check:           checkAlias,
+				Data: map[string]interface{}{
+					"name": "web",
+				},
+			},
+			loginStep(),
+		},
+	})
+}
+
 // Test against a collection of matching and non-matching rules
 func TestBackend_mixed_constraints(t *testing.T) {
 	tc := setupTestCerts(t)

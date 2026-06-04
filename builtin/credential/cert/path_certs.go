@@ -195,6 +195,16 @@ separated by a dash (-) instead of a dot (.) to allow usage in ACL templates.`,
 				Description: `The display name to use for clients using this
 certificate.`,
 			},
+			"alias_name_source": {
+				Type: framework.TypeString,
+				Description: fmt.Sprintf(`Source to use when deriving the Alias name.
+valid choices:
+	%q : <common_name> e.g. client.example.com
+	%q : <matching_uri_san> e.g. spiffe://example.com/ns/default/sa/openbao
+default: %q
+`, aliasNameSourceCommonName, aliasNameSourceURISAN, aliasNameSourceDefault),
+				Default: aliasNameSourceDefault,
+			},
 
 			"policies": {
 				Type:        framework.TypeCommaStringSlice,
@@ -329,6 +339,7 @@ func (b *backend) pathCertRead(ctx context.Context, req *logical.Request, d *fra
 		"allowed_organizational_units": cert.AllowedOrganizationalUnits,
 		"required_extensions":          cert.RequiredExtensions,
 		"allowed_metadata_extensions":  cert.AllowedMetadataExtensions,
+		"alias_name_source":            cert.aliasNameSource(),
 		"ocsp_ca_certificates":         cert.OcspCaCertificates,
 		"ocsp_enabled":                 cert.OcspEnabled,
 		"ocsp_servers_override":        cert.OcspServersOverride,
@@ -393,6 +404,9 @@ func (b *backend) pathCertWrite(ctx context.Context, req *logical.Request, d *fr
 	}
 	if displayNameRaw, ok := d.GetOk("display_name"); ok {
 		cert.DisplayName = displayNameRaw.(string)
+	}
+	if aliasNameSourceRaw, ok := d.GetOk("alias_name_source"); ok {
+		cert.AliasNameSource = aliasNameSourceRaw.(string)
 	}
 	if allowedNamesRaw, ok := d.GetOk("allowed_names"); ok {
 		cert.AllowedNames = allowedNamesRaw.([]string)
@@ -475,6 +489,12 @@ func (b *backend) pathCertWrite(ctx context.Context, req *logical.Request, d *fr
 	if cert.TokenPeriod > systemMaxTTL {
 		resp.AddWarning(fmt.Sprintf("Given period of %d seconds is greater than the backend's maximum TTL of %d seconds", cert.TokenPeriod/time.Second, systemMaxTTL/time.Second))
 	}
+	if err := validateAliasNameSource(cert.aliasNameSource()); err != nil {
+		return logical.ErrorResponse(err.Error()), nil
+	}
+	if cert.aliasNameSource() == aliasNameSourceURISAN && len(cert.AllowedURISANs) == 0 {
+		return logical.ErrorResponse("alias_name_source %q requires at least one allowed_uri_sans value", aliasNameSourceURISAN), nil
+	}
 
 	// Default the display name to the certificate name if not given
 	if cert.DisplayName == "" {
@@ -534,6 +554,7 @@ type CertEntry struct {
 	AllowedOrganizationalUnits []string
 	RequiredExtensions         []string
 	AllowedMetadataExtensions  []string
+	AliasNameSource            string
 	BoundCIDRs                 []*sockaddr.SockAddrMarshaler
 
 	OcspCaCertificates  string
@@ -541,6 +562,31 @@ type CertEntry struct {
 	OcspServersOverride []string
 	OcspFailOpen        bool
 	OcspQueryAllServers bool
+}
+
+const (
+	// aliasNameSourceUnset defaults to Common Name as to preserve backwards compatibility with preexisting roles.
+	aliasNameSourceUnset      = ""
+	aliasNameSourceCommonName = "common_name"
+	aliasNameSourceURISAN     = "uri_san"
+	aliasNameSourceDefault    = aliasNameSourceCommonName
+)
+
+func validateAliasNameSource(source string) error {
+	switch source {
+	case aliasNameSourceCommonName, aliasNameSourceURISAN:
+		return nil
+	default:
+		return fmt.Errorf("invalid alias_name_source: %s", source)
+	}
+}
+
+func (c *CertEntry) aliasNameSource() string {
+	if c == nil || c.AliasNameSource == aliasNameSourceUnset {
+		return aliasNameSourceDefault
+	}
+
+	return c.AliasNameSource
 }
 
 const pathCertHelpSyn = `

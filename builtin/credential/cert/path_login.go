@@ -115,10 +115,36 @@ func (b *backend) pathLoginAliasLookahead(ctx context.Context, req *logical.Requ
 		return nil, err
 	}
 
+	// Preserve the existing lookahead behavior for Common Name aliases:
+	// return the presented certificate's Common Name without full credential verification.
+	// URI SAN aliases require the named role because alias selection depends on allowed_uri_sans.
+	aliasName := clientCerts[0].Subject.CommonName
+	if d != nil {
+		certName := d.Get("name").(string)
+		if certName != "" {
+			cert, err := b.Cert(ctx, req.Storage, certName)
+			if err != nil {
+				return nil, err
+			}
+			if cert != nil {
+				switch cert.aliasNameSource() {
+				case aliasNameSourceCommonName:
+				case aliasNameSourceURISAN:
+					aliasName, err = getAliasName(clientCerts[0], cert)
+					if err != nil {
+						return logical.ErrorResponse(err.Error()), nil
+					}
+				default:
+					return logical.ErrorResponse("unknown alias_name_source %q", cert.AliasNameSource), nil
+				}
+			}
+		}
+	}
+
 	return &logical.Response{
 		Auth: &logical.Auth{
 			Alias: &logical.Alias{
-				Name: clientCerts[0].Subject.CommonName,
+				Name: aliasName,
 			},
 		},
 	}, nil
@@ -177,6 +203,11 @@ func (b *backend) pathLogin(ctx context.Context, req *logical.Request, data *fra
 	// with sanitized oids (dash-separated instead of dot-separated) as keys.
 	maps.Copy(metadata, b.certificateExtensionsMetadata(clientCerts[0], matched))
 
+	aliasName, err := getAliasName(clientCerts[0], matched.Entry)
+	if err != nil {
+		return logical.ErrorResponse(err.Error()), nil
+	}
+
 	auth := &logical.Auth{
 		InternalData: map[string]interface{}{
 			"certificate":      cert,
@@ -186,7 +217,7 @@ func (b *backend) pathLogin(ctx context.Context, req *logical.Request, data *fra
 		DisplayName: matched.Entry.DisplayName,
 		Metadata:    metadata,
 		Alias: &logical.Alias{
-			Name: clientCerts[0].Subject.CommonName,
+			Name: aliasName,
 		},
 	}
 
@@ -498,16 +529,8 @@ func (b *backend) matchesURISANs(clientCert *x509.Certificate, config *ParsedCer
 	if len(config.Entry.AllowedURISANs) == 0 {
 		return true
 	}
-	// At least one pattern must match at least one name if any patterns are specified
-	for _, allowedURI := range config.Entry.AllowedURISANs {
-		for _, name := range clientCert.URIs {
-			if glob.Glob(allowedURI, name.String()) {
-				return true
-			}
-		}
-	}
 
-	return false
+	return matchingURISAN(clientCert, config.Entry.AllowedURISANs) != ""
 }
 
 // matchesOrganizationalUnits verifies that the certificate matches at least one configurd allowed OU
@@ -563,6 +586,36 @@ func (b *backend) matchesCertificateExtensions(clientCert *x509.Certificate, con
 		}
 	}
 	return true
+}
+
+func getAliasName(clientCert *x509.Certificate, entry *CertEntry) (string, error) {
+	switch source := entry.aliasNameSource(); source {
+	case aliasNameSourceCommonName:
+		if clientCert.Subject.CommonName == "" {
+			return "", errors.New("client certificate common name is empty")
+		}
+		return clientCert.Subject.CommonName, nil
+	case aliasNameSourceURISAN:
+		aliasName := matchingURISAN(clientCert, entry.AllowedURISANs)
+		if aliasName == "" {
+			return "", errors.New("client certificate URI SAN did not match allowed_uri_sans")
+		}
+		return aliasName, nil
+	default:
+		return "", fmt.Errorf("unknown alias_name_source %q", source)
+	}
+}
+
+func matchingURISAN(clientCert *x509.Certificate, allowedURISANs []string) string {
+	for _, allowedURI := range allowedURISANs {
+		for _, name := range clientCert.URIs {
+			uri := name.String()
+			if glob.Glob(allowedURI, uri) {
+				return uri
+			}
+		}
+	}
+	return ""
 }
 
 // certificateExtensionsMetadata returns the metadata from configured
