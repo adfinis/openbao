@@ -49,6 +49,11 @@ Sets a CA cert and associated parameters in a role name.
   Names in the client certificate with a [globbed pattern](https://github.com/ryanuber/go-glob/blob/master/README.md#example). Value is
   a comma-separated list of URI patterns. Authentication requires at least one
   URI matching at least one pattern. If not set, defaults to allowing all URIs.
+- `alias_name_source` `(string: "common_name")` - The source used to derive the
+  identity alias name during login. Valid values are `common_name`, which uses
+  the client certificate Common Name, and `uri_san`, which uses a URI SAN matched
+  by `allowed_uri_sans`. Configure `allowed_uri_sans` narrowly enough to select
+  the intended identity.
 - `allowed_organizational_units` `(string: "" or array: [])` - Constrain the
   Organizational Units (OU) in the client certificate with a [globbed pattern](https://github.com/ryanuber/go-glob/blob/master/README.md#example). Value is
   a comma-separated list of OU patterns. Authentication requires at least one
@@ -135,6 +140,7 @@ $ curl \
   "data": {
     "certificate": "-----BEGIN CERTIFICATE-----\nMIIEtzCCA5+.......ZRtAfQ6r\nwlW975rYa1ZqEdA=\n-----END CERTIFICATE-----",
     "display_name": "test",
+    "alias_name_source": "common_name",
     "policies": "",
     "allowed_names": "",
     "required_extensions": "",

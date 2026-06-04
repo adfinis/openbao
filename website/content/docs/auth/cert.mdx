@@ -143,6 +143,17 @@ management tool.
    clients is given by the "web-cert.pem" file. Lastly, an optional `ttl` value
    can be provided in seconds to limit the lease duration.
 
+  For client certificates that use a URI SAN as their identity, configure
+  `allowed_uri_sans` and set `alias_name_source` to `uri_san`:
+
+  ```shell
+  $ bao write auth/cert/certs/spiffe-workload \
+    display_name=spiffe-workload \
+    certificate=@ca.pem \
+    allowed_uri_sans=spiffe://example.org/ns/default/sa/web \
+    alias_name_source=uri_san
+   ```
+
 ## API
 
 The TLS Certificate auth method has a full HTTP API. Please see the
