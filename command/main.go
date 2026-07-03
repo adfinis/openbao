@@ -41,7 +41,7 @@ var globalFlags = []string{
 
 // setupEnv parses args and may replace them and sets some env vars to known
 // values based on format options
-func setupEnv(args []string) (retArgs []string, format string, detailed bool, outputCurlString bool, outputPolicy bool) {
+func setupEnv(args []string) (retArgs []string, format string, detailed bool, dryRun string, outputPolicy bool) {
 	var err error
 	var nextArgFormat bool
 	var haveDetailed bool
@@ -63,8 +63,15 @@ func setupEnv(args []string) (retArgs []string, format string, detailed bool, ou
 		}
 
 		if isGlobalFlag(arg, globalFlagOutputCurlString) {
-			outputCurlString = true
+			dryRun = "curl"
 			continue
+		}
+		if isGlobalFlag(arg, "dry-run") {
+			dryRun = "true"
+			continue
+		}
+		if isGlobalFlagWithValue(arg, "dry-run") {
+			dryRun = getGlobalFlagValue(arg)
 		}
 
 		if isGlobalFlag(arg, globalFlagOutputPolicy) {
@@ -117,7 +124,7 @@ func setupEnv(args []string) (retArgs []string, format string, detailed bool, ou
 		}
 	}
 
-	return args, format, detailed, outputCurlString, outputPolicy
+	return args, format, detailed, dryRun, outputPolicy
 }
 
 func isGlobalFlag(arg string, flag string) bool {
@@ -155,9 +162,9 @@ func RunCustom(args []string, runOpts *RunOptions) int {
 
 	var format string
 	var detailed bool
-	var outputCurlString bool
+	var dryRun string
 	var outputPolicy bool
-	args, format, detailed, outputCurlString, outputPolicy = setupEnv(args)
+	args, format, detailed, dryRun, outputPolicy = setupEnv(args)
 
 	// Don't use color if disabled
 	useColor := !color.NoColor && api.ReadBaoVariable(EnvVaultCLINoColor) == ""
@@ -183,7 +190,7 @@ func RunCustom(args []string, runOpts *RunOptions) int {
 	}
 
 	uiErrWriter := runOpts.Stderr
-	if outputCurlString || outputPolicy {
+	if dryRun != "" || outputPolicy {
 		uiErrWriter = &bytes.Buffer{}
 	}
 
@@ -237,8 +244,8 @@ func RunCustom(args []string, runOpts *RunOptions) int {
 	}
 
 	exitCode, err := cli.Run()
-	if outputCurlString {
-		return generateCurlString(exitCode, runOpts, uiErrWriter.(*bytes.Buffer))
+	if dryRun != "" {
+		return generateCurlString(dryRun, exitCode, runOpts, uiErrWriter.(*bytes.Buffer))
 	} else if outputPolicy {
 		return generatePolicy(exitCode, runOpts, uiErrWriter.(*bytes.Buffer))
 	} else if err != nil {
@@ -302,7 +309,7 @@ func printCommand(w io.Writer, name string, cmdFn cli.CommandFactory) {
 	_, _ = fmt.Fprintf(w, "    %s\t%s\n", name, cmd.Synopsis())
 }
 
-func generateCurlString(exitCode int, runOpts *RunOptions, preParsingErrBuf *bytes.Buffer) int {
+func generateCurlString(dryRun string, exitCode int, runOpts *RunOptions, preParsingErrBuf *bytes.Buffer) int {
 	if exitCode == 0 {
 		_, _ = fmt.Fprint(runOpts.Stderr, "Could not generate cURL command")
 		return 1
@@ -316,6 +323,17 @@ func generateCurlString(exitCode int, runOpts *RunOptions, preParsingErrBuf *byt
 		_, _ = runOpts.Stderr.Write(preParsingErrBuf.Bytes())
 		_, _ = fmt.Fprint(runOpts.Stderr, "Unable to generate cURL string from command\n")
 		return exitCode
+	}
+
+	if dryRun != "curl" {
+		si, err := api.LastOutputStringError.AsRequest()
+		if err != nil {
+			_, _ = fmt.Fprintf(runOpts.Stderr, "Error creating request string: %s\n", err)
+			return 1
+		}
+
+		_, _ = fmt.Fprintf(runOpts.Stdout, "%s\n", si)
+		return 0
 	}
 
 	cs, err := api.LastOutputStringError.CurlString()

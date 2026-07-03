@@ -4,12 +4,16 @@
 package api
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 
 	retryablehttp "github.com/hashicorp/go-retryablehttp"
+	"github.com/hashicorp/hcl/v2/hclwrite"
+	"github.com/zclconf/go-cty/cty"
+	ctyjson "github.com/zclconf/go-cty/cty/json"
 )
 
 const (
@@ -36,6 +40,47 @@ func (d *OutputStringError) Error() string {
 	}
 
 	return ErrOutputStringRequest
+}
+
+func (d *OutputStringError) AsRequest() (string, error) {
+	path := d.Request.URL.Path
+	path, ok := strings.CutPrefix(path, "/v1/")
+	if !ok {
+		return "", fmt.Errorf("path %q does not start with /v1/", path)
+	}
+
+	body, err := d.BodyBytes()
+	if err != nil {
+		return "", err
+	}
+
+	data := ctyjson.SimpleJSONValue{}
+	err = json.Unmarshal(body, &data)
+	if err != nil {
+		return "", err
+	}
+
+	var operation string
+	switch d.Method {
+	case "GET":
+		operation = "read"
+
+	case "POST":
+		fallthrough
+	case "PUT":
+		operation = "update"
+
+	case "DELETE":
+		operation = "delete"
+	}
+
+	file := hclwrite.NewEmptyFile()
+	request := file.Body().AppendNewBlock("request", []string{"generated"})
+	request.Body().SetAttributeValue("path", cty.StringVal(path))
+	request.Body().SetAttributeValue("operation", cty.StringVal(operation))
+	request.Body().SetAttributeValue("data", data.Value)
+
+	return string(file.Bytes()), nil
 }
 
 func (d *OutputStringError) CurlString() (string, error) {

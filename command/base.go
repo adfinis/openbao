@@ -61,6 +61,7 @@ type BaseCommand struct {
 	flagField            string
 	flagDetailed         bool
 	flagOutputCurlString bool
+	flagDryRun           string
 	flagOutputPolicy     bool
 	flagNonInteractive   bool
 
@@ -95,8 +96,8 @@ func (c *BaseCommand) ClientWithoutToken() (*api.Client, error) {
 		config.Address = c.flagAgentProxyAddress
 	}
 
-	if c.flagOutputCurlString {
-		config.OutputCurlString = c.flagOutputCurlString
+	if c.flagOutputCurlString || c.flagDryRun != "false" {
+		config.OutputCurlString = true
 	}
 	if c.flagOutputPolicy {
 		config.OutputPolicy = c.flagOutputPolicy
@@ -478,6 +479,15 @@ func (c *BaseCommand) flagSet(bit FlagSetBit) *FlagSets {
 				Name:    "output-curl-string",
 				Target:  &c.flagOutputCurlString,
 				Default: false,
+				Usage: "Instead of executing the request, print an equivalent cURL " +
+					"command string and exit.",
+			})
+
+			f.StringVar(&StringVar{
+				Name:       "dry-run",
+				Target:     &c.flagDryRun,
+				Default:    "false",
+				Completion: complete.PredictSet("true", "false", "curl", "init-hcl", "init-json"),
 				Usage: "Instead of executing the request, print an equivalent cURL " +
 					"command string and exit.",
 			})
