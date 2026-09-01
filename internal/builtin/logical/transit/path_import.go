@@ -246,6 +246,8 @@ func (b *backend) pathImportWrite(ctx context.Context, req *logical.Request, d *
 		return nil, err
 	}
 
+	b.incrementKeyCount()
+
 	return nil, nil
 }
 

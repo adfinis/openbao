@@ -346,7 +346,9 @@ func (b *backend) pathPolicyWrite(ctx context.Context, req *logical.Request, d *
 	if err != nil {
 		return nil, err
 	}
-	if !upserted {
+	if upserted {
+		b.incrementKeyCount()
+	} else {
 		resp.AddWarning(fmt.Sprintf("key %s already existed", name))
 	}
 	return resp, nil
@@ -542,6 +544,8 @@ func (b *backend) pathPolicyDelete(ctx context.Context, req *logical.Request, d 
 	if err != nil {
 		return logical.ErrorResponse("error deleting policy %s: %s", name, err), err
 	}
+
+	b.decrementKeyCount()
 
 	return nil, nil
 }

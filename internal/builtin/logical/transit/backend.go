@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/go-multierror"
@@ -79,12 +80,28 @@ func Backend(ctx context.Context, conf *logical.BackendConfig) (*backend, error)
 			b.pathConfigKeys(),
 			b.pathCreateCSR(),
 			b.pathImportCertChain(),
+			b.pathConfigMetrics(),
 		},
 
 		Secrets:      []*framework.Secret{},
 		Invalidate:   b.invalidate,
 		BackendType:  logical.TypeLogical,
 		PeriodicFunc: b.periodicFunc,
+		InitializeFunc: func(ctx context.Context, ir *logical.InitializationRequest) error {
+			if !b.System().ReplicationState().HasState(consts.ReplicationPerformanceStandby) {
+				err := b.loadMetricsConfig(ctx, conf.StorageView)
+				if err != nil {
+					b.Logger().Warn("could not load metrics config", "error", err)
+				} else {
+					err = b.initMetrics(ctx, conf.StorageView)
+					if err != nil {
+						b.Logger().Warn("could not initialize metrics", "error", err)
+					}
+				}
+			}
+
+			return nil
+		},
 	}
 
 	b.backendUUID = conf.BackendUUID
@@ -123,6 +140,11 @@ type backend struct {
 	checkAutoRotateAfter time.Time
 	autoRotateOnce       sync.Once
 	backendUUID          string
+
+	// metrics
+	counter            atomic.Uint64
+	metricsConfigMutex sync.Mutex // this mutex only protects against concurrent update / patch operations
+	metricsConfig      atomic.Pointer[configMetrics]
 }
 
 func GetCacheSizeFromStorage(ctx context.Context, s logical.Storage) (int, error) {
@@ -194,12 +216,16 @@ func (b *backend) invalidate(ctx context.Context, key string) {
 		b.configMutex.Lock()
 		defer b.configMutex.Unlock()
 		b.cacheSizeChanged = true
+	case key == storagePathMetricsConfig:
+		// ignore, metric is only available on the primary
 	}
 }
 
 // periodicFunc is a central collection of functions that run on an interval.
 // Anything that should be called regularly can be placed within this method.
 func (b *backend) periodicFunc(ctx context.Context, req *logical.Request) error {
+	b.emitMetrics()
+
 	// These operations ensure the auto-rotate only happens once simultaneously. It's an unlikely edge
 	// given the time scale, but a safeguard nonetheless.
 	var err error

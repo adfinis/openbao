@@ -63,7 +63,14 @@ func (b *backend) pathRestoreUpdate(ctx context.Context, req *logical.Request, d
 		return nil, ErrInvalidKeyName
 	}
 
-	return nil, b.lm.RestorePolicy(ctx, req.Storage, keyName, backupB64, force)
+	err := b.lm.RestorePolicy(ctx, req.Storage, keyName, backupB64, force)
+	if err != nil {
+		return nil, err
+	}
+
+	b.incrementKeyCount()
+
+	return nil, nil
 }
 
 const (

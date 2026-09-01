@@ -157,6 +157,8 @@ func (b *backend) pathPolicyDeriveKeyWrite(ctx context.Context, req *logical.Req
 		return nil, err
 	}
 
+	b.incrementKeyCount()
+
 	return nil, nil
 }
 
