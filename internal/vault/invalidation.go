@@ -4,9 +4,9 @@
 package vault
 
 import (
+	"container/list"
 	"context"
 	"fmt"
-	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -32,6 +32,24 @@ const (
 	maxPluginInvalidateTime = 2 * time.Second
 	maxDispatchers          = 128
 )
+
+type outstandingQueueElement struct {
+	index string
+	keys  map[string]struct{}
+}
+
+// outstandingQueue is a truly outstanding queue :D
+type outstandingQueue struct {
+	sorted *list.List
+	lookup map[string]*list.Element
+}
+
+func newQueue() outstandingQueue {
+	return outstandingQueue{
+		sorted: list.New(),
+		lookup: map[string]*list.Element{},
+	}
+}
 
 func (c *Core) Invalidate(index string, key ...string) {
 	c.invalidations.Add(index, key...)
@@ -62,8 +80,10 @@ type invalidationManager struct {
 	pendingLock   sync.Mutex
 	accepting     atomic.Bool
 	pending       []pendingEntry
-	outstanding   map[string]map[string]struct{}
+	outstanding   outstandingQueue
 	pendingNotify chan struct{}
+
+	invalidatedUpToIncluding atomic.Pointer[string]
 
 	// quitCh notifies that we should stop actively processing invalidations.
 	//
@@ -86,7 +106,7 @@ func (core *Core) NewInvalidationManager() {
 		dispacherLogger: core.logger.Named(dispatcherName),
 
 		pendingNotify: make(chan struct{}),
-		outstanding:   map[string]map[string]struct{}{},
+		outstanding:   newQueue(),
 	}
 }
 
@@ -105,7 +125,7 @@ func (im *invalidationManager) Track() {
 	}
 
 	im.pending = nil
-	im.outstanding = map[string]map[string]struct{}{}
+	im.outstanding = newQueue()
 	im.accepting.Store(true)
 }
 
@@ -156,7 +176,7 @@ func (im *invalidationManager) Stop() {
 	// Clear any remaining items.
 	im.pendingLock.Lock()
 	im.pending = nil
-	im.outstanding = map[string]map[string]struct{}{}
+	im.outstanding = newQueue()
 	im.pendingLock.Unlock()
 
 	// Clear any start-specific state.
@@ -325,18 +345,30 @@ func (ij *invalidationJob) Execute() error {
 				ij.im.pendingLock.Lock()
 				defer ij.im.pendingLock.Unlock()
 
-				indexMap, ok := ij.im.outstanding[ij.index]
+				element, ok := ij.im.outstanding.lookup[ij.index]
 				if !ok {
 					return
 				}
+				indexMap := element.Value.(*outstandingQueueElement)
 
-				if _, present := indexMap[ij.key]; !present {
+				if _, present := indexMap.keys[ij.key]; !present {
 					return
 				}
 
-				delete(indexMap, ij.key)
-				if len(indexMap) == 0 {
-					delete(ij.im.outstanding, ij.index)
+				delete(indexMap.keys, ij.key)
+
+				if len(indexMap.keys) > 0 {
+					return
+				}
+
+				var index string
+				for first := ij.im.outstanding.sorted.Front(); first != nil && len(first.Value.(*outstandingQueueElement).keys) == 0; first = ij.im.outstanding.sorted.Front() {
+					index = first.Value.(*outstandingQueueElement).index
+					delete(ij.im.outstanding.lookup, index)
+					ij.im.outstanding.sorted.Remove(first)
+				}
+				if index != "" {
+					ij.im.invalidatedUpToIncluding.Store(&index)
 				}
 			}()
 		}()
@@ -655,12 +687,17 @@ func (im *invalidationManager) Add(index string, keys ...string) {
 		})
 
 		if index != "" {
-			indexMap, ok := im.outstanding[index]
-			if !ok {
-				indexMap = make(map[string]struct{}, len(keys))
-				im.outstanding[index] = indexMap
+			var element *outstandingQueueElement
+			if listElement, ok := im.outstanding.lookup[index]; ok {
+				element = listElement.Value.(*outstandingQueueElement)
+			} else {
+				element = &outstandingQueueElement{
+					index: index,
+					keys:  make(map[string]struct{}, len(keys)),
+				}
+				im.outstanding.lookup[index] = im.outstanding.sorted.PushBack(element)
 			}
-			indexMap[key] = struct{}{}
+			element.keys[key] = struct{}{}
 		}
 	}
 	im.pendingLock.Unlock()
@@ -683,19 +720,10 @@ func (im *invalidationManager) splitNamespaceFromKey(key string) (string, string
 	return namespaceUUID, namespacedKey
 }
 
-// hasOutstandingInvalidations returns the list of outstanding invalidations.
-func (im *invalidationManager) OutstandingInvalidationIndices() []string {
-	im.pendingLock.Lock()
-
-	// Create a clone of all outstanding, not-yet-invalidated index values
-	// we know about.
-	iter := maps.Keys(im.outstanding)
-	indices := make([]string, 0, len(im.outstanding))
-	for item := range iter {
-		indices = append(indices, item)
+func (im *invalidationManager) GetInvalidatedUpToIncluding() string {
+	ptr := im.invalidatedUpToIncluding.Load()
+	if ptr == nil { // TODO: we should initialize the index to our "start of tracking invalidations" index
+		return ""
 	}
-
-	im.pendingLock.Unlock()
-
-	return indices
+	return *ptr
 }

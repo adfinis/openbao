@@ -111,17 +111,12 @@ func (core *Core) HaveSeenStorageIndex(ctx context.Context, index string) (bool,
 
 	// We've seen the index, so check if we've handled all prior
 	// invalidations.
-	outstanding := core.indexManager.GetOutstanding()
-	for _, pending := range outstanding {
-		older, err := core.indexManager.backend.GreaterEqualReplicationIndex(ctx, index, pending)
-		if err != nil || older {
-			// We have an older index still waiting for its invalidation job to
-			// complete; this means we need to wait.
-			return false, err
-		}
+	invalidatedUpToIncluding := core.invalidations.GetInvalidatedUpToIncluding()
+	olderOrEqual, err := core.indexManager.backend.GreaterEqualReplicationIndex(ctx, invalidatedUpToIncluding, index)
+	if err != nil {
+		return false, err
 	}
-
-	return true, nil
+	return olderOrEqual, err
 }
 
 func (i *indexManager) Await(ctx context.Context, index string) error {
@@ -181,15 +176,13 @@ func (i *indexManager) AwaitInvalidated(ctx context.Context, index string) error
 	b.MaxInterval = 1 * time.Second
 
 	op := func() (none struct{}, err error) {
-		outstanding := i.GetOutstanding()
+		invalidatedUpToIncluding := i.invalidations.GetInvalidatedUpToIncluding()
+		olderOrEqual, err := i.backend.GreaterEqualReplicationIndex(ctx, invalidatedUpToIncluding, index)
 
-		for _, pending := range outstanding {
-			older, err := i.backend.GreaterEqualReplicationIndex(ctx, index, pending)
-			if err != nil || older {
-				// We have an older index still waiting for its invalidation job to
-				// complete; this means we need to wait.
-				return none, fmt.Errorf("still have outstanding replication index %v: %w", pending, err)
-			}
+		if err != nil || !olderOrEqual {
+			// We have an older index still waiting for its invalidation job to
+			// complete; this means we need to wait.
+			return none, fmt.Errorf("have only processed up to including replication index %v: %w", invalidatedUpToIncluding, err)
 		}
 
 		return none, nil
@@ -232,46 +225,4 @@ func (i *indexManager) getIndexLocked(ctx context.Context) (string, error) {
 	i.lastIndexUpdate = when
 
 	return storageIndex, nil
-}
-
-// getOutstanding returns the outstanding indices that need to be invalidated,
-// if it is within freshness thresholds.
-func (i *indexManager) GetOutstanding() []string {
-	if outstanding := func() []string {
-		i.outstandingLock.RLock()
-		defer i.outstandingLock.RUnlock()
-
-		if time.Now().After(i.outstandingUpdate.Add(i.backoff)) {
-			return nil
-		}
-
-		return i.outstandingIndices
-	}(); outstanding != nil {
-		return outstanding
-	}
-
-	i.outstandingLock.Lock()
-	defer i.outstandingLock.Unlock()
-
-	if i.outstandingIndices != nil && time.Now().Before(i.outstandingUpdate.Add(i.backoff)) {
-		return i.outstandingIndices
-	}
-
-	return i.getOutstandingLocked()
-}
-
-func (i *indexManager) getOutstandingLocked() []string {
-	// Assume the outstanding set is relative to the start of the check
-	// operation, not the end.
-	when := time.Now()
-	outstanding := i.invalidations.OutstandingInvalidationIndices()
-	if len(outstanding) == 0 {
-		// Ensure we're strictly non-nil to differentiate in getOutstanding(...).
-		outstanding = []string{}
-	}
-
-	i.outstandingIndices = outstanding
-	i.outstandingUpdate = when
-
-	return i.outstandingIndices
 }
